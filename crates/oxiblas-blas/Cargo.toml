@@ -1,0 +1,31 @@
+[package]
+name = "oxiblas-blas"
+description = "BLAS operations for OxiBLAS - pure Rust implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["blas", "gemm", "linear-algebra", "simd", "matrix"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+oxiblas-core.workspace = true
+oxiblas-matrix.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["rayon", "oxiblas-core/parallel"]
+
+# SIMD control features (propagate to oxiblas-core)
+force-scalar = ["oxiblas-core/force-scalar"]  # Disable all SIMD
+max-simd-128 = ["oxiblas-core/max-simd-128"]  # Limit to 128-bit SIMD
+max-simd-256 = ["oxiblas-core/max-simd-256"]  # Limit to 256-bit SIMD
+
+[lints]
+workspace = true

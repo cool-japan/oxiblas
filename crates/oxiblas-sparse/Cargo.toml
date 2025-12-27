@@ -1,0 +1,28 @@
+[package]
+name = "oxiblas-sparse"
+description = "Sparse matrix support for OxiBLAS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sparse", "matrix", "csr", "csc", "linear-algebra"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+oxiblas-core.workspace = true
+oxiblas-matrix.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+rand.workspace = true
+
+[features]
+default = []
+parallel = ["dep:rayon", "oxiblas-core/parallel"]
+
+[lints]
+workspace = true

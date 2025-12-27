@@ -1,0 +1,32 @@
+[package]
+name = "oxiblas-lapack"
+description = "LAPACK operations for OxiBLAS - pure Rust implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["lapack", "linear-algebra", "decomposition", "eigenvalue", "svd"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+oxiblas-core.workspace = true
+oxiblas-matrix.workspace = true
+oxiblas-blas.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["rayon", "oxiblas-blas/parallel", "oxiblas-core/parallel"]
+
+# SIMD control features (propagate to oxiblas-core and oxiblas-blas)
+force-scalar = ["oxiblas-core/force-scalar", "oxiblas-blas/force-scalar"]  # Disable all SIMD
+max-simd-128 = ["oxiblas-core/max-simd-128", "oxiblas-blas/max-simd-128"]  # Limit to 128-bit SIMD
+max-simd-256 = ["oxiblas-core/max-simd-256", "oxiblas-blas/max-simd-256"]  # Limit to 256-bit SIMD
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "oxiblas-ffi"
+description = "C FFI bindings for OxiBLAS - a pure Rust BLAS/LAPACK library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["ffi", "blas", "lapack", "linear-algebra", "c-bindings"]
+categories = ["external-ffi-bindings", "mathematics", "science"]
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+oxiblas-core.workspace = true
+oxiblas-matrix.workspace = true
+oxiblas-blas.workspace = true
+oxiblas-lapack.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+
+[features]
+default = []
+
+[build-dependencies]
+cbindgen = "0.29"
+
+# FFI crate uses relaxed lints - C interop requires different patterns
+[lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+
+[lints.clippy]
+# Allow all lint groups for FFI
+all = "allow"
+pedantic = "allow"
+nursery = "allow"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,35 @@
+[package]
+name = "oxiblas-matrix"
+description = "Matrix types and views for OxiBLAS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["matrix", "linear-algebra", "simd", "numerics", "blas"]
+categories = ["mathematics", "science", "data-structures"]
+
+[dependencies]
+oxiblas-core.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
+bytemuck.workspace = true
+serde = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+nalgebra = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+serde_json.workspace = true
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+
+[features]
+default = []
+serde = ["dep:serde"]
+mmap = ["dep:memmap2"]
+nalgebra = ["dep:nalgebra"]  # nalgebra type conversions
+
+[lints]
+workspace = true

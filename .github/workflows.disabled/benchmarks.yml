@@ -1,0 +1,178 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run benchmarks weekly on Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    # Allow manual triggering
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-benchmark-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install criterion
+        run: cargo install cargo-criterion || true
+
+      - name: Run BLAS Level 1 benchmarks
+        run: cargo criterion --bench blas_level1 -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Run BLAS Level 2 benchmarks
+        run: cargo criterion --bench blas_level2 -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Run BLAS Level 3 benchmarks
+        run: cargo criterion --bench blas_level3 -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Run GEMM benchmarks
+        run: cargo criterion --bench gemm -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Run sparse operations benchmarks
+        run: cargo criterion --bench sparse_ops -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Run LAPACK benchmarks
+        run: cargo criterion --bench lapack_qr lapack_svd lapack_solve -- --output-format bencher
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Store benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.os }}
+          path: |
+            crates/oxiblas-benchmarks/target/criterion/
+            !crates/oxiblas-benchmarks/target/criterion/**/raw.csv
+          retention-days: 30
+
+  benchmark-compare:
+    name: Compare Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Checkout base branch
+        run: git checkout ${{ github.base_ref }}
+
+      - name: Run baseline benchmarks
+        run: cargo bench --bench blas_level3 -- --save-baseline baseline
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Checkout PR branch
+        run: git checkout ${{ github.head_ref }}
+
+      - name: Run PR benchmarks
+        run: cargo bench --bench blas_level3 -- --baseline baseline
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Generate comparison report
+        run: |
+          echo "## Benchmark Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing PR against base branch" >> $GITHUB_STEP_SUMMARY
+          echo "See criterion HTML reports for details" >> $GITHUB_STEP_SUMMARY
+
+  performance-tracking:
+    name: Track Performance Over Time
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run key benchmarks
+        run: |
+          cargo bench --bench gemm -- --output-format json > gemm-results.json
+          cargo bench --bench blas_level3 -- --output-format json > blas3-results.json
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Store performance data
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-data-${{ github.sha }}
+          path: |
+            crates/oxiblas-benchmarks/*-results.json
+          retention-days: 90
+
+      - name: Generate performance report
+        run: |
+          echo "## Performance Report" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "Date: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "Performance data stored for tracking" >> $GITHUB_STEP_SUMMARY
+
+  benchmark-matrix:
+    name: Benchmark Matrix Sizes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run comprehensive benchmarks
+        run: |
+          echo "Running comprehensive benchmark suite..."
+          cargo bench --workspace -- --output-format json > comprehensive-benchmarks.json
+        working-directory: crates/oxiblas-benchmarks
+
+      - name: Generate benchmark report
+        run: |
+          echo "# Comprehensive Benchmark Report" > benchmark-report.md
+          echo "Date: $(date)" >> benchmark-report.md
+          echo "Commit: ${{ github.sha }}" >> benchmark-report.md
+          echo "" >> benchmark-report.md
+          echo "Full benchmark results stored in artifacts" >> benchmark-report.md
+
+      - name: Store comprehensive results
+        uses: actions/upload-artifact@v4
+        with:
+          name: comprehensive-benchmarks-${{ github.run_number }}
+          path: |
+            crates/oxiblas-benchmarks/comprehensive-benchmarks.json
+            benchmark-report.md
+          retention-days: 90

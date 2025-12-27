@@ -1,0 +1,82 @@
+[package]
+name = "oxiblas-benchmarks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oxiblas-core = { path = "../oxiblas-core", features = ["f16", "parallel"] }
+oxiblas-matrix = { path = "../oxiblas-matrix" }
+oxiblas-blas = { path = "../oxiblas-blas", features = ["parallel"] }
+oxiblas-lapack = { path = "../oxiblas-lapack" }
+oxiblas-sparse = { path = "../oxiblas-sparse" }
+
+# Optional: For comparison benchmarks with other BLAS implementations
+ndarray = { version = "0.17", optional = true }
+ndarray-linalg = { version = "0.18", optional = true, features = ["openblas-system"] }
+blas-src = { version = "0.14", optional = true, features = ["openblas"] }
+cblas-sys = { version = "0.3", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+num-complex = "0.4"
+
+[features]
+default = []
+# Enable comparison benchmarks with OpenBLAS (BSD-3-Clause license, compatible)
+compare-openblas = ["ndarray", "ndarray-linalg", "blas-src", "cblas-sys"]
+
+[[bench]]
+name = "blas_level1"
+harness = false
+
+[[bench]]
+name = "blas_level2"
+harness = false
+
+[[bench]]
+name = "blas_level3"
+harness = false
+
+[[bench]]
+name = "lapack_qr"
+harness = false
+
+[[bench]]
+name = "lapack_svd"
+harness = false
+
+[[bench]]
+name = "new_features"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+required-features = ["compare-openblas"]
+
+[[bench]]
+name = "advanced_features"
+harness = false
+
+[[bench]]
+name = "lapack_factorization"
+harness = false
+
+[[bench]]
+name = "lapack_evd"
+harness = false
+
+[[bench]]
+name = "lapack_solve"
+harness = false
+
+[[bench]]
+name = "sparse_ops"
+harness = false
+
+[[bench]]
+name = "sparse_eigen_svd"
+harness = false

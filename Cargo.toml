@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,14 +22,14 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxiblas-core = { path = "crates/oxiblas-core", version = "0.1.0" }
-oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.1.0" }
-oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.1.0" }
-oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.1.0" }
-oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.1.0" }
-oxiblas = { path = "crates/oxiblas", version = "0.1.0" }
-oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.1.0" }
-oxiblas-ffi = { path = "crates/oxiblas-ffi", version = "0.1.0" }
+oxiblas-core = { path = "crates/oxiblas-core", version = "0.1.1" }
+oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.1.1" }
+oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.1.1" }
+oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.1.1" }
+oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.1.1" }
+oxiblas = { path = "crates/oxiblas", version = "0.1.1" }
+oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.1.1" }
+oxiblas-ffi = { path = "crates/oxiblas-ffi", version = "0.1.1" }
 
 # Essential dependencies
 num-complex = { version = "0.4", features = ["bytemuck"] }

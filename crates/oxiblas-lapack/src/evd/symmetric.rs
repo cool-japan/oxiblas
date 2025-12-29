@@ -173,7 +173,10 @@ impl<T: Field + Real + bytemuck::Zeroable> SymmetricEvd<T> {
         let n = self.n;
         let mut a = Mat::zeros(n, n);
 
-        // A = V * D * V^T = sum_i lambda_i * v_i * v_i^T
+        // A = V^T * D * V = sum_i lambda_i * v_i^T * v_i (if eigenvectors are rows)
+        // OR A = V * D * V^T = sum_i lambda_i * v_i * v_i^T (if eigenvectors are columns)
+        //
+        // Current implementation assumes eigenvectors are columns
         for k in 0..n {
             let lambda = self.eigenvalues[k];
             for i in 0..n {
@@ -1121,7 +1124,9 @@ fn qr_algorithm<T: Field + Real>(
             let (c, s) = givens_rotation(x, z);
 
             if k > l {
-                off_diag[k - 1] = Real::hypot(x, z);
+                // The off-diagonal element is r = c*x - s*z from the Givens rotation
+                // Using hypot loses the sign, which affects eigenvectors (not eigenvalues)
+                off_diag[k - 1] = c * x - s * z;
             }
 
             // Update tridiagonal matrix
@@ -1159,7 +1164,14 @@ fn qr_algorithm<T: Field + Real>(
     Ok(diag)
 }
 
-/// Computes Givens rotation coefficients.
+/// Computes Givens rotation coefficients for implicit QR.
+///
+/// Returns (c, s) such that:
+///   [[c, -s], [s, c]] * [a; b] = [r; 0]
+/// i.e., G^T * [a; b] = [r; 0] where G = [[c, s], [-s, c]]
+///
+/// This means: c*a - s*b = r, s*a + c*b = 0
+/// So: s/c = -b/a, meaning c = a/r, s = -b/r (up to sign of r)
 fn givens_rotation<T: Field + Real>(a: T, b: T) -> (T, T) {
     if b == T::zero() {
         (T::one(), T::zero())
@@ -1243,6 +1255,35 @@ mod tests {
         let a = Mat::from_rows(&[&[4.0f64, 1.0, 1.0], &[1.0, 3.0, 2.0], &[1.0, 2.0, 3.0]]);
 
         let evd = SymmetricEvd::compute(a.as_ref()).unwrap();
+        let v = evd.eigenvectors();
+
+        // Test A*v = λ*v for each eigenvector
+        for col in 0..3 {
+            let lambda = evd.eigenvalues()[col];
+            let mut v_col = vec![0.0; 3];
+            for row in 0..3 {
+                v_col[row] = v[(row, col)];
+            }
+
+            let mut av = vec![0.0; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    av[i] += a[(i, j)] * v_col[j];
+                }
+            }
+
+            // Check A*v ≈ λ*v
+            for i in 0..3 {
+                assert!(
+                    approx_eq(av[i], lambda * v_col[i], 1e-9),
+                    "A*v[{}] = {}, λ*v[{}] = {}",
+                    i,
+                    av[i],
+                    i,
+                    lambda * v_col[i]
+                );
+            }
+        }
 
         // Reconstruct and verify
         let reconstructed = evd.reconstruct();
@@ -1760,6 +1801,72 @@ mod tests {
                         uplo
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_evd_numrs2_failing_matrix() {
+        // Matrix that previously failed due to off-diagonal sign bug in QR algorithm
+        let a = Mat::from_rows(&[
+            &[4.0f64, 1.0, 1.0],
+            &[1.0, 3.0, 1.0],
+            &[1.0, 1.0, 2.0],
+        ]);
+
+        let evd = SymmetricEvd::compute(a.as_ref()).unwrap();
+        let v = evd.eigenvectors();
+
+        // Verify eigenvectors are orthogonal
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut sum = 0.0;
+                for k in 0..3 {
+                    sum += v[(k, i)] * v[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    approx_eq(sum, expected, 1e-9),
+                    "V^T*V[{},{}] = {}, expected {}",
+                    i,
+                    j,
+                    sum,
+                    expected
+                );
+            }
+        }
+
+        // Verify A*v = λ*v for each eigenvector
+        for col in 0..3 {
+            let lambda = evd.eigenvalues()[col];
+            for i in 0..3 {
+                let mut av_i = 0.0;
+                for j in 0..3 {
+                    av_i += a[(i, j)] * v[(j, col)];
+                }
+                assert!(
+                    approx_eq(av_i, lambda * v[(i, col)], 1e-9),
+                    "A*v[{}] = {}, λ*v[{}] = {}",
+                    i,
+                    av_i,
+                    i,
+                    lambda * v[(i, col)]
+                );
+            }
+        }
+
+        // Verify reconstruction: A = V * D * V^T
+        let reconstructed = evd.reconstruct();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    approx_eq(reconstructed[(i, j)], a[(i, j)], 1e-9),
+                    "reconstructed[{},{}] = {}, a = {}",
+                    i,
+                    j,
+                    reconstructed[(i, j)],
+                    a[(i, j)]
+                );
             }
         }
     }

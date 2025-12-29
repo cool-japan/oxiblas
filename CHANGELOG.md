@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2025-12-29
+
+### Fixed
+
+- **Symmetric Eigenvalue Decomposition**: Fixed critical bug in QR algorithm for tridiagonal matrices where off-diagonal elements were incorrectly stored using `hypot(x, z)` (always positive) instead of `c * x - s * z` (preserves sign). This caused eigenvectors to be computed incorrectly for matrices requiring multiple QR iterations, while eigenvalues remained correct. The fix ensures proper accumulation of Givens rotations into the eigenvector matrix.
+
 ## [0.1.0] - 2025-12-27
 
 ### Initial Release
@@ -159,5 +165,6 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 
 ---
 
-[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/cool-japan/oxiblas/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/cool-japan/oxiblas/releases/tag/v0.1.0

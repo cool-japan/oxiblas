@@ -90,7 +90,7 @@ let a = Mat::from_rows(&[
 
 let lu = Lu::compute(a.as_ref()).expect("Matrix is not singular");
 let det = lu.determinant();
-assert!((det - 5.0).abs() < 1e-10); // det = 2*3 - 1*1 = 5
+assert!((det - 5.0_f64).abs() < 1e-10); // det = 2*3 - 1*1 = 5
 ```
 
 ### SVD

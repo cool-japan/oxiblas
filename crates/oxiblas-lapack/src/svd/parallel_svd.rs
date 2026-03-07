@@ -556,7 +556,7 @@ fn parallel_solve_secular_equations<T: Field + Real + Send + Sync>(
                 lower + z_norm_sq + T::one()
             };
 
-            let mut lambda = (lower + upper) / T::from_f64(2.0).unwrap();
+            let mut lambda = (lower + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
 
             for _iter in 0..MAX_SECULAR_ITER {
                 let (f, df) = secular_function_and_derivative(d, z, lambda);
@@ -568,18 +568,18 @@ fn parallel_solve_secular_equations<T: Field + Real + Send + Sync>(
                 if Scalar::abs(df) < eps {
                     let (f_lower, _) = secular_function_and_derivative(d, z, lower + tol);
                     if f_lower * f < T::zero() {
-                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap();
+                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else {
-                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap();
+                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     }
                 } else {
                     let delta = f / df;
                     let new_lambda = lambda - delta;
 
                     if new_lambda <= lower {
-                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap();
+                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else if new_lambda >= upper {
-                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap();
+                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else {
                         lambda = new_lambda;
                     }

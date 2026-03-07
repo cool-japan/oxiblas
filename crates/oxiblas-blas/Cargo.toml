@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 keywords = ["blas", "gemm", "linear-algebra", "simd", "matrix"]
 categories = ["mathematics", "science", "algorithms"]
 
@@ -19,8 +20,9 @@ bytemuck.workspace = true
 rayon = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["oxiblas-core/std", "oxiblas-matrix/std"]
 parallel = ["rayon", "oxiblas-core/parallel"]
+runtime-tuning = ["oxiblas-core/std"]
 
 # SIMD control features (propagate to oxiblas-core)
 force-scalar = ["oxiblas-core/force-scalar"]  # Disable all SIMD

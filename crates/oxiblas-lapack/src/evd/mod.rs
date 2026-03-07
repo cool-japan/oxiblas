@@ -20,6 +20,8 @@
 //!   for efficient eigenvector computation with clustered eigenvalues.
 //! - **ParallelSymmetricEvd** (feature = "parallel"): Multi-threaded divide-and-conquer
 //!   for symmetric eigenvalue decomposition using Rayon.
+//! - **RandomizedEvd**: Randomized algorithm (HMT) for computing k dominant eigenpairs.
+//!   Efficient for large matrices where only a few eigenpairs are needed.
 //!
 //! # Example
 //!
@@ -60,6 +62,8 @@ mod symmetric;
 mod symmetric_dc;
 mod tridiag_evd;
 
+pub mod randomized;
+
 #[cfg(feature = "parallel")]
 mod parallel_evd;
 
@@ -80,6 +84,10 @@ pub use hessenberg::{
 };
 pub use mrrr::{MrrrError, MrrrEvd};
 pub use qz::{GeneralizedEigenvalue, Qz, QzError};
+pub use randomized::{
+    RandomizedEvd, RandomizedEvdConfig, RandomizedEvdError, RandomizedEvdResult,
+    RandomizedEvdTarget,
+};
 pub use schur::{Eigenvalue, Schur, SchurError, trevc_left, trevc_right, trsna_s, trsna_sep};
 pub use symmetric::{
     SymmetricEvd, SymmetricEvdError, TridiagFactors, TridiagSide, TridiagTrans, Uplo, orgtr, ormtr,

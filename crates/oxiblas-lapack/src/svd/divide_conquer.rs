@@ -382,7 +382,7 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
         let t12 = d_prev * e_prev;
 
         // Wilkinson shift: eigenvalue of 2×2 trailing block closer to t22
-        let _delta = (t22 - _t11) / T::from_f64(2.0).unwrap();
+        let _delta = (t22 - _t11) / T::from_f64(2.0).unwrap_or_else(T::zero);
         let _shift = t22 - t12 * t12 / (_t11 + t22 + <T as Scalar>::epsilon());
 
         // Initial rotation
@@ -603,7 +603,7 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
             };
 
             // Initial guess (midpoint)
-            let mut lambda = (lower + upper) / T::from_f64(2.0).unwrap();
+            let mut lambda = (lower + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
 
             // Newton iteration
             for _iter in 0..Self::MAX_SECULAR_ITER {
@@ -617,9 +617,9 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
                     // Derivative too small, use bisection step
                     let (f_lower, _) = secular_function_and_derivative(d, z, lower + tol);
                     if f_lower * f < T::zero() {
-                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap();
+                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else {
-                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap();
+                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     }
                 } else {
                     let delta = f / df;
@@ -627,9 +627,9 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
 
                     // Ensure we stay within bounds
                     if new_lambda <= lower {
-                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap();
+                        lambda = (lower + lambda) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else if new_lambda >= upper {
-                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap();
+                        lambda = (lambda + upper) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     } else {
                         lambda = new_lambda;
                     }

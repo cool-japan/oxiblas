@@ -378,8 +378,14 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
             return T::zero();
         }
 
-        let vr = self.eigenvectors_real.as_ref().unwrap();
-        let vi = self.eigenvectors_imag.as_ref().unwrap();
+        let vr = self
+            .eigenvectors_real
+            .as_ref()
+            .expect("value should be present");
+        let vi = self
+            .eigenvectors_imag
+            .as_ref()
+            .expect("value should be present");
         let mut max_residual = T::zero();
 
         for (col, eigenvalue) in self.eigenvalues.iter().enumerate() {

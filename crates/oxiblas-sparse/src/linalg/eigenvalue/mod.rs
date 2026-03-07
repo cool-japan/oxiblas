@@ -22,8 +22,10 @@ mod error;
 mod generalized;
 mod iram;
 mod lanczos;
+pub mod lobpcg;
 mod shift_invert;
 mod special;
+pub mod thick_restart;
 pub(crate) mod utils;
 
 #[cfg(test)]
@@ -54,6 +56,12 @@ pub use block::{
     BlockArnoldi, BlockArnoldiConfig, BlockArnoldiResult, BlockLanczos, BlockLanczosConfig,
     BlockLanczosResult,
 };
+
+// Re-export Thick-Restart Lanczos solver
+pub use thick_restart::{EigenvalueTarget, ThickRestartLanczos, TrlConfig, TrlError, TrlResult};
+
+// Re-export LOBPCG solver
+pub use lobpcg::{Lobpcg, LobpcgConfig, LobpcgError, LobpcgResult, LobpcgTarget};
 
 // Re-export special solvers (interval and polynomial filtering)
 pub use special::{

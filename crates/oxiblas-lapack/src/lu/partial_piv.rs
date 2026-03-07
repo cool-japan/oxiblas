@@ -5,8 +5,12 @@
 
 use num_traits::{FromPrimitive, One};
 use oxiblas_blas::level3::gemm::gemm;
+#[cfg(feature = "parallel")]
+use oxiblas_blas::level3::gemm::gemm_with_par;
 use oxiblas_blas::level3::gemm_kernel::GemmKernel;
 use oxiblas_blas::level3::trsm::{Diag, Side, Trans, Uplo, trsm_in_place};
+#[cfg(feature = "parallel")]
+use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -763,6 +767,221 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     }
 }
 
+// Recursive cache-oblivious LU factorization with partial pivoting
+impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
+    /// Recursion threshold: matrices at or below this size use the unblocked algorithm.
+    const RECURSIVE_THRESHOLD: usize = 64;
+
+    /// Computes the LU decomposition using a recursive cache-oblivious algorithm.
+    ///
+    /// This divide-and-conquer approach automatically adapts to the cache hierarchy
+    /// by recursively splitting the matrix. At each level:
+    ///
+    /// 1. Split A into left panel (n x n1) and right panel (n x n2)
+    /// 2. Recursively factor the left panel to get [L11, U11, P1] and L21
+    /// 3. Apply P1 to the right panel
+    /// 4. Solve U12 = L11^{-1} * A12 via TRSM
+    /// 5. Update Schur complement: A22 -= L21 * U12 via GEMM
+    /// 6. Recursively factor the Schur complement to get [L22, U22, P2]
+    /// 7. Apply P2 to L21
+    ///
+    /// For matrices smaller than the recursion threshold (64), falls back to the
+    /// unblocked algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - A square matrix
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxiblas_lapack::lu::Lu;
+    /// use oxiblas_matrix::Mat;
+    ///
+    /// let n = 200;
+    /// let mut a = Mat::zeros(n, n);
+    /// for i in 0..n {
+    ///     for j in 0..n {
+    ///         a[(i, j)] = ((i * 17 + j * 31) % 100) as f64 / 100.0;
+    ///     }
+    ///     a[(i, i)] += 10.0; // Make diagonally dominant
+    /// }
+    ///
+    /// let lu = Lu::compute_recursive(a.as_ref()).expect("Matrix is non-singular");
+    /// let det = lu.determinant();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `LuError::NotSquare` if the matrix is not square.
+    /// Returns `LuError::Singular` if the matrix is singular.
+    pub fn compute_recursive(a: MatRef<'_, T>) -> Result<Self, LuError> {
+        let n = a.nrows();
+
+        if n != a.ncols() {
+            return Err(LuError::NotSquare {
+                nrows: n,
+                ncols: a.ncols(),
+            });
+        }
+
+        if n == 0 {
+            return Ok(Lu {
+                lu: Mat::zeros(0, 0),
+                pivot: Vec::new(),
+                num_swaps: 0,
+            });
+        }
+
+        // Copy A into LU matrix
+        let mut lu = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                lu[(i, j)] = a[(i, j)];
+            }
+        }
+
+        let mut pivot = vec![0usize; n];
+        let mut num_swaps = 0;
+
+        Self::recursive_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, n)?;
+
+        Ok(Lu {
+            lu,
+            pivot,
+            num_swaps,
+        })
+    }
+
+    /// Recursive LU factorization on a submatrix.
+    ///
+    /// Factors columns `col_start..col_start+width` of the full n x n matrix `lu`,
+    /// considering all rows from `col_start..n` for pivoting.
+    ///
+    /// # Arguments
+    ///
+    /// * `lu` - The full n x n working matrix (modified in place)
+    /// * `pivot` - Pivot indices array (global indices)
+    /// * `num_swaps` - Counter for row swaps
+    /// * `n` - Full matrix dimension
+    /// * `col_start` - Starting column of the current panel
+    /// * `width` - Number of columns to factor in this call
+    fn recursive_factor(
+        lu: &mut Mat<T>,
+        pivot: &mut [usize],
+        num_swaps: &mut usize,
+        n: usize,
+        col_start: usize,
+        width: usize,
+    ) -> Result<(), LuError> {
+        if width == 0 {
+            return Ok(());
+        }
+
+        // Base case: use unblocked panel factorization for small widths
+        if width <= Self::RECURSIVE_THRESHOLD {
+            // Factor columns col_start..col_start+width as a panel, considering all rows
+            Self::factor_panel(lu, pivot, num_swaps, n, col_start, width)?;
+
+            // If there are trailing columns, apply updates
+            let trailing_cols = n - col_start - width;
+            if trailing_cols > 0 {
+                // Apply row interchanges to trailing columns
+                for k in col_start..col_start + width {
+                    let pk = pivot[k];
+                    if pk != k {
+                        for j in (col_start + width)..n {
+                            let tmp = lu[(k, j)];
+                            lu[(k, j)] = lu[(pk, j)];
+                            lu[(pk, j)] = tmp;
+                        }
+                    }
+                }
+
+                // Extract L11 (lower triangular with unit diagonal, width x width)
+                let mut l11 = Mat::zeros(width, width);
+                for i in 0..width {
+                    l11[(i, i)] = T::one();
+                    for j in 0..i {
+                        l11[(i, j)] = lu[(col_start + i, col_start + j)];
+                    }
+                }
+
+                // Extract U12 block (width x trailing_cols)
+                let mut u12 = Mat::zeros(width, trailing_cols);
+                for j in 0..trailing_cols {
+                    for i in 0..width {
+                        u12[(i, j)] = lu[(col_start + i, col_start + width + j)];
+                    }
+                }
+
+                // Solve L11 * U12 = A12 via TRSM
+                let _ = trsm_in_place(
+                    Side::Left,
+                    Uplo::Lower,
+                    Trans::NoTrans,
+                    Diag::Unit,
+                    l11.as_ref(),
+                    u12.as_mut(),
+                );
+
+                // Copy U12 back
+                for j in 0..trailing_cols {
+                    for i in 0..width {
+                        lu[(col_start + i, col_start + width + j)] = u12[(i, j)];
+                    }
+                }
+
+                // Update trailing submatrix: A22 -= L21 * U12
+                let rows_below = n - col_start - width;
+                if rows_below > 0 {
+                    // Extract L21 (rows_below x width)
+                    let mut l21 = Mat::zeros(rows_below, width);
+                    for j in 0..width {
+                        for i in 0..rows_below {
+                            l21[(i, j)] = lu[(col_start + width + i, col_start + j)];
+                        }
+                    }
+
+                    // Compute update = L21 * U12
+                    let mut update = Mat::zeros(rows_below, trailing_cols);
+                    gemm(
+                        T::one(),
+                        l21.as_ref(),
+                        u12.as_ref(),
+                        T::zero(),
+                        update.as_mut(),
+                    );
+
+                    // A22 -= update
+                    for j in 0..trailing_cols {
+                        for i in 0..rows_below {
+                            lu[(col_start + width + i, col_start + width + j)] =
+                                lu[(col_start + width + i, col_start + width + j)] - update[(i, j)];
+                        }
+                    }
+                }
+            }
+
+            return Ok(());
+        }
+
+        // Recursive case: split the width in half
+        let n1 = width / 2;
+        let n2 = width - n1;
+
+        // Step 1: Recursively factor the left half (columns col_start..col_start+n1)
+        // This will also update the right half via the trailing column logic in the base case
+        Self::recursive_factor(lu, pivot, num_swaps, n, col_start, n1)?;
+
+        // Step 2: Now recursively factor the right half (columns col_start+n1..col_start+width)
+        // The Schur complement for these columns has already been computed in step 1
+        Self::recursive_factor(lu, pivot, num_swaps, n, col_start + n1, n2)?;
+
+        Ok(())
+    }
+}
+
 // Optimized automatic algorithm selection for f64 and f32
 impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// Computes the LU decomposition with automatic algorithm selection.
@@ -802,5 +1021,183 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
             // Use unblocked for small matrices
             Self::compute(a)
         }
+    }
+}
+
+// Parallel blocked LU factorization
+#[cfg(feature = "parallel")]
+impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
+    /// Computes the LU decomposition using a parallel blocked algorithm.
+    ///
+    /// Parallelizes the GEMM (Schur complement) updates within the blocked
+    /// factorization using Rayon. For matrices smaller than the block size,
+    /// falls back to the sequential unblocked algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - Square matrix A (n x n)
+    ///
+    /// # Returns
+    ///
+    /// The LU decomposition on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LuError::NotSquare` if the matrix is not square.
+    /// Returns `LuError::Singular` if the matrix is singular.
+    #[inline]
+    pub fn compute_blocked_par(a: MatRef<'_, T>) -> Result<Self, LuError> {
+        const BLOCK_SIZE: usize = 64;
+        Self::compute_blocked_par_with_block_size(a, BLOCK_SIZE)
+    }
+
+    /// Computes parallel blocked LU decomposition with a specified block size.
+    pub fn compute_blocked_par_with_block_size(
+        a: MatRef<'_, T>,
+        nb: usize,
+    ) -> Result<Self, LuError> {
+        let n = a.nrows();
+
+        if n != a.ncols() {
+            return Err(LuError::NotSquare {
+                nrows: n,
+                ncols: a.ncols(),
+            });
+        }
+
+        if n == 0 {
+            return Ok(Lu {
+                lu: Mat::zeros(0, 0),
+                pivot: Vec::new(),
+                num_swaps: 0,
+            });
+        }
+
+        // Copy A into LU matrix
+        let mut lu = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                lu[(i, j)] = a[(i, j)];
+            }
+        }
+
+        let mut pivot = vec![0usize; n];
+        let mut num_swaps = 0;
+
+        // Use blocked parallel algorithm for larger matrices
+        if n >= nb {
+            Self::blocked_factor_par(&mut lu, &mut pivot, &mut num_swaps, n, nb)?;
+        } else {
+            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0)?;
+        }
+
+        Ok(Lu {
+            lu,
+            pivot,
+            num_swaps,
+        })
+    }
+
+    /// Blocked LU factorization with parallel GEMM for Schur complement updates.
+    fn blocked_factor_par(
+        lu: &mut Mat<T>,
+        pivot: &mut [usize],
+        num_swaps: &mut usize,
+        n: usize,
+        nb: usize,
+    ) -> Result<(), LuError> {
+        let mut jb = 0;
+
+        while jb < n {
+            // Current block size (may be smaller for last block)
+            let jb_size = nb.min(n - jb);
+
+            // Factor the current panel (columns jb:jb+jb_size) -- sequential
+            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size)?;
+
+            // If there are more columns after this panel
+            if jb + jb_size < n {
+                // Apply row interchanges to columns jb+jb_size:n
+                for k in jb..jb + jb_size {
+                    let pk = pivot[k];
+                    if pk != k {
+                        for j in (jb + jb_size)..n {
+                            let tmp = lu[(k, j)];
+                            lu[(k, j)] = lu[(pk, j)];
+                            lu[(pk, j)] = tmp;
+                        }
+                    }
+                }
+
+                // Solve L11 * U12 = A12 using TRSM
+                // Extract L11 (lower triangular with unit diagonal)
+                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
+                for i in 0..jb_size {
+                    l11[(i, i)] = T::one();
+                    for j in 0..i {
+                        l11[(i, j)] = lu[(jb + i, jb + j)];
+                    }
+                }
+
+                // Extract and update U12 block
+                let mut u12: Mat<T> = Mat::zeros(jb_size, n - jb - jb_size);
+                for j in 0..(n - jb - jb_size) {
+                    for i in 0..jb_size {
+                        u12[(i, j)] = lu[(jb + i, jb + jb_size + j)];
+                    }
+                }
+
+                // Solve L11 * U12 = A12 (TRSM internally uses parallel GEMM)
+                let _ = trsm_in_place(
+                    Side::Left,
+                    Uplo::Lower,
+                    Trans::NoTrans,
+                    Diag::Unit,
+                    l11.as_ref(),
+                    u12.as_mut(),
+                );
+
+                // Copy U12 back
+                for j in 0..(n - jb - jb_size) {
+                    for i in 0..jb_size {
+                        lu[(jb + i, jb + jb_size + j)] = u12[(i, j)];
+                    }
+                }
+
+                // Update trailing submatrix: A22 -= L21 * U12 using parallel GEMM
+                let rows_remaining = n - jb - jb_size;
+
+                // Extract L21 block
+                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
+                for j in 0..jb_size {
+                    for i in 0..rows_remaining {
+                        l21[(i, j)] = lu[(jb + jb_size + i, jb + j)];
+                    }
+                }
+
+                // Compute update = L21 * U12 using parallel GEMM and subtract from A22
+                let mut update: Mat<T> = Mat::zeros(rows_remaining, n - jb - jb_size);
+                gemm_with_par(
+                    T::one(),
+                    l21.as_ref(),
+                    u12.as_ref(),
+                    T::zero(),
+                    update.as_mut(),
+                    Par::Rayon,
+                );
+
+                // A22 -= update
+                for j in 0..(n - jb - jb_size) {
+                    for i in 0..rows_remaining {
+                        lu[(jb + jb_size + i, jb + jb_size + j)] =
+                            lu[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
+                    }
+                }
+            }
+
+            jb += jb_size;
+        }
+
+        Ok(())
     }
 }

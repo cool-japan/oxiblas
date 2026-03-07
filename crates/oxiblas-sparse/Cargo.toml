@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 keywords = ["sparse", "matrix", "csr", "csc", "linear-algebra"]
 categories = ["mathematics", "science", "algorithms"]
 
@@ -21,7 +22,7 @@ rayon = { workspace = true, optional = true }
 rand.workspace = true
 
 [features]
-default = []
+default = ["oxiblas-core/std", "oxiblas-matrix/std"]
 parallel = ["dep:rayon", "oxiblas-core/parallel"]
 
 [lints]

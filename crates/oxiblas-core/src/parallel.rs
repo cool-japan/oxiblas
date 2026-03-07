@@ -5,6 +5,11 @@
 //! - Work partitioning utilities
 //! - Thread-local accumulation patterns
 
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "parallel")]
@@ -453,6 +458,14 @@ impl CustomRayonPool {
         Ok(CustomRayonPool { pool })
     }
 
+    /// Creates a new custom rayon pool with the specified number of threads.
+    ///
+    /// This is an alias for [`CustomRayonPool::new`] that matches the naming
+    /// convention used in the `OxiblasThreadConfig` builder API.
+    pub fn with_num_threads(n: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
+        Self::new(n)
+    }
+
     /// Creates a new custom rayon pool with builder configuration.
     pub fn with_builder<F>(configure: F) -> Result<Self, rayon::ThreadPoolBuildError>
     where
@@ -658,6 +671,191 @@ where
 }
 
 // =============================================================================
+// Global thread pool management
+// =============================================================================
+
+/// Configuration for the OxiBLAS thread pool.
+///
+/// `OxiblasThreadConfig` gathers all knobs that influence how OxiBLAS
+/// chooses threads for parallel operations.  Build one with the fluent
+/// builder methods, then apply it via [`set_global_thread_pool`] or
+/// [`with_thread_count`].
+///
+/// # Example
+///
+/// ```rust
+/// use oxiblas_core::parallel::OxiblasThreadConfig;
+///
+/// let cfg = OxiblasThreadConfig::new()
+///     .num_threads(4)
+///     .stack_size(2 * 1024 * 1024);
+/// println!("threads: {}", cfg.num_threads);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct OxiblasThreadConfig {
+    /// Number of worker threads.  `0` means "use all logical CPUs".
+    pub num_threads: usize,
+    /// Per-thread stack size in bytes.  `0` means "use OS default".
+    pub stack_size: usize,
+    /// Human-readable name prefix for spawned threads.
+    pub thread_name: Option<String>,
+}
+
+impl OxiblasThreadConfig {
+    /// Creates a new configuration with all defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the desired thread count.  Pass `0` for "all CPUs".
+    pub fn num_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
+        self
+    }
+
+    /// Sets the per-thread stack size.  Pass `0` for the OS default.
+    pub fn stack_size(mut self, bytes: usize) -> Self {
+        self.stack_size = bytes;
+        self
+    }
+
+    /// Sets a human-readable name prefix for spawned threads.
+    pub fn thread_name(mut self, name: impl Into<String>) -> Self {
+        self.thread_name = Some(name.into());
+        self
+    }
+
+    /// Returns the effective thread count, substituting the available
+    /// logical CPU count when `num_threads` is `0`.
+    pub fn effective_threads(&self) -> usize {
+        if self.num_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            self.num_threads
+        }
+    }
+
+    /// Builds a [`CustomRayonPool`] from this configuration.
+    ///
+    /// Returns an error if rayon fails to construct the pool.
+    #[cfg(feature = "parallel")]
+    pub fn build_pool(&self) -> Result<CustomRayonPool, rayon::ThreadPoolBuildError> {
+        let mut builder = rayon::ThreadPoolBuilder::new().num_threads(self.effective_threads());
+        if self.stack_size > 0 {
+            builder = builder.stack_size(self.stack_size);
+        }
+        if let Some(name) = &self.thread_name {
+            let name = name.clone();
+            builder = builder.thread_name(move |i| format!("{name}-{i}"));
+        }
+        let pool = builder.build()?;
+        Ok(CustomRayonPool { pool })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global pool registry
+// ---------------------------------------------------------------------------
+
+/// A type-erased, `Send + Sync` trait object for thread pools stored
+/// in the global registry.
+#[cfg(feature = "std")]
+trait AnyPool: Send + Sync {
+    fn num_threads_dyn(&self) -> usize;
+}
+
+#[cfg(all(feature = "std", feature = "parallel"))]
+impl AnyPool for CustomRayonPool {
+    fn num_threads_dyn(&self) -> usize {
+        self.num_threads()
+    }
+}
+
+#[cfg(feature = "std")]
+impl AnyPool for SequentialPool {
+    fn num_threads_dyn(&self) -> usize {
+        1
+    }
+}
+
+#[cfg(feature = "std")]
+static GLOBAL_POOL: std::sync::OnceLock<Box<dyn AnyPool>> = std::sync::OnceLock::new();
+
+/// Sets the global OxiBLAS thread pool.
+///
+/// The pool is stored in a `OnceLock` so it can only be set **once** per
+/// process.  Subsequent calls are silently ignored (the first writer wins).
+///
+/// # Arguments
+///
+/// * `pool` – Any value that implements [`ThreadPool`] and is
+///   `'static + Send + Sync`.  Typically a [`CustomRayonPool`] built via
+///   [`OxiblasThreadConfig::build_pool`] or
+///   [`CustomRayonPool::with_num_threads`].
+///
+/// # Example
+///
+/// ```rust
+/// # #[cfg(feature = "parallel")]
+/// # {
+/// use oxiblas_core::parallel::{CustomRayonPool, set_global_thread_pool};
+/// let pool = CustomRayonPool::with_num_threads(4).expect("build pool");
+/// set_global_thread_pool(pool);
+/// # }
+/// ```
+#[cfg(all(feature = "std", feature = "parallel"))]
+pub fn set_global_thread_pool(pool: CustomRayonPool) {
+    let _ = GLOBAL_POOL.set(Box::new(pool));
+}
+
+/// Sets the global OxiBLAS thread pool to a sequential (single-threaded)
+/// pool (available without the `parallel` feature).
+#[cfg(all(feature = "std", not(feature = "parallel")))]
+pub fn set_global_thread_pool(pool: SequentialPool) {
+    let _ = GLOBAL_POOL.set(Box::new(pool));
+}
+
+/// Returns the number of threads in the global pool, or `1` if no pool has
+/// been registered.
+#[cfg(feature = "std")]
+pub fn global_num_threads() -> usize {
+    GLOBAL_POOL.get().map(|p| p.num_threads_dyn()).unwrap_or(1)
+}
+
+/// Executes `f` inside a temporary rayon pool with exactly `n` threads.
+///
+/// This is useful for benchmarks or tests that need deterministic
+/// parallelism without replacing the global pool.  On platforms without
+/// the `parallel` feature the closure is called directly on the current
+/// thread.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiblas_core::parallel::with_thread_count;
+///
+/// with_thread_count(2, || {
+///     // work here runs with (up to) 2 rayon threads
+/// });
+/// ```
+#[cfg(feature = "parallel")]
+pub fn with_thread_count(n: usize, f: impl FnOnce() + Send) {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(n).build();
+    match pool {
+        Ok(p) => p.install(f),
+        Err(_) => f(), // fallback: run sequentially if build fails
+    }
+}
+
+/// Sequential fallback when the `parallel` feature is disabled.
+#[cfg(not(feature = "parallel"))]
+pub fn with_thread_count(_n: usize, f: impl FnOnce()) {
+    f();
+}
+
+// =============================================================================
 // Thread-local accumulation
 // =============================================================================
 
@@ -665,6 +863,8 @@ where
 ///
 /// This is useful for operations like parallel summation where each thread
 /// maintains its own accumulator to avoid synchronization.
+///
+/// Requires the `parallel` feature (which implies `std`).
 #[cfg(feature = "parallel")]
 pub struct ThreadLocalAccum<T> {
     values: Vec<std::sync::Mutex<T>>,
@@ -684,7 +884,9 @@ impl<T: Clone + Send> ThreadLocalAccum<T> {
     /// Gets or initializes the accumulator for the current thread.
     pub fn get(&self) -> std::sync::MutexGuard<'_, T> {
         let thread_idx = rayon::current_thread_index().unwrap_or(0) % self.values.len();
-        self.values[thread_idx].lock().unwrap()
+        self.values[thread_idx]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Reduces all thread-local values into a single result.
@@ -694,9 +896,12 @@ impl<T: Clone + Send> ThreadLocalAccum<T> {
     {
         self.values
             .into_iter()
-            .map(|m| m.into_inner().unwrap())
+            .map(|m| {
+                m.into_inner()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
             .reduce(f)
-            .unwrap()
+            .expect("ThreadLocalAccum should have at least one value")
     }
 }
 
@@ -881,5 +1086,84 @@ mod tests {
         // Test install
         let result = pool.install(|| (0..100).into_par_iter().sum::<usize>());
         assert_eq!(result, (0..100).sum());
+    }
+
+    // ---- OxiblasThreadConfig tests ------------------------------------------
+
+    #[test]
+    fn test_thread_config_default() {
+        let cfg = OxiblasThreadConfig::default();
+        assert_eq!(cfg.num_threads, 0);
+        assert_eq!(cfg.stack_size, 0);
+        assert!(cfg.thread_name.is_none());
+    }
+
+    #[test]
+    fn test_thread_config_builder() {
+        let cfg = OxiblasThreadConfig::new()
+            .num_threads(4)
+            .stack_size(1024 * 1024)
+            .thread_name("oxiblas-worker");
+        assert_eq!(cfg.num_threads, 4);
+        assert_eq!(cfg.stack_size, 1024 * 1024);
+        assert_eq!(cfg.thread_name.as_deref(), Some("oxiblas-worker"));
+    }
+
+    #[test]
+    fn test_thread_config_effective_threads_zero() {
+        let cfg = OxiblasThreadConfig::new().num_threads(0);
+        // effective_threads should fall back to available parallelism (>= 1)
+        assert!(cfg.effective_threads() >= 1);
+    }
+
+    #[test]
+    fn test_thread_config_effective_threads_explicit() {
+        let cfg = OxiblasThreadConfig::new().num_threads(3);
+        assert_eq!(cfg.effective_threads(), 3);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_custom_rayon_pool_with_num_threads() {
+        let pool = CustomRayonPool::with_num_threads(2).expect("build pool");
+        assert_eq!(pool.num_threads(), 2);
+        let sum: usize = pool.map_reduce(0..50, 0, |i| i, |a, b| a + b);
+        assert_eq!(sum, (0..50).sum::<usize>());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_oxiblas_thread_config_build_pool() {
+        let cfg = OxiblasThreadConfig::new().num_threads(2);
+        let pool = cfg.build_pool().expect("build pool");
+        assert_eq!(pool.num_threads(), 2);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_with_thread_count() {
+        // Run inside a 2-thread pool and verify rayon sees 2 threads.
+        with_thread_count(2, || {
+            assert_eq!(rayon::current_num_threads(), 2);
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    #[test]
+    fn test_with_thread_count_sequential() {
+        // Without parallel feature, should just call the closure directly.
+        let mut called = false;
+        with_thread_count(4, || {
+            called = true;
+        });
+        assert!(called);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_global_num_threads_default() {
+        // Before any pool is registered the answer must be at least 1.
+        // (May be > 1 if a sibling test already set the global pool.)
+        assert!(global_num_threads() >= 1);
     }
 }

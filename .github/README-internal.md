@@ -53,7 +53,7 @@ Automated release process triggered by version tags (`v*`).
 - **create-release**: Creates GitHub release with changelog
 - **publish-crates**: Sequential publication to crates.io
   - Publishes in dependency order with 30s delays
-  - oxiblas-core → oxiblas-matrix → oxiblas-blas → oxiblas-lapack → oxiblas-sparse → oxiblas-ffi → oxiblas-ndarray → oxiblas
+  - oxiblas-core → oxiblas-matrix → oxiblas-blas → oxiblas-lapack → oxiblas-sparse → oxiblas-ndarray → oxiblas
 - **build-documentation**: Builds and deploys rustdoc to GitHub Pages
 
 ## Performance Tracking

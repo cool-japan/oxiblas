@@ -37,6 +37,7 @@
 //! assert_eq!(x.abs_sq() + y.abs_sq(), 25.0);
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
@@ -45,6 +46,9 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
 #![allow(clippy::cast_precision_loss)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
 
 pub mod blocking;
 pub mod memory;
@@ -61,22 +65,37 @@ pub use blocking::{
 };
 pub use memory::{
     AlignedPool, AlignedVec, Alloc, CACHE_LINE_SIZE, DEFAULT_ALIGN, Global, MemStack, MemoryPool,
-    NumaAllocHint, NumaInterleavingStrategy, NumaTopology, NumaWorkHint, PrefetchDistance,
-    PrefetchLocality, StackReq, get_huge_page_size, get_page_size, numa_alloc, numa_alloc_zeroed,
-    numa_distribute_work, prefetch_read, prefetch_read_range, prefetch_write, prefetch_write_range,
+    PrefetchDistance, PrefetchLocality, StackReq, prefetch_read, prefetch_read_range,
+    prefetch_write, prefetch_write_range,
 };
+#[cfg(feature = "std")]
+pub use memory::{
+    MatNuma, NumaAllocHint, NumaAllocator, NumaInterleavingStrategy, NumaTopology, NumaVec,
+    NumaWorkHint, get_huge_page_size, get_page_size, numa_alloc, numa_alloc_zeroed,
+    numa_distribute_work,
+};
+#[cfg(feature = "std")]
+pub use parallel::global_num_threads;
+#[cfg(all(feature = "std", feature = "parallel"))]
+pub use parallel::set_global_thread_pool;
 #[cfg(feature = "parallel")]
 pub use parallel::{CustomRayonPool, RayonGlobalPool};
 pub use parallel::{
-    Par, ParThreshold, PoolScope, SequentialPool, ThreadPool, WorkRange, default_pool,
-    for_each_indexed, for_each_range, map_reduce, partition_work, with_default_pool,
+    OxiblasThreadConfig, Par, ParThreshold, PoolScope, SequentialPool, ThreadPool, WorkRange,
+    default_pool, for_each_indexed, for_each_range, map_reduce, partition_work, with_default_pool,
+    with_thread_count,
 };
+#[cfg(feature = "f128")]
+pub use scalar::QuadFloat;
+#[cfg(feature = "f16")]
+pub use scalar::f16;
 pub use scalar::{
     C32, C64, ComplexExt, ComplexScalar, ExtendedPrecision, Field, HasFastFma, I32, I64, KBKSum,
     KahanSum, Real, Scalar, ScalarBatch, ScalarClass, ScalarClassify, SimdCompatible, ToComplex,
     UnrollHints, c32, c64, from_polar, from_polar32, imag, imag_unit, imag_unit32, imag32,
     pairwise_sum, real, real32,
 };
+pub use simd::multiver::{GemmKernelKind, KernelSelector, SimdCapabilityInfo, SimdDispatcher};
 pub use simd::{
     SimdChunks, SimdLevel, SimdRegister, SimdScalar, detect_simd_level, detect_simd_level_raw,
 };
@@ -88,10 +107,16 @@ pub mod prelude {
         BlockRange, BlockVisitor, RecursiveTask, cache_oblivious_traverse, gemm_block_sizes,
     };
     pub use crate::memory::{
-        AlignedPool, AlignedVec, MemStack, MemoryPool, NumaAllocHint, NumaTopology,
-        PrefetchLocality, StackReq, numa_distribute_work, prefetch_read, prefetch_write,
+        AlignedPool, AlignedVec, MemStack, MemoryPool, PrefetchLocality, StackReq, prefetch_read,
+        prefetch_write,
     };
-    pub use crate::parallel::{Par, ParThreshold};
+    #[cfg(feature = "std")]
+    pub use crate::memory::{
+        MatNuma, NumaAllocHint, NumaAllocator, NumaTopology, NumaVec, numa_distribute_work,
+    };
+    #[cfg(feature = "std")]
+    pub use crate::parallel::global_num_threads;
+    pub use crate::parallel::{OxiblasThreadConfig, Par, ParThreshold, with_thread_count};
     pub use crate::scalar::{
         C32, C64, ComplexExt, ComplexScalar, ExtendedPrecision, Field, HasFastFma, I32, I64,
         KBKSum, KahanSum, Real, Scalar, ScalarBatch, ScalarClass, ScalarClassify, SimdCompatible,

@@ -17,7 +17,7 @@ impl<T: Real + FromPrimitive> Default for TruncatedSVDConfig<T> {
         Self {
             num_singular_values: 6,
             max_iterations: 1000,
-            tolerance: T::from_f64(1e-10).unwrap(),
+            tolerance: T::from_f64(1e-10).unwrap_or_else(T::zero),
             compute_vectors: true,
             krylov_dimension: 20,
             full_reorthogonalization: true,

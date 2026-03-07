@@ -16,6 +16,9 @@
 //! A unit triangular matrix has ones on the diagonal. This is common in LU
 //! decomposition where L is unit lower triangular.
 
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 use crate::packed::{PackedMat, PackedMut, PackedRef, TriangularKind};
 use crate::{Mat, MatMut, MatRef};
 use oxiblas_core::scalar::Scalar;

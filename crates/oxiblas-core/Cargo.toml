@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 keywords = ["blas", "lapack", "simd", "linear-algebra", "numerics"]
 categories = ["mathematics", "science", "algorithms"]
 
@@ -15,15 +16,16 @@ num-complex.workspace = true
 num-traits.workspace = true
 bytemuck.workspace = true
 rayon = { workspace = true, optional = true }
-half = { version = "2.4", features = ["num-traits", "bytemuck"], optional = true }
+half = { workspace = true, optional = true, features = ["num-traits", "bytemuck"] }
 twofloat = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [features]
-default = []
-parallel = ["rayon"]
+default = ["std"]
+std = ["libc"]
+parallel = ["rayon", "std"]
 f16 = ["half"]  # Half-precision (16-bit float) support
 f128 = ["dep:twofloat"]  # Quad-precision (double-double) support
 nightly = []  # Enable nightly-only optimizations
@@ -34,7 +36,7 @@ max-simd-128 = []  # Limit SIMD to 128-bit (SSE/NEON) maximum
 max-simd-256 = []  # Limit SIMD to 256-bit (AVX2) maximum
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [[bench]]
 name = "simd"

@@ -40,6 +40,7 @@ pub mod expert_symmetric;
 mod general;
 pub mod iterative_refinement;
 mod least_squares;
+pub mod mixed_precision;
 mod triangular;
 mod tridiagonal;
 
@@ -52,11 +53,14 @@ pub use expert_symmetric::{
 };
 pub use general::{SolveError, solve, solve_multiple};
 pub use iterative_refinement::{
-    MixedPrecisionResult, RefinementError, RefinementResult, mixed_precision_solve,
-    mixed_precision_solve_cholesky, mixed_precision_solve_symmetric, refine_solution,
-    refine_solution_cholesky, refine_solution_symmetric,
+    RefinementError, RefinementResult, refine_solution, refine_solution_cholesky,
+    refine_solution_symmetric,
 };
 pub use least_squares::{LeastSquaresResult, LstSqError, lstsq};
+pub use mixed_precision::{
+    MixedPrecisionResult, mixed_precision_solve, mixed_precision_solve_cholesky,
+    mixed_precision_solve_lu, mixed_precision_solve_qr, mixed_precision_solve_symmetric,
+};
 pub use triangular::{
     TriangularKind, TriangularSolveError, solve_triangular, solve_triangular_multiple,
 };

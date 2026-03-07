@@ -79,4 +79,4 @@ Core traits and SIMD abstractions for OxiBLAS.
 
 - [ ] RISC-V Vector (RVV) extension support
 - [ ] PowerPC VSX support
-- [ ] Runtime SIMD dispatch (function multi-versioning)
+- [x] Runtime SIMD dispatch (function multi-versioning) - `SimdCapabilities`, `SimdDispatcher`, `KernelSelector`, `simd_dispatch!` macro (v0.2.0)

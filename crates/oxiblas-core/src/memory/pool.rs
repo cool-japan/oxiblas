@@ -8,6 +8,9 @@
 //! - Memory pool for temporary allocations
 //! - Custom allocator support via the `Alloc` trait
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use core::mem::size_of;
 
 use super::aligned_vec::AlignedVec;

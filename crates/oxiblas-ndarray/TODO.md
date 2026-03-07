@@ -124,6 +124,6 @@ Integration with the ndarray crate.
 
 ## Future Enhancements
 
-- [ ] ndarray 0.17 support when released
-- [ ] Support for ndarray's parallel feature
-- [ ] Sparse ndarray integration
+- [x] ndarray 0.17 support (already using ndarray 0.17)
+- [x] Support for ndarray's parallel feature - `parallel` feature with `gemm_par_ndarray`, `matmul_par` (v0.2.0)
+- [x] Sparse ndarray integration - `sparse` feature with CSR/CSC conversions, `spmv_ndarray`, `sparse_solve_ndarray` (v0.2.0)

@@ -377,4 +377,4 @@ cargo bench --package oxiblas-benchmarks --bench lapack_factorization
 
 ## License
 
-Licensed under MIT or Apache-2.0 at your option.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../../LICENSE) for details.

@@ -7,10 +7,12 @@
 //! - Prefetch hints for cache optimization
 //! - Memory pool for temporary allocations
 //! - Custom allocator support via the `Alloc` trait
+//!
+//! Note: NUMA-aware allocation requires the `std` feature.
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use std::alloc::{alloc, alloc_zeroed};
+use std::alloc::{alloc, alloc_zeroed, dealloc};
 
 // =============================================================================
 // NUMA-aware utilities
@@ -331,16 +333,8 @@ fn apply_linux_numa_policy(ptr: *mut u8, size: usize, hint: &NumaAllocHint) {
     const MPOL_BIND: c_int = 2;
     const MPOL_INTERLEAVE: c_int = 3;
 
-    unsafe extern "C" {
-        fn mbind(
-            addr: *mut u8,
-            len: usize,
-            mode: c_int,
-            nodemask: *const usize,
-            maxnode: usize,
-            flags: u32,
-        ) -> c_int;
-    }
+    // SYS_mbind syscall number on x86_64
+    const SYS_MBIND: libc::c_long = 237;
 
     let (mode, node_mask, max_node) = match hint.strategy {
         NumaInterleavingStrategy::FirstTouch => return, // Default behavior
@@ -360,8 +354,16 @@ fn apply_linux_numa_policy(ptr: *mut u8, size: usize, hint: &NumaAllocHint) {
     };
 
     unsafe {
-        // Ignore errors - NUMA may not be available
-        let _ = mbind(ptr, size, mode, &node_mask, max_node, 0);
+        // Use syscall directly to avoid libnuma dependency
+        let _ = libc::syscall(
+            SYS_MBIND,
+            ptr as *mut libc::c_void,
+            size,
+            mode,
+            &node_mask as *const usize,
+            max_node,
+            0u32,
+        );
     }
 }
 
@@ -401,6 +403,448 @@ pub fn get_huge_page_size() -> Option<usize> {
     #[cfg(not(target_os = "linux"))]
     {
         None
+    }
+}
+
+// =============================================================================
+// NumaAllocator - typed allocator with NUMA affinity
+// =============================================================================
+
+/// A typed allocator that places memory on a preferred NUMA node.
+///
+/// `NumaAllocator<T>` wraps allocation of `T`-typed data with a
+/// `NumaAllocHint` so that the resulting memory respects the chosen
+/// NUMA interleaving strategy.  On non-NUMA platforms (or when the
+/// kernel call is unavailable) it silently falls back to the standard
+/// global allocator.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiblas_core::memory::numa::{NumaAllocator, NumaAllocHint};
+///
+/// let alloc: NumaAllocator<f64> = NumaAllocator::new(NumaAllocHint::on_node(0));
+/// let ptr = alloc.allocate(16).expect("allocation failed");
+/// unsafe { alloc.deallocate(ptr, 16); }
+/// ```
+pub struct NumaAllocator<T> {
+    hint: NumaAllocHint,
+    _marker: core::marker::PhantomData<T>,
+}
+
+impl<T> NumaAllocator<T> {
+    /// Creates a new `NumaAllocator` with the given hint.
+    #[inline]
+    pub fn new(hint: NumaAllocHint) -> Self {
+        NumaAllocator {
+            hint,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Creates a `NumaAllocator` that prefers the given NUMA node.
+    #[inline]
+    pub fn on_node(node: usize) -> Self {
+        Self::new(NumaAllocHint::on_node(node))
+    }
+
+    /// Creates a `NumaAllocator` that interleaves across all nodes.
+    #[inline]
+    pub fn interleaved() -> Self {
+        Self::new(NumaAllocHint::interleaved())
+    }
+
+    /// Creates a `NumaAllocator` with first-touch policy (the default).
+    #[inline]
+    pub fn first_touch() -> Self {
+        Self::new(NumaAllocHint::first_touch())
+    }
+
+    /// Allocates `count` elements of type `T`.
+    ///
+    /// Returns `None` on allocation failure or if `count` is zero.
+    pub fn allocate(&self, count: usize) -> Option<NonNull<T>> {
+        if count == 0 {
+            return None;
+        }
+        let layout = Layout::array::<T>(count).ok()?;
+        // Safety: layout is valid (non-zero size, proper alignment).
+        let raw = unsafe { numa_alloc(layout, &self.hint) }?;
+        Some(raw.cast::<T>())
+    }
+
+    /// Allocates `count` zero-initialised elements of type `T`.
+    ///
+    /// Returns `None` on allocation failure or if `count` is zero.
+    pub fn allocate_zeroed(&self, count: usize) -> Option<NonNull<T>> {
+        if count == 0 {
+            return None;
+        }
+        let layout = Layout::array::<T>(count).ok()?;
+        // Safety: layout is valid.
+        let raw = unsafe { numa_alloc_zeroed(layout, &self.hint) }?;
+        Some(raw.cast::<T>())
+    }
+
+    /// Deallocates a pointer previously returned by `allocate` or
+    /// `allocate_zeroed` for `count` elements.
+    ///
+    /// # Safety
+    ///
+    /// * `ptr` must have been returned by this allocator for exactly `count`
+    ///   elements.
+    /// * After this call `ptr` must not be used.
+    pub unsafe fn deallocate(&self, ptr: NonNull<T>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Ok(layout) = Layout::array::<T>(count) {
+            unsafe { dealloc(ptr.cast::<u8>().as_ptr(), layout) };
+        }
+    }
+}
+
+// =============================================================================
+// NumaVec - Vec-like container with NUMA-aware allocation
+// =============================================================================
+
+/// A `Vec`-like container whose backing storage is allocated with a
+/// `NumaAllocHint`, enabling preferred-node or interleaved placement.
+///
+/// On non-NUMA systems the allocation transparently falls back to the
+/// standard global allocator, so code written against `NumaVec` is
+/// portable.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiblas_core::memory::numa::{NumaVec, NumaAllocHint};
+///
+/// let mut v: NumaVec<f64> = NumaVec::with_hint_and_capacity(
+///     NumaAllocHint::on_node(0), 128,
+/// ).expect("allocation failed");
+/// v.push(1.0).expect("push failed");
+/// assert_eq!(v.len(), 1);
+/// ```
+pub struct NumaVec<T> {
+    ptr: NonNull<T>,
+    len: usize,
+    cap: usize,
+    hint: NumaAllocHint,
+}
+
+// Safety: NumaVec owns its data and the allocator is platform-level.
+unsafe impl<T: Send> Send for NumaVec<T> {}
+unsafe impl<T: Sync> Sync for NumaVec<T> {}
+
+impl<T> NumaVec<T> {
+    /// Creates an empty `NumaVec` with first-touch allocation policy.
+    pub fn new() -> Self {
+        NumaVec {
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: 0,
+            hint: NumaAllocHint::first_touch(),
+        }
+    }
+
+    /// Creates an empty `NumaVec` with the given allocation hint.
+    pub fn with_hint(hint: NumaAllocHint) -> Self {
+        NumaVec {
+            ptr: NonNull::dangling(),
+            len: 0,
+            cap: 0,
+            hint,
+        }
+    }
+
+    /// Allocates a `NumaVec` with at least `capacity` elements reserved.
+    ///
+    /// Returns an error string on allocation failure.
+    pub fn with_hint_and_capacity(
+        hint: NumaAllocHint,
+        capacity: usize,
+    ) -> Result<Self, &'static str> {
+        if capacity == 0 {
+            return Ok(Self::with_hint(hint));
+        }
+        let layout = Layout::array::<T>(capacity).map_err(|_| "layout overflow")?;
+        // Safety: layout is valid with non-zero size.
+        let raw = unsafe { numa_alloc(layout, &hint) }.ok_or("allocation failed")?;
+        Ok(NumaVec {
+            ptr: raw.cast::<T>(),
+            len: 0,
+            cap: capacity,
+            hint,
+        })
+    }
+
+    /// Returns the number of elements currently stored.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` when the vector is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the currently allocated capacity.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Returns a raw pointer to the first element.
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns a mutable raw pointer to the first element.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+
+    /// Returns a shared slice over the stored elements.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        // Safety: ptr is valid for `len` initialised elements.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Returns a mutable slice over the stored elements.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // Safety: ptr is valid for `len` initialised elements.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Appends an element to the end.
+    ///
+    /// Returns an error string if reallocation is needed and fails.
+    pub fn push(&mut self, value: T) -> Result<(), &'static str> {
+        if self.len == self.cap {
+            self.grow()?;
+        }
+        // Safety: ptr + len is within the allocation and uninitialised.
+        unsafe { core::ptr::write(self.ptr.as_ptr().add(self.len), value) };
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Removes and returns the last element, or `None` if empty.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        // Safety: the element at `len` is initialised and we are taking
+        // ownership.
+        Some(unsafe { core::ptr::read(self.ptr.as_ptr().add(self.len)) })
+    }
+
+    /// Reserves space for at least `additional` more elements.
+    ///
+    /// Returns an error string if allocation fails.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), &'static str> {
+        let required = self
+            .len
+            .checked_add(additional)
+            .ok_or("capacity overflow")?;
+        if required <= self.cap {
+            return Ok(());
+        }
+        self.realloc(required)
+    }
+
+    /// Grows the internal buffer using an exponential strategy.
+    fn grow(&mut self) -> Result<(), &'static str> {
+        let new_cap = if self.cap == 0 {
+            4
+        } else {
+            self.cap.checked_mul(2).ok_or("capacity overflow")?
+        };
+        self.realloc(new_cap)
+    }
+
+    fn realloc(&mut self, new_cap: usize) -> Result<(), &'static str> {
+        let new_layout = Layout::array::<T>(new_cap).map_err(|_| "layout overflow")?;
+        // Safety: new_layout is valid.
+        let new_raw = unsafe { numa_alloc(new_layout, &self.hint) }.ok_or("allocation failed")?;
+        let new_ptr = new_raw.cast::<T>();
+
+        if self.cap > 0 {
+            // Safety: both src and dst are valid, non-overlapping for `len`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
+            }
+            // Free old allocation.
+            if let Ok(old_layout) = Layout::array::<T>(self.cap) {
+                unsafe { dealloc(self.ptr.cast::<u8>().as_ptr(), old_layout) };
+            }
+        }
+
+        self.ptr = new_ptr;
+        self.cap = new_cap;
+        Ok(())
+    }
+}
+
+impl<T> Default for NumaVec<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Drop for NumaVec<T> {
+    fn drop(&mut self) {
+        if self.cap == 0 {
+            return;
+        }
+        // Drop initialised elements.
+        for i in 0..self.len {
+            unsafe { core::ptr::drop_in_place(self.ptr.as_ptr().add(i)) };
+        }
+        // Deallocate backing store.
+        if let Ok(layout) = Layout::array::<T>(self.cap) {
+            unsafe { dealloc(self.ptr.cast::<u8>().as_ptr(), layout) };
+        }
+    }
+}
+
+impl<T> core::ops::Deref for NumaVec<T> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T> core::ops::DerefMut for NumaVec<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+// =============================================================================
+// MatNuma - Matrix type with NUMA-aware allocation
+// =============================================================================
+
+/// A dense, row-major matrix whose backing storage is allocated with a
+/// `NumaAllocHint`.
+///
+/// Element `(row, col)` is stored at index `row * num_cols + col`.
+///
+/// # Example
+///
+/// ```rust
+/// use oxiblas_core::memory::numa::{MatNuma, NumaAllocHint};
+///
+/// let mut mat: MatNuma<f64> = MatNuma::zeros(
+///     4, 4, NumaAllocHint::on_node(0),
+/// ).expect("allocation failed");
+/// *mat.get_mut(1, 2).unwrap() = 3.14;
+/// assert!((mat.get(1, 2).unwrap() - 3.14).abs() < 1e-12);
+/// ```
+pub struct MatNuma<T> {
+    data: NumaVec<T>,
+    rows: usize,
+    cols: usize,
+}
+
+impl<T: Copy + Default> MatNuma<T> {
+    /// Allocates a zero-initialised `rows × cols` matrix on the preferred
+    /// NUMA node described by `hint`.
+    ///
+    /// Elements are value-initialised using `T::default()`.
+    pub fn zeros(rows: usize, cols: usize, hint: NumaAllocHint) -> Result<Self, &'static str> {
+        let total = rows.checked_mul(cols).ok_or("dimension overflow")?;
+        let mut data = NumaVec::with_hint_and_capacity(hint, total)?;
+        for _ in 0..total {
+            data.push(T::default()).map_err(|_| "push failed")?;
+        }
+        Ok(MatNuma { data, rows, cols })
+    }
+}
+
+impl<T> MatNuma<T> {
+    /// Returns the number of rows.
+    #[inline]
+    pub fn nrows(&self) -> usize {
+        self.rows
+    }
+
+    /// Returns the number of columns.
+    #[inline]
+    pub fn ncols(&self) -> usize {
+        self.cols
+    }
+
+    /// Returns the total number of elements.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.rows * self.cols
+    }
+
+    /// Returns `true` when the matrix has no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.rows == 0 || self.cols == 0
+    }
+
+    /// Returns a shared reference to the element at `(row, col)`, or `None`
+    /// if the indices are out of bounds.
+    pub fn get(&self, row: usize, col: usize) -> Option<&T> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let idx = row * self.cols + col;
+        self.data.as_slice().get(idx)
+    }
+
+    /// Returns a mutable reference to the element at `(row, col)`, or `None`
+    /// if the indices are out of bounds.
+    pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut T> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let idx = row * self.cols + col;
+        self.data.as_mut_slice().get_mut(idx)
+    }
+
+    /// Returns a flat shared slice of all elements in row-major order.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        self.data.as_slice()
+    }
+
+    /// Returns a flat mutable slice of all elements in row-major order.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.data.as_mut_slice()
+    }
+
+    /// Returns a shared slice for the given row, or `None` if out of bounds.
+    pub fn row(&self, row: usize) -> Option<&[T]> {
+        if row >= self.rows {
+            return None;
+        }
+        let start = row * self.cols;
+        self.data.as_slice().get(start..start + self.cols)
+    }
+
+    /// Returns a mutable slice for the given row, or `None` if out of bounds.
+    pub fn row_mut(&mut self, row: usize) -> Option<&mut [T]> {
+        if row >= self.rows {
+            return None;
+        }
+        let start = row * self.cols;
+        self.data.as_mut_slice().get_mut(start..start + self.cols)
     }
 }
 
@@ -470,5 +914,170 @@ mod tests {
         // Common page sizes
         assert!(page_size >= 4096);
         assert!(page_size <= 65536);
+    }
+
+    // ----- NumaAllocator tests -----------------------------------------------
+
+    #[test]
+    fn test_numa_allocator_alloc_dealloc() {
+        let alloc: NumaAllocator<f64> = NumaAllocator::first_touch();
+        let count = 64usize;
+        let ptr = alloc.allocate(count).expect("allocation must succeed");
+        // Write and read back to confirm memory is accessible.
+        unsafe {
+            for i in 0..count {
+                core::ptr::write(ptr.as_ptr().add(i), i as f64);
+            }
+            for i in 0..count {
+                assert!((core::ptr::read(ptr.as_ptr().add(i)) - i as f64).abs() < f64::EPSILON);
+            }
+            alloc.deallocate(ptr, count);
+        }
+    }
+
+    #[test]
+    fn test_numa_allocator_zeroed() {
+        let alloc: NumaAllocator<u64> = NumaAllocator::first_touch();
+        let count = 32usize;
+        let ptr = alloc
+            .allocate_zeroed(count)
+            .expect("zeroed allocation must succeed");
+        unsafe {
+            for i in 0..count {
+                assert_eq!(core::ptr::read(ptr.as_ptr().add(i)), 0u64);
+            }
+            alloc.deallocate(ptr, count);
+        }
+    }
+
+    #[test]
+    fn test_numa_allocator_on_node() {
+        // Node 0 is always valid; fallback on non-NUMA is fine.
+        let alloc: NumaAllocator<f32> = NumaAllocator::on_node(0);
+        let ptr = alloc.allocate(16).expect("allocation must succeed");
+        unsafe { alloc.deallocate(ptr, 16) };
+    }
+
+    #[test]
+    fn test_numa_allocator_zero_count_returns_none() {
+        let alloc: NumaAllocator<f64> = NumaAllocator::first_touch();
+        assert!(alloc.allocate(0).is_none());
+        assert!(alloc.allocate_zeroed(0).is_none());
+    }
+
+    // ----- NumaVec tests -----------------------------------------------------
+
+    #[test]
+    fn test_numa_vec_push_pop() {
+        let mut v: NumaVec<i32> = NumaVec::new();
+        assert!(v.is_empty());
+
+        for i in 0..100i32 {
+            v.push(i).expect("push must succeed");
+        }
+        assert_eq!(v.len(), 100);
+
+        for i in (0..100i32).rev() {
+            assert_eq!(v.pop(), Some(i));
+        }
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_numa_vec_slice_access() {
+        let mut v: NumaVec<f64> = NumaVec::new();
+        for i in 0..10 {
+            v.push(i as f64).expect("push");
+        }
+        let s = v.as_slice();
+        assert_eq!(s.len(), 10);
+        for (i, &x) in s.iter().enumerate() {
+            assert!((x - i as f64).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_numa_vec_with_hint_and_capacity() {
+        let v = NumaVec::<f64>::with_hint_and_capacity(NumaAllocHint::first_touch(), 128)
+            .expect("alloc");
+        assert_eq!(v.len(), 0);
+        assert_eq!(v.capacity(), 128);
+    }
+
+    #[test]
+    fn test_numa_vec_reserve() {
+        let mut v: NumaVec<u8> = NumaVec::new();
+        v.reserve(256).expect("reserve");
+        assert!(v.capacity() >= 256);
+    }
+
+    #[test]
+    fn test_numa_vec_interleaved() {
+        let mut v = NumaVec::<u32>::with_hint(NumaAllocHint::interleaved());
+        for i in 0..50u32 {
+            v.push(i).expect("push");
+        }
+        assert_eq!(v.len(), 50);
+        assert_eq!(v[0], 0);
+        assert_eq!(v[49], 49);
+    }
+
+    // ----- MatNuma tests -----------------------------------------------------
+
+    #[test]
+    fn test_mat_numa_zeros() {
+        let mat: MatNuma<f64> = MatNuma::zeros(4, 4, NumaAllocHint::first_touch()).expect("zeros");
+        assert_eq!(mat.nrows(), 4);
+        assert_eq!(mat.ncols(), 4);
+        assert_eq!(mat.len(), 16);
+        for &v in mat.as_slice() {
+            assert_eq!(v, 0.0f64);
+        }
+    }
+
+    #[test]
+    fn test_mat_numa_get_set() {
+        let mut mat: MatNuma<f64> =
+            MatNuma::zeros(3, 5, NumaAllocHint::first_touch()).expect("zeros");
+        *mat.get_mut(1, 3).expect("valid index") = 42.0;
+        assert!((mat.get(1, 3).expect("valid index") - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_mat_numa_out_of_bounds() {
+        let mat: MatNuma<f32> = MatNuma::zeros(2, 2, NumaAllocHint::first_touch()).expect("zeros");
+        assert!(mat.get(2, 0).is_none());
+        assert!(mat.get(0, 2).is_none());
+    }
+
+    #[test]
+    fn test_mat_numa_row_slice() {
+        let mut mat: MatNuma<i32> =
+            MatNuma::zeros(3, 4, NumaAllocHint::first_touch()).expect("zeros");
+        if let Some(row) = mat.row_mut(1) {
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = i as i32 * 10;
+            }
+        }
+        let row = mat.row(1).expect("valid row");
+        assert_eq!(row, &[0, 10, 20, 30]);
+    }
+
+    #[test]
+    fn test_mat_numa_on_node_zero() {
+        // Node 0 is always valid; on non-NUMA systems falls back silently.
+        let mat: MatNuma<f64> = MatNuma::zeros(8, 8, NumaAllocHint::on_node(0)).expect("zeros");
+        assert_eq!(mat.len(), 64);
+    }
+
+    #[test]
+    fn test_mat_numa_fallback_non_numa() {
+        // Interleaved hint on non-NUMA falls back to standard alloc.
+        let mat: MatNuma<f32> =
+            MatNuma::zeros(16, 16, NumaAllocHint::interleaved()).expect("zeros");
+        assert_eq!(mat.len(), 256);
+        for &v in mat.as_slice() {
+            assert_eq!(v, 0.0f32);
+        }
     }
 }

@@ -18,6 +18,9 @@
 //! [a00, a10, a20, a30, a11, a21, a31, a22, a32, a33, ...]
 //! ```
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Scalar;
 
@@ -265,7 +268,13 @@ impl<T: Scalar> PackedMat<T> {
 
     /// Returns the diagonal elements as a vector.
     pub fn diagonal(&self) -> Vec<T> {
-        (0..self.n).map(|i| *self.get(i, i).unwrap()).collect()
+        (0..self.n)
+            .map(|i| {
+                *self
+                    .get(i, i)
+                    .expect("diagonal index should always be valid")
+            })
+            .collect()
     }
 
     /// Sets the diagonal elements from a slice.

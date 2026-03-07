@@ -77,6 +77,7 @@
 mod bidiag_reduce;
 mod bidiagonal;
 mod complex;
+mod complex_bidiag;
 mod complex_dc;
 mod divide_conquer;
 mod qr_based;
@@ -92,6 +93,7 @@ pub use bidiag_reduce::{
 };
 pub use bidiagonal::{Svd, SvdError};
 pub use complex::{ComplexSvd, ComplexSvdError};
+pub use complex_bidiag::{ComplexBidiagFactors, complex_gebrd};
 pub use complex_dc::{ComplexSvdDc, ComplexSvdDcError};
 pub use divide_conquer::{SvdDc, SvdDcError};
 pub use qr_based::{QrSvd, QrSvdError};

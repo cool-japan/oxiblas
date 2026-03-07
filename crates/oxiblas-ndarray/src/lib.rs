@@ -95,6 +95,12 @@ pub mod blas;
 pub mod conversions;
 pub mod lapack;
 
+#[cfg(feature = "parallel")]
+pub mod parallel;
+
+#[cfg(feature = "sparse")]
+pub mod sparse;
+
 // Re-export core types from ndarray for convenience
 pub use ndarray::{
     Array1, Array2, ArrayD, ArrayView1, ArrayView2, ArrayViewD, ArrayViewMut1, ArrayViewMut2,
@@ -191,6 +197,17 @@ pub mod prelude {
 
     // Error types
     pub use crate::lapack::{LapackError, LapackResult};
+
+    // Parallel BLAS operations
+    #[cfg(feature = "parallel")]
+    pub use crate::parallel::{gemm_par_ndarray, matmul_par};
+
+    // Sparse integration
+    #[cfg(feature = "sparse")]
+    pub use crate::sparse::{
+        SparseNdarrayError, array2_to_csc, array2_to_csr, csc_to_array2, csr_to_array2,
+        sparse_solve_ndarray, sparse_solve_ndarray_with_options, spmv_full_ndarray, spmv_ndarray,
+    };
 }
 
 #[cfg(test)]

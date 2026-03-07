@@ -13,12 +13,15 @@
 //! - [`syr2k::syr2k`]: Symmetric rank-2k update
 //! - [`her2k::her2k`]: Hermitian rank-2k update
 //! - [`strassen`]: Strassen's algorithm for very large matrices
+//! - [`batched`]: Batched operations for ML workloads (batch GEMM, GEMV, AXPY)
 
 pub mod autotune;
+pub mod batched;
 pub mod complex_gemm;
 pub mod gemm;
 pub mod gemm_cache_oblivious;
 pub mod gemm_kernel;
+pub mod gemm_kernel_sse42;
 pub mod gemm_packing;
 pub mod gemm_small;
 pub mod gemm_winograd;
@@ -26,6 +29,8 @@ pub mod gemmt;
 pub mod hemm;
 pub mod her2k;
 pub mod herk;
+#[cfg(feature = "runtime-tuning")]
+pub mod runtime_autotune;
 pub mod strassen;
 pub mod symm;
 pub mod syr2k;
@@ -35,6 +40,15 @@ pub mod trsm;
 
 pub use autotune::{
     AutoTunedBlocking, CacheInfo, compute_blocking, compute_blocking_adaptive, get_cache_info,
+};
+pub use batched::{
+    BatchedError, Transpose as BatchedTranspose, axpy_batched, gemm_batched, gemm_strided_batched,
+    gemv_batched,
+};
+#[cfg(feature = "parallel")]
+pub use batched::{
+    axpy_batched_parallel, gemm_batched_parallel, gemm_strided_batched_parallel,
+    gemv_batched_parallel,
 };
 pub use complex_gemm::{gemm3m_c32, gemm3m_c64};
 pub use gemm::{

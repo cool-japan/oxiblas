@@ -8,9 +8,9 @@
 //! from 8 to 7 per block (12.5% reduction).
 //!
 //! For matrix multiplication C = A * B, the algorithm computes:
-//! - Row factors: r[i] = A[i,0] * A[i,1] (for each row of A)
-//! - Column factors: c[j] = B[0,j] * B[1,j] (for each column of B)
-//! - Then C[i,j] = -r[i] - c[j] + (A[i,0] + B[1,j]) * (A[i,1] + B[0,j])
+//! - Row factors: r\[i\] = A\[i,0\] * A\[i,1\] (for each row of A)
+//! - Column factors: c\[j\] = B\[0,j\] * B\[1,j\] (for each column of B)
+//! - Then C\[i,j\] = -r\[i\] - c\[j\] + (A\[i,0\] + B\[1,j\]) * (A\[i,1\] + B\[0,j\])
 
 use oxiblas_core::scalar::{Field, Real};
 use oxiblas_matrix::{MatMut, MatRef};

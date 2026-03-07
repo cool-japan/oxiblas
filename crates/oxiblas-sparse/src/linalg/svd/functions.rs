@@ -59,7 +59,7 @@ fn orthonormalize_dense<T: Scalar<Real = T> + Clone + Field + Real + FromPrimiti
                 .map(|x| x.clone() * x.clone())
                 .fold(T::zero(), |acc, x| acc + x),
         );
-        if norm > T::from_f64(1e-14).unwrap() {
+        if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
             u = u.iter().map(|x| x.clone() / norm.clone()).collect();
             result.push(u);
         }
@@ -100,7 +100,7 @@ pub(super) fn qr_decompose_dense<T: Scalar<Real = T> + Clone + Field + Real + Fr
                 .fold(T::zero(), |acc, x| acc + x),
         );
         r[j][j] = norm.clone();
-        if norm > T::from_f64(1e-14).unwrap() {
+        if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
             for l in 0..m {
                 q[l][j] = v[l].clone() / norm.clone();
             }
@@ -144,9 +144,9 @@ pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPr
     let mut singular_values: Vec<T> = Vec::new();
     let mut v_vectors: Vec<Vec<T>> = Vec::new();
     for _ in 0..min_dim {
-        let mut v = vec![T::from_f64(1.0).unwrap(); n];
+        let mut v = vec![T::from_f64(1.0).unwrap_or_else(T::zero); n];
         for i in 1..n {
-            v[i] = T::from_f64((i as f64).sin()).unwrap();
+            v[i] = T::from_f64((i as f64).sin()).unwrap_or_else(T::zero);
         }
         for prev_v in &v_vectors {
             let dot: T = v
@@ -171,7 +171,7 @@ pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPr
                     .map(|x| x.clone() * x.clone())
                     .fold(T::zero(), |acc, x| acc + x),
             );
-            if norm > T::from_f64(1e-14).unwrap() {
+            if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 v = new_v.iter().map(|x| x.clone() / norm.clone()).collect();
             } else {
                 break;
@@ -188,7 +188,7 @@ pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPr
                 .map(|x| x.clone() * x.clone())
                 .fold(T::zero(), |acc, x| acc + x),
         );
-        if sigma < T::from_f64(1e-10).unwrap() {
+        if sigma < T::from_f64(1e-10).unwrap_or_else(T::zero) {
             break;
         }
         singular_values.push(sigma);
@@ -197,8 +197,8 @@ pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPr
             for j in 0..n {
                 let deflate = sigma.clone()
                     * sigma.clone()
-                    * v_vectors.last().unwrap()[i].clone()
-                    * v_vectors.last().unwrap()[j].clone();
+                    * v_vectors.last().expect("collection should be non-empty")[i].clone()
+                    * v_vectors.last().expect("collection should be non-empty")[j].clone();
                 ata[i][j] = ata[i][j].clone() - deflate;
             }
         }
@@ -210,7 +210,7 @@ pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPr
             for j in 0..n {
                 sum = sum + matrix[i][j].clone() * v[j].clone();
             }
-            if Scalar::abs(sigma.clone()) > T::from_f64(1e-14).unwrap() {
+            if Scalar::abs(sigma.clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 u_vectors[i][k] = sum / sigma.clone();
             }
         }

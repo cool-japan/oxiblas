@@ -43,6 +43,7 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Condition number estimation for eigenvalues (trsna_s, trsna_sep)
 - [x] Eigenvector refinement (trevc) - trevc_right, trevc_left, Schur::eigenvectors
 - [x] Balancing (gebal/gebak)
+- [x] Randomized EVD (HMT algorithm) - RandomizedEvd with power iteration, f64/f32 (v0.2.0)
 
 ---
 
@@ -161,7 +162,6 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Hermitian D&C eigenvalue decomposition (HermitianEvdDc)
 - [x] Complex SVD - Jacobi method (ComplexSvd)
 - [x] Complex SVD - Divide-and-conquer (ComplexSvdDc)
-- [ ] Limited FFI exposure
 
 ### Implemented
 - [x] Complex LU decomposition (Lu<Complex64/Complex32> via generic Scalar trait)
@@ -169,7 +169,7 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Complex QR decomposition (UnitaryQr with Q^H Q = I)
 
 ### Remaining
-- [ ] Complex bidiagonal reduction (direct, currently using real via phase absorption)
+- [x] Complex bidiagonal reduction - `ComplexBidiagFactors` with direct complex Householder (v0.2.0)
 
 ---
 
@@ -221,7 +221,7 @@ LAPACK (Linear Algebra Package) implementations.
 
 ## Testing
 
-- [ ] LAPACK test suite compatibility
+- [x] LAPACK test suite compatibility - 61 integration tests in tests/lapack_compat.rs (v0.2.0)
 - [x] Unit tests (passing)
 - [x] Accuracy tests (residual norms) - error_bounds::accuracy_tests module
 - [x] Orthogonality tests - orthogonality_defect function

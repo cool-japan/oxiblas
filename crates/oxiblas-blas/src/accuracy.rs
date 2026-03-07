@@ -119,9 +119,9 @@ pub fn max_relative_error<T: Float>(computed: &[T], exact: &[T]) -> T {
     assert_eq!(computed.len(), exact.len(), "Vectors must have same length");
 
     let eps = if std::mem::size_of::<T>() == 4 {
-        T::from(EPSILON_F32).unwrap()
+        T::from(EPSILON_F32).unwrap_or_else(|| T::epsilon())
     } else {
-        T::from(EPSILON_F64).unwrap()
+        T::from(EPSILON_F64).unwrap_or_else(|| T::epsilon())
     };
 
     computed

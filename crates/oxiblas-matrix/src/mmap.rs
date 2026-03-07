@@ -255,11 +255,15 @@ impl Header {
 
         Ok(Header {
             magic,
-            version: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            elem_type: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            nrows: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            ncols: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-            row_stride: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            version: u64::from_le_bytes(bytes[8..16].try_into().expect("slice is exactly 8 bytes")),
+            elem_type: u64::from_le_bytes(
+                bytes[16..24].try_into().expect("slice is exactly 8 bytes"),
+            ),
+            nrows: u64::from_le_bytes(bytes[24..32].try_into().expect("slice is exactly 8 bytes")),
+            ncols: u64::from_le_bytes(bytes[32..40].try_into().expect("slice is exactly 8 bytes")),
+            row_stride: u64::from_le_bytes(
+                bytes[40..48].try_into().expect("slice is exactly 8 bytes"),
+            ),
             _padding: [0; 16],
         })
     }

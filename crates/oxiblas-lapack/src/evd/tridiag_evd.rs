@@ -487,7 +487,7 @@ fn inverse_iteration<T: Field + Real + bytemuck::Zeroable>(
                 // Adjust shift
                 diag_shifted = diagonal
                     .iter()
-                    .map(|&d| d - lambda - shift * T::from_f64(2.0).unwrap())
+                    .map(|&d| d - lambda - shift * T::from_f64(2.0).unwrap_or_else(T::zero))
                     .collect();
                 continue;
             }

@@ -135,7 +135,8 @@ pub fn subtract_scaled_matrices<T: Scalar + Clone>(
         row_ptrs[i + 1] = col_indices.len();
     }
 
-    CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap()
+    CsrMatrix::new(n, n, row_ptrs, col_indices, values)
+        .expect("CSR matrix construction with valid parameters")
 }
 
 /// Compute C = A + sigma * B (sparse matrix addition).
@@ -211,7 +212,8 @@ pub fn add_scaled_matrices<T: Scalar + Clone>(
         row_ptrs[i + 1] = col_indices.len();
     }
 
-    CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap()
+    CsrMatrix::new(n, n, row_ptrs, col_indices, values)
+        .expect("CSR matrix construction with valid parameters")
 }
 
 /// Convert CSR matrix to CSC format.
@@ -221,7 +223,8 @@ pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CscMatrix<T> {
     let nnz = csr.nnz();
 
     if nnz == 0 {
-        return CscMatrix::new(nrows, ncols, vec![0; ncols + 1], vec![], vec![]).unwrap();
+        return CscMatrix::new(nrows, ncols, vec![0; ncols + 1], vec![], vec![])
+            .expect("CSC matrix construction with valid parameters");
     }
 
     // Count entries per column
@@ -253,5 +256,6 @@ pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CscMatrix<T> {
         }
     }
 
-    CscMatrix::new(nrows, ncols, col_ptrs, row_indices, values).unwrap()
+    CscMatrix::new(nrows, ncols, col_ptrs, row_indices, values)
+        .expect("CSC matrix construction with valid parameters")
 }

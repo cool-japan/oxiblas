@@ -26,6 +26,9 @@
 //! [ 0    0    0   a43  a44]
 //! ```
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Scalar;
 

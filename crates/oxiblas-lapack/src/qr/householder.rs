@@ -55,7 +55,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Qr<T> {
     ///     &[5.0, 6.0],
     /// ]);
     ///
-    /// let qr = Qr::compute(a.as_ref()).unwrap();
+    /// let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
     /// let r = qr.r();
     ///
     /// // R is upper triangular
@@ -289,6 +289,8 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     /// let qr = Qr::compute_blocked(a.as_ref(), 64).unwrap();
     /// ```
     pub fn compute_blocked(a: MatRef<'_, T>, nb: usize) -> Result<Self, QrError> {
+        use oxiblas_blas::level3::gemm::gemm;
+
         let m = a.nrows();
         let n = a.ncols();
 
@@ -312,16 +314,179 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
         while j < k {
             let jb = nb.min(k - j); // Current block size
 
-            // Factor the panel: columns j..j+jb using standard unblocked QR
+            // Step 1: Factor the panel columns j..j+jb using unblocked Householder.
+            // Apply each reflector only within the panel (not the trailing matrix).
             for jj in 0..jb {
                 let col = j + jj;
                 let (tau_col, beta) = householder_vector(&mut qr, col, m, n);
                 tau[col] = tau_col;
                 qr[(col, col)] = beta;
 
-                // Apply to all remaining columns (both within panel and trailing matrix)
-                if col + 1 < n {
-                    apply_householder_left(&mut qr, col, m, n, tau_col);
+                // Apply this reflector only to remaining columns within the panel
+                if tau_col != T::zero() {
+                    for panel_col in (col + 1)..(j + jb).min(n) {
+                        // Compute w = v^T * qr[:, panel_col]
+                        let mut w = qr[(col, panel_col)]; // v[col] = 1
+                        for i in (col + 1)..m {
+                            w = w + qr[(i, col)] * qr[(i, panel_col)];
+                        }
+                        // Update qr[:, panel_col] -= tau * w * v
+                        let tw = tau_col * w;
+                        qr[(col, panel_col)] = qr[(col, panel_col)] - tw;
+                        for i in (col + 1)..m {
+                            qr[(i, panel_col)] = qr[(i, panel_col)] - tw * qr[(i, col)];
+                        }
+                    }
+                }
+            }
+
+            // Step 2: If there is a trailing submatrix, build the T matrix and
+            // apply the block reflector using GEMM (Level 3 BLAS).
+            let trailing_start = j + jb;
+            if trailing_start < n {
+                let panel_rows = m - j; // Rows from j to m
+                let trailing_cols = n - trailing_start;
+
+                // Build T matrix (upper triangular, jb x jb).
+                // T is defined by: T(i,i) = tau(i), and for i < j:
+                //   T(i,j) = -tau(j) * V(:,i)^T * V(:,j)  then premultiply by T(0..i, 0..i)
+                // This is the LAPACK DLARFT algorithm (forward, column-wise).
+                let mut t_mat = Mat::zeros(jb, jb);
+                for jj in 0..jb {
+                    let col = j + jj;
+                    t_mat[(jj, jj)] = tau[col];
+
+                    if tau[col] != T::zero() && jj > 0 {
+                        // Compute z = -tau[col] * V(:, 0..jj)^T * V(:, jj)
+                        // V(:,jj) has v[col]=1 implicit, and v[col+1..m] stored in qr[col+1..m, col]
+                        // V(:,ii) for ii<jj has v[j+ii]=1 implicit, v[j+ii+1..m] in qr[j+ii+1..m, j+ii]
+                        // But we need to work in the "panel coordinate" where V starts at row j.
+                        for ii in 0..jj {
+                            let col_ii = j + ii;
+                            // Compute V(:,ii)^T * V(:,jj) where both vectors start at row j
+                            // V(:,ii) has 1 at row j+ii, zeros above, and stored values below
+                            // V(:,jj) has 1 at row j+jj, zeros above, and stored values below
+                            let mut dot = T::zero();
+
+                            // Both vectors are zero above their respective pivots.
+                            // V(row, ii) is nonzero for row >= j+ii (1 at j+ii, stored below)
+                            // V(row, jj) is nonzero for row >= j+jj (1 at j+jj, stored below)
+                            // Since ii < jj, we have j+ii < j+jj.
+                            // The overlap starts at row j+jj.
+
+                            // At row j+jj: V(j+jj, ii) = qr[(j+jj, col_ii)], V(j+jj, jj) = 1
+                            dot = dot + qr[(col, col_ii)]; // V(j+jj, ii) * 1
+
+                            // For rows below j+jj:
+                            for i in (col + 1)..m {
+                                dot = dot + qr[(i, col_ii)] * qr[(i, col)];
+                            }
+
+                            t_mat[(ii, jj)] = -tau[col] * dot;
+                        }
+
+                        // Apply T(0..jj, 0..jj) to T(0..jj, jj):
+                        // T(0..jj, jj) = T(0..jj, 0..jj) * T(0..jj, jj)
+                        // Since T is upper triangular, solve from top.
+                        // Actually this is a matrix-vector multiply: z = T_sub * z
+                        // where T_sub is jj x jj upper triangular.
+                        let mut temp = vec![T::zero(); jj];
+                        for ii in 0..jj {
+                            temp[ii] = t_mat[(ii, jj)];
+                        }
+                        for ii in 0..jj {
+                            let mut s = T::zero();
+                            for kk in ii..jj {
+                                s = s + t_mat[(ii, kk)] * temp[kk];
+                            }
+                            t_mat[(ii, jj)] = s;
+                        }
+                    }
+                }
+
+                // Step 3: Apply the block reflector I - V * T * V^T to trailing matrix.
+                //
+                // The trailing submatrix is qr[j..m, trailing_start..n].
+                // V is panel_rows x jb, stored in qr[j..m, j..j+jb] with unit diagonal.
+                //
+                // We compute:
+                //   W = V^T * A_trail    (jb x trailing_cols)
+                //   W = T * W            (jb x trailing_cols)
+                //   A_trail -= V * W     (panel_rows x trailing_cols)
+                //
+                // All three steps use GEMM for Level 3 performance.
+
+                // Extract V matrix explicitly (panel_rows x jb) with unit lower triangular
+                let mut v_mat = Mat::zeros(panel_rows, jb);
+                for jj in 0..jb {
+                    // V has unit diagonal at position (jj, jj) in panel coords
+                    v_mat[(jj, jj)] = T::one();
+                    // Below diagonal of V: stored in qr
+                    for i in (jj + 1)..panel_rows {
+                        v_mat[(i, jj)] = qr[(j + i, j + jj)];
+                    }
+                }
+
+                // Extract trailing submatrix
+                let mut a_trail = Mat::zeros(panel_rows, trailing_cols);
+                for jj in 0..trailing_cols {
+                    for i in 0..panel_rows {
+                        a_trail[(i, jj)] = qr[(j + i, trailing_start + jj)];
+                    }
+                }
+
+                // W = V^T * A_trail  (jb x trailing_cols)
+                // Compute V^T explicitly since gemm requires MatRef (not TransposeRef)
+                let mut v_t = Mat::zeros(jb, panel_rows);
+                for ii in 0..jb {
+                    for i in 0..panel_rows {
+                        v_t[(ii, i)] = v_mat[(i, ii)];
+                    }
+                }
+                let mut w_mat = Mat::zeros(jb, trailing_cols);
+                gemm(
+                    T::one(),
+                    v_t.as_ref(),
+                    a_trail.as_ref(),
+                    T::zero(),
+                    w_mat.as_mut(),
+                );
+
+                // W = T^T * W  (jb x trailing_cols)
+                // We apply the TRANSPOSE of the block reflector: (I - V*T*V^T)^T = I - V*T^T*V^T
+                // because the forward WY form I - V*T*V^T = H(0)*H(1)*...*H(jb-1),
+                // and we need H(jb-1)*...*H(1)*H(0) (i.e., H(0) applied first).
+                // Since each H(i) is symmetric, (H(0)*...*H(jb-1))^T = H(jb-1)*...*H(0).
+                // Compute T^T explicitly since T is small (jb x jb).
+                let mut t_trans = Mat::zeros(jb, jb);
+                for ii in 0..jb {
+                    for kk in 0..jb {
+                        t_trans[(ii, kk)] = t_mat[(kk, ii)];
+                    }
+                }
+                let mut tw_mat = Mat::zeros(jb, trailing_cols);
+                gemm(
+                    T::one(),
+                    t_trans.as_ref(),
+                    w_mat.as_ref(),
+                    T::zero(),
+                    tw_mat.as_mut(),
+                );
+
+                // A_trail -= V * (T * W)
+                gemm(
+                    -T::one(),
+                    v_mat.as_ref(),
+                    tw_mat.as_ref(),
+                    T::one(),
+                    a_trail.as_mut(),
+                );
+
+                // Write back the updated trailing submatrix
+                for jj in 0..trailing_cols {
+                    for i in 0..panel_rows {
+                        qr[(j + i, trailing_start + jj)] = a_trail[(i, jj)];
+                    }
                 }
             }
 
@@ -329,6 +494,313 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
         }
 
         Ok(Self { qr, tau, m, n })
+    }
+
+    /// Recursion threshold for compute_recursive: panels at or below this width
+    /// use the blocked algorithm (which itself falls back to unblocked for small panels).
+    const RECURSIVE_THRESHOLD: usize = 48;
+
+    /// Computes QR decomposition using a recursive cache-oblivious algorithm.
+    ///
+    /// This divide-and-conquer approach automatically adapts to the cache hierarchy
+    /// by recursively splitting the column space. At each level:
+    ///
+    /// 1. Split the columns into a left half (n1 cols) and right half (n2 cols)
+    /// 2. Recursively factor the left panel to get its Householder vectors and tau
+    /// 3. Build the compact WY representation (I - V*T*V^T) for the left panel
+    /// 4. Apply the block reflector Q_left^T to the right panel using GEMM
+    /// 5. Recursively factor the trailing submatrix of the right panel
+    ///
+    /// For panels narrower than the recursion threshold (48), falls back to the
+    /// blocked algorithm which is more efficient at that scale.
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - The m x n matrix to factor
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxiblas_lapack::qr::Qr;
+    /// use oxiblas_matrix::Mat;
+    ///
+    /// let n = 200;
+    /// let mut a = Mat::zeros(n, n);
+    /// for i in 0..n {
+    ///     for j in 0..n {
+    ///         a[(i, j)] = ((i * 7 + j * 11) % 13 + 1) as f64;
+    ///     }
+    ///     a[(i, i)] += 50.0;
+    /// }
+    ///
+    /// let qr = Qr::compute_recursive(a.as_ref()).expect("recursive QR should succeed");
+    /// let q = qr.q();
+    /// let r = qr.r();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `QrError::EmptyMatrix` if the matrix has zero rows or columns.
+    pub fn compute_recursive(a: MatRef<'_, T>) -> Result<Self, QrError> {
+        let m = a.nrows();
+        let n = a.ncols();
+
+        if m == 0 || n == 0 {
+            return Err(QrError::EmptyMatrix);
+        }
+
+        // Copy A to working matrix
+        let mut qr = Mat::zeros(m, n);
+        for j in 0..n {
+            for i in 0..m {
+                qr[(i, j)] = a[(i, j)];
+            }
+        }
+
+        let k = m.min(n);
+        let mut tau = vec![T::zero(); k];
+
+        // Launch the recursive factorization starting at column 0
+        Self::recursive_qr_factor(&mut qr, &mut tau, m, n, 0, k)?;
+
+        Ok(Self { qr, tau, m, n })
+    }
+
+    /// Recursive QR factorization on columns col_start..col_start+width.
+    ///
+    /// Factors the submatrix qr[col_start..m, col_start..col_start+width] in place,
+    /// storing Householder vectors below the diagonal and R on/above the diagonal.
+    /// The tau values for columns col_start..col_start+width are filled in.
+    ///
+    /// After factoring, the Householder reflectors are also applied to any trailing
+    /// columns col_start+width..n so that the full matrix remains consistent.
+    ///
+    /// # Arguments
+    ///
+    /// * `qr` - The full m x n working matrix (modified in place)
+    /// * `tau` - Householder scalar array (length min(m,n))
+    /// * `m` - Number of rows of the full matrix
+    /// * `n` - Number of columns of the full matrix
+    /// * `col_start` - Starting column for this recursive call
+    /// * `width` - Number of columns to factor in this call
+    fn recursive_qr_factor(
+        qr: &mut Mat<T>,
+        tau: &mut [T],
+        m: usize,
+        n: usize,
+        col_start: usize,
+        width: usize,
+    ) -> Result<(), QrError> {
+        if width == 0 {
+            return Ok(());
+        }
+
+        // Base case: use blocked (or unblocked for very small) factorization
+        if width <= Self::RECURSIVE_THRESHOLD {
+            // Factor the panel columns col_start..col_start+width using
+            // the panel-level Householder, applying reflectors only within the panel.
+            Self::factor_panel_unblocked(qr, tau, m, col_start, width);
+
+            // Apply the panel's reflectors to the trailing columns
+            let trailing_start = col_start + width;
+            if trailing_start < n {
+                Self::apply_block_reflector_to_trailing(qr, tau, m, n, col_start, width)?;
+            }
+            return Ok(());
+        }
+
+        // Recursive case: split the width in half
+        let n1 = width / 2;
+        let n2 = width - n1;
+
+        // Step 1: Recursively factor the left half.
+        // This factors columns col_start..col_start+n1 and applies the resulting
+        // reflectors to all trailing columns (col_start+n1..n), including the right half.
+        Self::recursive_qr_factor(qr, tau, m, n, col_start, n1)?;
+
+        // Step 2: Recursively factor the right half.
+        // The trailing submatrix for the right half starts at row col_start+n1.
+        // Columns col_start+n1..col_start+width need factoring, and reflectors
+        // must be applied to columns col_start+width..n.
+        Self::recursive_qr_factor(qr, tau, m, n, col_start + n1, n2)?;
+
+        Ok(())
+    }
+
+    /// Factors a panel of columns using unblocked Householder reflections.
+    ///
+    /// Applies each reflector only within the panel (not to trailing columns).
+    /// The trailing column update is done separately via block reflector application.
+    fn factor_panel_unblocked(
+        qr: &mut Mat<T>,
+        tau: &mut [T],
+        m: usize,
+        col_start: usize,
+        width: usize,
+    ) {
+        let panel_end = col_start + width;
+
+        for jj in 0..width {
+            let col = col_start + jj;
+
+            // Compute Householder vector for this column
+            let (tau_col, beta) = householder_vector(qr, col, m, panel_end);
+            tau[col] = tau_col;
+            qr[(col, col)] = beta;
+
+            // Apply this reflector to remaining columns within the panel
+            if tau_col != T::zero() {
+                for panel_col in (col + 1)..panel_end {
+                    // Compute w = v^T * qr[:, panel_col]
+                    let mut w = qr[(col, panel_col)]; // v[col] = 1
+                    for i in (col + 1)..m {
+                        w = w + qr[(i, col)] * qr[(i, panel_col)];
+                    }
+                    // Update qr[:, panel_col] -= tau * w * v
+                    let tw = tau_col * w;
+                    qr[(col, panel_col)] = qr[(col, panel_col)] - tw;
+                    for i in (col + 1)..m {
+                        qr[(i, panel_col)] = qr[(i, panel_col)] - tw * qr[(i, col)];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the T matrix for the compact WY representation and applies
+    /// the block reflector (I - V*T^T*V^T) to the trailing columns.
+    ///
+    /// This uses GEMM (Level 3 BLAS) for cache-efficient application.
+    fn apply_block_reflector_to_trailing(
+        qr: &mut Mat<T>,
+        tau: &[T],
+        m: usize,
+        n: usize,
+        col_start: usize,
+        width: usize,
+    ) -> Result<(), QrError> {
+        use oxiblas_blas::level3::gemm::gemm;
+
+        let trailing_start = col_start + width;
+        if trailing_start >= n {
+            return Ok(());
+        }
+
+        let panel_rows = m - col_start; // Rows from col_start to m
+        let trailing_cols = n - trailing_start;
+
+        // Build T matrix (upper triangular, width x width) using DLARFT-style algorithm.
+        // T(i,i) = tau(col_start + i)
+        // For i < j: T(i,j) = -tau(col_start + j) * V(:,i)^T * V(:,j), then T(0..j, j) = T(0..j, 0..j) * T(0..j, j)
+        let mut t_mat = Mat::zeros(width, width);
+        for jj in 0..width {
+            let col = col_start + jj;
+            t_mat[(jj, jj)] = tau[col];
+
+            if tau[col] != T::zero() && jj > 0 {
+                for ii in 0..jj {
+                    let col_ii = col_start + ii;
+                    // Compute V(:,ii)^T * V(:,jj)
+                    // Both vectors are zero above their respective pivots.
+                    // V(row, ii) is nonzero for row >= col_start+ii (1 at col_start+ii, stored below)
+                    // V(row, jj) is nonzero for row >= col_start+jj (1 at col_start+jj, stored below)
+                    // Since ii < jj, the overlap starts at row col_start+jj = col.
+                    let mut dot = T::zero();
+
+                    // At row col: V(col, ii) = qr[(col, col_ii)], V(col, jj) = 1
+                    dot = dot + qr[(col, col_ii)]; // V(col, ii) * 1
+
+                    // For rows below col:
+                    for i in (col + 1)..m {
+                        dot = dot + qr[(i, col_ii)] * qr[(i, col)];
+                    }
+
+                    t_mat[(ii, jj)] = -tau[col] * dot;
+                }
+
+                // Apply T(0..jj, 0..jj) to T(0..jj, jj): z = T_sub * z
+                let mut temp = vec![T::zero(); jj];
+                for ii in 0..jj {
+                    temp[ii] = t_mat[(ii, jj)];
+                }
+                for ii in 0..jj {
+                    let mut s = T::zero();
+                    for kk in ii..jj {
+                        s = s + t_mat[(ii, kk)] * temp[kk];
+                    }
+                    t_mat[(ii, jj)] = s;
+                }
+            }
+        }
+
+        // Extract V matrix explicitly (panel_rows x width) with unit lower triangular
+        let mut v_mat = Mat::zeros(panel_rows, width);
+        for jj in 0..width {
+            v_mat[(jj, jj)] = T::one();
+            for i in (jj + 1)..panel_rows {
+                v_mat[(i, jj)] = qr[(col_start + i, col_start + jj)];
+            }
+        }
+
+        // Extract trailing submatrix (panel_rows x trailing_cols)
+        let mut a_trail = Mat::zeros(panel_rows, trailing_cols);
+        for jj in 0..trailing_cols {
+            for i in 0..panel_rows {
+                a_trail[(i, jj)] = qr[(col_start + i, trailing_start + jj)];
+            }
+        }
+
+        // W = V^T * A_trail  (width x trailing_cols)
+        let mut v_t = Mat::zeros(width, panel_rows);
+        for ii in 0..width {
+            for i in 0..panel_rows {
+                v_t[(ii, i)] = v_mat[(i, ii)];
+            }
+        }
+        let mut w_mat = Mat::zeros(width, trailing_cols);
+        gemm(
+            T::one(),
+            v_t.as_ref(),
+            a_trail.as_ref(),
+            T::zero(),
+            w_mat.as_mut(),
+        );
+
+        // W = T^T * W  (width x trailing_cols)
+        // We need the transpose of T because the forward WY form I - V*T*V^T = H(0)*H(1)*...*H(jb-1),
+        // and we need the product applied as H(0) first (from left: H(jb-1)*...*H(0)*A).
+        let mut t_trans = Mat::zeros(width, width);
+        for ii in 0..width {
+            for kk in 0..width {
+                t_trans[(ii, kk)] = t_mat[(kk, ii)];
+            }
+        }
+        let mut tw_mat = Mat::zeros(width, trailing_cols);
+        gemm(
+            T::one(),
+            t_trans.as_ref(),
+            w_mat.as_ref(),
+            T::zero(),
+            tw_mat.as_mut(),
+        );
+
+        // A_trail -= V * (T^T * W)
+        gemm(
+            -T::one(),
+            v_mat.as_ref(),
+            tw_mat.as_ref(),
+            T::one(),
+            a_trail.as_mut(),
+        );
+
+        // Write back the updated trailing submatrix
+        for jj in 0..trailing_cols {
+            for i in 0..panel_rows {
+                qr[(col_start + i, trailing_start + jj)] = a_trail[(i, jj)];
+            }
+        }
+
+        Ok(())
     }
 
     /// Computes QR decomposition with automatic algorithm selection.
@@ -523,7 +995,7 @@ mod tests {
     fn test_qr_square() {
         let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 10.0]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -575,7 +1047,7 @@ mod tests {
         // 4x2 matrix
         let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0], &[7.0, 8.0]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -616,7 +1088,7 @@ mod tests {
         // 2x3 matrix
         let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -644,7 +1116,7 @@ mod tests {
     fn test_qr_identity() {
         let eye = Mat::from_rows(&[&[1.0f64, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]]);
 
-        let qr = Qr::compute(eye.as_ref()).unwrap();
+        let qr = Qr::compute(eye.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -666,7 +1138,7 @@ mod tests {
     fn test_qr_thin() {
         let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q_thin = qr.q_thin();
         let r_thin = qr.r_thin();
 
@@ -696,8 +1168,10 @@ mod tests {
         let a = Mat::from_rows(&[&[1.0f64, 1.0], &[1.0, 2.0], &[1.0, 3.0]]);
         let b = Mat::from_rows(&[&[1.0f64], &[2.0], &[2.5]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
-        let x = qr.solve_least_squares(b.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
+        let x = qr
+            .solve_least_squares(b.as_ref())
+            .expect("least squares should succeed");
 
         // Verify the solution minimizes ||Ax - b||
         // The solution should be close to x = [0.5, 0.75] for this problem
@@ -725,7 +1199,7 @@ mod tests {
     fn test_qr_f32() {
         let a = Mat::from_rows(&[&[1.0f32, 2.0], &[3.0, 4.0]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -745,7 +1219,7 @@ mod tests {
     fn test_qr_single() {
         let a = Mat::from_rows(&[&[3.0f64]]);
 
-        let qr = Qr::compute(a.as_ref()).unwrap();
+        let qr = Qr::compute(a.as_ref()).expect("QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -753,6 +1227,128 @@ mod tests {
         assert!(q[(0, 0)].abs() > 0.99);
         assert!(r[(0, 0)].abs() > 2.99);
         assert!(approx_eq((q[(0, 0)] * r[(0, 0)]).abs(), 3.0, 1e-10));
+    }
+
+    #[test]
+    fn test_qr_blocked_vs_unblocked_4x4() {
+        // Verify blocked and unblocked produce equivalent factorizations
+        let a = Mat::from_rows(&[
+            &[1.0f64, 2.0, 3.0, 4.0],
+            &[5.0, 6.0, 7.0, 8.0],
+            &[9.0, 10.0, 11.0, 12.0],
+            &[13.0, 14.0, 15.0, 16.0],
+        ]);
+
+        let qr_blocked = Qr::compute_blocked(a.as_ref(), 2).expect("blocked QR should succeed");
+        let q_b = qr_blocked.q();
+        let r_b = qr_blocked.r();
+
+        // Verify Q * R = A for blocked
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    sum += q_b[(i, k)] * r_b[(k, j)];
+                }
+                let diff = sum - a[(i, j)];
+                assert!(
+                    diff.abs() < 1e-10,
+                    "Blocked reconstruction error at ({}, {}): got {}, expected {}, diff={}",
+                    i,
+                    j,
+                    sum,
+                    a[(i, j)],
+                    diff
+                );
+            }
+        }
+
+        // Verify Q is orthogonal
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    sum += q_b[(k, i)] * q_b[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - expected).abs() < 1e-10,
+                    "Q not orthogonal at ({}, {}): got {}, expected {}",
+                    i,
+                    j,
+                    sum,
+                    expected
+                );
+            }
+        }
+
+        // Verify R is upper triangular
+        for i in 0..4 {
+            for j in 0..i {
+                assert!(
+                    r_b[(i, j)].abs() < 1e-10,
+                    "R not upper triangular at ({}, {}): got {}",
+                    i,
+                    j,
+                    r_b[(i, j)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_various_block_sizes() {
+        // Test blocked QR with different block sizes on a 12x12 matrix
+        let n = 12;
+        let mut a = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 3 + j * 7 + 1) % 11) as f64 + 1.0;
+            }
+            a[(i, i)] += 20.0; // Make well-conditioned
+        }
+
+        for nb in [1, 2, 3, 4, 6, 12] {
+            let qr = Qr::compute_blocked(a.as_ref(), nb).expect("blocked QR should succeed");
+            let q = qr.q();
+            let r = qr.r();
+
+            // Verify Q * R = A
+            for i in 0..n {
+                for j in 0..n {
+                    let mut sum = 0.0;
+                    for k in 0..n {
+                        sum += q[(i, k)] * r[(k, j)];
+                    }
+                    assert!(
+                        (sum - a[(i, j)]).abs() < 1e-9,
+                        "nb={}: reconstruction error at ({}, {}): diff={}",
+                        nb,
+                        i,
+                        j,
+                        sum - a[(i, j)]
+                    );
+                }
+            }
+
+            // Verify Q^T * Q = I
+            for i in 0..n {
+                for j in 0..n {
+                    let mut sum = 0.0;
+                    for k in 0..n {
+                        sum += q[(k, i)] * q[(k, j)];
+                    }
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (sum - expected).abs() < 1e-9,
+                        "nb={}: Q not orthogonal at ({}, {})",
+                        nb,
+                        i,
+                        j
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -767,7 +1363,7 @@ mod tests {
         }
 
         // Compute using blocked algorithm with small block size
-        let qr_blocked = Qr::compute_blocked(a.as_ref(), 4).unwrap();
+        let qr_blocked = Qr::compute_blocked(a.as_ref(), 4).expect("blocked QR should succeed");
         let q = qr_blocked.q();
         let r = qr_blocked.r();
 
@@ -823,7 +1419,7 @@ mod tests {
         }
 
         // Compute using blocked algorithm
-        let qr_blocked = Qr::compute_blocked(a.as_ref(), 64).unwrap();
+        let qr_blocked = Qr::compute_blocked(a.as_ref(), 64).expect("blocked QR should succeed");
         let q = qr_blocked.q();
         let r = qr_blocked.r();
 
@@ -890,7 +1486,7 @@ mod tests {
             }
         }
 
-        let qr = Qr::compute_auto(a.as_ref()).unwrap();
+        let qr = Qr::compute_auto(a.as_ref()).expect("auto QR should succeed");
         let q = qr.q();
         let r = qr.r();
 
@@ -934,7 +1530,6 @@ mod tests {
     }
 
     #[test]
-
     fn test_qr_blocked_tall_matrix() {
         // Test blocked QR on tall matrix (m > n)
         let m = 300;
@@ -946,7 +1541,7 @@ mod tests {
             }
         }
 
-        let qr = Qr::compute_blocked(a.as_ref(), 32).unwrap();
+        let qr = Qr::compute_blocked(a.as_ref(), 32).expect("blocked QR should succeed");
         let r = qr.r_thin();
 
         // Verify R is upper triangular
@@ -973,6 +1568,319 @@ mod tests {
                 assert!(
                     (sum - a[(i, j)]).abs() < 1e-8,
                     "Thin QR reconstruction error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_wide_matrix() {
+        // Test blocked QR on wide matrix (m < n)
+        let m = 50;
+        let n = 120;
+        let mut a = Mat::zeros(m, n);
+        for i in 0..m {
+            for j in 0..n {
+                a[(i, j)] = ((i * 5 + j * 3 + 2) % 11) as f64 + 0.5;
+            }
+        }
+
+        let qr = Qr::compute_blocked(a.as_ref(), 16).expect("blocked QR should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        // Verify Q^T * Q = I
+        for i in 0..m {
+            for j in 0..m {
+                let mut sum = 0.0;
+                for k in 0..m {
+                    sum += q[(k, i)] * q[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - expected).abs() < 1e-9,
+                    "Q not orthogonal at ({}, {}): diff={}",
+                    i,
+                    j,
+                    (sum - expected).abs()
+                );
+            }
+        }
+
+        // Verify R is upper triangular
+        let k = m.min(n);
+        for i in 0..m {
+            for j in 0..i.min(k) {
+                assert!(
+                    r[(i, j)].abs() < 1e-10,
+                    "R not upper triangular at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+
+        // Verify Q * R = A
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..m {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                assert!(
+                    (sum - a[(i, j)]).abs() < 1e-8,
+                    "Wide reconstruction error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_f32() {
+        // Test blocked QR with f32 precision
+        let n = 32;
+        let mut a: Mat<f32> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 3 + j * 5 + 1) % 9 + 1) as f32;
+            }
+            a[(i, i)] += 10.0;
+        }
+
+        let qr = Qr::compute_blocked(a.as_ref(), 8).expect("f32 blocked QR should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        // Verify Q * R = A with f32 tolerance
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum: f32 = 0.0;
+                for k in 0..n {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                assert!(
+                    (sum - a[(i, j)]).abs() < 1e-3,
+                    "f32 blocked reconstruction error at ({}, {}): diff={}",
+                    i,
+                    j,
+                    (sum - a[(i, j)]).abs()
+                );
+            }
+        }
+
+        // Verify Q^T * Q = I with f32 tolerance
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum: f32 = 0.0;
+                for k in 0..n {
+                    sum += q[(k, i)] * q[(k, j)];
+                }
+                let expected: f32 = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - expected).abs() < 1e-3,
+                    "f32 Q not orthogonal at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_identity_matrix() {
+        // The identity should decompose trivially
+        let n = 16;
+        let mut eye = Mat::zeros(n, n);
+        for i in 0..n {
+            eye[(i, i)] = 1.0f64;
+        }
+
+        let qr = Qr::compute_blocked(eye.as_ref(), 4).expect("identity blocked QR should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        for i in 0..n {
+            for j in 0..n {
+                let expected: f64 = if i == j { 1.0 } else { 0.0 };
+                // Q and R should each be +/-I (with possible sign flips on diagonal)
+                assert!(
+                    (q[(i, j)].abs() - expected.abs()).abs() < 1e-10
+                        || (i == j && q[(i, j)].abs() > 0.99),
+                    "Identity Q error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+
+        // Q * R should reconstruct identity
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - expected).abs() < 1e-10,
+                    "Identity reconstruction error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_block_size_1() {
+        // Block size 1 should be equivalent to unblocked
+        let n = 20;
+        let mut a = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i + j + 1) % 7) as f64 + 1.0;
+            }
+            a[(i, i)] += 15.0;
+        }
+
+        let qr_unblocked = Qr::compute(a.as_ref()).expect("unblocked QR should succeed");
+        let qr_blocked =
+            Qr::compute_blocked(a.as_ref(), 1).expect("nb=1 blocked QR should succeed");
+
+        // R matrices should be numerically identical
+        let r_u = qr_unblocked.r();
+        let r_b = qr_blocked.r();
+
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    (r_u[(i, j)] - r_b[(i, j)]).abs() < 1e-10,
+                    "R mismatch at ({}, {}): unblocked={}, blocked={}",
+                    i,
+                    j,
+                    r_u[(i, j)],
+                    r_b[(i, j)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_block_size_exceeds_n() {
+        // Block size larger than matrix dimension -- single panel, no trailing update
+        let n = 8;
+        let mut a = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = (i * n + j + 1) as f64;
+            }
+        }
+
+        let qr = Qr::compute_blocked(a.as_ref(), 64).expect("large nb should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        // Verify Q * R = A
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                assert!(
+                    (sum - a[(i, j)]).abs() < 1e-9,
+                    "Large nb reconstruction error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_auto_small_uses_unblocked() {
+        // For small matrices (< 128), auto should use unblocked
+        let n = 64;
+        let mut a = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 3 + j * 7) % 17 + 1) as f64;
+            }
+            a[(i, i)] += 20.0;
+        }
+
+        let qr = Qr::compute_auto(a.as_ref()).expect("auto QR should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        // Verify reconstruction
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                assert!(
+                    (sum - a[(i, j)]).abs() < 1e-8,
+                    "Auto small reconstruction error at ({}, {})",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_qr_blocked_well_conditioned() {
+        // Test with a well-conditioned matrix (diagonally dominant)
+        let n = 100;
+        let mut a = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = if i == j {
+                    100.0
+                } else {
+                    1.0 / ((i as f64 - j as f64).abs() + 1.0)
+                };
+            }
+        }
+
+        let qr = Qr::compute_blocked(a.as_ref(), 32).expect("well-conditioned QR should succeed");
+        let q = qr.q();
+        let r = qr.r();
+
+        // Tight orthogonality check
+        for i in 0..n {
+            for j in i..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += q[(k, i)] * q[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (sum - expected).abs() < 1e-10,
+                    "Well-conditioned Q orthogonality error at ({}, {}): diff={}",
+                    i,
+                    j,
+                    (sum - expected).abs()
+                );
+            }
+        }
+
+        // Tight reconstruction check
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += q[(i, k)] * r[(k, j)];
+                }
+                assert!(
+                    (sum - a[(i, j)]).abs() < 1e-9,
+                    "Well-conditioned reconstruction error at ({}, {})",
                     i,
                     j
                 );

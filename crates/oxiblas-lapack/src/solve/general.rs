@@ -2,7 +2,7 @@
 //!
 //! Solves Ax = b for general (non-triangular) matrices using LU decomposition.
 
-use oxiblas_core::scalar::{Field, Real};
+use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatRef};
 
 use crate::lu::{Lu, LuError};
@@ -68,7 +68,7 @@ impl From<LuError> for SolveError {
 /// let x = solve(a.as_ref(), b.as_ref()).unwrap();
 /// // Check: Ax ≈ b
 /// ```
-pub fn solve<T: Field + Real + bytemuck::Zeroable>(
+pub fn solve<T: Field + bytemuck::Zeroable>(
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
 ) -> Result<Mat<T>, SolveError> {
@@ -120,7 +120,7 @@ pub fn solve<T: Field + Real + bytemuck::Zeroable>(
 /// let x = solve_multiple(a.as_ref(), b.as_ref()).unwrap();
 /// // X has shape 2×2
 /// ```
-pub fn solve_multiple<T: Field + Real + bytemuck::Zeroable>(
+pub fn solve_multiple<T: Field + bytemuck::Zeroable>(
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
 ) -> Result<Mat<T>, SolveError> {

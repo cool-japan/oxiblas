@@ -376,7 +376,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         }
 
         let max_sv = self.sigma[0];
-        let min_sv = *self.sigma.last().unwrap();
+        let min_sv = *self.sigma.last().expect("collection should be non-empty");
 
         if min_sv > T::zero() {
             max_sv / min_sv

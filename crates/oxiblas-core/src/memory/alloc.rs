@@ -10,6 +10,10 @@
 
 use core::alloc::Layout;
 use core::mem::size_of;
+
+#[cfg(not(feature = "std"))]
+use alloc::alloc::{alloc, alloc_zeroed, dealloc};
+#[cfg(feature = "std")]
 use std::alloc::{alloc, alloc_zeroed, dealloc};
 
 // =============================================================================

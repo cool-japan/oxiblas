@@ -66,6 +66,18 @@
 //! - `ExtendedPrecision`: Accumulator type mapping (f32→f64)
 //! - `KahanSum`, `pairwise_sum`: Compensated summation for accuracy
 //!
+//! ## Comparison with Other Libraries
+//!
+//! | Feature | OxiBLAS | ndarray-linalg | nalgebra | faer |
+//! |---------|---------|----------------|----------|------|
+//! | Pure Rust | yes | no (LAPACKE) | yes | yes |
+//! | no_std | partial | no | yes | yes |
+//! | Sparse support | yes | no | partial | no |
+//! | Complex numbers | yes | yes | yes | partial |
+//! | BLAS-compatible API | yes | yes | no | no |
+//! | Extended precision | yes | no | no | no |
+//! | Parallel (Rayon) | yes | partial | no | yes |
+//!
 //! ## Feature Flags
 //!
 //! - `sparse`: Enable sparse matrix operations (enabled by default)
@@ -369,6 +381,59 @@ pub use oxiblas_matrix::lazy::{fma as lazy_fma, gemm as lazy_gemm};
 // Re-export BLAS operations
 pub use oxiblas_blas::level3::{GemmBlocking, GemmKernel, gemm, gemm_with_par};
 
+/// Parallel BLAS and GEMM variants (requires `parallel` feature).
+///
+/// These functions dispatch work to rayon thread pools and are recommended
+/// for matrices with dimensions >= 256.
+#[cfg(feature = "parallel")]
+pub use oxiblas_core::{CustomRayonPool, RayonGlobalPool};
+
+/// Half-precision (f16) scalar type (requires `f16` feature).
+///
+/// `half::f16` implements the [`Scalar`] and [`Real`] traits, making it
+/// compatible with all OxiBLAS matrix and BLAS operations.
+#[cfg(feature = "f16")]
+pub use oxiblas_core::f16;
+
+/// Quad-precision scalar type backed by double-double arithmetic (requires `f128` feature).
+///
+/// [`QuadFloat`] provides ~31 decimal digits of precision using a
+/// two-`f64` representation and implements all core OxiBLAS scalar traits.
+#[cfg(feature = "f128")]
+pub use oxiblas_core::QuadFloat;
+
+/// Compile-time feature availability flags.
+///
+/// These constants let library users and downstream crates check which
+/// optional features are compiled in at compile time without resorting to
+/// `cfg` attributes on every call site.
+///
+/// # Example
+///
+/// ```
+/// use oxiblas::features;
+///
+/// if features::HAS_PARALLEL {
+///     // safe to use gemm_with_par with Par::Rayon
+/// }
+/// ```
+pub mod features {
+    /// `true` when the `parallel` feature (Rayon integration) is compiled in.
+    pub const HAS_PARALLEL: bool = cfg!(feature = "parallel");
+    /// `true` when the `sparse` feature (sparse matrix types and solvers) is compiled in.
+    pub const HAS_SPARSE: bool = cfg!(feature = "sparse");
+    /// `true` when the `f16` feature (half-precision scalar support) is compiled in.
+    pub const HAS_F16: bool = cfg!(feature = "f16");
+    /// `true` when the `f128` feature (quad-precision scalar via `QuadFloat`) is compiled in.
+    pub const HAS_F128: bool = cfg!(feature = "f128");
+    /// `true` when the `ndarray` feature (ndarray interop) is compiled in.
+    pub const HAS_NDARRAY: bool = cfg!(feature = "ndarray");
+    /// `true` when the `oxiblas-core` std feature is absent (no-std mode for the core layer).
+    ///
+    /// Note: check `oxiblas_core` feature flags directly for precise no-std detection.
+    pub const NO_STD: bool = !cfg!(feature = "default");
+}
+
 /// Prelude module - import everything commonly needed.
 ///
 /// The prelude provides convenient access to the most commonly used types
@@ -422,6 +487,18 @@ pub mod prelude {
     // Memory-mapped matrices (requires `mmap` feature)
     #[cfg(feature = "mmap")]
     pub use oxiblas_matrix::{MmapBuilder, MmapMat, MmapMatMut};
+
+    // Half-precision scalar type (requires `f16` feature)
+    #[cfg(feature = "f16")]
+    pub use oxiblas_core::f16;
+
+    // Quad-precision scalar type (requires `f128` feature)
+    #[cfg(feature = "f128")]
+    pub use oxiblas_core::QuadFloat;
+
+    // Parallel rayon pool types (requires `parallel` feature)
+    #[cfg(feature = "parallel")]
+    pub use oxiblas_core::{CustomRayonPool, RayonGlobalPool};
 
     // Lazy evaluation helpers
     pub use crate::{lazy_fma, lazy_gemm};

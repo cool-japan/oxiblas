@@ -501,7 +501,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> TruncatedSVD<T>
             .collect();
         let v = lanczos_result.eigenvectors;
         let u = if self.config.compute_vectors && v.is_some() {
-            let v_vecs = v.as_ref().unwrap();
+            let v_vecs = v.as_ref().expect("value should be present");
             let mut u_vecs = Vec::with_capacity(singular_values.len());
             for (i, v_i) in v_vecs.iter().enumerate() {
                 let mut av = vec![T::zero(); m];
@@ -560,7 +560,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> TruncatedSVD<T>
             .collect();
         let u = lanczos_result.eigenvectors;
         let v = if self.config.compute_vectors && u.is_some() {
-            let u_vecs = u.as_ref().unwrap();
+            let u_vecs = u.as_ref().expect("value should be present");
             let mut v_vecs = Vec::with_capacity(singular_values.len());
             for (i, u_i) in u_vecs.iter().enumerate() {
                 let mut atu = vec![T::zero(); n];
@@ -753,7 +753,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
             for i in 0..p {
                 let mut u_row = vec![T::zero(); self.k];
                 for j in 0..self.k {
-                    if Scalar::abs(self.s[j].clone()) > T::from_f64(1e-14).unwrap() {
+                    if Scalar::abs(self.s[j].clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                         u_row[j] = m_matrix[i][j].clone() / self.s[j].clone();
                     }
                 }
@@ -869,7 +869,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
         if q_prime == 0 {
             for i in 0..self.k {
                 for j in 0..q {
-                    if Scalar::abs(self.s[i].clone()) > T::from_f64(1e-14).unwrap() {
+                    if Scalar::abs(self.s[i].clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                         self.vt[i].push(p_matrix[i][j].clone() / self.s[i].clone());
                     } else {
                         self.vt[i].push(T::zero());

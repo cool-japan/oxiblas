@@ -308,7 +308,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> Lanczos<T> {
             // where s_m is the last component of the Ritz vector in the Lanczos basis
             let residual = if idx < ritz_vectors.len() && actual_dim > 0 && !beta.is_empty() {
                 let s_last = ritz_vectors[idx][actual_dim - 1].clone();
-                Scalar::abs(beta.last().unwrap().clone() * s_last)
+                Scalar::abs(beta.last().expect("collection should be non-empty").clone() * s_last)
             } else {
                 T::zero()
             };

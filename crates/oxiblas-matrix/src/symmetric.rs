@@ -15,6 +15,9 @@
 //! The packed storage format is compatible with BLAS routines like DSPMV,
 //! DSPR, DSPR2 (symmetric) and ZHPMV, ZHPR, ZHPR2 (Hermitian).
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::packed::{PackedMat, PackedMut, PackedRef, TriangularKind};
 use crate::{Mat, MatMut, MatRef};
 use num_complex::Complex;

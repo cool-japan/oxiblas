@@ -52,6 +52,7 @@
 //! assert_eq!(view.diagonal()[2], 3.0);
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
@@ -62,6 +63,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 // Loop index variables are common in matrix operations
 #![allow(clippy::needless_range_loop)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
 
 // Core matrix types
 pub mod mat;

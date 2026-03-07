@@ -243,7 +243,11 @@ impl<T: Field + Real + bytemuck::Zeroable + FromPrimitive> Aasen<T> {
                 tjj = tjj - l[(j, k)] * l[(j, k)] * t_diag[k];
             }
             for k in 0..(j - 1) {
-                tjj = tjj - T::from_f64(2.0).unwrap() * l[(j, k)] * l[(j, k + 1)] * t_subdiag[k];
+                tjj = tjj
+                    - T::from_f64(2.0).unwrap_or_else(T::zero)
+                        * l[(j, k)]
+                        * l[(j, k + 1)]
+                        * t_subdiag[k];
             }
             t_diag[j] = tjj;
 

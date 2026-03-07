@@ -589,7 +589,7 @@ where
                 lower + z_norm_sq + T::Real::one()
             };
 
-            let mut lambda = (lower + upper) / T::Real::from_f64(2.0).unwrap();
+            let mut lambda = (lower + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
 
             // Newton iteration
             for _iter in 0..Self::MAX_SECULAR_ITER {
@@ -602,18 +602,22 @@ where
                 if <T::Real as Scalar>::abs(df) < eps {
                     let (f_lower, _) = real_secular_function_and_derivative(d, z, lower + tol);
                     if f_lower * f < T::Real::zero() {
-                        lambda = (lower + lambda) / T::Real::from_f64(2.0).unwrap();
+                        lambda =
+                            (lower + lambda) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
                     } else {
-                        lambda = (lambda + upper) / T::Real::from_f64(2.0).unwrap();
+                        lambda =
+                            (lambda + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
                     }
                 } else {
                     let delta = f / df;
                     let new_lambda = lambda - delta;
 
                     if new_lambda <= lower {
-                        lambda = (lower + lambda) / T::Real::from_f64(2.0).unwrap();
+                        lambda =
+                            (lower + lambda) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
                     } else if new_lambda >= upper {
-                        lambda = (lambda + upper) / T::Real::from_f64(2.0).unwrap();
+                        lambda =
+                            (lambda + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
                     } else {
                         lambda = new_lambda;
                     }

@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 keywords = ["matrix", "linear-algebra", "simd", "numerics", "blas"]
 categories = ["mathematics", "science", "data-structures"]
 
@@ -22,13 +23,14 @@ nalgebra = { workspace = true, optional = true }
 [dev-dependencies]
 approx.workspace = true
 serde_json.workspace = true
-quickcheck = "1.0"
-quickcheck_macros = "1.0"
+quickcheck = "1.1"
+quickcheck_macros = "1.2"
 
 [features]
-default = []
-serde = ["dep:serde"]
-mmap = ["dep:memmap2"]
+default = ["std"]
+std = ["oxiblas-core/std"]
+serde = ["dep:serde", "std"]
+mmap = ["dep:memmap2", "std"]
 nalgebra = ["dep:nalgebra"]  # nalgebra type conversions
 
 [lints]

@@ -46,15 +46,16 @@ Sparse matrix operations and solvers.
 - [x] Sparse Cholesky
 - [x] Sparse LU (with ILU0)
 - [x] Sparse QR (Givens-based)
+- [x] Sparse QR (column ordering + Givens, SparseQr with least squares solve) (v0.2.0)
 
 ### Advanced Factorizations
 - [x] Supernodal Cholesky (SupernodalCholesky) - BLAS-3 optimized with supernode detection
 - [x] Supernodal LU (SupernodalLU) - Basic implementation with supernode structure
 
 ### Missing
-- [ ] Multifrontal methods
-- [ ] Out-of-core factorization
-- [ ] Advanced pivoting strategies for sparse LU
+- [x] Multifrontal methods - `MultifrontalCholesky`, `MultifrontalLU` (v0.2.0)
+- [x] Out-of-core factorization - OutOfCoreLu, OutOfCoreCholesky with block I/O (v0.2.0)
+- [x] Advanced pivoting strategies for sparse LU - threshold, static, Bunch-Kaufman LDL^T (v0.2.0)
 
 ---
 
@@ -113,6 +114,8 @@ Sparse matrix operations and solvers.
 - [x] Block Lanczos
 - [x] Block Arnoldi
 - [x] Polynomial filtering - PolynomialFilteredLanczos with Chebyshev polynomial
+- [x] Thick-restart Lanczos (TRL) - superior convergence vs basic Lanczos, Wu-Simon algorithm (v0.2.0)
+- [x] LOBPCG (Locally Optimal Block Preconditioned CG) - Knyazev 2001, preconditioned block iteration (v0.2.0)
 
 ### Features
 - [x] K largest/smallest eigenvalues
@@ -150,7 +153,7 @@ Sparse matrix operations and solvers.
 - [x] Fill-in estimation - `estimate_fill_in()`, `fill_in_ratio()`
 - [x] Bandwidth/profile metrics - `bandwidth_with_ordering()`, `profile_with_ordering()`
 - [x] OrderingAlgorithm enum - unified interface for AMD, MMD, RCM, NestedDissection, Natural
-- [ ] METIS interface
+- [x] METIS-equivalent pure Rust multilevel nested dissection (multilevel.rs)
 - [ ] Scotch interface
 
 ---
@@ -174,13 +177,24 @@ Sparse matrix operations and solvers.
 - [x] Matrix Market format support - read/write for real/pattern/symmetric
 
 ### Missing
-- [ ] Standard test matrices (Florida/SuiteSparse collection)
+- [x] Standard test matrices - `test_matrices` module with 7 generators (v0.2.0)
 - [x] Unit tests (passing)
 - [x] Convergence tests for iterative solvers - CG, PCG, BiCGStab, GMRES, PGMRES, MINRES, TFQMR, QMR, IDR(s), FGMRES
 - [x] Preconditioner effectiveness tests - Jacobi, BlockJacobi, GaussSeidel, SOR, SSOR, IC0, ICT, ILU0, ILUT, AMG, SPAI, AINV, AdditiveSchwarz
-- [ ] Memory usage tests
+- [x] Memory usage tests - 27 integration tests (v0.2.0)
 - [x] Ordering quality tests - fill-in estimation, bandwidth, profile metrics
 - [x] Iterative solvers refactored into 13 modules (iterative/)
+
+---
+
+## Stochastic Methods
+
+- [x] Hutchinson trace estimator - unbiased, O(m * nnz) (v0.2.0)
+- [x] Hutch++ trace estimator - improved variance reduction (v0.2.0)
+- [x] XTrace estimator - minimum variance stochastic trace (v0.2.0)
+- [x] Diagonal estimator - Bekas et al., per-element diagonal estimate (v0.2.0)
+- [x] Stochastic Frobenius norm estimate (v0.2.0)
+- [x] Stochastic log-determinant via Lanczos quadrature (v0.2.0)
 
 ---
 

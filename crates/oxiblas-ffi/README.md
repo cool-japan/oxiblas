@@ -1,5 +1,7 @@
 # oxiblas-ffi
 
+> **DEPRECATED: This crate has been retired as of v0.2.0. The COOLJAPAN ecosystem is Pure Rust. This crate is no longer part of the workspace and will not receive further updates.**
+
 **C FFI bindings for OxiBLAS - Drop-in replacement for BLAS/LAPACK libraries**
 
 [![Crates.io](https://img.shields.io/crates/v/oxiblas-ffi.svg)](https://crates.io/crates/oxiblas-ffi)
@@ -316,4 +318,4 @@ LDFLAGS += -L/path/to/oxiblas/target/release -loxiblas_ffi
 
 ## License
 
-Licensed under MIT or Apache-2.0 at your option.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../../LICENSE) for details.

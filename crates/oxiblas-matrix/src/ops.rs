@@ -7,6 +7,9 @@
 //! - Block extraction
 //! - Matrix copy utilities
 
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 use crate::{Mat, MatMut, MatRef};
 use num_traits::Zero;
 use oxiblas_core::scalar::Scalar;

@@ -254,7 +254,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Balance<T> {
             // Iteratively balance the non-isolated block [ilo..=ihi] x [ilo..=ihi]
             // using diagonal similarity transformations
 
-            let radix = T::from_f64(2.0).unwrap();
+            let radix = T::from_f64(2.0).unwrap_or_else(T::zero);
             let radix_sq = radix * radix;
             let sfmin1 = T::from_f64(f64::MIN_POSITIVE).unwrap_or(<T as Scalar>::epsilon());
             let sfmax1 = T::one() / sfmin1;
@@ -302,7 +302,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Balance<T> {
 
                     // Apply scaling only if it improves the balance significantly
                     // Check: (col_norm + row_norm) / f < 0.95 * s
-                    let factor = T::from_f64(0.95).unwrap();
+                    let factor = T::from_f64(0.95).unwrap_or_else(T::zero);
                     if (col_norm + row_norm) / f < factor * s {
                         // Check for overflow/underflow
                         if f >= sfmin1 && f <= sfmax1 {

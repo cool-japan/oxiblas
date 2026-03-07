@@ -536,7 +536,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> ILUT<T> {
 
             // Check for zero pivot
             let diag = u_row.iter().find(|(col, _)| *col == i);
-            if diag.is_none() || Scalar::abs(diag.unwrap().1.clone()) <= <T as Scalar>::epsilon() {
+            if diag.is_none()
+                || Scalar::abs(diag.expect("diag checked above").1.clone())
+                    <= <T as Scalar>::epsilon()
+            {
                 return Err(SparseLUError::Singular { row: i });
             }
 
@@ -852,7 +855,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> ILUTP<T> {
             }
 
             let diag = u_row.iter().find(|(col, _)| *col == i);
-            if diag.is_none() || Scalar::abs(diag.unwrap().1.clone()) <= <T as Scalar>::epsilon() {
+            if diag.is_none()
+                || Scalar::abs(diag.expect("diag checked above").1.clone())
+                    <= <T as Scalar>::epsilon()
+            {
                 return Err(SparseLUError::Singular { row: i });
             }
 

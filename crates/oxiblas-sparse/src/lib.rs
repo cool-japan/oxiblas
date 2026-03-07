@@ -111,6 +111,8 @@ pub mod linalg;
 pub mod mtx;
 pub mod ops;
 pub mod sell;
+pub mod stochastic;
+pub mod test_matrices;
 
 pub use bsc::{BscError, BscMatrix};
 pub use bsr::{BsrError, BsrMatrix, DenseBlock};
@@ -169,6 +171,13 @@ pub use mtx::{
     write_matrix_market_symmetric,
 };
 pub use sell::{SellError, SellMatrix, SellStats, SliceSize};
+pub use stochastic::{
+    DiagEstimate, ProbeType, StochasticConfig, StochasticError, StochasticEstimator, TraceEstimate,
+};
+pub use test_matrices::{
+    TestMatrixError, arrow_matrix, diagonal, laplacian_2d, laplacian_3d, poisson_1d, random_spd,
+    tridiagonal,
+};
 
 /// Prelude module for convenient imports.
 pub mod prelude {

@@ -878,11 +878,11 @@ impl<T: Field + Real + bytemuck::Zeroable + FromPrimitive> BunchKaufman<T> {
                 // Eigenvalues of 2×2 symmetric: (trace ± sqrt(trace² - 4*det)) / 2
                 let trace = d11 + d22;
                 let det = d11 * d22 - d21 * d21;
-                let discriminant = trace * trace - T::from_f64(4.0).unwrap() * det;
+                let discriminant = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
                 if discriminant.real() >= T::Real::zero() {
                     let sqrt_disc = Real::sqrt(discriminant);
-                    let two = T::from_f64(2.0).unwrap();
+                    let two = T::from_f64(2.0).unwrap_or_else(T::zero);
                     let lambda1 = (trace + sqrt_disc) / two;
                     let lambda2 = (trace - sqrt_disc) / two;
 

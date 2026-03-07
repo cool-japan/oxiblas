@@ -231,7 +231,15 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
     // GAM and GAMSQ are the machine-dependent constants
     // GAM = 2^(base/2) where base is the number of bits in the mantissa
     // For simplicity, use reasonable constants
-    let gam: T = T::from(4096.0).unwrap(); // 2^12
+    let gam: T = T::from(4096.0).unwrap_or_else(|| {
+        // Fallback: 2^12 = 4096
+        let two = one + one;
+        let mut v = one;
+        for _ in 0..12 {
+            v = v * two;
+        }
+        v
+    }); // 2^12
     let gamsq: T = gam * gam;
     let rgamsq: T = one / gamsq;
 

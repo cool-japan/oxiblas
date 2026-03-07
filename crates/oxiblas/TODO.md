@@ -13,7 +13,7 @@ Main OxiBLAS crate - unified interface.
 ### Missing
 - [x] Sparse operations (re-exported as oxiblas::sparse)
 - [x] ndarray integration (via `ndarray` feature flag)
-- [ ] Feature-gated imports
+- [x] Feature-gated imports - `#[cfg(feature)]` guards + `features` module with compile-time constants (v0.2.0)
 
 ---
 
@@ -52,7 +52,7 @@ Main OxiBLAS crate - unified interface.
 - [x] `simd` - SIMD optimizations control (`force-scalar`, `max-simd-128`, `max-simd-256`)
 - [x] `sparse` - Sparse support feature flag (enabled by default)
 - [x] `serde` - Serialization support (Mat type)
-- [ ] `no_std` - Embedded support (partial)
+- [x] `no_std` - oxiblas-core and oxiblas-matrix support `#![no_std]` with alloc (v0.2.0)
 
 ---
 
@@ -68,4 +68,4 @@ Main OxiBLAS crate - unified interface.
 - [x] 5 example files (basic_blas, lapack_decompositions, extended_precision, tensor_operations, sparse_matrices)
 - [x] Performance guide (in lib.rs)
 - [x] Algorithm selection guide (auto.rs)
-- [ ] Comparison with other libraries
+- [x] Comparison with other libraries - comparison table in lib.rs docs and README (v0.2.0)

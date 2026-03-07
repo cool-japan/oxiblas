@@ -88,26 +88,27 @@ pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
         let sigma = dot(&r_tilde, &v);
 
         // Compute alpha
-        let alpha =
-            if Scalar::abs(sigma.clone()) > <T as Scalar>::epsilon() * T::from_f64(1e10).unwrap() {
-                rho.clone() / sigma.clone()
-            } else {
-                // Stagnation - return best current solution
-                let mut r_final = vec![T::zero(); n];
-                spmv(T::one(), a, &x, T::zero(), &mut r_final);
-                for i in 0..n {
-                    r_final[i] = b[i].clone() - r_final[i].clone();
-                }
-                let actual_residual = norm(&r_final);
+        let alpha = if Scalar::abs(sigma.clone())
+            > <T as Scalar>::epsilon() * T::from_f64(1e10).unwrap_or_else(T::zero)
+        {
+            rho.clone() / sigma.clone()
+        } else {
+            // Stagnation - return best current solution
+            let mut r_final = vec![T::zero(); n];
+            spmv(T::one(), a, &x, T::zero(), &mut r_final);
+            for i in 0..n {
+                r_final[i] = b[i].clone() - r_final[i].clone();
+            }
+            let actual_residual = norm(&r_final);
 
-                return Ok(QmrResult {
-                    x,
-                    iterations: iter,
-                    residual_norm: actual_residual,
-                    converged: actual_residual <= tol_abs,
-                    residual_history,
-                });
-            };
+            return Ok(QmrResult {
+                x,
+                iterations: iter,
+                residual_norm: actual_residual,
+                converged: actual_residual <= tol_abs,
+                residual_history,
+            });
+        };
 
         // Update residual: r = r - alpha * v
         for i in 0..n {
@@ -175,12 +176,13 @@ pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
         let rho_new = dot(&r_tilde, &r);
 
         // Compute beta
-        let beta =
-            if Scalar::abs(rho.clone()) > <T as Scalar>::epsilon() * T::from_f64(1e10).unwrap() {
-                rho_new.clone() / rho.clone()
-            } else {
-                T::from_f64(0.1).unwrap() // Small beta to continue
-            };
+        let beta = if Scalar::abs(rho.clone())
+            > <T as Scalar>::epsilon() * T::from_f64(1e10).unwrap_or_else(T::zero)
+        {
+            rho_new.clone() / rho.clone()
+        } else {
+            T::from_f64(0.1).unwrap_or_else(T::zero) // Small beta to continue
+        };
 
         // Update p: p = r + beta * p
         for i in 0..n {
@@ -296,7 +298,7 @@ where
     let mut rho = r_hat_norm.clone();
     let mut xi = r_hat_norm.clone();
     let mut gamma = T::one();
-    let mut eta = T::from_f64(-1.0).unwrap();
+    let mut eta = T::from_f64(-1.0).unwrap_or_else(T::zero);
     let mut delta: T;
     let mut eps: T;
     let mut _theta = T::zero();
@@ -378,7 +380,8 @@ where
         let c = Real::sqrt(c_sq.clone());
         let gamma_new = gamma.clone() * c.clone();
         let eta_new =
-            T::from_f64(-1.0).unwrap() * eta.clone() * rho.clone() * c_sq.clone() / alpha.clone();
+            T::from_f64(-1.0).unwrap_or_else(T::zero) * eta.clone() * rho.clone() * c_sq.clone()
+                / alpha.clone();
 
         for i in 0..n {
             x[i] = x[i].clone() + eta_new.clone() * p[i].clone();

@@ -366,6 +366,159 @@ where
 }
 
 // =============================================================================
+// Complex-Specific Functions (for Complex<f64>, Complex<f32>)
+// =============================================================================
+
+/// Result of complex SVD decomposition.
+#[derive(Debug, Clone)]
+pub struct ComplexSvdResult<T>
+where
+    T: oxiblas_core::Scalar,
+{
+    /// Left singular vectors U (m×k, complex unitary)
+    pub u: Array2<T>,
+    /// Singular values σ (real, sorted in descending order)
+    pub s: Array1<T::Real>,
+    /// Right singular vectors V^H (k×n, complex unitary)
+    pub vt: Array2<T>,
+}
+
+/// Computes the SVD of a complex matrix using ComplexSvd algorithm.
+///
+/// For complex matrices, this function uses the one-sided Jacobi algorithm
+/// specifically designed for complex numbers.
+///
+/// # Arguments
+/// * `a` - The input complex matrix (m×n)
+///
+/// # Returns
+/// U, singular values (real), and V^H
+pub fn svd_complex_ndarray<T>(a: &Array2<T>) -> LapackResult<ComplexSvdResult<T>>
+where
+    T: Field + oxiblas_core::scalar::ComplexScalar + Clone + bytemuck::Zeroable,
+    T::Real: oxiblas_core::scalar::Real,
+{
+    let mat = array2_to_mat(a);
+
+    match svd::ComplexSvd::compute(mat.as_ref()) {
+        Ok(svd_decomp) => {
+            let u = mat_ref_to_array2(svd_decomp.u().as_ref());
+            let s = Array1::from_vec(svd_decomp.singular_values().to_vec());
+            let vh = mat_ref_to_array2(svd_decomp.vh().as_ref());
+
+            Ok(ComplexSvdResult { u, s, vt: vh })
+        }
+        Err(e) => Err(LapackError::NotConverged(format!("{e:?}"))),
+    }
+}
+
+/// Computes the QR decomposition of a complex matrix.
+///
+/// # Arguments
+/// * `a` - The input complex matrix (m×n)
+///
+/// # Returns
+/// Q (unitary) and R (upper triangular)
+pub fn qr_complex_ndarray<T>(a: &Array2<T>) -> LapackResult<QrResult<T>>
+where
+    T: Field + oxiblas_core::scalar::ComplexScalar + Clone + bytemuck::Zeroable,
+    T::Real: oxiblas_core::scalar::Real,
+{
+    let mat = array2_to_mat(a);
+
+    match qr::UnitaryQr::compute(mat.as_ref()) {
+        Ok(qr_decomp) => {
+            let q_mat = qr_decomp.q();
+            let r_mat = qr_decomp.r();
+            let q = mat_to_array2(&q_mat);
+            let r = mat_to_array2(&r_mat);
+            Ok(QrResult { q, r })
+        }
+        Err(e) => Err(LapackError::NotConverged(format!("{e:?}"))),
+    }
+}
+
+/// Computes the Cholesky decomposition of a Hermitian positive definite matrix.
+///
+/// # Arguments
+/// * `a` - The input Hermitian positive definite matrix (n×n)
+///
+/// # Returns
+/// Lower triangular factor L such that A = LL^H
+pub fn cholesky_hermitian_ndarray<T>(a: &Array2<T>) -> LapackResult<CholeskyResult<T>>
+where
+    T: Field + oxiblas_core::scalar::ComplexScalar + Clone + bytemuck::Zeroable,
+    T::Real: oxiblas_core::scalar::Real,
+{
+    let (m, n) = a.dim();
+    if m != n {
+        return Err(LapackError::DimensionMismatch(
+            "Matrix must be square".to_string(),
+        ));
+    }
+
+    let mat = array2_to_mat(a);
+
+    match cholesky::HermitianCholesky::compute(mat.as_ref()) {
+        Ok(chol) => {
+            let l_mat = chol.l_factor();
+            let l = mat_to_array2(&l_mat);
+            Ok(CholeskyResult { l })
+        }
+        Err(e) => Err(LapackError::NotPositiveDefinite(format!("{e:?}"))),
+    }
+}
+
+/// Result of Hermitian eigenvalue decomposition for complex matrices.
+#[derive(Debug, Clone)]
+pub struct HermitianEvdResult<T>
+where
+    T: oxiblas_core::Scalar,
+{
+    /// Eigenvalues (real, sorted in ascending order)
+    pub eigenvalues: Array1<T>,
+    /// Eigenvectors (complex columns)
+    pub eigenvectors: Array2<T>,
+}
+
+/// Computes the eigenvalue decomposition of a Hermitian matrix.
+///
+/// For Hermitian matrices (A = A^H), all eigenvalues are real but eigenvectors are complex.
+///
+/// # Arguments
+/// * `a` - The input Hermitian matrix (n×n, only upper triangle is used)
+///
+/// # Returns
+/// Eigenvalues (real, sorted in ascending order) and eigenvectors (complex columns)
+pub fn eig_hermitian_ndarray<T>(a: &Array2<T>) -> LapackResult<(Array1<T::Real>, Array2<T>)>
+where
+    T: Field + oxiblas_core::scalar::ComplexScalar + Clone + bytemuck::Zeroable,
+    T::Real: oxiblas_core::scalar::Real + Clone + bytemuck::Zeroable,
+{
+    let (m, n) = a.dim();
+    if m != n {
+        return Err(LapackError::DimensionMismatch(
+            "Matrix must be square".to_string(),
+        ));
+    }
+
+    let mat = array2_to_mat(a);
+
+    match evd::HermitianEvd::compute(mat.as_ref()) {
+        Ok(evd_result) => {
+            let eigenvalues = Array1::from_vec(evd_result.eigenvalues().to_vec());
+
+            // Convert eigenvectors MatRef<T> to Array2<T>
+            let evec_ref = evd_result.eigenvectors();
+            let eigenvectors = mat_ref_to_array2(evec_ref);
+
+            Ok((eigenvalues, eigenvectors))
+        }
+        Err(e) => Err(LapackError::NotConverged(format!("{e:?}"))),
+    }
+}
+
+// =============================================================================
 // Cholesky Decomposition
 // =============================================================================
 
@@ -462,7 +615,7 @@ where
 /// The solution vector x
 pub fn solve_ndarray<T>(a: &Array2<T>, b: &Array1<T>) -> LapackResult<Array1<T>>
 where
-    T: Field + Clone + bytemuck::Zeroable + oxiblas_core::scalar::Real,
+    T: Field + Clone + bytemuck::Zeroable,
 {
     let (m, n) = a.dim();
     if m != n {
@@ -503,7 +656,7 @@ where
 /// The solution matrix X (n×k)
 pub fn solve_multiple_ndarray<T>(a: &Array2<T>, b: &Array2<T>) -> LapackResult<Array2<T>>
 where
-    T: Field + Clone + bytemuck::Zeroable + oxiblas_core::scalar::Real,
+    T: Field + Clone + bytemuck::Zeroable,
 {
     let (m, n) = a.dim();
     let (b_rows, _b_cols) = b.dim();

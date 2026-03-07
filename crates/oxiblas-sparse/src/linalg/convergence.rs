@@ -451,7 +451,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + PartialOrd> ConvergenceMonitor
         }
 
         let initial = &self.residual_history[0];
-        let current = self.residual_history.last().unwrap();
+        let current = self
+            .residual_history
+            .last()
+            .expect("collection should be non-empty");
 
         if Scalar::abs(initial.clone()) > <T as Scalar>::epsilon() {
             Scalar::abs(current.clone()) / Scalar::abs(initial.clone())
@@ -468,7 +471,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + PartialOrd> ConvergenceMonitor
         }
 
         let prev = &self.residual_history[self.residual_history.len() - 2];
-        let curr = self.residual_history.last().unwrap();
+        let curr = self
+            .residual_history
+            .last()
+            .expect("collection should be non-empty");
 
         if Scalar::abs(prev.clone()) > <T as Scalar>::epsilon() {
             let relative_change =

@@ -192,7 +192,11 @@ where
 
         // Sort singular values in descending order and reorder U, V accordingly
         let mut indices: Vec<usize> = (0..k).collect();
-        indices.sort_by(|&a, &b| sigma[b].partial_cmp(&sigma[a]).unwrap());
+        indices.sort_by(|&a, &b| {
+            sigma[b]
+                .partial_cmp(&sigma[a])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
 
         let mut sigma_sorted = vec![T::Real::zero(); k];
         let mut u_sorted: Mat<T> = Mat::zeros(m, m);

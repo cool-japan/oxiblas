@@ -11,6 +11,7 @@
 pub mod aligned_vec;
 pub mod alloc;
 pub mod arena;
+#[cfg(feature = "std")]
 pub mod numa;
 pub mod pool;
 pub mod stack;
@@ -19,6 +20,7 @@ pub mod stack;
 pub use aligned_vec::*;
 pub use alloc::*;
 pub use arena::*;
+#[cfg(feature = "std")]
 pub use numa::*;
 pub use pool::*;
 pub use stack::*;

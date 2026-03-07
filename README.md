@@ -2,7 +2,7 @@
 
 **Pure Rust BLAS/LAPACK implementation for the SciRS2 ecosystem**
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
 OxiBLAS is a production-grade, pure Rust implementation of BLAS (Basic Linear Algebra Subprograms) and LAPACK (Linear Algebra PACKage). Designed as the foundational linear algebra library for the [SciRS2](https://github.com/cool-japan/scirs) scientific computing ecosystem.
@@ -19,10 +19,16 @@ OxiBLAS is a production-grade, pure Rust implementation of BLAS (Basic Linear Al
 - **Complete BLAS** - Full Level 1, 2, 3 operations (including packed/banded)
 - **Extensive LAPACK** - LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg
 - **Extended Precision** - f16, f128 (quad precision), Kahan/pairwise summation
-- **Tensor Operations** - Einstein summation (24 patterns), batched matmul
+- **Tensor Operations** - Einstein summation (24 patterns), batched matmul, batched BLAS
 - **Sparse Support** - 9 formats (CSR, CSC, COO, ELL, DIA, BSR, BSC, HYB, SELL) with advanced solvers
 - **Advanced Preconditioners** - AMG, SPAI, AINV, Schwarz, polynomial
-- **C FFI** - Drop-in replacement for C BLAS/LAPACK libraries
+- **Recursive Factorizations** - Cache-oblivious Cholesky, LU, QR (`compute_recursive()`)
+- **Parallel Factorizations** - Parallel blocked Cholesky and LU (`compute_blocked_par()`)
+- **Batched BLAS** - `gemm_batched`, `gemm_strided_batched`, `axpy_batched`, `gemv_batched`
+- **Mixed-Precision Refinement** - f32 factorization + f64 residual for LU, Cholesky, QR
+- **Runtime Auto-Tuning** - `RuntimeAutoTuner` selects optimal block sizes at runtime
+- **Multifrontal Sparse** - `MultifrontalCholesky`, `MultifrontalLU` for large sparse systems
+- **no_std Support** - `oxiblas-core` and `oxiblas-matrix` support `#![no_std]` with alloc
 - **Comprehensive Benchmarks** - Direct performance comparison with OpenBLAS
 
 ## Supported Types
@@ -42,16 +48,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiblas = "0.1"
+oxiblas = "0.2"
 
 # With parallelization
-oxiblas = { version = "0.1", features = ["parallel"] }
+oxiblas = { version = "0.2", features = ["parallel"] }
 
 # With extended precision
-oxiblas = { version = "0.1", features = ["f16", "f128"] }
+oxiblas = { version = "0.2", features = ["f16", "f128"] }
 
 # All features
-oxiblas = { version = "0.1", features = ["full"] }
+oxiblas = { version = "0.2", features = ["full"] }
 ```
 
 ### Basic BLAS Example
@@ -141,13 +147,12 @@ OxiBLAS is organized as a workspace with specialized sub-crates:
 | Crate | Description |
 |-------|-------------|
 | `oxiblas` | Unified re-exports and prelude |
-| `oxiblas-core` | Core traits, SIMD abstractions, memory management, scalar types (f16, f128) |
-| `oxiblas-matrix` | Matrix types (`Mat`, `MatRef`, `MatMut`, `DiagRef`) |
-| `oxiblas-blas` | BLAS Level 1/2/3 operations, tensor operations, einsum |
-| `oxiblas-lapack` | LAPACK decompositions and solvers |
-| `oxiblas-sparse` | Sparse matrix formats (9 types) and algorithms |
-| `oxiblas-ndarray` | Integration with ndarray |
-| `oxiblas-ffi` | C FFI bindings for interoperability |
+| `oxiblas-core` | Core traits, SIMD abstractions, memory management, scalar types (f16, f128); `no_std` |
+| `oxiblas-matrix` | Matrix types (`Mat`, `MatRef`, `MatMut`, `DiagRef`); `no_std` |
+| `oxiblas-blas` | BLAS Level 1/2/3 operations, tensor operations, einsum, batched BLAS |
+| `oxiblas-lapack` | LAPACK decompositions and solvers (blocked, recursive, parallel, auto variants) |
+| `oxiblas-sparse` | Sparse matrix formats (9 types), multifrontal factorizations, and algorithms |
+| `oxiblas-ndarray` | Integration with ndarray (parallel GEMM, sparse integration) |
 | `oxiblas-benchmarks` | Performance benchmarks with OpenBLAS comparison (not in meta crate) |
 
 ## BLAS Operations
@@ -210,13 +215,13 @@ OxiBLAS is organized as a workspace with specialized sub-crates:
 
 | Decomposition | Description |
 |---------------|-------------|
-| `Lu` | LU with partial pivoting |
+| `Lu` | LU with partial pivoting (`compute`, `compute_blocked`, `compute_recursive`, `compute_auto`, `compute_blocked_par`) |
 | `LuFullPiv` | LU with full pivoting |
 | `BandLu` | Banded LU factorization |
-| `Cholesky` | LL^T for positive definite matrices |
+| `Cholesky` | LL^T for positive definite matrices (`compute`, `compute_blocked`, `compute_recursive`, `compute_auto`, `compute_blocked_par`) |
 | `Ldlt` | LDL^T decomposition |
 | `BandCholesky` | Banded Cholesky |
-| `Qr` | QR decomposition |
+| `Qr` | QR decomposition (`compute`, `compute_blocked`, `compute_recursive`, `compute_auto`) |
 | `QrPivot` | QR with column pivoting |
 | `Svd` | Singular value decomposition (Jacobi) |
 | `SvdDc` | SVD with divide-and-conquer |
@@ -393,24 +398,6 @@ let c = batched_matmul(&a, &b)?;
 - COLAMD (Column AMD for unsymmetric/rectangular)
 - Nested Dissection (level-set based)
 
-## C FFI
-
-OxiBLAS provides C-compatible FFI bindings through `oxiblas-ffi`, allowing it to serve as a drop-in replacement for C BLAS/LAPACK libraries:
-
-```c
-// Link with -loxiblas_ffi
-extern void dgemm_(char* transa, char* transb, int* m, int* n, int* k,
-                   double* alpha, double* a, int* lda, double* b, int* ldb,
-                   double* beta, double* c, int* ldc);
-```
-
-Build the FFI library:
-
-```bash
-cargo build --release -p oxiblas-ffi
-# Produces liboxiblas_ffi.{a,dylib,so}
-```
-
 ## Performance
 
 OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD kernels and platform-aware cache tuning.
@@ -523,17 +510,40 @@ OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD
 | HERK/HER2K | **6-15×** speedup | - | GEMM-based optimization ✓ |
 | TRMM | **7-11×** speedup | - | GEMM-based optimization ✓ |
 | TRSM | **2.5-10×** speedup | - | Blocked algorithm with GEMM ✓ |
-| QR Factorization | TBD | TBD | Householder reflections |
+| QR Factorization | **3-7×** vs unblocked ✓ | - | WY representation (fixed v0.2.0) |
 | SVD | TBD | TBD | Divide-and-conquer |
 
 **Achievement:** OxiBLAS matches or exceeds OpenBLAS on Apple M3 (97-172%), and is competitive on Linux x86_64 (80-112%). Pure Rust with NEON/AVX2 intrinsics.
+
+### LAPACK Factorization Speedups (Blocked vs Unblocked)
+
+Blocked algorithms using GEMM/TRSM as building blocks deliver dramatic speedups over the unblocked Level 2 baseline. All results measured on Apple M3 (f64).
+
+#### LU Factorization
+
+| Matrix Size | Unblocked | Blocked | Speedup |
+|-------------|-----------|---------|---------|
+| 256×256 | 0.62 Gf/s | 9.05 Gf/s | **14.5×** |
+| 512×512 | 0.45 Gf/s | 6.65 Gf/s | **14.9×** |
+| 768×768 | 0.60 Gf/s | 13.84 Gf/s | **23.0×** |
+| 1024×1024 | 0.35 Gf/s | 6.99 Gf/s | **19.7×** |
+
+#### Cholesky Factorization
+
+| Matrix Size | Unblocked | Blocked | Speedup |
+|-------------|-----------|---------|---------|
+| 200×200 | 2.32 Gelem/s | 10.47 Gelem/s | **4.5×** |
+| 256×256 | 2.16 Gf/s | 13.01 Gf/s | **6.0×** |
+| 500×500 | 1.65 Gelem/s | 15.60 Gelem/s | **9.5×** |
+| 512×512 | 1.65 Gf/s | 14.97 Gf/s | **9.1×** |
+| 1024×1024 | 1.44 Gf/s | 14.73 Gf/s | **10.2×** |
 
 ### Parallelization
 
 Enable multi-core parallelization:
 
 ```toml
-oxiblas = { version = "0.1", features = ["parallel"] }
+oxiblas = { version = "0.2", features = ["parallel"] }
 ```
 
 Parallel operations automatically use all available cores via Rayon for large workloads.
@@ -554,6 +564,109 @@ open target/criterion/report/index.html
 ```
 
 See [crates/oxiblas-benchmarks/README.md](crates/oxiblas-benchmarks/README.md) for detailed benchmarking guide.
+
+## Platform Support and Performance
+
+### Tested Platforms
+
+| Platform | CPU | SIMD | DGEMM | vs OpenBLAS |
+|----------|-----|------|-------|-------------|
+| macOS (Apple M3) | ARM64 | NEON 128-bit | 25.6 GFLOPS | ~100% |
+| Linux x86_64 | Intel Xeon E5-2623 v4 | AVX2 256-bit | 220 GFLOPS | ~102% (1024x1024) |
+| Any | Scalar fallback | None | varies | ~30-50% |
+
+### SIMD Feature Detection
+
+OxiBLAS automatically detects and uses the best available SIMD:
+- **x86_64**: AVX-512 > AVX2 > SSE4.2 > scalar
+- **aarch64**: NEON (native 128-bit) + emulated 256-bit
+- **wasm32**: SIMD128 (if enabled) + emulated 256-bit
+- **others**: Scalar fallback
+
+Runtime detection via `SimdCapabilities::detect()` with zero overhead after first call.
+
+### Performance Regression CLI
+
+OxiBLAS ships a `regress` binary for tracking performance over time:
+
+```bash
+# Build the CLI
+cargo build --release -p oxiblas-benchmarks
+
+# Capture current performance as a baseline
+./target/release/regress capture --output baseline.json
+
+# On a subsequent commit/build, check for regressions (fail if >5% slower)
+./target/release/regress check --baseline baseline.json --threshold 5.0
+
+# Print a formatted performance report
+./target/release/regress report --baseline baseline.json
+
+# List all available benchmark names
+./target/release/regress list
+```
+
+The `check` subcommand exits with a non-zero status when any operation regresses beyond the threshold, making it suitable for CI pipelines.
+
+## Algorithm Selection Guide
+
+OxiBLAS provides multiple computation variants for dense factorizations, each suited to different use cases. The `compute_auto()` method is the recommended default — it selects between blocked and unblocked algorithms based on matrix size at zero cost.
+
+### Dense Factorizations (Cholesky, LU, QR)
+
+| Method | When to Use | Notes |
+|--------|-------------|-------|
+| `compute()` | Small matrices (n < 64-128), minimal overhead | Unblocked Level 2 BLAS |
+| `compute_blocked(nb)` | Large matrices, explicit block size control | Level 3 BLAS; 6-23× over unblocked |
+| `compute_recursive()` | Very large matrices, cache-oblivious | No explicit block size; auto-adapts to cache |
+| `compute_auto()` | **Recommended default** | Auto-selects blocked (n >= 128) or unblocked (n < 128) |
+| `compute_blocked_par()` | Very large matrices on multi-core systems | Requires `parallel` feature; Rayon-based |
+
+```rust
+use oxiblas_lapack::{cholesky::Cholesky, lu::Lu, qr::Qr};
+
+// Recommended: automatic algorithm selection
+let chol = Cholesky::compute_auto(a.as_ref())?;  // up to 9.75× faster than compute()
+let lu   = Lu::compute_auto(a.as_ref())?;         // up to 23× faster than compute()
+let qr   = Qr::compute_auto(a.as_ref())?;         // 3-7× faster for large matrices
+
+// Explicit blocked with custom block size
+let chol = Cholesky::compute_blocked(a.as_ref(), 64)?;
+
+// Cache-oblivious recursive (no tuning required)
+let lu = Lu::compute_recursive(a.as_ref())?;
+
+// Parallel blocked (requires "parallel" feature)
+let chol = Cholesky::compute_blocked_par(a.as_ref())?;
+```
+
+### Mixed-Precision Iterative Refinement
+
+For applications requiring double-precision accuracy with single-precision speed:
+
+```rust
+use oxiblas_lapack::refine::{mixed_precision_solve, mixed_precision_solve_cholesky};
+
+// LU-based: factorize in f32, refine residuals in f64
+let x = mixed_precision_solve(a.as_ref(), b.as_ref())?;
+
+// Cholesky-based (symmetric positive definite systems)
+let x = mixed_precision_solve_cholesky(a.as_ref(), b.as_ref())?;
+```
+
+### Batched BLAS Operations
+
+For batches of independent small matrix operations (e.g., neural network layers):
+
+```rust
+use oxiblas_blas::batched::{gemm_batched, gemm_strided_batched, axpy_batched};
+
+// Batch of independent GEMMs: C[i] = A[i] * B[i]
+gemm_batched(1.0, &a_slices, &b_slices, 0.0, &mut c_slices)?;
+
+// Strided batched GEMM (contiguous memory layout)
+gemm_strided_batched(1.0, &a, stride_a, &b, stride_b, 0.0, &mut c, stride_c, batch)?;
+```
 
 ## Feature Flags
 
@@ -578,19 +691,31 @@ See [crates/oxiblas-benchmarks/README.md](crates/oxiblas-benchmarks/README.md) f
 
 ## Project Status
 
-- **Lines of Code:** ~154,600 Rust (314 files)
-- **Documentation:** ~15,859 lines of comments, 5 comprehensive examples
-- **Tests:** 469+ passing lib tests, full coverage across all modules
+**Version:** 0.2.0 (2026-03-06)
+
+- **Lines of Code:** ~168,794 Rust (356 files)
+- **Documentation:** ~15,034 lines of comments, 5 comprehensive examples
+- **Tests:** 2,811 passing lib tests + 195 doctests (100% success rate)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ Extensive LAPACK (LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg)
+  - ✅ Recursive cache-oblivious factorizations (Cholesky, LU, QR)
+  - ✅ Parallel blocked factorizations (Cholesky, LU)
+  - ✅ Fixed blocked QR with WY representation (3-7x speedup realized)
+  - ✅ Complex bidiagonal reduction (`ComplexBidiagFactors`)
+  - ✅ Batched BLAS operations (gemm_batched, axpy_batched, gemv_batched)
+  - ✅ Mixed-precision iterative refinement (LU, Cholesky, symmetric, QR)
+  - ✅ Runtime auto-tuning infrastructure (`RuntimeAutoTuner`)
+  - ✅ Multifrontal sparse factorizations (`MultifrontalCholesky`, `MultifrontalLU`)
+  - ✅ ndarray parallel GEMM and sparse integration
+  - ✅ no_std support for oxiblas-core and oxiblas-matrix
+  - ✅ Advanced sparse LU pivoting (threshold, static, Bunch-Kaufman LDL^T)
   - ✅ Sparse matrices (9 formats: CSR, CSC, COO, ELL, DIA, BSR, BSC, HYB, SELL)
   - ✅ Iterative solvers (GMRES, FGMRES, CG, BiCGStab, MINRES, QMR, TFQMR, IDR(s))
   - ✅ Advanced preconditioners (ILUT, IC, AMG, SA-AMG, SPAI, AINV, Schwarz)
   - ✅ Sparse eigenvalue/SVD (Lanczos, Arnoldi, IRAM, polynomial filtering, truncated/randomized SVD)
   - ✅ Tensor operations (einsum with 24 patterns, batched matmul)
   - ✅ Extended precision (f16, f128, Kahan/pairwise summation)
-  - ✅ Complex FFI bindings (complete BLAS L1/L2/L3, LAPACK factorizations)
   - ✅ Comprehensive benchmarks with OpenBLAS comparison
   - ✅ Complete API documentation with examples
 
@@ -610,12 +735,9 @@ OxiBLAS is part of the SciRS2 scientific computing ecosystem:
 
 ## License
 
-Licensed under either of:
+Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+See [LICENSE](LICENSE) for details.
 
 ## Contributing
 

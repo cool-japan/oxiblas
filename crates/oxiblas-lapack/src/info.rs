@@ -747,7 +747,7 @@ where
             min_diag = diag_abs;
         }
         if diag > T::zero() {
-            log_det = log_det + T::from(2.0).unwrap() * Real::ln(diag);
+            log_det = log_det + T::from(2.0).unwrap_or_else(T::zero) * Real::ln(diag);
         }
     }
 
@@ -892,7 +892,7 @@ where
     };
 
     // Detect clusters and compute gaps
-    let cluster_tol = T::from(0.1).unwrap(); // 10% relative gap threshold
+    let cluster_tol = T::from(0.1).unwrap_or_else(T::zero); // 10% relative gap threshold
     let mut num_clusters = 1;
     let mut min_relative_gap = T::infinity();
 
@@ -1046,7 +1046,7 @@ where
     let mut num_complex_pairs = 0;
     let mut trace = T::zero();
 
-    let tol = <T as Scalar>::epsilon() * T::from(100.0).unwrap();
+    let tol = <T as Scalar>::epsilon() * T::from(100.0).unwrap_or_else(T::zero);
 
     for i in 0..num_ev {
         let re = eigenvalues_real[i];
@@ -1086,7 +1086,7 @@ where
     }
 
     // Cluster detection
-    let cluster_tol = T::from(0.1).unwrap() * spectral_radius;
+    let cluster_tol = T::from(0.1).unwrap_or_else(T::zero) * spectral_radius;
     let num_clusters = if min_separation < cluster_tol {
         num_ev / 2 // Rough estimate
     } else {
@@ -1094,7 +1094,7 @@ where
     };
 
     let eigenvector_condition = eigenvector_cond.unwrap_or(T::one());
-    let well_conditioned = eigenvector_condition < T::from(100.0).unwrap();
+    let well_conditioned = eigenvector_condition < T::from(100.0).unwrap_or_else(T::zero);
 
     EvdInfo::new(
         n,

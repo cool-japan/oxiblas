@@ -1,32 +1,44 @@
 [package]
 name = "oxiblas-benchmarks"
+description = "Benchmarks for OxiBLAS - Pure Rust BLAS/LAPACK"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["benchmark", "blas", "lapack", "linear-algebra", "performance"]
+categories = ["mathematics", "science", "development-tools::profiling"]
 
 [dependencies]
-oxiblas-core = { path = "../oxiblas-core", features = ["f16", "parallel"] }
-oxiblas-matrix = { path = "../oxiblas-matrix" }
-oxiblas-blas = { path = "../oxiblas-blas", features = ["parallel"] }
-oxiblas-lapack = { path = "../oxiblas-lapack" }
-oxiblas-sparse = { path = "../oxiblas-sparse" }
+oxiblas-core = { workspace = true, features = ["std", "f16", "parallel"] }
+oxiblas-matrix = { workspace = true, features = ["std"] }
+oxiblas-blas = { workspace = true, features = ["parallel"] }
+oxiblas-lapack.workspace = true
+oxiblas-sparse.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 # Optional: For comparison benchmarks with other BLAS implementations
-ndarray = { version = "0.17", optional = true }
+ndarray = { workspace = true, optional = true }
 ndarray-linalg = { version = "0.18", optional = true, features = ["openblas-system"] }
 blas-src = { version = "0.14", optional = true, features = ["openblas"] }
 cblas-sys = { version = "0.3", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
-num-complex = "0.4"
+criterion = { workspace = true, features = ["html_reports"] }
+num-complex.workspace = true
+half.workspace = true
 
 [features]
 default = []
 # Enable comparison benchmarks with OpenBLAS (BSD-3-Clause license, compatible)
 compare-openblas = ["ndarray", "ndarray-linalg", "blas-src", "cblas-sys"]
+
+[[bin]]
+name = "regress"
+path = "src/bin/regress.rs"
 
 [[bench]]
 name = "blas_level1"
@@ -79,4 +91,12 @@ harness = false
 
 [[bench]]
 name = "sparse_eigen_svd"
+harness = false
+
+[[bench]]
+name = "size_variations"
+harness = false
+
+[[bench]]
+name = "precision_bench"
 harness = false

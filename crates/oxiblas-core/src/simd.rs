@@ -26,6 +26,7 @@ pub mod wasm32;
 
 pub mod complex;
 pub mod dispatch;
+pub mod multiver;
 pub mod scalar;
 
 use crate::scalar::{Field, Real, Scalar};
@@ -118,7 +119,8 @@ pub fn detect_simd_level() -> SimdLevel {
 /// hardware SIMD capability.
 #[inline]
 pub fn detect_simd_level_raw() -> SimdLevel {
-    #[cfg(target_arch = "x86_64")]
+    // On x86_64 with std, use runtime feature detection
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
         if is_x86_feature_detected!("avx512f") {
             SimdLevel::Simd512
@@ -127,6 +129,39 @@ pub fn detect_simd_level_raw() -> SimdLevel {
         } else if is_x86_feature_detected!("sse2") {
             SimdLevel::Simd128
         } else {
+            SimdLevel::Scalar
+        }
+    }
+
+    // On x86_64 without std, use compile-time target features only
+    #[cfg(all(target_arch = "x86_64", not(feature = "std")))]
+    {
+        #[cfg(target_feature = "avx512f")]
+        {
+            SimdLevel::Simd512
+        }
+        #[cfg(all(
+            target_feature = "avx2",
+            target_feature = "fma",
+            not(target_feature = "avx512f")
+        ))]
+        {
+            SimdLevel::Simd256
+        }
+        #[cfg(all(
+            target_feature = "sse2",
+            not(target_feature = "avx2"),
+            not(target_feature = "avx512f")
+        ))]
+        {
+            SimdLevel::Simd128
+        }
+        #[cfg(not(any(
+            target_feature = "sse2",
+            target_feature = "avx2",
+            target_feature = "avx512f"
+        )))]
+        {
             SimdLevel::Scalar
         }
     }
@@ -360,40 +395,6 @@ impl SimdChunks {
     pub fn body_vectors(&self) -> usize {
         self.body_len() / self.lanes
     }
-}
-
-/// Dispatch macro for runtime SIMD level selection.
-///
-/// This macro generates code that dispatches to the appropriate SIMD
-/// implementation based on the detected CPU features.
-#[macro_export]
-macro_rules! simd_dispatch {
-    ($level:expr, $scalar:ty, |$reg:ident| $body:expr) => {{
-        match $level {
-            $crate::simd::SimdLevel::Simd512 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    type $reg = <$scalar as $crate::simd::SimdScalar>::Simd512;
-                    $body
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    // Fallback to 256-bit
-                    type $reg = <$scalar as $crate::simd::SimdScalar>::Simd256;
-                    $body
-                }
-            }
-            $crate::simd::SimdLevel::Simd256 | $crate::simd::SimdLevel::Simd128 => {
-                type $reg = <$scalar as $crate::simd::SimdScalar>::Simd256;
-                $body
-            }
-            $crate::simd::SimdLevel::Scalar => {
-                // Scalar fallback - process one element at a time
-                type $reg = $scalar;
-                $body
-            }
-        }
-    }};
 }
 
 #[cfg(test)]

@@ -435,4 +435,441 @@ mod tests {
             det_32
         );
     }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_small() {
+        // Test parallel blocked algorithm on small matrix
+        let a: Mat<f64> = Mat::from_rows(&[&[2.0, 1.0], &[4.0, 3.0]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[3.0], &[7.0]]);
+
+        let lu = Lu::compute_blocked_par(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-10, "x[0] = {}", x[(0, 0)]);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-10, "x[1] = {}", x[(1, 0)]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_large() {
+        // Test parallel blocked algorithm on a larger matrix (200x200)
+        let n = 200;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+
+        // Create a diagonally dominant matrix
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    a[(i, j)] = (n as f64) + 1.0;
+                } else {
+                    a[(i, j)] = 0.5;
+                }
+            }
+        }
+
+        // Create RHS such that solution is all ones
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += a[(i, j)];
+            }
+            b[(i, 0)] = sum;
+        }
+
+        let lu = Lu::compute_blocked_par(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        for i in 0..n {
+            assert!(
+                (x[(i, 0)] - 1.0).abs() < 1e-8,
+                "x[{}] = {}, expected 1.0",
+                i,
+                x[(i, 0)]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_vs_sequential() {
+        // Verify parallel and sequential blocked give same results
+        let n = 150;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+
+        // Create a random-ish matrix
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 17 + j * 31) % 100) as f64 / 100.0;
+                if i == j {
+                    a[(i, j)] += 10.0; // Make diagonally dominant
+                }
+            }
+        }
+
+        let lu_seq = Lu::compute_blocked(a.as_ref()).expect("Sequential blocked should work");
+        let lu_par = Lu::compute_blocked_par(a.as_ref()).expect("Parallel blocked should work");
+
+        let det_seq = lu_seq.determinant();
+        let det_par = lu_par.determinant();
+
+        let rel_error = if det_seq.abs() > 1e-15 {
+            ((det_seq - det_par) / det_seq).abs()
+        } else {
+            (det_seq - det_par).abs()
+        };
+        assert!(
+            rel_error < 1e-10,
+            "det_seq = {}, det_par = {}, rel_error = {}",
+            det_seq,
+            det_par,
+            rel_error
+        );
+
+        // Verify solve gives same results
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += a[(i, j)];
+            }
+            b[(i, 0)] = sum;
+        }
+
+        let x_seq = lu_seq.solve(b.as_ref()).expect("Sequential solve");
+        let x_par = lu_par.solve(b.as_ref()).expect("Parallel solve");
+
+        for i in 0..n {
+            let diff = (x_seq[(i, 0)] - x_par[(i, 0)]).abs();
+            assert!(
+                diff < 1e-10,
+                "x[{}] differs: seq={}, par={}, diff={}",
+                i,
+                x_seq[(i, 0)],
+                x_par[(i, 0)],
+                diff
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_determinant() {
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 10.0]]);
+
+        let lu = Lu::compute_blocked_par(a.as_ref()).expect("Should not be singular");
+        let det = lu.determinant();
+
+        // Expected det = -3
+        assert!((det + 3.0).abs() < 1e-10, "det = {}", det);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_f32() {
+        // Test parallel blocked with f32
+        let a: Mat<f32> =
+            Mat::from_rows(&[&[10.0f32, 1.0, 2.0], &[3.0, 8.0, 1.0], &[2.0, 1.0, 12.0]]);
+        let b: Mat<f32> = Mat::from_rows(&[&[13.0f32], &[12.0], &[15.0]]);
+
+        let lu = Lu::compute_blocked_par(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        // Verify Ax = b
+        for i in 0..3 {
+            let mut ax_i = 0.0f32;
+            for j in 0..3 {
+                ax_i += a[(i, j)] * x[(j, 0)];
+            }
+            assert!(
+                (ax_i - b[(i, 0)]).abs() < 1e-4,
+                "Ax[{}] = {}, expected {}",
+                i,
+                ax_i,
+                b[(i, 0)]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_lu_blocked_par_singular() {
+        // Verify the parallel version detects singular matrices
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[2.0, 4.0]]);
+        let result = Lu::compute_blocked_par(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    // ---- Recursive cache-oblivious LU tests ----
+
+    #[test]
+    fn test_lu_recursive_2x2() {
+        let a: Mat<f64> = Mat::from_rows(&[&[2.0, 1.0], &[4.0, 3.0]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[3.0], &[7.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-10, "x[0] = {}", x[(0, 0)]);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-10, "x[1] = {}", x[(1, 0)]);
+    }
+
+    #[test]
+    fn test_lu_recursive_3x3() {
+        let a: Mat<f64> = Mat::from_rows(&[&[2.0, 1.0, 1.0], &[4.0, 3.0, 3.0], &[8.0, 7.0, 9.0]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[4.0], &[10.0], &[24.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-10, "x[0] = {}", x[(0, 0)]);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-10, "x[1] = {}", x[(1, 0)]);
+        assert!((x[(2, 0)] - 1.0).abs() < 1e-10, "x[2] = {}", x[(2, 0)]);
+    }
+
+    #[test]
+    fn test_lu_recursive_determinant() {
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 10.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let det = lu.determinant();
+        assert!((det + 3.0).abs() < 1e-10, "det = {}", det);
+    }
+
+    #[test]
+    fn test_lu_recursive_singular() {
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[2.0, 4.0]]);
+        let result = Lu::compute_recursive(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lu_recursive_not_square() {
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
+        let result = Lu::compute_recursive(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lu_recursive_empty() {
+        let a: Mat<f64> = Mat::zeros(0, 0);
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Empty should work");
+        assert_eq!(lu.size(), 0);
+        assert!((lu.determinant() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_lu_recursive_inverse() {
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 7.0], &[2.0, 6.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let a_inv = lu.inverse().expect("Should invert");
+
+        assert!((a_inv[(0, 0)] - 0.6).abs() < 1e-10);
+        assert!((a_inv[(0, 1)] + 0.7).abs() < 1e-10);
+        assert!((a_inv[(1, 0)] + 0.2).abs() < 1e-10);
+        assert!((a_inv[(1, 1)] - 0.4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_lu_recursive_large() {
+        // 200x200 diagonally dominant matrix
+        let n = 200;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    a[(i, j)] = (n as f64) + 1.0;
+                } else {
+                    a[(i, j)] = 0.5;
+                }
+            }
+        }
+
+        // RHS: b = A * ones
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += a[(i, j)];
+            }
+            b[(i, 0)] = sum;
+        }
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        for i in 0..n {
+            assert!(
+                (x[(i, 0)] - 1.0).abs() < 1e-8,
+                "x[{}] = {}, expected 1.0",
+                i,
+                x[(i, 0)],
+            );
+        }
+    }
+
+    #[test]
+    fn test_lu_recursive_vs_unblocked() {
+        // Compare recursive and unblocked on a diagonally dominant matrix
+        let n = 150;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 17 + j * 31) % 100) as f64 / 100.0;
+                if i == j {
+                    a[(i, j)] += 10.0;
+                }
+            }
+        }
+
+        let lu_unblocked = Lu::compute(a.as_ref()).expect("Unblocked");
+        let lu_recursive = Lu::compute_recursive(a.as_ref()).expect("Recursive");
+
+        let det_unblocked = lu_unblocked.determinant();
+        let det_recursive = lu_recursive.determinant();
+
+        let rel_error = if det_unblocked.abs() > 1e-15 {
+            ((det_unblocked - det_recursive) / det_unblocked).abs()
+        } else {
+            (det_unblocked - det_recursive).abs()
+        };
+        assert!(
+            rel_error < 1e-10,
+            "det_unblocked = {}, det_recursive = {}, rel_error = {}",
+            det_unblocked,
+            det_recursive,
+            rel_error,
+        );
+
+        // Also verify solve gives same results
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += a[(i, j)];
+            }
+            b[(i, 0)] = sum;
+        }
+
+        let x_unblocked = lu_unblocked.solve(b.as_ref()).expect("Unblocked solve");
+        let x_recursive = lu_recursive.solve(b.as_ref()).expect("Recursive solve");
+
+        for i in 0..n {
+            let diff = (x_unblocked[(i, 0)] - x_recursive[(i, 0)]).abs();
+            assert!(
+                diff < 1e-8,
+                "x[{}] differs: unblocked={}, recursive={}, diff={}",
+                i,
+                x_unblocked[(i, 0)],
+                x_recursive[(i, 0)],
+                diff,
+            );
+        }
+    }
+
+    #[test]
+    fn test_lu_recursive_f32() {
+        let a: Mat<f32> = Mat::from_rows(&[&[2.0f32, 1.0], &[4.0, 3.0]]);
+        let b: Mat<f32> = Mat::from_rows(&[&[3.0f32], &[7.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        assert!((x[(0, 0)] - 1.0).abs() < 1e-5, "x[0] = {}", x[(0, 0)]);
+        assert!((x[(1, 0)] - 1.0).abs() < 1e-5, "x[1] = {}", x[(1, 0)]);
+    }
+
+    #[test]
+    fn test_lu_recursive_needs_pivoting() {
+        // Matrix that requires pivoting: first pivot is zero
+        let a: Mat<f64> = Mat::from_rows(&[&[0.0, 1.0, 2.0], &[1.0, 0.0, 3.0], &[2.0, 3.0, 0.0]]);
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should handle pivoting");
+        let det = lu.determinant();
+
+        // det = 0*(0*0-3*3) - 1*(1*0-3*2) + 2*(1*3-0*2) = 0 + 6 + 6 = 12
+        assert!((det - 12.0).abs() < 1e-10, "det = {}", det);
+
+        // Verify solve
+        let b: Mat<f64> = Mat::from_rows(&[&[3.0], &[4.0], &[5.0]]);
+        let x = lu.solve(b.as_ref()).expect("Should solve");
+
+        // Verify Ax = b
+        for i in 0..3 {
+            let mut ax_i = 0.0;
+            for j in 0..3 {
+                ax_i += a[(i, j)] * x[(j, 0)];
+            }
+            assert!(
+                (ax_i - b[(i, 0)]).abs() < 1e-10,
+                "Ax[{}] = {}, expected {}",
+                i,
+                ax_i,
+                b[(i, 0)],
+            );
+        }
+    }
+
+    #[test]
+    fn test_lu_recursive_reconstruct_pa_eq_lu() {
+        // Verify PA = LU reconstruction
+        let n = 100;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 13 + j * 37 + 7) % 100) as f64 / 50.0;
+                if i == j {
+                    a[(i, j)] += 10.0;
+                }
+            }
+        }
+
+        let lu = Lu::compute_recursive(a.as_ref()).expect("Should not be singular");
+        let l = lu.l_factor();
+        let u = lu.u_factor();
+        let p = lu.permutation_matrix();
+
+        // Compute PA
+        let mut pa: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += p[(i, k)] * a[(k, j)];
+                }
+                pa[(i, j)] = sum;
+            }
+        }
+
+        // Compute LU
+        let mut lu_product: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += l[(i, k)] * u[(k, j)];
+                }
+                lu_product[(i, j)] = sum;
+            }
+        }
+
+        // PA should equal LU
+        for i in 0..n {
+            for j in 0..n {
+                let diff = (pa[(i, j)] - lu_product[(i, j)]).abs();
+                assert!(
+                    diff < 1e-8,
+                    "PA[{},{}]={} != LU[{},{}]={}",
+                    i,
+                    j,
+                    pa[(i, j)],
+                    i,
+                    j,
+                    lu_product[(i, j)],
+                );
+            }
+        }
+    }
 }

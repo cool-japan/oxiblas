@@ -131,7 +131,7 @@ pub fn lstsq<T: Field + Real + bytemuck::Zeroable>(
     } else {
         T::one()
     };
-    let tol = eps * T::from_f64(m.max(n) as f64).unwrap() * r_max;
+    let tol = eps * T::from_f64(m.max(n) as f64).unwrap_or_else(T::zero) * r_max;
 
     for i in 0..n {
         if Scalar::abs(r[(i, i)]) < tol {

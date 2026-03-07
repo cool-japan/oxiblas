@@ -52,8 +52,8 @@ use super::alloc::*;
 pub struct Arena<const ALIGN: usize = DEFAULT_ALIGN> {
     buffer: AlignedVec<u8, ALIGN>,
     /// Offset uses Cell for interior mutability, allowing multiple allocations
-    offset: std::cell::Cell<usize>,
-    high_water_mark: std::cell::Cell<usize>,
+    offset: core::cell::Cell<usize>,
+    high_water_mark: core::cell::Cell<usize>,
 }
 
 impl<const ALIGN: usize> Arena<ALIGN> {
@@ -61,8 +61,8 @@ impl<const ALIGN: usize> Arena<ALIGN> {
     pub fn with_capacity(capacity: usize) -> Self {
         Arena {
             buffer: AlignedVec::zeros(capacity),
-            offset: std::cell::Cell::new(0),
-            high_water_mark: std::cell::Cell::new(0),
+            offset: core::cell::Cell::new(0),
+            high_water_mark: core::cell::Cell::new(0),
         }
     }
 
@@ -382,6 +382,7 @@ impl<'a, T, const ALIGN: usize> core::ops::IndexMut<usize> for ArenaVec<'a, T, A
 ///
 /// // Arena is reset, memory can be reused next time
 /// ```
+#[cfg(feature = "std")]
 pub fn with_blas_arena<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Arena) -> R,
@@ -593,6 +594,7 @@ mod arena_tests {
         assert_eq!(arena.used(), 80); // Previous allocation preserved
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_with_blas_arena() {
         with_blas_arena(|arena| {

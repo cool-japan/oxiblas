@@ -230,10 +230,10 @@ pub fn reverse_cuthill_mckee<T: Scalar>(a: &CscMatrix<T>) -> Vec<usize> {
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
     while order.len() < n {
-        let start = (0..n)
-            .filter(|&i| !visited[i])
-            .min_by_key(|&i| degree[i])
-            .unwrap();
+        let start = match (0..n).filter(|&i| !visited[i]).min_by_key(|&i| degree[i]) {
+            Some(s) => s,
+            None => break,
+        };
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(start);
         visited[start] = true;
@@ -969,6 +969,13 @@ pub fn compute_ordering<T: Scalar>(a: &CscMatrix<T>, alg: OrderingAlgorithm) -> 
         OrderingAlgorithm::MMD => multiple_minimum_degree(a),
         OrderingAlgorithm::RCM => reverse_cuthill_mckee(a),
         OrderingAlgorithm::NestedDissection => nested_dissection(a, None),
+        OrderingAlgorithm::MultilevelND => {
+            let n = a.nrows();
+            let xadj: Vec<usize> = (0..=n).map(|i| a.col_ptrs()[i]).collect();
+            let adjncy: Vec<usize> = a.row_indices().to_vec();
+            super::multilevel::multilevel_nested_dissection(n, &xadj, &adjncy)
+                .unwrap_or_else(|_| (0..n).collect())
+        }
         OrderingAlgorithm::Natural => (0..a.nrows()).collect(),
     }
 }

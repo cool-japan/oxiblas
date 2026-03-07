@@ -1085,7 +1085,7 @@ fn householder_vector_with_tau<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
     }
 
     // tau = 2 / ||v||^2
-    let tau = T::from_f64(2.0).unwrap() / v_norm_sq;
+    let tau = T::from_f64(2.0).unwrap_or_else(T::zero) / v_norm_sq;
 
     (v, tau)
 }

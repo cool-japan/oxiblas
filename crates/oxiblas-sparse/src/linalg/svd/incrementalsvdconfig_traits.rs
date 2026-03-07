@@ -16,7 +16,7 @@ impl<T: Real + FromPrimitive> Default for IncrementalSVDConfig<T> {
     fn default() -> Self {
         Self {
             max_rank: 10,
-            tolerance: T::from_f64(1e-10).unwrap(),
+            tolerance: T::from_f64(1e-10).unwrap_or_else(T::zero),
             reorthogonalize: true,
         }
     }

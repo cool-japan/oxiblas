@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/oxiblas.svg)](https://crates.io/crates/oxiblas)
 [![Documentation](https://docs.rs/oxiblas/badge.svg)](https://docs.rs/oxiblas)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](../../LICENSE)
 
 ## Overview
 
@@ -129,7 +129,7 @@ The `oxiblas` crate re-exports from these sub-crates:
 | `oxiblas::lapack` | `oxiblas-lapack` | LAPACK decompositions |
 | `oxiblas::sparse` | `oxiblas-sparse` | Sparse matrices and solvers |
 | `oxiblas::ndarray` | `oxiblas-ndarray` | ndarray integration (optional) |
-| `oxiblas::ffi` | `oxiblas-ffi` | C FFI bindings (optional) |
+| | `oxiblas-ffi` | **RETIRED** (v0.2.0) - C FFI bindings |
 
 ## Prelude
 
@@ -239,7 +239,6 @@ For more detailed documentation on specific components:
 - **[oxiblas-lapack](../oxiblas-lapack/README.md)** - LAPACK decompositions
 - **[oxiblas-sparse](../oxiblas-sparse/README.md)** - Sparse matrices
 - **[oxiblas-ndarray](../oxiblas-ndarray/README.md)** - ndarray integration
-- **[oxiblas-ffi](../oxiblas-ffi/README.md)** - C FFI bindings
 - **[oxiblas-benchmarks](../oxiblas-benchmarks/README.md)** - Benchmarking suite
 
 ## Ecosystem
@@ -262,12 +261,7 @@ OxiBLAS is part of the SciRS2 scientific computing ecosystem:
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](../../LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](../../LICENSE-MIT))
-
-at your option.
+Licensed under the Apache License, Version 2.0. See [LICENSE](../../LICENSE) for details.
 
 ## Contributing
 

@@ -887,7 +887,7 @@ fn bisection_eigenvalues<T: Field + Real>(
         let mut hi = value_high;
 
         for _ in 0..MAX_BISECTION_ITER {
-            let mid = (lo + hi) / T::from_f64(2.0).unwrap();
+            let mid = (lo + hi) / T::from_f64(2.0).unwrap_or_else(T::zero);
             let count = sturm_count(diag, offdiag, mid);
 
             if count <= target_index {
@@ -901,7 +901,7 @@ fn bisection_eigenvalues<T: Field + Real>(
             }
         }
 
-        eigenvalues[k] = (lo + hi) / T::from_f64(2.0).unwrap();
+        eigenvalues[k] = (lo + hi) / T::from_f64(2.0).unwrap_or_else(T::zero);
     }
 
     Ok(eigenvalues)

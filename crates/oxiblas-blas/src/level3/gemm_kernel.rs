@@ -10,6 +10,10 @@
 
 use oxiblas_core::scalar::Field;
 
+// Pull in SSE4.2 kernels (x86-64 only).
+#[cfg(target_arch = "x86_64")]
+use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
+
 /// Describes the shape of a micro-kernel.
 #[derive(Debug, Clone, Copy)]
 pub struct MicroKernelShape {
@@ -72,6 +76,10 @@ impl GemmKernel for f64 {
             if is_x86_feature_detected!("avx2") {
                 return MicroKernelShape { mr: 8, nr: 6 };
             }
+            // SSE4.2: 4×2 (2 f64 per xmm register, 4 accumulators = 2 columns × 2 rows)
+            if is_x86_feature_detected!("sse4.2") {
+                return MicroKernelShape { mr: 4, nr: 2 };
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -104,6 +112,10 @@ impl GemmKernel for f64 {
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 return micro_kernel_f64_avx2(k, alpha, a, b, beta, c, c_stride);
+            }
+            // SSE4.2 fallback: no FMA, uses separate mul+add
+            if is_x86_feature_detected!("sse4.2") {
+                return micro_kernel_f64_sse42(k, alpha, a, b, beta, c, c_stride);
             }
         }
 
@@ -760,6 +772,10 @@ impl GemmKernel for f32 {
             if is_x86_feature_detected!("avx2") {
                 return MicroKernelShape { mr: 8, nr: 8 };
             }
+            // SSE4.2: 4×4 (4 f32 per xmm register)
+            if is_x86_feature_detected!("sse4.2") {
+                return MicroKernelShape { mr: 4, nr: 4 };
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -789,6 +805,10 @@ impl GemmKernel for f32 {
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 return micro_kernel_f32_avx2(k, alpha, a, b, beta, c, c_stride);
+            }
+            // SSE4.2 fallback: no FMA, uses separate mul+add
+            if is_x86_feature_detected!("sse4.2") {
+                return micro_kernel_f32_sse42(k, alpha, a, b, beta, c, c_stride);
             }
         }
 

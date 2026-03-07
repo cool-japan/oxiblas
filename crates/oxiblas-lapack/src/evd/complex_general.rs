@@ -275,7 +275,7 @@ where
             return real_zero::<T::Real>();
         }
 
-        let v = self.eigenvectors.as_ref().unwrap();
+        let v = self.eigenvectors.as_ref().expect("value should be present");
         let mut max_residual = real_zero::<T::Real>();
 
         for (col, &lambda) in self.eigenvalues.iter().enumerate() {
@@ -308,13 +308,13 @@ where
 /// Helper function to get zero for a Real type
 #[inline]
 fn real_zero<R: Real>() -> R {
-    R::from_f64(0.0).unwrap()
+    R::from_f64(0.0).unwrap_or_else(R::zero)
 }
 
 /// Helper function to get one for a Real type
 #[inline]
 fn real_one<R: Real>() -> R {
-    R::from_f64(1.0).unwrap()
+    R::from_f64(1.0).unwrap_or_else(R::zero)
 }
 
 /// Helper function to get epsilon for a Real type
@@ -326,7 +326,7 @@ fn real_eps<R: Real>() -> R {
 /// Helper function to get a constant for a Real type
 #[inline]
 fn real_const<R: Real>(val: f64) -> R {
-    R::from_f64(val).unwrap()
+    R::from_f64(val).unwrap_or_else(R::zero)
 }
 
 /// Computes eigenvalues of a 2x2 complex matrix directly using quadratic formula.

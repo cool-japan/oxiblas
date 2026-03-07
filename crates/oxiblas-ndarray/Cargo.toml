@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "README.md"
 keywords = ["blas", "lapack", "ndarray", "linear-algebra", "matrix"]
 categories = ["mathematics", "science", "algorithms"]
 
@@ -15,13 +16,15 @@ oxiblas-core.workspace = true
 oxiblas-matrix.workspace = true
 oxiblas-blas.workspace = true
 oxiblas-lapack.workspace = true
+oxiblas-sparse = { workspace = true, optional = true }
 ndarray.workspace = true
 num-complex.workspace = true
 bytemuck.workspace = true
 
 [features]
-default = []
-parallel = ["oxiblas-blas/parallel"]
+default = ["oxiblas-core/std", "oxiblas-matrix/std"]
+parallel = ["oxiblas-blas/parallel", "oxiblas-core/parallel"]
+sparse = ["dep:oxiblas-sparse"]
 
 [dev-dependencies]
 criterion.workspace = true

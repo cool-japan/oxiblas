@@ -14,8 +14,10 @@ pub enum OrderingAlgorithm {
     MMD,
     /// Reverse Cuthill-McKee.
     RCM,
-    /// Nested Dissection.
+    /// Nested Dissection (level-set based).
     NestedDissection,
+    /// Multilevel Nested Dissection (METIS-equivalent, pure Rust).
+    MultilevelND,
     /// Natural (identity) ordering.
     Natural,
 }
@@ -27,6 +29,7 @@ impl OrderingAlgorithm {
             OrderingAlgorithm::MMD => "MMD",
             OrderingAlgorithm::RCM => "RCM",
             OrderingAlgorithm::NestedDissection => "NestedDissection",
+            OrderingAlgorithm::MultilevelND => "MultilevelND",
             OrderingAlgorithm::Natural => "Natural",
         }
     }
@@ -142,7 +145,7 @@ impl SymbolicCholesky {
         let mut l_col_ptrs = Vec::with_capacity(n + 1);
         l_col_ptrs.push(0);
         for &count in &col_counts {
-            l_col_ptrs.push(l_col_ptrs.last().unwrap() + count);
+            l_col_ptrs.push(l_col_ptrs.last().expect("collection should be non-empty") + count);
         }
         let l_row_indices = compute_l_pattern(a, &parent, &l_col_ptrs);
         Self {

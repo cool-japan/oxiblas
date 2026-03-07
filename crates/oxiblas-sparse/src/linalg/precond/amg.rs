@@ -511,7 +511,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
         }
 
         CsrMatrix::new(n, num_coarse, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(n, num_coarse, vec![0; n + 1], vec![], vec![]).unwrap()
+            CsrMatrix::new(n, num_coarse, vec![0; n + 1], vec![], vec![])
+                .expect("CSR matrix construction with valid parameters")
         })
     }
 
@@ -552,7 +553,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
         }
 
         CsrMatrix::new(ncols, nrows, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(ncols, nrows, vec![0; ncols + 1], vec![], vec![]).unwrap()
+            CsrMatrix::new(ncols, nrows, vec![0; ncols + 1], vec![], vec![])
+                .expect("CSR matrix construction with valid parameters")
         })
     }
 
@@ -562,7 +564,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
         let n = b.ncols();
 
         if n == 0 || m == 0 {
-            return CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![]).unwrap();
+            return CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
+                .expect("CSR matrix construction with valid parameters");
         }
 
         let mut row_ptrs = vec![0usize; m + 1];
@@ -622,8 +625,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
             row_ptrs[i + 1] = col_indices.len();
         }
 
-        CsrMatrix::new(m, n, row_ptrs, col_indices, values)
-            .unwrap_or_else(|_| CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![]).unwrap())
+        CsrMatrix::new(m, n, row_ptrs, col_indices, values).unwrap_or_else(|_| {
+            CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
+                .expect("CSR matrix construction with valid parameters")
+        })
     }
 
     /// Apply the preconditioner using V-cycle or W-cycle.

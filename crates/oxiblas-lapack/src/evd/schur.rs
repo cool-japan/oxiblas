@@ -186,7 +186,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
                 let a22 = t[(p - 1, p - 1)];
                 let trace = a11 + a22;
                 let det = a11 * a22 - a12 * a21;
-                let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+                let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
                 if disc < T::zero() {
                     // Complex eigenvalues, keep as 2×2 block
@@ -237,7 +237,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
 
         let trace = a11 + a22;
         let det = a11 * a22 - a12 * a21;
-        let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+        let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
         let mut q = Mat::zeros(2, 2);
         let eigenvalues: Vec<Eigenvalue<T>>;
@@ -245,15 +245,15 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
         if disc >= T::zero() {
             // Real eigenvalues - triangularize
             let sqrt_disc = Real::sqrt(disc);
-            let lambda1 = (trace + sqrt_disc) / T::from_f64(2.0).unwrap();
-            let lambda2 = (trace - sqrt_disc) / T::from_f64(2.0).unwrap();
+            let lambda1 = (trace + sqrt_disc) / T::from_f64(2.0).unwrap_or_else(T::zero);
+            let lambda2 = (trace - sqrt_disc) / T::from_f64(2.0).unwrap_or_else(T::zero);
 
             // Find rotation to triangularize
             if Scalar::abs(a21) > <T as Scalar>::epsilon() {
                 let theta = if Scalar::abs(a11 - lambda1) > <T as Scalar>::epsilon() {
                     Real::atan2(a21, a11 - lambda1)
                 } else {
-                    T::from_f64(core::f64::consts::FRAC_PI_2).unwrap()
+                    T::from_f64(core::f64::consts::FRAC_PI_2).unwrap_or_else(T::zero)
                 };
                 let c = Real::cos(theta);
                 let s = Real::sin(theta);
@@ -298,8 +298,8 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
         } else {
             // Complex eigenvalues - keep as 2×2 block
             let sqrt_disc = Real::sqrt(-disc);
-            let real_part = trace / T::from_f64(2.0).unwrap();
-            let imag_part = sqrt_disc / T::from_f64(2.0).unwrap();
+            let real_part = trace / T::from_f64(2.0).unwrap_or_else(T::zero);
+            let imag_part = sqrt_disc / T::from_f64(2.0).unwrap_or_else(T::zero);
 
             q[(0, 0)] = T::one();
             q[(1, 1)] = T::one();
@@ -447,20 +447,22 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
 
                     let trace = a11 + a22;
                     let det = a11 * a22 - a12 * a21;
-                    let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+                    let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
                     if disc >= T::zero() {
                         // Real eigenvalues
                         let sqrt_disc = Real::sqrt(disc);
-                        let lambda1 = (trace + sqrt_disc) / T::from_f64(2.0).unwrap();
-                        let lambda2 = (trace - sqrt_disc) / T::from_f64(2.0).unwrap();
+                        let lambda1 =
+                            (trace + sqrt_disc) / T::from_f64(2.0).unwrap_or_else(T::zero);
+                        let lambda2 =
+                            (trace - sqrt_disc) / T::from_f64(2.0).unwrap_or_else(T::zero);
                         eigenvalues.push(Eigenvalue::real_only(lambda1));
                         eigenvalues.push(Eigenvalue::real_only(lambda2));
                     } else {
                         // Complex conjugate pair
                         let sqrt_disc = Real::sqrt(-disc);
-                        let real_part = trace / T::from_f64(2.0).unwrap();
-                        let imag_part = sqrt_disc / T::from_f64(2.0).unwrap();
+                        let real_part = trace / T::from_f64(2.0).unwrap_or_else(T::zero);
+                        let imag_part = sqrt_disc / T::from_f64(2.0).unwrap_or_else(T::zero);
                         eigenvalues.push(Eigenvalue::complex(real_part, imag_part));
                         eigenvalues.push(Eigenvalue::complex(real_part, -imag_part));
                     }
@@ -692,7 +694,7 @@ pub fn trsna_s<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
         let is_2x2 = if j + 1 < n {
             let sub = Scalar::abs(t[(j + 1, j)]);
             let diag_sum = Scalar::abs(t[(j, j)]) + Scalar::abs(t[(j + 1, j + 1)]);
-            sub > eps * T::from_f64(100.0).unwrap() * diag_sum
+            sub > eps * T::from_f64(100.0).unwrap_or_else(T::zero) * diag_sum
         } else {
             false
         };
@@ -767,7 +769,7 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
         let is_2x2 = if j + 1 < n {
             let sub = Scalar::abs(t[(j + 1, j)]);
             let diag_sum = Scalar::abs(t[(j, j)]) + Scalar::abs(t[(j + 1, j + 1)]);
-            sub > eps * T::from_f64(100.0).unwrap() * diag_sum
+            sub > eps * T::from_f64(100.0).unwrap_or_else(T::zero) * diag_sum
         } else {
             false
         };
@@ -779,12 +781,12 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
             // Compute approximate separation as minimum distance to other eigenvalues
             let a11 = t[(j, j)];
             let a22 = t[(jp1, jp1)];
-            let lambda_real = (a11 + a22) / T::from_f64(2.0).unwrap();
+            let lambda_real = (a11 + a22) / T::from_f64(2.0).unwrap_or_else(T::zero);
             let trace = a11 + a22;
             let det = a11 * a22 - t[(j, jp1)] * t[(jp1, j)];
-            let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+            let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
             let lambda_imag = if disc < T::zero() {
-                Real::sqrt(-disc) / T::from_f64(2.0).unwrap()
+                Real::sqrt(-disc) / T::from_f64(2.0).unwrap_or_else(T::zero)
             } else {
                 T::zero()
             };
@@ -804,7 +806,7 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
                 let k_is_2x2 = if k + 1 < n && !adjacent {
                     let sub = Scalar::abs(t[(k + 1, k)]);
                     let diag_sum = Scalar::abs(t[(k, k)]) + Scalar::abs(t[(k + 1, k + 1)]);
-                    sub > eps * T::from_f64(100.0).unwrap() * diag_sum
+                    sub > eps * T::from_f64(100.0).unwrap_or_else(T::zero) * diag_sum
                 } else {
                     false
                 };
@@ -815,11 +817,11 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
                     let b22 = t[(kp1, kp1)];
                     let other_trace = b11 + b22;
                     let other_det = b11 * b22 - t[(k, kp1)] * t[(kp1, k)];
-                    let other_disc =
-                        other_trace * other_trace - T::from_f64(4.0).unwrap() * other_det;
-                    let r = (b11 + b22) / T::from_f64(2.0).unwrap();
+                    let other_disc = other_trace * other_trace
+                        - T::from_f64(4.0).unwrap_or_else(T::zero) * other_det;
+                    let r = (b11 + b22) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     let i = if other_disc < T::zero() {
-                        Real::sqrt(-other_disc) / T::from_f64(2.0).unwrap()
+                        Real::sqrt(-other_disc) / T::from_f64(2.0).unwrap_or_else(T::zero)
                     } else {
                         T::zero()
                     };
@@ -873,7 +875,7 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
                 let k_is_2x2 = if k + 1 < n && !adjacent_to_j {
                     let sub = Scalar::abs(t[(k + 1, k)]);
                     let diag_sum = Scalar::abs(t[(k, k)]) + Scalar::abs(t[(k + 1, k + 1)]);
-                    sub > eps * T::from_f64(100.0).unwrap() * diag_sum
+                    sub > eps * T::from_f64(100.0).unwrap_or_else(T::zero) * diag_sum
                 } else {
                     false
                 };
@@ -884,11 +886,11 @@ pub fn trsna_sep<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Vec<T> {
                     let b22 = t[(kp1, kp1)];
                     let other_trace = b11 + b22;
                     let other_det = b11 * b22 - t[(k, kp1)] * t[(kp1, k)];
-                    let other_disc =
-                        other_trace * other_trace - T::from_f64(4.0).unwrap() * other_det;
-                    let r = (b11 + b22) / T::from_f64(2.0).unwrap();
+                    let other_disc = other_trace * other_trace
+                        - T::from_f64(4.0).unwrap_or_else(T::zero) * other_det;
+                    let r = (b11 + b22) / T::from_f64(2.0).unwrap_or_else(T::zero);
                     let i = if other_disc < T::zero() {
-                        Real::sqrt(-other_disc) / T::from_f64(2.0).unwrap()
+                        Real::sqrt(-other_disc) / T::from_f64(2.0).unwrap_or_else(T::zero)
                     } else {
                         T::zero()
                     };
@@ -970,10 +972,10 @@ pub fn trevc_right<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Mat<T> {
 
             let trace = a11 + a22;
             let det = a11 * a22 - a12 * a21;
-            let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+            let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
             // Complex eigenvalues: λ = (trace ± i*sqrt(-disc)) / 2
-            let two = T::from_f64(2.0).unwrap();
+            let two = T::from_f64(2.0).unwrap_or_else(T::zero);
             let real_part = trace / two;
             let imag_part = Real::sqrt(-disc) / two;
 
@@ -1165,9 +1167,9 @@ pub fn trevc_left<T: Field + Real + bytemuck::Zeroable>(t: &Mat<T>) -> Mat<T> {
 
             let trace = a11 + a22;
             let det = a11 * a22 - a12 * a21;
-            let disc = trace * trace - T::from_f64(4.0).unwrap() * det;
+            let disc = trace * trace - T::from_f64(4.0).unwrap_or_else(T::zero) * det;
 
-            let two = T::from_f64(2.0).unwrap();
+            let two = T::from_f64(2.0).unwrap_or_else(T::zero);
             let real_part = trace / two;
             let imag_part = Real::sqrt(-disc) / two;
 
@@ -1295,7 +1297,7 @@ fn householder_3<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
     }
 
     if v_norm_sq > T::zero() {
-        let tau = T::from_f64(2.0).unwrap() / v_norm_sq;
+        let tau = T::from_f64(2.0).unwrap_or_else(T::zero) / v_norm_sq;
         (v, tau)
     } else {
         (v, T::zero())

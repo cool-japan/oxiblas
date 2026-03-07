@@ -616,7 +616,7 @@ fn matrix_frob_norm<T: Field + Real>(a: &Mat<T>) -> T {
 /// Helper: from_f64 with unwrap
 #[inline]
 fn from_f64<T: Field>(val: f64) -> T {
-    num_traits::FromPrimitive::from_f64(val).unwrap()
+    num_traits::FromPrimitive::from_f64(val).unwrap_or_else(T::zero)
 }
 /// Internal helper: Newton's method for matrix square root.
 fn sqrtm_newton<T: Field + Real + bytemuck::Zeroable>(a: &Mat<T>) -> Result<Mat<T>, MatFunError> {
@@ -707,7 +707,10 @@ fn pade_approximant<T: Field + Real + bytemuck::Zeroable>(a: &Mat<T>, order: usi
     }
     a_powers.push(a_k.clone());
     for _ in 2..=order {
-        let next = mat_mult(a_powers.last().unwrap(), &a_powers[1]);
+        let next = mat_mult(
+            a_powers.last().expect("collection should be non-empty"),
+            &a_powers[1],
+        );
         a_powers.push(next);
     }
     let mut num = Mat::zeros(n, n);

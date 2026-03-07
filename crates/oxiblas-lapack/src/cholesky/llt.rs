@@ -5,8 +5,12 @@
 
 use num_traits::{FromPrimitive, One};
 use oxiblas_blas::level3::gemm::gemm;
+#[cfg(feature = "parallel")]
+use oxiblas_blas::level3::gemm::gemm_with_par;
 use oxiblas_blas::level3::gemm_kernel::GemmKernel;
 use oxiblas_blas::level3::trsm::{Diag, Side, Trans, Uplo, trsm_in_place};
+#[cfg(feature = "parallel")]
+use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -497,11 +501,175 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     }
 }
 
+// Recursive cache-oblivious Cholesky factorization
+impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
+    /// Recursion threshold: matrices at or below this size use the unblocked algorithm.
+    const RECURSIVE_THRESHOLD: usize = 64;
+
+    /// Computes the Cholesky decomposition using a recursive cache-oblivious algorithm.
+    ///
+    /// This divide-and-conquer approach automatically adapts to the cache hierarchy
+    /// by recursively splitting the matrix into quadrants. At each level:
+    ///
+    /// 1. Factor the top-left quadrant A11 recursively to get L11
+    /// 2. Solve L21 = A21 * L11^{-T} via TRSM
+    /// 3. Update A22 -= L21 * L21^T via SYRK (symmetric rank-k update)
+    /// 4. Factor the updated A22 recursively to get L22
+    ///
+    /// For matrices smaller than the recursion threshold (64), falls back to the
+    /// unblocked algorithm which is more efficient at that scale.
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - A symmetric positive definite matrix (only lower triangle is read)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oxiblas_lapack::cholesky::Cholesky;
+    /// use oxiblas_matrix::Mat;
+    ///
+    /// let n = 200;
+    /// let mut a = Mat::zeros(n, n);
+    /// for i in 0..n {
+    ///     a[(i, i)] = 2.0;
+    ///     if i > 0 {
+    ///         a[(i, i - 1)] = -1.0;
+    ///         a[(i - 1, i)] = -1.0;
+    ///     }
+    /// }
+    ///
+    /// let chol = Cholesky::compute_recursive(a.as_ref()).expect("Matrix is SPD");
+    /// let det = chol.determinant();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `CholeskyError::NotSquare` if the matrix is not square.
+    /// Returns `CholeskyError::NotPositiveDefinite` if the matrix is not positive definite.
+    pub fn compute_recursive(a: MatRef<'_, T>) -> Result<Self, CholeskyError> {
+        let n = a.nrows();
+
+        if n != a.ncols() {
+            return Err(CholeskyError::NotSquare {
+                nrows: n,
+                ncols: a.ncols(),
+            });
+        }
+
+        if n == 0 {
+            return Ok(Cholesky {
+                l: Mat::zeros(0, 0),
+            });
+        }
+
+        // Copy lower triangular part of A into L
+        let mut l = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in j..n {
+                l[(i, j)] = a[(i, j)];
+            }
+        }
+
+        Self::recursive_factor(&mut l, n, 0)?;
+
+        Ok(Cholesky { l })
+    }
+
+    /// Recursive Cholesky factorization on a submatrix starting at (offset, offset).
+    ///
+    /// Operates in-place on the lower triangular part of `l`.
+    /// The submatrix from (offset, offset) to (offset+size-1, offset+size-1) is factored.
+    fn recursive_factor(l: &mut Mat<T>, size: usize, offset: usize) -> Result<(), CholeskyError> {
+        // Base case: use unblocked algorithm for small matrices
+        if size <= Self::RECURSIVE_THRESHOLD {
+            let full_n = l.nrows();
+            Self::unblocked_factor_block(l, full_n, offset, size)?;
+            return Ok(());
+        }
+
+        // Split: n1 = size/2 (upper half), n2 = size - n1 (lower half)
+        let n1 = size / 2;
+        let n2 = size - n1;
+
+        // Step 1: Recursively factor A11 (top-left n1 x n1 block)
+        Self::recursive_factor(l, n1, offset)?;
+
+        // Step 2: Solve L21 = A21 * L11^{-T} via TRSM
+        // Extract L11 (lower triangular, already factored)
+        let mut l11 = Mat::zeros(n1, n1);
+        for i in 0..n1 {
+            for j in 0..=i {
+                l11[(i, j)] = l[(offset + i, offset + j)];
+            }
+        }
+
+        // Extract A21 (the block that will become L21)
+        let mut l21 = Mat::zeros(n2, n1);
+        for j in 0..n1 {
+            for i in 0..n2 {
+                l21[(i, j)] = l[(offset + n1 + i, offset + j)];
+            }
+        }
+
+        // TRSM: B = B * inv(L11^T), where B = L21
+        // Side::Right, Uplo::Lower, Trans::Trans, Diag::NonUnit
+        let _ = trsm_in_place(
+            Side::Right,
+            Uplo::Lower,
+            Trans::Trans,
+            Diag::NonUnit,
+            l11.as_ref(),
+            l21.as_mut(),
+        );
+
+        // Copy L21 back into l
+        for j in 0..n1 {
+            for i in 0..n2 {
+                l[(offset + n1 + i, offset + j)] = l21[(i, j)];
+            }
+        }
+
+        // Step 3: Symmetric rank-k update on A22
+        // A22 -= L21 * L21^T (only lower triangle)
+        let mut a22 = Mat::zeros(n2, n2);
+        for j in 0..n2 {
+            for i in j..n2 {
+                a22[(i, j)] = l[(offset + n1 + i, offset + n1 + j)];
+            }
+        }
+
+        use oxiblas_blas::level3::syrk::syrk;
+
+        // SYRK: C = alpha*A*A^T + beta*C  =>  A22 = -1*L21*L21^T + 1*A22
+        let _ = syrk(
+            Uplo::Lower,
+            Trans::NoTrans,
+            -T::one(),
+            l21.as_ref(),
+            T::one(),
+            a22.as_mut(),
+        );
+
+        // Copy updated A22 back into l (lower triangle only)
+        for j in 0..n2 {
+            for i in j..n2 {
+                l[(offset + n1 + i, offset + n1 + j)] = a22[(i, j)];
+            }
+        }
+
+        // Step 4: Recursively factor updated A22
+        Self::recursive_factor(l, n2, offset + n1)?;
+
+        Ok(())
+    }
+}
+
 // Optimized automatic algorithm selection for f64 and f32
 impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     /// Computes the Cholesky decomposition with automatic algorithm selection.
     ///
-    /// For matrices with size ≥ 128, automatically uses the blocked algorithm
+    /// For matrices with size >= 128, automatically uses the blocked algorithm
     /// for better cache efficiency and performance. Otherwise uses the unblocked
     /// algorithm which has less overhead for small matrices.
     ///
@@ -537,5 +705,147 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
             // Use unblocked for small matrices
             Self::compute(a)
         }
+    }
+}
+
+// Parallel blocked Cholesky factorization
+#[cfg(feature = "parallel")]
+impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T> {
+    /// Computes the Cholesky decomposition using a parallel blocked algorithm.
+    ///
+    /// Parallelizes the GEMM (symmetric rank-k) updates within the blocked
+    /// factorization using Rayon. For matrices smaller than the block size,
+    /// falls back to the sequential unblocked algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `a` - A symmetric positive definite matrix
+    ///
+    /// # Returns
+    ///
+    /// The Cholesky decomposition on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CholeskyError::NotSquare` if the matrix is not square.
+    /// Returns `CholeskyError::NotPositiveDefinite` if the matrix is not positive definite.
+    #[inline]
+    pub fn compute_blocked_par(a: MatRef<'_, T>) -> Result<Self, CholeskyError> {
+        const BLOCK_SIZE: usize = 64;
+        Self::compute_blocked_par_with_block_size(a, BLOCK_SIZE)
+    }
+
+    /// Computes parallel blocked Cholesky decomposition with a specified block size.
+    pub fn compute_blocked_par_with_block_size(
+        a: MatRef<'_, T>,
+        nb: usize,
+    ) -> Result<Self, CholeskyError> {
+        let n = a.nrows();
+
+        if n != a.ncols() {
+            return Err(CholeskyError::NotSquare {
+                nrows: n,
+                ncols: a.ncols(),
+            });
+        }
+
+        if n == 0 {
+            return Ok(Cholesky {
+                l: Mat::zeros(0, 0),
+            });
+        }
+
+        // Copy lower triangular part of A
+        let mut l = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in j..n {
+                l[(i, j)] = a[(i, j)];
+            }
+        }
+
+        // Use blocked parallel algorithm for larger matrices
+        if n >= nb {
+            Self::blocked_factor_par(&mut l, n, nb)?;
+        } else {
+            Self::unblocked_factor(&mut l, n, 0)?;
+        }
+
+        Ok(Cholesky { l })
+    }
+
+    /// Blocked Cholesky factorization with parallel GEMM for symmetric updates.
+    fn blocked_factor_par(l: &mut Mat<T>, n: usize, nb: usize) -> Result<(), CholeskyError> {
+        let mut jb = 0;
+
+        while jb < n {
+            // Current block size (may be smaller for last block)
+            let jb_size = nb.min(n - jb);
+
+            // Factor diagonal block A11 using unblocked Cholesky (sequential -- panel is small)
+            Self::unblocked_factor_block(l, n, jb, jb_size)?;
+
+            // If there are more rows below this block
+            if jb + jb_size < n {
+                let rows_remaining = n - jb - jb_size;
+
+                // Extract L11 (the diagonal block we just factored)
+                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
+                for i in 0..jb_size {
+                    for j in 0..=i {
+                        l11[(i, j)] = l[(jb + i, jb + j)];
+                    }
+                }
+
+                // Extract A21 block (will become L21)
+                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
+                for j in 0..jb_size {
+                    for i in 0..rows_remaining {
+                        l21[(i, j)] = l[(jb + jb_size + i, jb + j)];
+                    }
+                }
+
+                // Solve L21 = A21 * L11^(-T) using TRSM
+                // TRSM internally uses parallel GEMM when the "parallel" feature is active
+                let _ = trsm_in_place(
+                    Side::Right,
+                    Uplo::Lower,
+                    Trans::Trans,
+                    Diag::NonUnit,
+                    l11.as_ref(),
+                    l21.as_mut(),
+                );
+
+                // Copy L21 back
+                for j in 0..jb_size {
+                    for i in 0..rows_remaining {
+                        l[(jb + jb_size + i, jb + j)] = l21[(i, j)];
+                    }
+                }
+
+                // Update A22 -= L21 * L21^T using parallel GEMM (symmetric rank-k update)
+                let l21_t = l21.transpose();
+                let mut update: Mat<T> = Mat::zeros(rows_remaining, rows_remaining);
+                gemm_with_par(
+                    T::one(),
+                    l21.as_ref(),
+                    l21_t.as_ref(),
+                    T::zero(),
+                    update.as_mut(),
+                    Par::Rayon,
+                );
+
+                // Subtract update from lower triangular part of A22
+                for j in 0..rows_remaining {
+                    for i in j..rows_remaining {
+                        l[(jb + jb_size + i, jb + jb_size + j)] =
+                            l[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
+                    }
+                }
+            }
+
+            jb += jb_size;
+        }
+
+        Ok(())
     }
 }

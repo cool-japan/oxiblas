@@ -31,12 +31,18 @@
 //! assert!(!b.is_shared()); // b now has its own copy
 //! ```
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::mat::Mat;
 use crate::mat_mut::MatMut;
 use crate::mat_ref::MatRef;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
 use core::ops::{Index, IndexMut};
 use oxiblas_core::memory::{AlignedVec, DEFAULT_ALIGN};
 use oxiblas_core::scalar::Scalar;
+#[cfg(feature = "std")]
 use std::sync::Arc;
 
 /// Shared matrix data with reference counting.

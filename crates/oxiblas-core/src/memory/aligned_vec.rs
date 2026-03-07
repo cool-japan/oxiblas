@@ -11,6 +11,10 @@
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
+
+#[cfg(not(feature = "std"))]
+use alloc::alloc::handle_alloc_error;
+#[cfg(feature = "std")]
 use std::alloc::handle_alloc_error;
 
 use super::alloc::*;

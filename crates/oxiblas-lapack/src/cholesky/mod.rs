@@ -316,4 +316,409 @@ mod tests {
             rel_error
         );
     }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_cholesky_blocked_par_small() {
+        // Test parallel blocked algorithm on a small matrix
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 2.0], &[2.0, 5.0]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[8.0], &[11.0]]);
+
+        let chol = Cholesky::compute_blocked_par(a.as_ref()).expect("Should be positive definite");
+        let x = chol.solve(b.as_ref()).expect("Should solve");
+
+        let ax0 = 4.0 * x[(0, 0)] + 2.0 * x[(1, 0)];
+        let ax1 = 2.0 * x[(0, 0)] + 5.0 * x[(1, 0)];
+        assert!((ax0 - 8.0).abs() < 1e-10, "Ax[0] = {}", ax0);
+        assert!((ax1 - 11.0).abs() < 1e-10, "Ax[1] = {}", ax1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_cholesky_blocked_par_large() {
+        // Test parallel blocked algorithm on larger matrix
+        let n = 200;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+
+        // Create SPD matrix: A = B^T B + n*I
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = ((i * 17 + j * 31) % 100) as f64 / 100.0;
+            }
+        }
+
+        let mut spd: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += a[(k, i)] * a[(k, j)];
+                }
+                spd[(i, j)] = sum;
+                if i == j {
+                    spd[(i, j)] += n as f64;
+                }
+            }
+        }
+
+        // Create RHS such that solution is all ones
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += spd[(i, j)];
+            }
+            b[(i, 0)] = sum;
+        }
+
+        let chol =
+            Cholesky::compute_blocked_par(spd.as_ref()).expect("Should be positive definite");
+        let x = chol.solve(b.as_ref()).expect("Should solve");
+
+        for i in 0..n {
+            assert!(
+                (x[(i, 0)] - 1.0).abs() < 1e-6,
+                "x[{}] = {}, expected 1.0",
+                i,
+                x[(i, 0)]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_cholesky_blocked_par_vs_sequential() {
+        // Verify parallel and sequential blocked give same results
+        // Use a tridiagonal SPD matrix to keep determinant in a reasonable range
+        let n = 150;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+
+        for i in 0..n {
+            a[(i, i)] = 4.0;
+            if i > 0 {
+                a[(i, i - 1)] = -1.0;
+                a[(i - 1, i)] = -1.0;
+            }
+        }
+
+        let chol_seq =
+            Cholesky::compute_blocked(a.as_ref()).expect("Sequential blocked should work");
+        let chol_par =
+            Cholesky::compute_blocked_par(a.as_ref()).expect("Parallel blocked should work");
+
+        // Compare via log-determinant to avoid overflow
+        let log_det_seq = chol_seq.log_determinant();
+        let log_det_par = chol_par.log_determinant();
+
+        let abs_error = (log_det_seq - log_det_par).abs();
+        assert!(
+            abs_error < 1e-10,
+            "log_det_seq = {}, log_det_par = {}, abs_error = {}",
+            log_det_seq,
+            log_det_par,
+            abs_error
+        );
+
+        // Also compare L factors element-wise
+        let l_seq = chol_seq.l_factor();
+        let l_par = chol_par.l_factor();
+        for i in 0..n {
+            for j in 0..=i {
+                let diff = (l_seq[(i, j)] - l_par[(i, j)]).abs();
+                assert!(
+                    diff < 1e-10,
+                    "L[{},{}] differs: seq={}, par={}, diff={}",
+                    i,
+                    j,
+                    l_seq[(i, j)],
+                    l_par[(i, j)],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_cholesky_blocked_par_f32() {
+        // Test parallel blocked with f32
+        let a: Mat<f32> =
+            Mat::from_rows(&[&[10.0f32, 2.0, 1.0], &[2.0, 8.0, 3.0], &[1.0, 3.0, 12.0]]);
+        let b: Mat<f32> = Mat::from_rows(&[&[13.0f32], &[13.0], &[16.0]]);
+
+        let chol = Cholesky::compute_blocked_par(a.as_ref()).expect("Should be positive definite");
+        let x = chol.solve(b.as_ref()).expect("Should solve");
+
+        // Verify Ax = b
+        for i in 0..3 {
+            let mut ax_i = 0.0f32;
+            for j in 0..3 {
+                ax_i += a[(i, j)] * x[(j, 0)];
+            }
+            assert!(
+                (ax_i - b[(i, 0)]).abs() < 1e-4,
+                "Ax[{}] = {}, expected {}",
+                i,
+                ax_i,
+                b[(i, 0)]
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_cholesky_blocked_par_not_positive_definite() {
+        // Verify the parallel version also detects non-positive-definite matrices
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[2.0, 1.0]]);
+        let result = Cholesky::compute_blocked_par(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    // ---- Recursive cache-oblivious Cholesky tests ----
+
+    #[test]
+    fn test_cholesky_recursive_2x2() {
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 2.0], &[2.0, 5.0]]);
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Should be SPD");
+        let det = chol.determinant();
+        assert!((det - 16.0).abs() < 1e-10, "det = {}", det);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_3x3() {
+        // Classic test: A = [4 12 -16; 12 37 -43; -16 -43 98]
+        let a: Mat<f64> = Mat::from_rows(&[
+            &[4.0, 12.0, -16.0],
+            &[12.0, 37.0, -43.0],
+            &[-16.0, -43.0, 98.0],
+        ]);
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Should be SPD");
+        let l = chol.l_factor();
+
+        assert!((l[(0, 0)] - 2.0).abs() < 1e-10);
+        assert!((l[(1, 0)] - 6.0).abs() < 1e-10);
+        assert!((l[(1, 1)] - 1.0).abs() < 1e-10);
+        assert!((l[(2, 0)] + 8.0).abs() < 1e-10);
+        assert!((l[(2, 1)] - 5.0).abs() < 1e-10);
+        assert!((l[(2, 2)] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_identity() {
+        let a: Mat<f64> = Mat::eye(5);
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Identity is SPD");
+        let l = chol.l_factor();
+        for i in 0..5 {
+            for j in 0..5 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (l[(i, j)] - expected).abs() < 1e-10,
+                    "L[{},{}] = {}, expected {}",
+                    i,
+                    j,
+                    l[(i, j)],
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cholesky_recursive_solve() {
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 2.0], &[2.0, 5.0]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[8.0], &[11.0]]);
+
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Should be SPD");
+        let x = chol.solve(b.as_ref()).expect("Should solve");
+
+        let ax0 = 4.0 * x[(0, 0)] + 2.0 * x[(1, 0)];
+        let ax1 = 2.0 * x[(0, 0)] + 5.0 * x[(1, 0)];
+        assert!((ax0 - 8.0).abs() < 1e-10, "Ax[0] = {}", ax0);
+        assert!((ax1 - 11.0).abs() < 1e-10, "Ax[1] = {}", ax1);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_not_positive_definite() {
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[2.0, 1.0]]);
+        let result = Cholesky::compute_recursive(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cholesky_recursive_not_square() {
+        // 2x3 matrix
+        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
+        let result = Cholesky::compute_recursive(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cholesky_recursive_empty() {
+        let a: Mat<f64> = Mat::zeros(0, 0);
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Empty should work");
+        assert_eq!(chol.size(), 0);
+        assert!((chol.determinant() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_large() {
+        // 200x200 SPD matrix: A = B^T * B + n*I
+        let n = 200;
+        let mut b_mat: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                b_mat[(i, j)] = ((i * 17 + j * 31) % 100) as f64 / 100.0;
+            }
+        }
+
+        let mut spd: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += b_mat[(k, i)] * b_mat[(k, j)];
+                }
+                spd[(i, j)] = sum;
+                if i == j {
+                    spd[(i, j)] += n as f64;
+                }
+            }
+        }
+
+        // RHS: b = A * ones
+        let mut rhs: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += spd[(i, j)];
+            }
+            rhs[(i, 0)] = sum;
+        }
+
+        let chol = Cholesky::compute_recursive(spd.as_ref()).expect("Should be SPD");
+        let x = chol.solve(rhs.as_ref()).expect("Should solve");
+
+        for i in 0..n {
+            assert!(
+                (x[(i, 0)] - 1.0).abs() < 1e-6,
+                "x[{}] = {}, expected 1.0",
+                i,
+                x[(i, 0)],
+            );
+        }
+    }
+
+    #[test]
+    fn test_cholesky_recursive_vs_unblocked() {
+        // Compare recursive and unblocked on a tridiagonal SPD matrix
+        // (keeps determinant in a reasonable range)
+        let n = 150;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            a[(i, i)] = 4.0;
+            if i > 0 {
+                a[(i, i - 1)] = -1.0;
+                a[(i - 1, i)] = -1.0;
+            }
+        }
+
+        let chol_unblocked = Cholesky::compute(a.as_ref()).expect("Unblocked");
+        let chol_recursive = Cholesky::compute_recursive(a.as_ref()).expect("Recursive");
+
+        // Compare via log-determinant to avoid overflow
+        let log_det_unblocked = chol_unblocked.log_determinant();
+        let log_det_recursive = chol_recursive.log_determinant();
+
+        let abs_error = (log_det_unblocked - log_det_recursive).abs();
+        assert!(
+            abs_error < 1e-10,
+            "log_det_unblocked = {}, log_det_recursive = {}, abs_error = {}",
+            log_det_unblocked,
+            log_det_recursive,
+            abs_error,
+        );
+
+        // Compare L factors element-wise
+        let l_unblocked = chol_unblocked.l_factor();
+        let l_recursive = chol_recursive.l_factor();
+        for i in 0..n {
+            for j in 0..=i {
+                let diff = (l_unblocked[(i, j)] - l_recursive[(i, j)]).abs();
+                assert!(
+                    diff < 1e-10,
+                    "L[{},{}] differs: unblocked={}, recursive={}, diff={}",
+                    i,
+                    j,
+                    l_unblocked[(i, j)],
+                    l_recursive[(i, j)],
+                    diff,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cholesky_recursive_f32() {
+        let a: Mat<f32> = Mat::from_rows(&[&[4.0f32, 2.0], &[2.0, 5.0]]);
+        let b: Mat<f32> = Mat::from_rows(&[&[8.0f32], &[11.0]]);
+
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Should be SPD");
+        let x = chol.solve(b.as_ref()).expect("Should solve");
+
+        let ax0 = 4.0 * x[(0, 0)] + 2.0 * x[(1, 0)];
+        let ax1 = 2.0 * x[(0, 0)] + 5.0 * x[(1, 0)];
+        assert!((ax0 - 8.0).abs() < 1e-5, "Ax[0] = {}", ax0);
+        assert!((ax1 - 11.0).abs() < 1e-5, "Ax[1] = {}", ax1);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_inverse() {
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 2.0], &[2.0, 5.0]]);
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Should be SPD");
+        let a_inv = chol.inverse().expect("Should invert");
+
+        assert!((a_inv[(0, 0)] - 0.3125).abs() < 1e-10);
+        assert!((a_inv[(0, 1)] + 0.125).abs() < 1e-10);
+        assert!((a_inv[(1, 0)] + 0.125).abs() < 1e-10);
+        assert!((a_inv[(1, 1)] - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cholesky_recursive_tridiagonal_spd() {
+        // Tridiagonal SPD matrix: diagonal=2, off-diagonal=-1
+        let n = 130; // Larger than threshold (64) to exercise recursion
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            a[(i, i)] = 2.0;
+            if i > 0 {
+                a[(i, i - 1)] = -1.0;
+                a[(i - 1, i)] = -1.0;
+            }
+        }
+
+        let chol = Cholesky::compute_recursive(a.as_ref()).expect("Tridiagonal SPD");
+
+        // Verify L * L^T = A by checking a few entries
+        let l = chol.l_factor();
+        let l_t = l.transpose();
+
+        // Reconstruct A = L * L^T and check
+        for i in 0..n {
+            for j in 0..=i {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += l[(i, k)] * l_t[(k, j)];
+                }
+                let expected = a[(i, j)];
+                assert!(
+                    (sum - expected).abs() < 1e-8,
+                    "A[{},{}]: reconstructed={}, expected={}",
+                    i,
+                    j,
+                    sum,
+                    expected,
+                );
+            }
+        }
+    }
 }

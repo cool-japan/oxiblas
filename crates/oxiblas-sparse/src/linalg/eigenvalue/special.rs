@@ -73,7 +73,7 @@ impl<T: Real + FromPrimitive> IntervalEigenConfig<T> {
             low,
             high,
             max_iterations: 500,
-            tolerance: T::from_f64(1e-10).unwrap(),
+            tolerance: T::from_f64(1e-10).unwrap_or_else(T::zero),
             compute_eigenvectors: true,
             krylov_dimension: 50,
             full_reorthogonalization: true,
@@ -274,7 +274,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
         } else {
             // Use deterministic initial vector
             (0..n)
-                .map(|i| T::from_f64((i + 1) as f64 / (n + 1) as f64).unwrap())
+                .map(|i| T::from_f64((i + 1) as f64 / (n + 1) as f64).unwrap_or_else(T::zero))
                 .collect()
         };
 
@@ -284,7 +284,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             norm_sq = norm_sq + qi.clone() * qi.clone();
         }
         let norm = Real::sqrt(norm_sq);
-        if norm < T::from_f64(1e-15).unwrap() {
+        if norm < T::from_f64(1e-15).unwrap_or_else(T::zero) {
             return Err(EigenvalueError::Breakdown {
                 iteration: 0,
                 description: "Initial vector is too small".to_string(),
@@ -362,7 +362,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             return 0;
         }
 
-        let eps = T::from_f64(1e-30).unwrap();
+        let eps = T::from_f64(1e-30).unwrap_or_else(T::zero);
         let mut count = 0;
         let mut d = alpha[0].clone() - x.clone();
 
@@ -426,7 +426,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             let mut hi = self.config.high.clone();
 
             for _ in 0..max_iter {
-                let mid = (lo.clone() + hi.clone()) / T::from_f64(2.0).unwrap();
+                let mid = (lo.clone() + hi.clone()) / T::from_f64(2.0).unwrap_or_else(T::zero);
                 let c = self.sturm_count(alpha, beta, mid.clone());
 
                 if c <= target_index {
@@ -440,7 +440,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
                 }
             }
 
-            eigenvalues.push((lo + hi) / T::from_f64(2.0).unwrap());
+            eigenvalues.push((lo + hi) / T::from_f64(2.0).unwrap_or_else(T::zero));
         }
 
         // Sort eigenvalues in ascending order
@@ -489,7 +489,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
                 norm_sq = norm_sq + xi.clone() * xi.clone();
             }
             let norm = Real::sqrt(norm_sq);
-            if norm > T::from_f64(1e-15).unwrap() {
+            if norm > T::from_f64(1e-15).unwrap_or_else(T::zero) {
                 for xi in &mut x {
                     *xi = xi.clone() / norm.clone();
                 }
@@ -526,11 +526,11 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
 
         let max_iter = 100;
         let tol = self.config.tolerance.clone();
-        let eps = T::from_f64(1e-14).unwrap();
+        let eps = T::from_f64(1e-14).unwrap_or_else(T::zero);
 
         // Initial vector
         let mut y: Vec<T> = (0..n)
-            .map(|i| T::from_f64((i + 1) as f64).unwrap())
+            .map(|i| T::from_f64((i + 1) as f64).unwrap_or_else(T::zero))
             .collect();
 
         // Normalize
@@ -590,7 +590,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             return Ok(vec![]);
         }
 
-        let eps = T::from_f64(1e-14).unwrap();
+        let eps = T::from_f64(1e-14).unwrap_or_else(T::zero);
 
         // Forward elimination
         let mut c_prime = vec![T::zero(); n];
@@ -800,7 +800,7 @@ impl<T: Clone + Real + FromPrimitive> Default for PolynomialFilterConfig<T> {
             polynomial_degree: 20,
             krylov_dimension: 50,
             max_iterations: 100,
-            tolerance: T::from_f64(1e-8).unwrap(),
+            tolerance: T::from_f64(1e-8).unwrap_or_else(T::zero),
             compute_eigenvectors: true,
             full_reorthogonalization: true,
         }
@@ -988,7 +988,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .map(|vi| vi.clone() * vi.clone())
                     .fold(T::zero(), |acc, x| acc + x);
 
-                if vtv <= T::from_f64(1e-14).unwrap() {
+                if vtv <= T::from_f64(1e-14).unwrap_or_else(T::zero) {
                     continue;
                 }
 
@@ -1079,7 +1079,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
 
         // Run a few Lanczos iterations to estimate bounds
         let v0: Vec<T> = (0..n)
-            .map(|i| T::from_f64(((i * 7 + 13) % 101) as f64 / 100.0 - 0.5).unwrap())
+            .map(|i| T::from_f64(((i * 7 + 13) % 101) as f64 / 100.0 - 0.5).unwrap_or_else(T::zero))
             .collect();
         let norm: T = Real::sqrt(
             v0.iter()
@@ -1126,7 +1126,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .fold(T::zero(), |acc, x| acc + x),
             );
 
-            if beta_j <= T::from_f64(1e-14).unwrap() {
+            if beta_j <= T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 break;
             }
 
@@ -1156,7 +1156,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         }
 
         // Add some margin
-        let margin = (max_val.clone() - min_val.clone()) * T::from_f64(0.1).unwrap();
+        let margin = (max_val.clone() - min_val.clone()) * T::from_f64(0.1).unwrap_or_else(T::zero);
         Ok((min_val - margin.clone(), max_val + margin))
     }
 
@@ -1175,7 +1175,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         // For Chebyshev of first kind: T_n(x) = cos(n * acos(x))
         // We use Jackson damping for smoother filter
 
-        let two = T::from_f64(2.0).unwrap();
+        let two = T::from_f64(2.0).unwrap_or_else(T::zero);
         let pi_f64 = std::f64::consts::PI;
 
         // Compute Jackson damping coefficients using f64 for trig functions
@@ -1189,7 +1189,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             let cot_pi_n = (pi_f64 / n_f64).cos() / (pi_f64 / n_f64).sin();
 
             let g_k = ((n_f64 - k_f64) * cos_val + sin_val * cot_pi_n) / n_f64;
-            coeffs[k] = T::from_f64(g_k).unwrap();
+            coeffs[k] = T::from_f64(g_k).unwrap_or_else(T::zero);
         }
 
         // Scale coefficients for the spectral range
@@ -1210,7 +1210,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             // Enhance contribution near target center
             let arg = k_f64 * pi_f64 * ((target_center_f64 - center_f64) * scale_f64);
             let enhancement = arg.cos().abs() + 0.5;
-            *coeff = coeff.clone() * T::from_f64(enhancement).unwrap();
+            *coeff = coeff.clone() * T::from_f64(enhancement).unwrap_or_else(T::zero);
         }
 
         coeffs
@@ -1231,7 +1231,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         }
 
         // Scale and shift parameters
-        let two = T::from_f64(2.0).unwrap();
+        let two = T::from_f64(2.0).unwrap_or_else(T::zero);
         let e = (lambda_max.clone() - lambda_min.clone()) / two.clone();
         let c = (lambda_max.clone() + lambda_min.clone()) / two.clone();
 
@@ -1314,7 +1314,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                 .fold(T::zero(), |acc, x| acc + x),
         );
 
-        if norm <= T::from_f64(1e-14).unwrap() {
+        if norm <= T::from_f64(1e-14).unwrap_or_else(T::zero) {
             return Ok((vec![], vec![], vec![]));
         }
 
@@ -1370,7 +1370,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .fold(T::zero(), |acc, x| acc + x),
             );
 
-            if beta_j <= T::from_f64(1e-12).unwrap() {
+            if beta_j <= T::from_f64(1e-12).unwrap_or_else(T::zero) {
                 break;
             }
 
@@ -1427,7 +1427,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
 
         // Find all eigenvalues using bisection
         let mut eigenvalues = Vec::with_capacity(n);
-        let margin = (upper.clone() - lower.clone()) * T::from_f64(0.01).unwrap();
+        let margin = (upper.clone() - lower.clone()) * T::from_f64(0.01).unwrap_or_else(T::zero);
         let a = lower.clone() - margin.clone();
         let b = upper.clone() + margin;
 
@@ -1450,10 +1450,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         let mut low = a.clone();
         let mut high = b.clone();
 
-        let tol = T::from_f64(1e-14).unwrap();
+        let tol = T::from_f64(1e-14).unwrap_or_else(T::zero);
 
         for _ in 0..100 {
-            let mid = (low.clone() + high.clone()) / T::from_f64(2.0).unwrap();
+            let mid = (low.clone() + high.clone()) / T::from_f64(2.0).unwrap_or_else(T::zero);
 
             if Scalar::abs(high.clone() - low.clone()) < tol {
                 return mid;
@@ -1468,7 +1468,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             }
         }
 
-        (low + high) / T::from_f64(2.0).unwrap()
+        (low + high) / T::from_f64(2.0).unwrap_or_else(T::zero)
     }
 
     /// Count eigenvalues <= x using Sturm sequence.
@@ -1478,7 +1478,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             return 0;
         }
 
-        let eps = T::from_f64(1e-30).unwrap();
+        let eps = T::from_f64(1e-30).unwrap_or_else(T::zero);
         let mut count = 0;
         let mut d = alpha[0].clone() - x.clone();
 
@@ -1516,10 +1516,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
 
         // Start with random vector
         let mut v: Vec<T> = (0..n)
-            .map(|i| T::from_f64(((i * 13 + 7) % 97) as f64 / 97.0 - 0.5).unwrap())
+            .map(|i| T::from_f64(((i * 13 + 7) % 97) as f64 / 97.0 - 0.5).unwrap_or_else(T::zero))
             .collect();
 
-        let shift = T::from_f64(1e-10).unwrap();
+        let shift = T::from_f64(1e-10).unwrap_or_else(T::zero);
 
         for _ in 0..5 {
             // Solve (T - lambda*I) * w = v
@@ -1532,7 +1532,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .fold(T::zero(), |acc, x| acc + x),
             );
 
-            if norm > T::from_f64(1e-14).unwrap() {
+            if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 v = w.iter().map(|x| x.clone() / norm.clone()).collect();
             } else {
                 break;
@@ -1565,7 +1565,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
 
         // Forward sweep
         let diag_0 = alpha[0].clone() - lambda_shift.clone();
-        let eps = T::from_f64(1e-14).unwrap();
+        let eps = T::from_f64(1e-14).unwrap_or_else(T::zero);
         let diag_0_safe = if Scalar::abs(diag_0.clone()) < eps {
             eps.clone()
         } else {
@@ -1626,7 +1626,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                         (((i + j * n) * 1103515245 + 12345) % 2147483648) as f64 / 2147483648.0
                             - 0.5,
                     )
-                    .unwrap()
+                    .unwrap_or_else(T::zero)
                 })
                 .collect();
 
@@ -1649,7 +1649,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .fold(T::zero(), |acc, x| acc + x),
             );
 
-            if norm > T::from_f64(1e-14).unwrap() {
+            if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 v = v.iter().map(|x| x.clone() / norm.clone()).collect();
                 vectors.push(v);
             }
@@ -1684,7 +1684,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                     .fold(T::zero(), |acc, x| acc + x),
             );
 
-            if norm > T::from_f64(1e-14).unwrap() {
+            if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
                 u = u.iter().map(|x| x.clone() / norm.clone()).collect();
                 result.push(u);
             }
@@ -1718,7 +1718,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                 .fold(T::zero(), |acc, x| acc + x),
         );
 
-        if norm > T::from_f64(1e-14).unwrap() {
+        if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
             result = result.iter().map(|x| x.clone() / norm.clone()).collect();
         }
 

@@ -342,7 +342,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> BlockLanczos<T>
             // Approximate residual norm using the last block
             let residual = if *idx < ritz_vectors.len() && !b_blocks.is_empty() {
                 // Residual ~ ||B_m * s_last|| where s_last is the last p components
-                let last_b = b_blocks.last().unwrap();
+                let last_b = b_blocks.last().expect("collection should be non-empty");
                 let y = &ritz_vectors[*idx];
                 let total_dim = actual_blocks * p;
 

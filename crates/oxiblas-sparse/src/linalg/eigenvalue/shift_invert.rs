@@ -403,7 +403,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> ShiftInvertLanc
         for &idx in &selected_indices {
             let residual = if idx < ritz_vectors.len() && actual_dim > 0 && !beta.is_empty() {
                 let s_last = ritz_vectors[idx][actual_dim - 1].clone();
-                Scalar::abs(beta.last().unwrap().clone() * s_last)
+                Scalar::abs(beta.last().expect("collection should be non-empty").clone() * s_last)
             } else {
                 T::zero()
             };

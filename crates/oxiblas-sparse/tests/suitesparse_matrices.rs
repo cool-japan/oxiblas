@@ -103,7 +103,7 @@ pub fn laplacian_3d_7pt(nx: usize, ny: usize, nz: usize) -> CsrMatrix<f64> {
 ///
 /// Uses the formula A = B^T * B + λI where B is random and λ ensures positive definiteness.
 pub fn random_spd_matrix(n: usize, density: f64, lambda: f64) -> CsrMatrix<f64> {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
 
     let nnz_per_row = (density * n as f64) as usize;

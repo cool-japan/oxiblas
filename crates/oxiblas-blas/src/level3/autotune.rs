@@ -354,19 +354,19 @@ pub fn compute_blocking(
     // - L1: 80% for B micro-panel (critical path, keep hot)
     // - L2: Variable based on size (smaller caches need higher utilization)
     // - L3: 60% for B macro-panel (largest, less pressure)
-    let l1_target = (cache.l1d * 4 / 5) as usize; // 80%
+    let l1_target = cache.l1d * 4 / 5; // 80%
 
     // L2 target: Use higher percentage for smaller caches to maximize utilization
     // For 256KB L2, we want to use 75% to ensure packed A fits well
     let l2_target = if cache.l2 <= 256 * 1024 {
-        (cache.l2 * 3 / 4) as usize // 75% for small L2 (256KB or less)
+        cache.l2 * 3 / 4 // 75% for small L2 (256KB or less)
     } else if cache.l2 <= 512 * 1024 {
-        (cache.l2 * 7 / 10) as usize // 70% for medium-small L2
+        cache.l2 * 7 / 10 // 70% for medium-small L2
     } else {
-        (cache.l2 * 7 / 10) as usize // 70% for larger L2
+        cache.l2 * 7 / 10 // 70% for larger L2
     };
 
-    let l3_target = (cache.l3 * 6 / 10) as usize; // 60%
+    let l3_target = cache.l3 * 6 / 10; // 60%
 
     // Compute KC: B micro-panel (KC × NR) should fit in L1
     // KC × NR × elem_size ≤ L1_target

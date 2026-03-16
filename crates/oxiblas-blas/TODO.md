@@ -192,3 +192,10 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] Winograd algorithm for GEMM (reduces multiplications) - implemented in level3
 - [x] Cache-oblivious GEMM algorithm option - recursive divide-and-conquer
 - [x] BLAS-like extensions (batched operations with variable strides) - `gemm_batched`, `gemm_strided_batched`, `axpy_batched`, `gemv_batched` + parallel (v0.2.0)
+
+---
+
+## Version 0.2.1 (2026-03-16)
+
+- **780 lib tests + 68 doctests passing, 0 stubs**
+- All BLAS Level 1/2/3, tensor, CBLAS, and extended operations fully implemented and tested

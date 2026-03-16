@@ -56,7 +56,7 @@ Matrix types and storage formats for OxiBLAS.
 
 ## Testing
 
-- [x] Unit tests (~129 passing)
+- [x] Unit tests (~187 passing)
 - [x] Doc tests
 - [x] Property-based tests (quickcheck) - 29 tests
 - [x] Integration tests (blas_compat_tests - 16 tests, property_tests - 29 tests)
@@ -67,3 +67,9 @@ Matrix types and storage formats for OxiBLAS.
 
 - [x] Copy-on-write semantics - Implemented in cow.rs
 - [x] Arena-based allocation for temporary matrices - Arena<ALIGN> in oxiblas-core/memory.rs with Cell-based interior mutability, ArenaVec, save/restore, with_blas_arena thread-local access
+
+## Status (v0.2.1, 2026-03-16)
+
+- 187 lib tests passing
+- 12 doctests passing
+- 0 todo!() stubs remaining

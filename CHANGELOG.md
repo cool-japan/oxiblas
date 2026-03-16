@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-03-16
+
+### Fixed
+- Fixed compilation error in sparse eigenvalue test imports
+- Fixed unnecessary type casts in BLAS level 3 autotune module
+
+### Changed
+- Updated dependencies to latest versions
+
 ## [0.2.0] - 2026-03-06
 
 ### Added
@@ -266,7 +275,8 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 
 ---
 
-[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/cool-japan/oxiblas/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxiblas/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxiblas/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/cool-japan/oxiblas/compare/v0.1.0...v0.1.1

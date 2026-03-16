@@ -68,7 +68,7 @@
 
 ```toml
 [dependencies]
-oxiblas-lapack = "0.1"
+oxiblas-lapack = "0.2"
 ```
 
 ## Usage Examples

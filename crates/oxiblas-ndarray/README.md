@@ -21,7 +21,7 @@
 
 ```toml
 [dependencies]
-oxiblas-ndarray = "0.1"
+oxiblas-ndarray = "0.2"
 ```
 
 ## Usage

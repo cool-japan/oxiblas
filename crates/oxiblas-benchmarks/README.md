@@ -502,7 +502,7 @@ jobs:
 
 ## Performance Goals
 
-### macOS (Apple M3) - Updated 2025-12-28
+### macOS (Apple M3) - Updated 2026-03-16
 
 | Category | Current vs OpenBLAS | Status | Notes |
 |----------|---------------------|--------|-------|
@@ -520,12 +520,12 @@ jobs:
 | **DOT (f64) 1M** | **167%** | 🟢 **Outstanding** | **67% faster!** |
 | AXPY (f64) | 64% | 🟡 Good | Optimization opportunity |
 
-**Breakthrough Achievement (2025-12-28):** OxiBLAS **matches or exceeds OpenBLAS** on Apple M3!
+**Breakthrough Achievement:** OxiBLAS **matches or exceeds OpenBLAS** on Apple M3!
 - f64 GEMM: **97-101% of OpenBLAS** (competitive across all sizes)
 - f32 GEMM: **101-172% of OpenBLAS** (dominates f32 operations)
 - DOT product: **165-167% of OpenBLAS** (significantly faster)
 
-### Linux x86_64 (Intel Xeon E5-2623 v4) - Updated 2025-12-27
+### Linux x86_64 (Intel Xeon E5-2623 v4) - Updated 2026-03-16
 
 | Category | Current vs OpenBLAS | Status | Notes |
 |----------|---------------------|--------|-------|
@@ -543,7 +543,7 @@ jobs:
 - **13-20% performance improvement** after Linux-specific cache tuning
 - **Fine-tuned blocking parameters:** KC=192, MC=128 (optimized for 256KB L2 cache)
 - **Platform-aware cache detection:** Linux sysfs, macOS sysctl, x86_64 CPUID fallback
-- **All 2833 tests passing** with zero warnings
+- **All tests passing** with zero warnings
 - **OxiBLAS outperforms OpenBLAS** on very large f64 matrices (1024×1024) and small f32 matrices (64×64)
 
 **Legend:**

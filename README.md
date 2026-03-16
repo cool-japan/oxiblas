@@ -96,7 +96,7 @@ let a = Mat::from_rows(&[
 
 let lu = Lu::compute(a.as_ref()).expect("Matrix is not singular");
 let det = lu.determinant();
-assert!((det - 5.0).abs() < 1e-10); // det = 2*3 - 1*1 = 5
+assert!((det - 5.0_f64).abs() < 1e-10); // det = 2*3 - 1*1 = 5
 ```
 
 ### SVD
@@ -439,7 +439,7 @@ OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD
 - **Fine-tuned blocking parameters:** KC=192, MC=128 (optimized for 256KB L2 cache)
 - **Increased prefetch distance:** 12 iterations (optimized for Intel Xeon E5-2600 memory latency)
 - **Platform-aware cache detection:** Linux sysfs, macOS sysctl, x86_64 CPUID fallback
-- **All 2833 tests passing** with zero warnings
+- **All 2,922 tests passing** with zero warnings
 
 ### macOS AArch64 Performance (Apple M3)
 
@@ -691,11 +691,11 @@ gemm_strided_batched(1.0, &a, stride_a, &b, stride_b, 0.0, &mut c, stride_c, bat
 
 ## Project Status
 
-**Version:** 0.2.0 (2026-03-06)
+**Version:** 0.2.1 (2026-03-16)
 
-- **Lines of Code:** ~168,794 Rust (356 files)
-- **Documentation:** ~15,034 lines of comments, 5 comprehensive examples
-- **Tests:** 2,811 passing lib tests + 195 doctests (100% success rate)
+- **Lines of Code:** ~223,935 Rust (371 files)
+- **Documentation:** ~16,163 lines of comments, 12 comprehensive examples
+- **Tests:** 2,922 passing lib tests + 287 doctests (100% success rate)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ Extensive LAPACK (LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg)
@@ -732,6 +732,21 @@ OxiBLAS is part of the SciRS2 scientific computing ecosystem:
 - [TrustformeRS](https://github.com/cool-japan/trustformers) - Transformers
 - [QuantRS2](https://github.com/cool-japan/quantrs) - Quantum computing framework
 - [OxiRS](https://github.com/cool-japan/oxirs) - Semantic Web platform (SPARQL 1.2, GraphQL, Industrial Digital Twin, AI-augmented reasoning)
+
+## Sponsorship
+
+OxiBLAS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+
+If you find OxiBLAS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
+
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red?logo=github)](https://github.com/sponsors/cool-japan)
+
+**[https://github.com/sponsors/cool-japan](https://github.com/sponsors/cool-japan)**
+
+Your sponsorship helps us:
+- Maintain and improve the COOLJAPAN ecosystem
+- Keep the entire ecosystem (OxiBLAS, OxiFFT, SciRS2, etc.) 100% Pure Rust
+- Provide long-term support and security updates
 
 ## License
 

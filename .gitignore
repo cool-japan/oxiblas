@@ -12,6 +12,9 @@ Cargo.lock
 # IDE and editor
 .idea/
 .vscode/
+
+# Claude AI config
+**/.claude/
 *.swp
 *.swo
 .project
@@ -25,3 +28,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Rustc ICE dumps
+rustc-ice-*.txt

@@ -98,7 +98,7 @@
 
 ```toml
 [dependencies]
-oxiblas-sparse = "0.1"
+oxiblas-sparse = "0.2"
 ```
 
 ## Usage Examples

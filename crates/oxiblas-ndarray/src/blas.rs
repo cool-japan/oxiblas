@@ -331,7 +331,7 @@ pub fn gemv_ndarray<T: Field + Clone>(
             beta,
             &mut y_vec,
         );
-        for (yi, val) in y.iter_mut().zip(y_vec.into_iter()) {
+        for (yi, val) in y.iter_mut().zip(y_vec) {
             *yi = val;
         }
     }

@@ -28,7 +28,7 @@ sparse = ["dep:oxiblas-sparse"]
 
 [dev-dependencies]
 criterion.workspace = true
-faer = "0.23"
+faer = "0.24"
 
 [[bench]]
 name = "ndarray_blas"

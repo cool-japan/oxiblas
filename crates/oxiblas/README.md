@@ -24,10 +24,10 @@
 
 ```toml
 [dependencies]
-oxiblas = "0.1"
+oxiblas = "0.2"
 
 # With all features
-oxiblas = { version = "0.1", features = ["full"] }
+oxiblas = { version = "0.2", features = ["full"] }
 ```
 
 ## Usage
@@ -129,7 +129,7 @@ The `oxiblas` crate re-exports from these sub-crates:
 | `oxiblas::lapack` | `oxiblas-lapack` | LAPACK decompositions |
 | `oxiblas::sparse` | `oxiblas-sparse` | Sparse matrices and solvers |
 | `oxiblas::ndarray` | `oxiblas-ndarray` | ndarray integration (optional) |
-| | `oxiblas-ffi` | **RETIRED** (v0.2.0) - C FFI bindings |
+| | `oxiblas-ffi` | **RETIRED** (v0.2.1) - C FFI bindings |
 
 ## Prelude
 
@@ -164,19 +164,19 @@ use oxiblas::prelude::*;
 
 ```toml
 # Minimal (dense matrices only)
-oxiblas = "0.1"
+oxiblas = "0.2"
 
 # With parallelization
-oxiblas = { version = "0.1", features = ["parallel"] }
+oxiblas = { version = "0.2", features = ["parallel"] }
 
 # With extended precision
-oxiblas = { version = "0.1", features = ["f16", "f128"] }
+oxiblas = { version = "0.2", features = ["f16", "f128"] }
 
 # With ndarray support
-oxiblas = { version = "0.1", features = ["ndarray"] }
+oxiblas = { version = "0.2", features = ["ndarray"] }
 
 # All features
-oxiblas = { version = "0.1", features = ["full"] }
+oxiblas = { version = "0.2", features = ["full"] }
 ```
 
 ## Examples
@@ -272,10 +272,10 @@ Contributions are welcome! Please see [CONTRIBUTING.md](../../CONTRIBUTING.md) f
 If you use OxiBLAS in your research, please cite:
 
 ```bibtex
-@software{oxiblas2025,
+@software{oxiblas2026,
   author = {OxiBLAS Contributors},
   title = {OxiBLAS: Pure Rust BLAS/LAPACK Implementation},
-  year = {2025},
+  year = {2026},
   url = {https://github.com/cool-japan/oxiblas}
 }
 ```

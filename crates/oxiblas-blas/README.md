@@ -29,10 +29,10 @@
 
 ```toml
 [dependencies]
-oxiblas-blas = "0.1"
+oxiblas-blas = "0.2"
 
 # With parallelization
-oxiblas-blas = { version = "0.1", features = ["parallel"] }
+oxiblas-blas = { version = "0.2", features = ["parallel"] }
 ```
 
 ## BLAS Level 1 (Vector-Vector)

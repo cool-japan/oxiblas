@@ -228,3 +228,10 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Edge cases (singular, ill-conditioned) - test_ill_conditioned_matrix, test_1x1_matrix
 - [x] Complex number tests - error_bounds::complex_accuracy_tests module
 - [x] Large matrix tests - test_large_matrix_accuracy (50x50)
+
+---
+
+## Version 0.2.1 (2026-03-16)
+
+- **971 lib tests + 136 doctests passing, 0 stubs**
+- All LAPACK factorizations, solvers, eigenvalue problems, SVD, matrix functions, and complex support fully implemented and tested

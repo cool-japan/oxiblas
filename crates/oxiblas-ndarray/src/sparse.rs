@@ -222,7 +222,7 @@ pub fn spmv_full_ndarray<T: Scalar + Clone + Field>(
     } else {
         let mut y_vec: Vec<T> = y.iter().cloned().collect();
         oxiblas_sparse::ops::spmv(alpha, a, &x_vec, beta, &mut y_vec);
-        for (yi, val) in y.iter_mut().zip(y_vec.into_iter()) {
+        for (yi, val) in y.iter_mut().zip(y_vec) {
             *yi = val;
         }
     }

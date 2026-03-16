@@ -2,11 +2,11 @@
 
 Production-grade pure Rust BLAS/LAPACK implementation.
 
-## Project Status (v0.2.0 Release - Updated 2026-03-06)
+## Project Status (v0.2.1 Release - Updated 2026-03-16)
 
-- **Tests:** 2,922 tests passing (100% success rate) + 195 doctests
-- **Code:** ~169,900 lines of Rust across 359 files
-- **Documentation:** ~15,302 lines of comments, 5 comprehensive examples
+- **Tests:** 2,922 tests passing (100% success rate) + 287 doctests
+- **Code:** ~223,935 lines of Rust across 371 files
+- **Documentation:** ~16,163 lines of comments, 12 comprehensive examples
 - **Benchmarks:** 14 criterion suites (+ size_variations, precision_bench), 121+ benchmarks
 - **Coverage:** Full BLAS/LAPACK feature parity + modern extensions + sparse operations
 - **no_std:** oxiblas-core and oxiblas-matrix support `#![no_std]` with alloc

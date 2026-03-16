@@ -46,19 +46,19 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiblas-matrix = "0.1"
+oxiblas-matrix = "0.2"
 
 # With serialization
-oxiblas-matrix = { version = "0.1", features = ["serde"] }
+oxiblas-matrix = { version = "0.2", features = ["serde"] }
 
 # With memory-mapped matrices
-oxiblas-matrix = { version = "0.1", features = ["mmap"] }
+oxiblas-matrix = { version = "0.2", features = ["mmap"] }
 
 # With nalgebra interop
-oxiblas-matrix = { version = "0.1", features = ["nalgebra"] }
+oxiblas-matrix = { version = "0.2", features = ["nalgebra"] }
 
 # All features
-oxiblas-matrix = { version = "0.1", features = ["serde", "mmap", "nalgebra"] }
+oxiblas-matrix = { version = "0.2", features = ["serde", "mmap", "nalgebra"] }
 ```
 
 ## Usage

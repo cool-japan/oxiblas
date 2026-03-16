@@ -76,16 +76,16 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-oxiblas-core = "0.1"
+oxiblas-core = "0.2"
 
 # With extended precision
-oxiblas-core = { version = "0.1", features = ["f16", "f128"] }
+oxiblas-core = { version = "0.2", features = ["f16", "f128"] }
 
 # With parallelization
-oxiblas-core = { version = "0.1", features = ["parallel"] }
+oxiblas-core = { version = "0.2", features = ["parallel"] }
 
 # All features
-oxiblas-core = { version = "0.1", features = ["f16", "f128", "parallel"] }
+oxiblas-core = { version = "0.2", features = ["f16", "f128", "parallel"] }
 ```
 
 ## Usage

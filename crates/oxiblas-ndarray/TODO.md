@@ -114,7 +114,7 @@ Integration with the ndarray crate.
 
 ## Testing
 
-- [x] Unit tests (~94 passing)
+- [x] Unit tests (119 passing)
 - [x] Doc tests
 - [x] Conversion roundtrip tests
 - [x] Numerical accuracy tests

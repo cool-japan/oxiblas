@@ -191,22 +191,74 @@ impl MemStack {
 
     /// Creates a sub-stack with the remaining memory.
     ///
-    /// This is useful for recursive algorithms that need to pass
-    /// scratch space to sub-operations.
+    /// This is useful for recursive algorithms that need to pass scratch space
+    /// to sub-operations. The parent stack's remaining capacity is marked as
+    /// consumed; the sub-stack receives a freshly-allocated buffer of the same
+    /// size so that the two stacks can coexist without aliasing.
     ///
-    /// Note: This is a placeholder implementation. A full implementation
-    /// would use raw pointers to share the buffer without ownership transfer.
+    /// # Ownership model
+    ///
+    /// Because `MemStack` owns its buffer through `AlignedVec`, true zero-copy
+    /// buffer sharing requires lifetime parameters (API-breaking). The chosen
+    /// approach trades a single allocation for correct, safe semantics while
+    /// keeping the current owned-buffer API.
     pub fn make_sub_stack(&mut self) -> MemStack {
-        let _remaining = self.remaining();
-        let _ptr = unsafe { self.buffer.as_mut_ptr().add(self.offset) };
+        let remaining = self.remaining();
 
-        // Mark all remaining as used
+        // Mark parent's remaining capacity as consumed so the parent cannot
+        // hand out overlapping allocations.
         self.offset = self.buffer.len();
 
-        // TODO: Implement proper sub-stack that shares buffer
         MemStack {
-            buffer: AlignedVec::new(),
+            buffer: AlignedVec::zeros(remaining),
             offset: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_sub_stack_receives_remaining_capacity() {
+        // Parent stack with 256 bytes; allocate 64 bytes, then make a sub-stack.
+        // The sub-stack should receive the remaining 192 bytes.
+        let mut parent = MemStack::with_size(256);
+        let _ = parent.alloc::<u8>(64);
+        assert_eq!(parent.remaining(), 192);
+
+        let sub = parent.make_sub_stack();
+
+        // Parent is now exhausted.
+        assert_eq!(parent.remaining(), 0);
+        // Sub-stack has the capacity that the parent had left.
+        assert_eq!(sub.remaining(), 192);
+    }
+
+    #[test]
+    fn test_make_sub_stack_no_aliasing() {
+        // Allocations on the sub-stack must not overlap with those on the parent.
+        let mut parent = MemStack::with_size(128);
+        let parent_slice: *mut u8 = parent.alloc::<u8>(32).as_mut_ptr() as *mut u8;
+
+        let mut sub = parent.make_sub_stack();
+        let sub_slice: *mut u8 = sub.alloc::<u8>(16).as_mut_ptr() as *mut u8;
+
+        // The two regions must not overlap.  We check this by verifying the
+        // pointers are distinct — they live in separate AlignedVecs.
+        assert_ne!(parent_slice as usize, sub_slice as usize,
+            "parent and sub-stack allocations must not alias");
+    }
+
+    #[test]
+    fn test_make_sub_stack_from_full_parent() {
+        // If the parent is already full, the sub-stack gets zero capacity.
+        let mut parent = MemStack::with_size(64);
+        let _ = parent.alloc::<u8>(64);
+        assert_eq!(parent.remaining(), 0);
+
+        let sub = parent.make_sub_stack();
+        assert_eq!(sub.remaining(), 0);
     }
 }

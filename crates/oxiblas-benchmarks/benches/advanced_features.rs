@@ -9,8 +9,6 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-// TODO: Re-enable when Complex types implement GemmKernel
-#[cfg(any())] // Never compiles - prevents unused import warning
 use num_complex::Complex64;
 use oxiblas_blas::level1::parallel::{axpy_par, dot_par, nrm2_par, scal_par};
 use oxiblas_blas::level1::{axpy, dot, nrm2, scal};
@@ -384,8 +382,6 @@ fn bench_trsm_f64(c: &mut Criterion) {
     group.finish();
 }
 
-// TODO: Re-enable when Complex types implement GemmKernel
-#[cfg(any())] // Never compiles - prevents type errors with Complex TRSM
 fn bench_trsm_complex(c: &mut Criterion) {
     let mut group = c.benchmark_group("trsm_complex");
 
@@ -482,7 +478,7 @@ criterion_group!(
     bench_asymmetric_inner_product,
     // TRSM
     bench_trsm_f64,
-    // bench_trsm_complex, // TODO: Complex types don't implement GemmKernel yet
+    bench_trsm_complex,
     // Scaling
     bench_gemm_scaling,
 );

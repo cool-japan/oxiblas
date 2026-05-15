@@ -8,6 +8,7 @@
 // We gate these with runtime CPU feature detection
 #![allow(clippy::incompatible_msrv)]
 
+use num_complex::{Complex32, Complex64};
 use oxiblas_core::scalar::Field;
 
 // Pull in SSE4.2 kernels (x86-64 only).
@@ -1436,6 +1437,149 @@ unsafe fn micro_kernel_f32_neon(
     scale_and_store!(7, acc7_lo, acc7_hi);
 }
 
+// =============================================================================
+// Complex64 micro-kernel
+//
+// Complex GEMM uses the standard (4-mul) approach in the micro-kernel because
+// the MR×NR tile is small and the 3M method's benefit only appears when
+// packing overhead is amortized over large matrices.  Callers that need 3M
+// performance should use `gemm3m_c64` directly.
+// =============================================================================
+
+impl GemmKernel for Complex64 {
+    fn micro_kernel_shape() -> MicroKernelShape {
+        // 2×2 tile: each element is 16 bytes, so a 2×2 tile is 64 bytes —
+        // fits easily in registers and keeps the packing logic simple.
+        MicroKernelShape { mr: 2, nr: 2 }
+    }
+
+    #[inline]
+    unsafe fn micro_kernel(
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) {
+        micro_kernel_c64_scalar(k, alpha, a, b, beta, c, c_stride);
+    }
+}
+
+/// Scalar micro-kernel for Complex64 (2×2 tile).
+///
+/// Computes C = alpha * A * B + beta * C for a 2-row × 2-column tile.
+/// A is a (k × 2) packed column-major panel, B is a (k × 2) packed panel.
+#[inline]
+unsafe fn micro_kernel_c64_scalar(
+    k: usize,
+    alpha: Complex64,
+    a: *const Complex64,
+    b: *const Complex64,
+    beta: Complex64,
+    c: *mut Complex64,
+    c_stride: usize,
+) {
+    const MR: usize = 2;
+    const NR: usize = 2;
+
+    let zero = Complex64::new(0.0, 0.0);
+    let mut acc = [[zero; NR]; MR];
+
+    for p in 0..k {
+        let a_ptr = a.add(p * MR);
+        let b_ptr = b.add(p * NR);
+
+        for i in 0..MR {
+            let a_val = *a_ptr.add(i);
+            for j in 0..NR {
+                let b_val = *b_ptr.add(j);
+                // Standard complex multiply-accumulate:
+                // (ar + ai·i)(br + bi·i) = (ar·br - ai·bi) + (ar·bi + ai·br)·i
+                acc[i][j] = Complex64::new(
+                    acc[i][j].re + a_val.re * b_val.re - a_val.im * b_val.im,
+                    acc[i][j].im + a_val.re * b_val.im + a_val.im * b_val.re,
+                );
+            }
+        }
+    }
+
+    // Store: C[i,j] = alpha * acc[i][j] + beta * C[i,j]
+    for j in 0..NR {
+        for i in 0..MR {
+            let c_ptr = c.add(i + j * c_stride);
+            let c_val = *c_ptr;
+            *c_ptr = alpha * acc[i][j] + beta * c_val;
+        }
+    }
+}
+
+// =============================================================================
+// Complex32 micro-kernel
+// =============================================================================
+
+impl GemmKernel for Complex32 {
+    fn micro_kernel_shape() -> MicroKernelShape {
+        MicroKernelShape { mr: 2, nr: 2 }
+    }
+
+    #[inline]
+    unsafe fn micro_kernel(
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) {
+        micro_kernel_c32_scalar(k, alpha, a, b, beta, c, c_stride);
+    }
+}
+
+/// Scalar micro-kernel for Complex32 (2×2 tile).
+#[inline]
+unsafe fn micro_kernel_c32_scalar(
+    k: usize,
+    alpha: Complex32,
+    a: *const Complex32,
+    b: *const Complex32,
+    beta: Complex32,
+    c: *mut Complex32,
+    c_stride: usize,
+) {
+    const MR: usize = 2;
+    const NR: usize = 2;
+
+    let zero = Complex32::new(0.0, 0.0);
+    let mut acc = [[zero; NR]; MR];
+
+    for p in 0..k {
+        let a_ptr = a.add(p * MR);
+        let b_ptr = b.add(p * NR);
+
+        for i in 0..MR {
+            let a_val = *a_ptr.add(i);
+            for j in 0..NR {
+                let b_val = *b_ptr.add(j);
+                acc[i][j] = Complex32::new(
+                    acc[i][j].re + a_val.re * b_val.re - a_val.im * b_val.im,
+                    acc[i][j].im + a_val.re * b_val.im + a_val.im * b_val.re,
+                );
+            }
+        }
+    }
+
+    for j in 0..NR {
+        for i in 0..MR {
+            let c_ptr = c.add(i + j * c_stride);
+            let c_val = *c_ptr;
+            *c_ptr = alpha * acc[i][j] + beta * c_val;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,5 +1595,170 @@ mod tests {
         println!("f32 micro-kernel shape: {:?}", shape_f32);
         assert!(shape_f32.mr >= 4);
         assert!(shape_f32.nr >= 4);
+    }
+
+    #[test]
+    fn test_micro_kernel_shape_complex() {
+        let shape_c64 = Complex64::micro_kernel_shape();
+        assert_eq!(shape_c64.mr, 2);
+        assert_eq!(shape_c64.nr, 2);
+
+        let shape_c32 = Complex32::micro_kernel_shape();
+        assert_eq!(shape_c32.mr, 2);
+        assert_eq!(shape_c32.nr, 2);
+    }
+
+    /// Verify the Complex64 micro-kernel computes the correct product.
+    ///
+    /// A = [[1+2i, 3+4i],  (k=2, mr=2 column panel after packing: [1+2i, 5+6i, 3+4i, 7+8i])
+    ///      [5+6i, 7+8i]]
+    /// B = [[1+0i, 0+1i],  (k=2, nr=2 row panel: [1+0i, 0+1i, 2+0i, 0+2i])
+    ///      [2+0i, 0+2i]]
+    ///
+    /// Row 0 of A * B:
+    ///   C[0,0] = (1+2i)(1+0i) + (3+4i)(2+0i) = (1+2i) + (6+8i) = 7+10i
+    ///   C[0,1] = (1+2i)(0+1i) + (3+4i)(0+2i) = (-2+1i) + (-8+6i) = -10+7i
+    /// Row 1 of A * B:
+    ///   C[1,0] = (5+6i)(1+0i) + (7+8i)(2+0i) = (5+6i) + (14+16i) = 19+22i
+    ///   C[1,1] = (5+6i)(0+1i) + (7+8i)(0+2i) = (-6+5i) + (-16+14i) = -22+19i
+    #[test]
+    fn test_micro_kernel_c64_correctness() {
+        use num_complex::Complex64;
+
+        // Packed A panel: k=2, mr=2, column-major in the tile
+        // a[p*MR + i] for p in 0..k, i in 0..MR
+        // p=0: a[0]=1+2i (row 0), a[1]=5+6i (row 1)
+        // p=1: a[2]=3+4i (row 0), a[3]=7+8i (row 1)
+        let a = [
+            Complex64::new(1.0, 2.0),
+            Complex64::new(5.0, 6.0),
+            Complex64::new(3.0, 4.0),
+            Complex64::new(7.0, 8.0),
+        ];
+
+        // Packed B panel: k=2, nr=2
+        // b[p*NR + j] for p in 0..k, j in 0..NR
+        // p=0: b[0]=1+0i (col 0), b[1]=0+1i (col 1)
+        // p=1: b[2]=2+0i (col 0), b[3]=0+2i (col 1)
+        let b = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 1.0),
+            Complex64::new(2.0, 0.0),
+            Complex64::new(0.0, 2.0),
+        ];
+
+        // C is a 2×2 column-major matrix stored with stride 2
+        let zero = Complex64::new(0.0, 0.0);
+        let alpha = Complex64::new(1.0, 0.0);
+        let beta = Complex64::new(0.0, 0.0);
+
+        let mut c = [zero; 4]; // c[i + j*2]
+
+        unsafe {
+            micro_kernel_c64_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
+        }
+
+        // c[0+0*2]=c[0] = C[0,0] = 7+10i
+        // c[1+0*2]=c[1] = C[1,0] = 19+22i
+        // c[0+1*2]=c[2] = C[0,1] = -10+7i
+        // c[1+1*2]=c[3] = C[1,1] = -22+19i
+        let tol = 1e-12;
+        assert!((c[0].re - 7.0).abs() < tol, "C[0,0].re got {}", c[0].re);
+        assert!((c[0].im - 10.0).abs() < tol, "C[0,0].im got {}", c[0].im);
+        assert!((c[1].re - 19.0).abs() < tol, "C[1,0].re got {}", c[1].re);
+        assert!((c[1].im - 22.0).abs() < tol, "C[1,0].im got {}", c[1].im);
+        assert!((c[2].re - (-10.0)).abs() < tol, "C[0,1].re got {}", c[2].re);
+        assert!((c[2].im - 7.0).abs() < tol, "C[0,1].im got {}", c[2].im);
+        assert!((c[3].re - (-22.0)).abs() < tol, "C[1,1].re got {}", c[3].re);
+        assert!((c[3].im - 19.0).abs() < tol, "C[1,1].im got {}", c[3].im);
+    }
+
+    #[test]
+    fn test_micro_kernel_c64_alpha_beta_scaling() {
+        use num_complex::Complex64;
+
+        // Test alpha scaling: 2×2 with identity-like A and a scalar B
+        // a[0,0] = 1+0i, all other a = 0
+        // b[0,0] = 5+3i, all other b = 0
+        // acc[0][0] = (1+0i)*(5+3i) = 5+3i
+        // With alpha=2+0i, beta=0: C[0,0] = 2*(5+3i) = 10+6i
+        let a2 = [
+            Complex64::new(1.0, 0.0), // p=0, row 0
+            Complex64::new(0.0, 0.0), // p=0, row 1
+            Complex64::new(0.0, 0.0), // p=1, row 0
+            Complex64::new(0.0, 0.0), // p=1, row 1
+        ];
+        let b2 = [
+            Complex64::new(5.0, 3.0), // p=0, col 0
+            Complex64::new(0.0, 0.0), // p=0, col 1
+            Complex64::new(0.0, 0.0), // p=1, col 0
+            Complex64::new(0.0, 0.0), // p=1, col 1
+        ];
+        let alpha2 = Complex64::new(2.0, 0.0);
+        let beta2 = Complex64::new(0.0, 0.0);
+        let mut c2 = [Complex64::new(99.0, 99.0); 4];
+        unsafe {
+            micro_kernel_c64_scalar(2, alpha2, a2.as_ptr(), b2.as_ptr(), beta2, c2.as_mut_ptr(), 2);
+        }
+        let tol = 1e-12;
+        // alpha * acc[0][0] + 0*c = 2*(5+3i) = 10+6i
+        assert!((c2[0].re - 10.0).abs() < tol, "alpha*acc[0,0].re = {}", c2[0].re);
+        assert!((c2[0].im - 6.0).abs() < tol, "alpha*acc[0,0].im = {}", c2[0].im);
+        // beta=0 so all other C entries are zeroed regardless of initial value
+        assert!(c2[1].re.abs() < tol, "C[1,0].re = {}", c2[1].re);
+        assert!(c2[2].re.abs() < tol, "C[0,1].re = {}", c2[2].re);
+        assert!(c2[3].re.abs() < tol, "C[1,1].re = {}", c2[3].re);
+
+        // Test beta accumulation: same A,B but with beta=1 and non-zero C
+        // C = alpha*acc + 1*C_init: C[0,0] = 10+6i + 1+1i = 11+7i
+        let mut c3 = [
+            Complex64::new(1.0, 1.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+        ];
+        let beta3 = Complex64::new(1.0, 0.0);
+        unsafe {
+            micro_kernel_c64_scalar(2, alpha2, a2.as_ptr(), b2.as_ptr(), beta3, c3.as_mut_ptr(), 2);
+        }
+        assert!((c3[0].re - 11.0).abs() < tol, "beta=1 C[0,0].re = {}", c3[0].re);
+        assert!((c3[0].im - 7.0).abs() < tol, "beta=1 C[0,0].im = {}", c3[0].im);
+    }
+
+    #[test]
+    fn test_micro_kernel_c32_correctness() {
+        use num_complex::Complex32;
+
+        // Same test as c64 but with f32 precision
+        let a = [
+            Complex32::new(1.0, 2.0),
+            Complex32::new(5.0, 6.0),
+            Complex32::new(3.0, 4.0),
+            Complex32::new(7.0, 8.0),
+        ];
+        let b = [
+            Complex32::new(1.0, 0.0),
+            Complex32::new(0.0, 1.0),
+            Complex32::new(2.0, 0.0),
+            Complex32::new(0.0, 2.0),
+        ];
+        let zero = Complex32::new(0.0, 0.0);
+        let alpha = Complex32::new(1.0, 0.0);
+        let beta = Complex32::new(0.0, 0.0);
+        let mut c = [zero; 4];
+
+        unsafe {
+            micro_kernel_c32_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
+        }
+
+        let tol = 1e-5_f32;
+        assert!((c[0].re - 7.0).abs() < tol, "C[0,0].re got {}", c[0].re);
+        assert!((c[0].im - 10.0).abs() < tol, "C[0,0].im got {}", c[0].im);
+        assert!((c[1].re - 19.0).abs() < tol, "C[1,0].re got {}", c[1].re);
+        assert!((c[1].im - 22.0).abs() < tol, "C[1,0].im got {}", c[1].im);
+        assert!((c[2].re - (-10.0)).abs() < tol, "C[0,1].re got {}", c[2].re);
+        assert!((c[2].im - 7.0).abs() < tol, "C[0,1].im got {}", c[2].im);
+        assert!((c[3].re - (-22.0)).abs() < tol, "C[1,1].re got {}", c[3].re);
+        assert!((c[3].im - 19.0).abs() < tol, "C[1,1].im got {}", c[3].im);
     }
 }

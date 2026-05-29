@@ -1698,12 +1698,28 @@ mod tests {
         let beta2 = Complex64::new(0.0, 0.0);
         let mut c2 = [Complex64::new(99.0, 99.0); 4];
         unsafe {
-            micro_kernel_c64_scalar(2, alpha2, a2.as_ptr(), b2.as_ptr(), beta2, c2.as_mut_ptr(), 2);
+            micro_kernel_c64_scalar(
+                2,
+                alpha2,
+                a2.as_ptr(),
+                b2.as_ptr(),
+                beta2,
+                c2.as_mut_ptr(),
+                2,
+            );
         }
         let tol = 1e-12;
         // alpha * acc[0][0] + 0*c = 2*(5+3i) = 10+6i
-        assert!((c2[0].re - 10.0).abs() < tol, "alpha*acc[0,0].re = {}", c2[0].re);
-        assert!((c2[0].im - 6.0).abs() < tol, "alpha*acc[0,0].im = {}", c2[0].im);
+        assert!(
+            (c2[0].re - 10.0).abs() < tol,
+            "alpha*acc[0,0].re = {}",
+            c2[0].re
+        );
+        assert!(
+            (c2[0].im - 6.0).abs() < tol,
+            "alpha*acc[0,0].im = {}",
+            c2[0].im
+        );
         // beta=0 so all other C entries are zeroed regardless of initial value
         assert!(c2[1].re.abs() < tol, "C[1,0].re = {}", c2[1].re);
         assert!(c2[2].re.abs() < tol, "C[0,1].re = {}", c2[2].re);
@@ -1719,10 +1735,26 @@ mod tests {
         ];
         let beta3 = Complex64::new(1.0, 0.0);
         unsafe {
-            micro_kernel_c64_scalar(2, alpha2, a2.as_ptr(), b2.as_ptr(), beta3, c3.as_mut_ptr(), 2);
+            micro_kernel_c64_scalar(
+                2,
+                alpha2,
+                a2.as_ptr(),
+                b2.as_ptr(),
+                beta3,
+                c3.as_mut_ptr(),
+                2,
+            );
         }
-        assert!((c3[0].re - 11.0).abs() < tol, "beta=1 C[0,0].re = {}", c3[0].re);
-        assert!((c3[0].im - 7.0).abs() < tol, "beta=1 C[0,0].im = {}", c3[0].im);
+        assert!(
+            (c3[0].re - 11.0).abs() < tol,
+            "beta=1 C[0,0].re = {}",
+            c3[0].re
+        );
+        assert!(
+            (c3[0].im - 7.0).abs() < tol,
+            "beta=1 C[0,0].im = {}",
+            c3[0].im
+        );
     }
 
     #[test]

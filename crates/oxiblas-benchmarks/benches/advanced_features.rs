@@ -8,7 +8,6 @@
 //! - Scaling tests (sequential vs parallel)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
 use num_complex::Complex64;
 use oxiblas_blas::level1::parallel::{axpy_par, dot_par, nrm2_par, scal_par};
 use oxiblas_blas::level1::{axpy, dot, nrm2, scal};
@@ -17,6 +16,7 @@ use oxiblas_blas::level3::{
 };
 use oxiblas_core::parallel::Par;
 use oxiblas_matrix::Mat;
+use std::hint::black_box;
 
 // =============================================================================
 // Parallel Level 1 Benchmarks

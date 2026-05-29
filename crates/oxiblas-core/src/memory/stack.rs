@@ -247,8 +247,10 @@ mod tests {
 
         // The two regions must not overlap.  We check this by verifying the
         // pointers are distinct — they live in separate AlignedVecs.
-        assert_ne!(parent_slice as usize, sub_slice as usize,
-            "parent and sub-stack allocations must not alias");
+        assert_ne!(
+            parent_slice as usize, sub_slice as usize,
+            "parent and sub-stack allocations must not alias"
+        );
     }
 
     #[test]

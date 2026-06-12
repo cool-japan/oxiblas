@@ -1,5 +1,10 @@
 # OxiBLAS TODO
 
+## Stubs to implement (added 2026-06-12 by /cooljapan-stub-check)
+
+- [ ] `oxiblas-blas`: `crates/oxiblas-blas/src/level3/gemm_packing.rs:284` — add AVX-512 streaming stores for GEMM packing once `std::arch::x86_64::_mm512_stream_ps` is stabilized
+  - Priority: P2 | Scope: small | Hint: none
+
 Production-grade pure Rust BLAS/LAPACK implementation.
 
 ## Project Status (v0.2.1 Release - Updated 2026-03-16)

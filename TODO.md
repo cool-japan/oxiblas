@@ -593,4 +593,11 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 
 **All files now under 2000 lines!** Largest file: simd/x86_64.rs at 1,989 lines.
 
+## Stubs to implement (added 2026-06-22 by /cooljapan-stub-check)
+
+- [ ] **oxiblas** `oxiblas-blas`: `crates/oxiblas-blas/src/level3/gemm_packing.rs:284` — `TODO`: `Add streaming stores for AVX-512 when stabilized` (packed C-block writes currently go through `pack_b_optimized`)
+  - **Priority:** P2  **Scope:** small  **Cross-project:** none
+  - **Approach:** Under an `avx512` feature gate, replace the packed C-block store path with `_mm512_stream_ps` non-temporal writes (with the required fence) to avoid polluting cache during large GEMM packing; keep the current optimized path as the non-gated fallback.
+  - **Risk:** Streaming stores require correct alignment + a trailing `_mm_sfence`; misuse yields silent data corruption. Must stay behind the `avx512` feature so default Pure-Rust/portable builds are unaffected.
+
 

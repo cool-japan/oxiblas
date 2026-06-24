@@ -10,6 +10,11 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["benchmark", "blas", "lapack", "linear-algebra", "performance"]
 categories = ["mathematics", "science", "development-tools::profiling"]
+# Dev/benchmark-only crate: kept off crates.io so the optional `compare-openblas`
+# comparison bench (openblas-src/cblas-sys/lapack-sys/ndarray-linalg/blas-src) stays
+# out of the published Pure-Rust audit surface.
+# Run it with: cargo bench -p oxiblas-benchmarks --features compare-openblas
+publish = false
 
 [dependencies]
 oxiblas-core = { workspace = true, features = ["std", "f16", "parallel"] }

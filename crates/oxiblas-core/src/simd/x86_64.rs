@@ -1435,7 +1435,7 @@ impl Avx512Vnni {
 
     /// Dot product of 4-element vectors of u8 and i8, accumulated to i32.
     ///
-    /// This performs: dst[i] = src[i] + sum(a[i*4+j] * b[i*4+j]) for j in 0..4
+    /// This performs: `dst[i] = src[i] + sum(a[i*4+j] * b[i*4+j])` for j in 0..4
     ///
     /// # Safety
     /// Requires AVX-512VNNI support.
@@ -1457,7 +1457,7 @@ impl Avx512Vnni {
 
     /// Dot product of 2-element i16 vectors accumulated to i32.
     ///
-    /// This performs: dst[i] = src[i] + sum(a[i*2+j] * b[i*2+j]) for j in 0..2
+    /// This performs: `dst[i] = src[i] + sum(a[i*2+j] * b[i*2+j])` for j in 0..2
     ///
     /// # Safety
     /// Requires AVX-512VNNI support.

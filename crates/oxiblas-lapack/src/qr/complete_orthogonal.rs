@@ -290,15 +290,34 @@ impl<T: Field + Real + bytemuck::Zeroable> CompleteOrthogonalDecomp<T> {
             }
         }
 
-        // Step 3: Compute z = Z^T * [0; y] where we put y in the last r positions
-        // Since T is in columns (n-r) to (n-1), we use Z[:, n-r:n]
-        // z = Z[:, n-r:n] * y = sum_{k=0}^{r-1} Z[:, n-r+k] * y[k, :]
+        // Step 3: Undo the RQ rotation to recover the (still column-permuted) solution.
+        //
+        // The stored decomposition is  A·P = Q · R_ext · Z  (see `reconstruct`),
+        // so  A = Q · R_ext · Z · Pᵀ.  Substituting s = Z·Pᵀ·x turns the
+        // least-squares problem into minimising ‖R_ext·s − Qᵀb‖.  Because R_ext
+        // keeps its r×r triangular block T in the LAST r columns, its minimum-norm
+        // minimiser is  s = u = [0 ; y]  with y in the trailing r entries and the
+        // leading n−r entries forced to zero (those zeros are precisely what makes
+        // ‖x‖ minimal, since ‖x‖ = ‖s‖ under the orthogonal Z and permutation P).
+        // Recovering x then requires
+        //     x = P · Zᵀ · u ,
+        // so here we form  w = Zᵀ · u.
+        //
+        // CRITICAL: this must be Zᵀ, NOT Z.  As u is supported only on its last r
+        // entries, (Zᵀ·u)_i = Σ_{k<r} Z[n−r+k, i] · y_k — we read the reflectors
+        // DOWN a column of Z (the transpose), not across a row.  Indexing Z as a
+        // plain product (self.z[(i, n−r+k)]) computes Z·u instead and returns a
+        // vector that is generally neither a least-squares solution nor of minimum
+        // norm on rank-deficient / underdetermined inputs, defeating the whole
+        // point of the complete orthogonal decomposition.  The error stays hidden
+        // on full-rank inputs only because there R_rank is a square upper-triangular
+        // block whose RQ factor Z is a symmetric ±1 signature matrix (Z = Zᵀ).
         let mut z_result = Mat::zeros(n, nrhs);
         for j in 0..nrhs {
             for i in 0..n {
                 let mut sum = T::zero();
                 for k in 0..r {
-                    sum = sum + self.z[(i, n - r + k)] * y[(k, j)];
+                    sum = sum + self.z[(n - r + k, i)] * y[(k, j)];
                 }
                 z_result[(i, j)] = sum;
             }
@@ -324,6 +343,31 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
+    }
+
+    /// Multiplies matrix `a` (m×k) by column vector `x` (k×1), returning m×1.
+    fn matvec(a: &Mat<f64>, x: &Mat<f64>) -> Mat<f64> {
+        let m = a.nrows();
+        let k = a.ncols();
+        let mut y = Mat::zeros(m, 1);
+        for i in 0..m {
+            let mut s = 0.0;
+            for j in 0..k {
+                s += a[(i, j)] * x[(j, 0)];
+            }
+            y[(i, 0)] = s;
+        }
+        y
+    }
+
+    /// Independent reference for the minimum-norm least-squares solution.
+    ///
+    /// x_minnorm = A⁺·b, where A⁺ is the Moore-Penrose pseudoinverse obtained
+    /// from this crate's SVD-based `pinv` — a code path entirely disjoint from
+    /// the complete orthogonal decomposition being tested.
+    fn min_norm_lstsq_reference(a: &Mat<f64>, b: &Mat<f64>, tol: f64) -> Mat<f64> {
+        let result = crate::utils::pinv(a.as_ref(), tol).expect("pinv reference should succeed");
+        matvec(&result.pinv, b)
     }
 
     #[test]
@@ -551,6 +595,185 @@ mod tests {
                 "A^T*r[{}] = {}, expected 0",
                 j,
                 atr
+            );
+        }
+    }
+
+    #[test]
+    fn test_cod_solve_rank_deficient_min_norm() {
+        // Genuinely rank-deficient 5×3 matrix (rank 2), built as an explicit sum
+        // of two rank-1 outer products so the null space is known exactly:
+        //   A = u1·v1ᵀ + u2·v2ᵀ,
+        //   u1 = [1,2,1,0,1], v1 = [1, 0,-1]
+        //   u2 = [0,1,1,1,2], v2 = [1, 1, 1]
+        // Both v1 and v2 are orthogonal to w = [1,-2,1], so Null(A) = span{w}.
+        //
+        // This is exactly the case the Z-vs-Zᵀ bug corrupted: with the old code
+        // the returned vector was neither a least-squares solution nor of minimum
+        // norm.  The full-rank tests above cannot catch it because there Z is a
+        // symmetric signature matrix; this rank-deficient input makes Z ≠ Zᵀ.
+        let a = Mat::from_rows(&[
+            &[1.0f64, 0.0, -1.0],
+            &[3.0, 1.0, -1.0],
+            &[2.0, 1.0, 0.0],
+            &[1.0, 1.0, 1.0],
+            &[3.0, 2.0, 1.0],
+        ]);
+        let b = Mat::from_rows(&[&[1.0f64], &[0.0], &[2.0], &[1.0], &[3.0]]);
+
+        let cod = CompleteOrthogonalDecomp::compute(a.as_ref(), 1e-9).unwrap();
+        assert_eq!(cod.rank(), 2, "constructed matrix must be detected as rank 2");
+
+        let x = cod.solve(b.as_ref()).unwrap();
+
+        // Agreement with the independent SVD-pseudoinverse reference.
+        let x_ref = min_norm_lstsq_reference(&a, &b, 1e-9);
+        for i in 0..3 {
+            assert!(
+                approx_eq(x[(i, 0)], x_ref[(i, 0)], 1e-8),
+                "x[{}] = {}, reference A+ b = {}",
+                i,
+                x[(i, 0)],
+                x_ref[(i, 0)]
+            );
+        }
+
+        // Property 1 — least squares: normal equations Aᵀ(Ax − b) = 0.
+        let ax = matvec(&a, &x);
+        for j in 0..3 {
+            let mut atr = 0.0;
+            for i in 0..5 {
+                atr += a[(i, j)] * (ax[(i, 0)] - b[(i, 0)]);
+            }
+            assert!(
+                approx_eq(atr, 0.0, 1e-8),
+                "normal-equation component {} = {}, expected 0",
+                j,
+                atr
+            );
+        }
+
+        // Property 2 — minimum norm: x must be orthogonal to Null(A) = span{[1,-2,1]}.
+        let null = [1.0f64, -2.0, 1.0];
+        let mut dot = 0.0;
+        for i in 0..3 {
+            dot += x[(i, 0)] * null[i];
+        }
+        assert!(
+            approx_eq(dot, 0.0, 1e-8),
+            "min-norm solution must be orthogonal to the null space, got x·n = {}",
+            dot
+        );
+    }
+
+    #[test]
+    fn test_cod_solve_underdetermined_min_norm() {
+        // Genuinely underdetermined system: 2 equations, 4 unknowns, full row rank 2.
+        // A x = b is consistent, so infinitely many exact solutions exist; COD must
+        // return the unique minimum-norm one.  Null(A) is 2-dimensional and spanned
+        // by n1 = [2,-1,1,0] and n2 = [3,-2,0,1] (verified: A·n1 = A·n2 = 0).
+        let a = Mat::from_rows(&[&[1.0f64, 2.0, 0.0, 1.0], &[0.0, 1.0, 1.0, 2.0]]);
+        let b = Mat::from_rows(&[&[3.0f64], &[1.0]]);
+
+        let cod = CompleteOrthogonalDecomp::compute(a.as_ref(), 1e-9).unwrap();
+        assert_eq!(cod.rank(), 2);
+
+        let x = cod.solve(b.as_ref()).unwrap();
+
+        // The system is consistent (full row rank) => A x = b must hold exactly.
+        let ax = matvec(&a, &x);
+        for i in 0..2 {
+            assert!(
+                approx_eq(ax[(i, 0)], b[(i, 0)], 1e-8),
+                "A x [{}] = {}, expected b = {}",
+                i,
+                ax[(i, 0)],
+                b[(i, 0)]
+            );
+        }
+
+        // Agreement with the independent SVD-pseudoinverse reference.
+        let x_ref = min_norm_lstsq_reference(&a, &b, 1e-9);
+        for i in 0..4 {
+            assert!(
+                approx_eq(x[(i, 0)], x_ref[(i, 0)], 1e-8),
+                "x[{}] = {}, reference A+ b = {}",
+                i,
+                x[(i, 0)],
+                x_ref[(i, 0)]
+            );
+        }
+
+        // Minimum norm => x ⟂ Null(A); check against both explicit null vectors.
+        for null in [[2.0f64, -1.0, 1.0, 0.0], [3.0, -2.0, 0.0, 1.0]] {
+            let mut dot = 0.0;
+            for i in 0..4 {
+                dot += x[(i, 0)] * null[i];
+            }
+            assert!(
+                approx_eq(dot, 0.0, 1e-8),
+                "min-norm solution must be orthogonal to null vector {:?}, got {}",
+                null,
+                dot
+            );
+        }
+    }
+
+    #[test]
+    fn test_cod_solve_rank_deficient_underdetermined() {
+        // Combined worst case: 3×4, rank 2 (row 2 = row 0 + row 1), so it is both
+        // rank-deficient AND underdetermined.  n − r = 2 free trailing columns of Z
+        // exercise the Zᵀ projection most strongly, and b is chosen inconsistent so
+        // this is a true (non-exact) least-squares problem.  Null(A) = span{n1,n2}.
+        let a = Mat::from_rows(&[
+            &[1.0f64, 2.0, 0.0, 1.0],
+            &[0.0, 1.0, 1.0, 2.0],
+            &[1.0, 3.0, 1.0, 3.0],
+        ]);
+        let b = Mat::from_rows(&[&[1.0f64], &[2.0], &[4.0]]);
+
+        let cod = CompleteOrthogonalDecomp::compute(a.as_ref(), 1e-9).unwrap();
+        assert_eq!(cod.rank(), 2);
+
+        let x = cod.solve(b.as_ref()).unwrap();
+
+        let x_ref = min_norm_lstsq_reference(&a, &b, 1e-9);
+        for i in 0..4 {
+            assert!(
+                approx_eq(x[(i, 0)], x_ref[(i, 0)], 1e-8),
+                "x[{}] = {}, reference A+ b = {}",
+                i,
+                x[(i, 0)],
+                x_ref[(i, 0)]
+            );
+        }
+
+        // Property 1 — least squares: normal equations Aᵀ(Ax − b) = 0.
+        let ax = matvec(&a, &x);
+        for j in 0..4 {
+            let mut atr = 0.0;
+            for i in 0..3 {
+                atr += a[(i, j)] * (ax[(i, 0)] - b[(i, 0)]);
+            }
+            assert!(
+                approx_eq(atr, 0.0, 1e-8),
+                "normal-equation component {} = {}, expected 0",
+                j,
+                atr
+            );
+        }
+
+        // Property 2 — minimum norm: x ⟂ Null(A) = span{[2,-1,1,0],[3,-2,0,1]}.
+        for null in [[2.0f64, -1.0, 1.0, 0.0], [3.0, -2.0, 0.0, 1.0]] {
+            let mut dot = 0.0;
+            for i in 0..4 {
+                dot += x[(i, 0)] * null[i];
+            }
+            assert!(
+                approx_eq(dot, 0.0, 1e-8),
+                "min-norm solution must be orthogonal to null vector {:?}, got {}",
+                null,
+                dot
             );
         }
     }

@@ -3,7 +3,7 @@
 //! This is the standard LU decomposition algorithm used by LAPACK's DGETRF.
 //! For large matrices, uses blocked algorithm with GEMM/TRSM for cache efficiency.
 
-use num_traits::{FromPrimitive, One};
+use num_traits::{FromPrimitive, One, Zero};
 use oxiblas_blas::level3::gemm::gemm;
 #[cfg(feature = "parallel")]
 use oxiblas_blas::level3::gemm::gemm_with_par;
@@ -55,6 +55,64 @@ impl core::fmt::Display for LuError {
 }
 
 impl std::error::Error for LuError {}
+
+/// Computes the infinity-norm (maximum absolute row sum) of `a`.
+///
+/// This is the scale reference consumed by [`singular_tol`]. It is deliberately
+/// computed once from the *original* input matrix rather than from the
+/// in-progress factor: doing so keeps the singularity decision byte-for-byte
+/// identical across the unblocked, blocked, recursive and parallel variants,
+/// which all factor the same matrix but visit its columns in different orders
+/// (a norm taken mid-factorization would reflect the partially-eliminated Schur
+/// complement, not `A`, and would drift between variants).
+///
+/// Works for complex `T` as well as real `T` because it accumulates
+/// `Scalar::abs` (the modulus), which is always a real, non-negative
+/// `T::Real`.
+fn matrix_inf_norm<T: Field>(a: MatRef<'_, T>) -> T::Real {
+    let nrows = a.nrows();
+    let ncols = a.ncols();
+    let mut max_row = <T::Real as Zero>::zero();
+    for i in 0..nrows {
+        let mut row_sum = <T::Real as Zero>::zero();
+        for j in 0..ncols {
+            row_sum = row_sum + Scalar::abs(a[(i, j)]);
+        }
+        if row_sum > max_row {
+            max_row = row_sum;
+        }
+    }
+    max_row
+}
+
+/// Relative singularity tolerance `eps * ||A||_inf * n`.
+///
+/// # Why relative, not absolute
+///
+/// A bare absolute threshold such as `eps * n` is *not* scale-invariant, so it
+/// falsely rejects perfectly well-conditioned matrices whose entries merely
+/// happen to be small in magnitude. Concretely, `1e-16 * I` is trivially
+/// invertible (its inverse is `1e16 * I`), yet every one of its pivots equals
+/// `1e-16`, which is below `f64::EPSILON * n ≈ 2.2e-16 * n`, so an absolute
+/// check would report it singular.
+///
+/// Scaling the threshold by `||A||_inf` makes the test *relative* to the
+/// matrix's own magnitude, mirroring LAPACK's scale-aware rank/condition
+/// checks: a pivot is treated as negligible only when it is tiny *compared to
+/// the entries of `A`*, i.e. when the corresponding column is numerically
+/// linearly dependent. A genuinely rank-deficient matrix still leaves a pivot
+/// of order `eps * ||A||` after elimination and is correctly flagged, while a
+/// uniformly scaled matrix (any `c * A`) yields the same pass/fail outcome as
+/// `A` itself.
+///
+/// The comparison against this tolerance uses `<=`, not `<`, so an exactly
+/// zero pivot in the zero matrix (`||A||_inf == 0`, hence `tol == 0`) is still
+/// reported singular instead of driving a division by zero.
+fn singular_tol<T: Field>(anorm: T::Real, n: usize) -> T::Real {
+    let n_real =
+        <T::Real as FromPrimitive>::from_usize(n).unwrap_or_else(<T::Real as One>::one);
+    T::epsilon() * anorm * n_real
+}
 
 /// LU decomposition with partial (row) pivoting.
 ///
@@ -138,6 +196,9 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
 
+        // Scale reference for the relative singularity tolerance (see `singular_tol`).
+        let anorm = matrix_inf_norm(a);
+
         // Doolittle algorithm with partial pivoting
         for k in 0..n {
             // Find pivot: largest absolute value in column k, rows k..n
@@ -152,11 +213,10 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            // Use a relative tolerance based on machine epsilon and matrix size
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Reject the pivot only if it is negligible *relative to* ||A||;
+            // an absolute threshold would wrongly flag well-conditioned matrices
+            // with uniformly small entries (see `singular_tol`).
+            if pivot_val <= singular_tol::<T>(anorm, n) {
                 return Err(LuError::Singular { index: k });
             }
 
@@ -264,36 +324,21 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
         let m = b.ncols();
         let mut x = Mat::zeros(n, m);
 
-        // Copy b to x, applying row permutation
-        for k in 0..n {
-            let pk = self.pivot[k];
-            for j in 0..m {
-                let tmp = if k != pk { b[(pk, j)] } else { b[(k, j)] };
-                x[(k, j)] = tmp;
-            }
-        }
-
-        // Apply permutation in-place
-        for k in 0..n {
-            let pk = self.pivot[k];
-            if k != pk {
-                for j in 0..m {
-                    let tmp = x[(k, j)];
-                    x[(k, j)] = x[(pk, j)];
-                    x[(pk, j)] = tmp;
-                }
-            }
-        }
-
-        // Re-copy b with permutation (the swap above doesn't work correctly for all cases)
-        // Let's fix by properly applying the permutation sequence
+        // Apply the row permutation P to b, forming Pb in x.
+        //
+        // P is stored as the sequence of interchanges performed during
+        // factorization: at step k, row k was exchanged with row `pivot[k]`.
+        // Replaying that same sequence in ascending k reproduces Pb — this is
+        // LAPACK's forward application of interchanges (cf. DLASWP). We copy b
+        // verbatim first and then swap in place so that a chain of pivots
+        // (e.g. 0->2 followed by 1->2) is *composed* correctly, rather than
+        // applied as independent per-row assignments which would be wrong for
+        // any permutation that is not a single transposition.
         for j in 0..m {
             for i in 0..n {
                 x[(i, j)] = b[(i, j)];
             }
         }
-
-        // Apply permutations in order
         for k in 0..n {
             let pk = self.pivot[k];
             if k != pk {
@@ -536,11 +581,15 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
 
+        // Scale reference for the relative singularity tolerance (see `singular_tol`),
+        // taken from the original matrix so every code path uses the same threshold.
+        let anorm = matrix_inf_norm(a);
+
         // Use blocked algorithm for larger matrices
         if n >= nb {
-            Self::blocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, nb)?;
+            Self::blocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, nb, anorm)?;
         } else {
-            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0)?;
+            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, anorm)?;
         }
 
         Ok(Lu {
@@ -551,12 +600,16 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     }
 
     /// Blocked LU factorization using GEMM for Schur complement updates.
+    ///
+    /// `anorm` is the infinity-norm of the *original* matrix, threaded through
+    /// to the panel factorization for the scale-aware singularity check.
     fn blocked_factor(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
         num_swaps: &mut usize,
         n: usize,
         nb: usize,
+        anorm: T::Real,
     ) -> Result<(), LuError> {
         let mut jb = 0;
 
@@ -565,7 +618,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
             let jb_size = nb.min(n - jb);
 
             // Factor the current panel (columns jb:jb+jb_size)
-            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size)?;
+            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size, anorm)?;
 
             // If there are more columns after this panel
             if jb + jb_size < n {
@@ -653,6 +706,9 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     }
 
     /// Factor a panel of columns using unblocked algorithm.
+    ///
+    /// `anorm` is the infinity-norm of the *original* matrix, used for the
+    /// scale-aware singularity check (see [`singular_tol`]).
     fn factor_panel(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
@@ -660,6 +716,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         n: usize,
         jb: usize,
         jb_size: usize,
+        anorm: T::Real,
     ) -> Result<(), LuError> {
         for k in jb..(jb + jb_size) {
             // Find pivot in column k, rows k..n
@@ -674,10 +731,10 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Reject the pivot only if it is negligible *relative to* ||A||;
+            // an absolute threshold would wrongly flag well-conditioned matrices
+            // with uniformly small entries (see `singular_tol`).
+            if pivot_val <= singular_tol::<T>(anorm, n) {
                 return Err(LuError::Singular { index: k });
             }
 
@@ -711,12 +768,16 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     }
 
     /// Unblocked LU factorization (for small matrices or panels).
+    ///
+    /// `anorm` is the infinity-norm of the *original* matrix, used for the
+    /// scale-aware singularity check (see [`singular_tol`]).
     fn unblocked_factor(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
         num_swaps: &mut usize,
         n: usize,
         start: usize,
+        anorm: T::Real,
     ) -> Result<(), LuError> {
         for k in start..n {
             // Find pivot: largest absolute value in column k, rows k..n
@@ -731,10 +792,10 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Reject the pivot only if it is negligible *relative to* ||A||;
+            // an absolute threshold would wrongly flag well-conditioned matrices
+            // with uniformly small entries (see `singular_tol`).
+            if pivot_val <= singular_tol::<T>(anorm, n) {
                 return Err(LuError::Singular { index: k });
             }
 
@@ -844,7 +905,10 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
 
-        Self::recursive_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, n)?;
+        // Scale reference for the relative singularity tolerance (see `singular_tol`).
+        let anorm = matrix_inf_norm(a);
+
+        Self::recursive_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, n, anorm)?;
 
         Ok(Lu {
             lu,
@@ -866,6 +930,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// * `n` - Full matrix dimension
     /// * `col_start` - Starting column of the current panel
     /// * `width` - Number of columns to factor in this call
+    /// * `anorm` - Infinity-norm of the original matrix (scale-aware singularity check)
     fn recursive_factor(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
@@ -873,6 +938,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         n: usize,
         col_start: usize,
         width: usize,
+        anorm: T::Real,
     ) -> Result<(), LuError> {
         if width == 0 {
             return Ok(());
@@ -881,7 +947,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         // Base case: use unblocked panel factorization for small widths
         if width <= Self::RECURSIVE_THRESHOLD {
             // Factor columns col_start..col_start+width as a panel, considering all rows
-            Self::factor_panel(lu, pivot, num_swaps, n, col_start, width)?;
+            Self::factor_panel(lu, pivot, num_swaps, n, col_start, width, anorm)?;
 
             // If there are trailing columns, apply updates
             let trailing_cols = n - col_start - width;
@@ -972,11 +1038,11 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
 
         // Step 1: Recursively factor the left half (columns col_start..col_start+n1)
         // This will also update the right half via the trailing column logic in the base case
-        Self::recursive_factor(lu, pivot, num_swaps, n, col_start, n1)?;
+        Self::recursive_factor(lu, pivot, num_swaps, n, col_start, n1, anorm)?;
 
         // Step 2: Now recursively factor the right half (columns col_start+n1..col_start+width)
         // The Schur complement for these columns has already been computed in step 1
-        Self::recursive_factor(lu, pivot, num_swaps, n, col_start + n1, n2)?;
+        Self::recursive_factor(lu, pivot, num_swaps, n, col_start + n1, n2, anorm)?;
 
         Ok(())
     }
@@ -1084,11 +1150,14 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
 
+        // Scale reference for the relative singularity tolerance (see `singular_tol`).
+        let anorm = matrix_inf_norm(a);
+
         // Use blocked parallel algorithm for larger matrices
         if n >= nb {
-            Self::blocked_factor_par(&mut lu, &mut pivot, &mut num_swaps, n, nb)?;
+            Self::blocked_factor_par(&mut lu, &mut pivot, &mut num_swaps, n, nb, anorm)?;
         } else {
-            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0)?;
+            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, anorm)?;
         }
 
         Ok(Lu {
@@ -1099,12 +1168,16 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
     }
 
     /// Blocked LU factorization with parallel GEMM for Schur complement updates.
+    ///
+    /// `anorm` is the infinity-norm of the *original* matrix, threaded through
+    /// to the panel factorization for the scale-aware singularity check.
     fn blocked_factor_par(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
         num_swaps: &mut usize,
         n: usize,
         nb: usize,
+        anorm: T::Real,
     ) -> Result<(), LuError> {
         let mut jb = 0;
 
@@ -1113,7 +1186,7 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
             let jb_size = nb.min(n - jb);
 
             // Factor the current panel (columns jb:jb+jb_size) -- sequential
-            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size)?;
+            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size, anorm)?;
 
             // If there are more columns after this panel
             if jb + jb_size < n {
@@ -1199,5 +1272,252 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dense matrix-vector product `a * x`, returned as a `Vec`.
+    fn matvec(a: &Mat<f64>, x: &[f64]) -> Vec<f64> {
+        let n = a.nrows();
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let mut s = 0.0;
+            for (j, &xj) in x.iter().enumerate() {
+                s += a[(i, j)] * xj;
+            }
+            y[i] = s;
+        }
+        y
+    }
+
+    /// Asserts that `P A == L U` (the defining identity of the factorization),
+    /// using an absolute tolerance scaled by the matrix magnitude so it works
+    /// for both `O(1)` and tiny-magnitude inputs.
+    fn assert_pa_eq_lu(lu: &Lu<f64>, a: &Mat<f64>, scale: f64) {
+        let n = a.nrows();
+        let l = lu.l_factor();
+        let u = lu.u_factor();
+        let p = lu.permutation_matrix();
+
+        for i in 0..n {
+            for j in 0..n {
+                let mut pa = 0.0;
+                let mut prod = 0.0;
+                for k in 0..n {
+                    pa += p[(i, k)] * a[(k, j)];
+                    prod += l[(i, k)] * u[(k, j)];
+                }
+                let diff = (pa - prod).abs();
+                assert!(
+                    diff <= 1e-10 * scale,
+                    "PA[{i},{j}] = {pa} != LU[{i},{j}] = {prod} (diff {diff})",
+                );
+            }
+        }
+    }
+
+    /// The exact scenario from the audit finding: a well-conditioned matrix whose
+    /// entries are simply small in magnitude (`1e-16 * I`). The old *absolute*
+    /// tolerance `eps * n` (≈ 1.1e-15 here) exceeds every pivot (`1e-16`) and so
+    /// wrongly reported this trivially-invertible matrix as singular. The
+    /// corrected *relative* tolerance must accept it.
+    #[test]
+    fn test_tiny_identity_not_singular() {
+        const C: f64 = 1e-16;
+        let n = 5;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            a[(i, i)] = C;
+        }
+
+        let lu = Lu::compute(a.as_ref())
+            .expect("1e-16 * I is perfectly invertible and must not be flagged singular");
+
+        // det = C^n, exactly representable for these small n.
+        let det = lu.determinant();
+        let expected_det = C.powi(n as i32);
+        let rel = ((det - expected_det) / expected_det).abs();
+        assert!(rel < 1e-10, "det = {det}, expected {expected_det}");
+
+        // A^-1 = (1/C) * I = 1e16 * I.
+        let inv = lu.inverse().expect("should invert");
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { 1.0 / C } else { 0.0 };
+                let diff = (inv[(i, j)] - expected).abs();
+                assert!(diff <= 1e-10 / C, "inv[{i},{j}] = {}", inv[(i, j)]);
+            }
+        }
+    }
+
+    /// A tiny-magnitude, well-conditioned matrix that *also* requires a genuine
+    /// row interchange (the `(0,0)` entry is zero). Exercises the relative
+    /// tolerance and the (de-duplicated) permutation path together.
+    #[test]
+    fn test_tiny_wellcond_needs_pivot_not_singular() {
+        const C: f64 = 1e-16;
+        // base is invertible (det = -22) and forces a swap at step 0.
+        let base: Mat<f64> =
+            Mat::from_rows(&[&[0.0, 2.0, 1.0], &[4.0, 3.0, 1.0], &[2.0, 1.0, 3.0]]);
+        let mut a: Mat<f64> = Mat::zeros(3, 3);
+        for i in 0..3 {
+            for j in 0..3 {
+                a[(i, j)] = C * base[(i, j)];
+            }
+        }
+
+        let x_true = [1.0, -2.0, 0.5];
+        let b_vec = matvec(&a, &x_true);
+        let b: Mat<f64> = Mat::from_rows(&[&[b_vec[0]], &[b_vec[1]], &[b_vec[2]]]);
+
+        let lu = Lu::compute(a.as_ref())
+            .expect("tiny well-conditioned matrix must not be flagged singular");
+        let x = lu.solve(b.as_ref()).expect("should solve");
+
+        for i in 0..3 {
+            assert!(
+                (x[(i, 0)] - x_true[i]).abs() < 1e-8,
+                "x[{i}] = {}, expected {}",
+                x[(i, 0)],
+                x_true[i],
+            );
+        }
+        assert_pa_eq_lu(&lu, &a, C);
+    }
+
+    /// A *genuinely* singular matrix at tiny scale must still be detected: the
+    /// relative tolerance must not be so loose that it accepts rank deficiency.
+    /// `1e-16 * [[1,2],[2,4]]` has a second pivot of exactly zero after
+    /// elimination.
+    #[test]
+    fn test_tiny_singular_still_detected() {
+        const C: f64 = 1e-16;
+        let a: Mat<f64> = Mat::from_rows(&[&[C, 2.0 * C], &[2.0 * C, 4.0 * C]]);
+        let result = Lu::compute(a.as_ref());
+        assert!(
+            matches!(result, Err(LuError::Singular { .. })),
+            "rank-deficient matrix must be reported singular, got {result:?}",
+        );
+    }
+
+    /// Regression across *all* factorization variants (unblocked, blocked and
+    /// recursive) at once: a large (`n = 80`), well-conditioned but tiny-scale
+    /// (`1e-16`) diagonally-dominant matrix. With the old absolute tolerance
+    /// every variant's panel factorization aborted with `Singular`; the relative
+    /// tolerance accepts it, and all variants must agree on the solution.
+    #[test]
+    fn test_tiny_scale_all_variants() {
+        const C: f64 = 1e-16;
+        let n = 80;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let off = ((i * 7 + j * 13) % 5) as f64 * 0.001;
+                let base = if i == j { 4.0 } else { off };
+                a[(i, j)] = C * base;
+            }
+        }
+
+        let mut x_true = vec![0.0f64; n];
+        for (i, xi) in x_true.iter_mut().enumerate() {
+            *xi = (i % 7) as f64 - 3.0;
+        }
+        let b_vec = matvec(&a, &x_true);
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            b[(i, 0)] = b_vec[i];
+        }
+
+        let check = |lu: &Lu<f64>, label: &str| {
+            let x = lu.solve(b.as_ref()).expect("should solve");
+            for i in 0..n {
+                assert!(
+                    (x[(i, 0)] - x_true[i]).abs() < 1e-8,
+                    "{label}: x[{i}] = {}, expected {}",
+                    x[(i, 0)],
+                    x_true[i],
+                );
+            }
+        };
+
+        let lu_unblocked = Lu::compute(a.as_ref()).expect("unblocked must not flag singular");
+        check(&lu_unblocked, "unblocked");
+
+        let lu_blocked =
+            Lu::compute_blocked(a.as_ref()).expect("blocked must not flag singular");
+        check(&lu_blocked, "blocked");
+
+        let lu_recursive =
+            Lu::compute_recursive(a.as_ref()).expect("recursive must not flag singular");
+        check(&lu_recursive, "recursive");
+
+        #[cfg(feature = "parallel")]
+        {
+            let lu_par = Lu::compute_blocked_par(a.as_ref())
+                .expect("parallel blocked must not flag singular");
+            check(&lu_par, "parallel");
+        }
+    }
+
+    /// Guards the removal of the two dead permutation blocks in `solve`. The
+    /// matrix is a row-shuffle of a diagonally-dominant (hence non-singular)
+    /// matrix, so partial pivoting must apply a *chain* of interchanges to
+    /// recover the natural order — precisely the case the deleted
+    /// per-row-assignment code got wrong. Both the solution and the `PA = LU`
+    /// identity must hold.
+    #[test]
+    fn test_solve_pivot_permutation_chain() {
+        // Rows of a diagonally-dominant matrix, shuffled so that pivoting is
+        // forced at several steps.
+        let a: Mat<f64> = Mat::from_rows(&[
+            &[1.0, 2.0, 1.0, 10.0],
+            &[2.0, 1.0, 10.0, 1.0],
+            &[1.0, 10.0, 1.0, 2.0],
+            &[10.0, 1.0, 2.0, 1.0],
+        ]);
+
+        let x_true = [1.0, 2.0, 3.0, 4.0];
+        let b_vec = matvec(&a, &x_true);
+        let b: Mat<f64> =
+            Mat::from_rows(&[&[b_vec[0]], &[b_vec[1]], &[b_vec[2]], &[b_vec[3]]]);
+
+        let lu = Lu::compute(a.as_ref()).expect("should not be singular");
+
+        // The permutation must be non-trivial (at least one swap), otherwise the
+        // test would not exercise the permutation path at all.
+        let swapped = lu.pivot().iter().enumerate().any(|(k, &pk)| k != pk);
+        assert!(swapped, "test matrix should force at least one row interchange");
+
+        let x = lu.solve(b.as_ref()).expect("should solve");
+        for i in 0..4 {
+            assert!(
+                (x[(i, 0)] - x_true[i]).abs() < 1e-10,
+                "x[{i}] = {}, expected {}",
+                x[(i, 0)],
+                x_true[i],
+            );
+        }
+
+        // Multiple right-hand sides through the same (chained) permutation.
+        let b_multi: Mat<f64> = Mat::from_rows(&[
+            &[b_vec[0], 1.0],
+            &[b_vec[1], 0.0],
+            &[b_vec[2], 0.0],
+            &[b_vec[3], 0.0],
+        ]);
+        let x_multi = lu.solve(b_multi.as_ref()).expect("should solve multi-RHS");
+        for i in 0..4 {
+            assert!(
+                (x_multi[(i, 0)] - x_true[i]).abs() < 1e-10,
+                "multi x[{i},0] = {}, expected {}",
+                x_multi[(i, 0)],
+                x_true[i],
+            );
+        }
+
+        assert_pa_eq_lu(&lu, &a, 1.0);
     }
 }

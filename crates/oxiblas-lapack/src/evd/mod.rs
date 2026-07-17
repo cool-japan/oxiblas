@@ -54,6 +54,7 @@ mod general;
 mod generalized;
 mod hermitian;
 mod hermitian_dc;
+mod hermitian_tridiag;
 mod hessenberg;
 mod mrrr;
 mod qz;

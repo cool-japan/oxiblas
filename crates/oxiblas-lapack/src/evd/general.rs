@@ -450,6 +450,34 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
 }
 
 #[cfg(test)]
+impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
+    /// Test-only hook mirroring [`GeneralEvd::eigenvalues_only`] but with a custom
+    /// QR iteration budget for the underlying Schur decomposition.
+    ///
+    /// Its sole purpose is to exercise the `Schur -> GeneralEvd` non-convergence
+    /// propagation path: the `?` below routes a [`SchurError::NotConverged`]
+    /// through `From<SchurError> for GeneralEvdError`, which must surface as
+    /// [`GeneralEvdError::NotConverged`] rather than being swallowed or mislabelled.
+    pub(crate) fn eigenvalues_only_with_budget(
+        a: MatRef<'_, T>,
+        max_total_iterations: usize,
+    ) -> Result<Self, GeneralEvdError> {
+        let schur = Schur::compute_with_iteration_budget(a, max_total_iterations)?;
+        let n = a.nrows();
+        let eigenvalues = schur.eigenvalues().to_vec();
+
+        Ok(Self {
+            eigenvalues,
+            eigenvectors_real: None,
+            eigenvectors_imag: None,
+            left_eigenvectors_real: None,
+            left_eigenvectors_imag: None,
+            n,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -670,5 +698,48 @@ mod tests {
                 tol
             );
         }
+    }
+
+    /// A 5×5 non-symmetric matrix with a tightly clustered spectrum (near 5). It
+    /// is solvable, but a single QR sweep cannot deflate it, so a starved budget
+    /// exposes the non-convergence propagation path.
+    fn slow_converging_5x5() -> Mat<f64> {
+        Mat::from_rows(&[
+            &[5.0, 1.0, 0.2, 0.0, 0.1],
+            &[0.3, 5.0, 1.0, 0.15, 0.0],
+            &[0.0, 0.25, 5.0, 1.0, 0.2],
+            &[0.1, 0.0, 0.3, 5.0, 1.0],
+            &[0.2, 0.1, 0.0, 0.35, 5.0],
+        ])
+    }
+
+    #[test]
+    fn test_general_evd_reports_non_convergence() {
+        // Regression for the dead `NotConverged` variant: when the internal Schur
+        // decomposition fails to converge, GeneralEvd must report NotConverged
+        // rather than returning fabricated eigenvalues from a partial reduction.
+        let a = slow_converging_5x5();
+
+        let result = GeneralEvd::eigenvalues_only_with_budget(a.as_ref(), 1);
+        assert_eq!(
+            result.err(),
+            Some(GeneralEvdError::NotConverged),
+            "SchurError::NotConverged must propagate to GeneralEvdError::NotConverged"
+        );
+    }
+
+    #[test]
+    fn test_general_evd_converges_with_full_budget() {
+        // Control: the same matrix converges under the real default budget, so the
+        // error above is purely the artificial cap — not a broken matrix.
+        let a = slow_converging_5x5();
+
+        let evd = GeneralEvd::eigenvalues_only(a.as_ref()).expect("full budget must converge");
+        let trace: f64 = (0..5).map(|i| a[(i, i)]).sum();
+        let eig_sum: f64 = evd.eigenvalues().iter().map(|e| e.real).sum();
+        assert!(
+            approx_eq(eig_sum, trace, 1e-8),
+            "eigenvalue real-part sum {eig_sum} != trace {trace}"
+        );
     }
 }

@@ -37,8 +37,19 @@ impl From<LuError> for DetError {
 
 /// Computes the determinant of a square matrix.
 ///
-/// Uses LU decomposition internally. Returns an error if the matrix
-/// is singular.
+/// Uses LU decomposition internally. A singular (but square) matrix is
+/// mathematically guaranteed to have determinant zero, so this function
+/// returns `Ok(0.0)` for singular input rather than an error — matching
+/// the behavior of reference LAPACK/numpy-style consumers, which rely on
+/// `det(a) == 0` as the standard idiom for testing singularity.
+///
+/// Internally, `Lu::compute` reports a zero/near-zero pivot as
+/// [`LuError::Singular`]. Rather than propagating that as a hard failure,
+/// this function treats it as the honest numerical answer: a zero pivot
+/// in Gaussian elimination means the (partially reduced) matrix has a
+/// linearly dependent column, so the determinant of that submatrix — and
+/// therefore of the original matrix — is exactly zero, without needing to
+/// complete the rest of the factorization.
 ///
 /// # Arguments
 ///
@@ -46,12 +57,12 @@ impl From<LuError> for DetError {
 ///
 /// # Returns
 ///
-/// The determinant det(A).
+/// The determinant det(A). This is exactly `0.0` for singular matrices.
 ///
 /// # Errors
 ///
-/// Returns `DetError::NotSquare` if the matrix is not square.
-/// Returns `DetError::Singular` if the matrix is singular.
+/// Returns `DetError::NotSquare` if the matrix is not square. This is the
+/// only error case: singular-but-square input yields `Ok(0.0)`.
 ///
 /// # Example
 ///
@@ -66,16 +77,39 @@ impl From<LuError> for DetError {
 ///
 /// let d = det(a.as_ref()).unwrap();
 /// assert!((d - 10.0).abs() < 1e-10); // det = 4*6 - 7*2 = 10
+///
+/// // Singular matrices yield 0.0, not an error.
+/// let singular = Mat::from_rows(&[
+///     &[1.0f64, 2.0],
+///     &[2.0, 4.0],
+/// ]);
+/// assert_eq!(det(singular.as_ref()).unwrap(), 0.0);
 /// ```
 pub fn det<T: Field + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<T, DetError> {
-    let lu = Lu::compute(a)?;
-    Ok(lu.determinant())
+    match Lu::compute(a) {
+        Ok(lu) => Ok(lu.determinant()),
+        // A zero/near-zero pivot means the matrix (or the remaining Schur
+        // complement) has a linearly dependent column, so the determinant
+        // is exactly zero by construction. This is the correct, honest
+        // value — not an error condition — for a square matrix.
+        Err(LuError::Singular { .. }) => Ok(T::zero()),
+        // Genuine structural errors (non-square input, etc.) still propagate.
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Computes the determinant using LU decomposition, returning the LU object as well.
 ///
 /// This is useful when you need both the determinant and want to reuse the
 /// LU decomposition for other operations (like solving systems).
+///
+/// Unlike [`det`], this function still returns `Err(DetError::Singular)` for
+/// singular-but-square input: a singular matrix has no usable LU
+/// factorization to hand back (forward/back substitution would divide by a
+/// zero pivot), so there is no meaningful `Lu<T>` this function could return
+/// alongside the determinant. Callers that only need the determinant value
+/// (and want `0.0` rather than an error for singular input) should use
+/// [`det`] instead.
 ///
 /// # Arguments
 ///
@@ -84,6 +118,12 @@ pub fn det<T: Field + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<T, DetErro
 /// # Returns
 ///
 /// A tuple of (determinant, LU decomposition).
+///
+/// # Errors
+///
+/// Returns `DetError::NotSquare` if the matrix is not square.
+/// Returns `DetError::Singular` if the matrix is singular (no reusable LU
+/// factorization is available in that case).
 ///
 /// # Example
 ///
@@ -152,11 +192,56 @@ mod tests {
     }
 
     #[test]
-    fn test_det_singular() {
+    fn test_det_singular_proportional_rows() {
+        // Row 2 = 2 * Row 1: linearly dependent rows, exactly singular.
+        // det() must return the mathematically correct value 0.0, not an
+        // error -- this is the standard idiom (numpy/LAPACK-style) for
+        // testing singularity via the determinant.
         let a = Mat::from_rows(&[&[1.0f64, 2.0], &[2.0, 4.0]]);
 
-        let result = det(a.as_ref());
-        assert!(matches!(result, Err(DetError::Singular)));
+        let d = det(a.as_ref()).expect("det() must not error on singular square input");
+        assert_eq!(d, 0.0, "singular matrix must yield det == 0.0 exactly");
+    }
+
+    #[test]
+    fn test_det_singular_identical_rows() {
+        // Two exactly identical rows (rows 0 and 1) force a pivot to hit
+        // exactly zero *after* a row swap has already occurred during
+        // elimination, exercising the code path where the zero pivot shows
+        // up in the interior of the factorization rather than trivially at
+        // the first step.
+        let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[1.0, 2.0, 3.0], &[4.0, 5.0, 7.0]]);
+
+        let d = det(a.as_ref()).expect("det() must not error on singular square input");
+        assert_eq!(
+            d, 0.0,
+            "two identical rows must yield det == 0.0 exactly, got {d}"
+        );
+    }
+
+    #[test]
+    fn test_det_small_magnitude_well_conditioned_not_falsely_singular() {
+        // 1e-8 * I is perfectly well-conditioned (condition number 1) despite
+        // every entry being tiny. It must NOT be treated as singular, and
+        // det() must return the true (small but nonzero) value rather than
+        // clamping to 0.0.
+        let scale = 1.0e-8f64;
+        let a = Mat::from_rows(&[
+            &[scale, 0.0, 0.0],
+            &[0.0, scale, 0.0],
+            &[0.0, 0.0, scale],
+        ]);
+
+        let d = det(a.as_ref()).expect("well-conditioned small-magnitude matrix must not error");
+        let expected = scale * scale * scale;
+        assert!(
+            d != 0.0,
+            "small-magnitude well-conditioned matrix must not be falsely flagged as det == 0"
+        );
+        assert!(
+            ((d - expected) / expected).abs() < 1e-9,
+            "det = {d}, expected ~= {expected}"
+        );
     }
 
     #[test]
@@ -165,6 +250,17 @@ mod tests {
 
         let result = det(a.as_ref());
         assert!(matches!(result, Err(DetError::NotSquare)));
+    }
+
+    #[test]
+    fn test_det_lu_still_errors_on_singular() {
+        // det_lu() must keep erroring on singular input: it hands back a
+        // usable LU factorization for reuse (e.g. solve()), and no such
+        // factorization exists for a singular matrix.
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[2.0, 4.0]]);
+
+        let result = det_lu(a.as_ref());
+        assert!(matches!(result, Err(DetError::Singular)));
     }
 
     #[test]

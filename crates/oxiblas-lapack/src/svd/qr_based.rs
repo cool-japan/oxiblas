@@ -174,9 +174,34 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         Ok(Self { u, sigma, vt, m, n })
     }
 
-    /// Compute SVD of a bidiagonal matrix using implicit QR iteration.
-    /// Returns (U, sigma, V^T) where U and V^T are orthogonal and sigma are singular values.
+    /// Compute the SVD of a bidiagonal matrix using implicit-shift QR iteration.
+    ///
+    /// Returns `(U, sigma, Vᵀ)` where `U` and `Vᵀ` are orthogonal and `sigma`
+    /// holds the singular values (sorted descending, all non-negative).
+    ///
+    /// Non-convergence is reported honestly: if the iteration budget is exhausted
+    /// while any super-diagonal of the working bidiagonal is still non-negligible,
+    /// the routine returns [`QrSvdError::NotConverged`] carrying the number of
+    /// super-diagonals (≈ singular values) that failed to deflate — mirroring the
+    /// `INFO > 0` convention of LAPACK `DBDSQR`. It never falls through and returns
+    /// a partially-reduced (garbage) factorization as if it had succeeded.
     fn bidiagonal_svd_qr(d: &[T], e: &[T]) -> Result<(Mat<T>, Vec<T>, Mat<T>), QrSvdError> {
+        Self::bidiagonal_svd_qr_with_limit(d, e, Self::MAX_BIDIAG_ITER)
+    }
+
+    /// Implementation of [`Self::bidiagonal_svd_qr`] with an explicit per-value
+    /// iteration budget.
+    ///
+    /// The number of Golub–Kahan sweeps is bounded by `max_iter_per_value * n`;
+    /// the public entry point passes [`Self::MAX_BIDIAG_ITER`]. Factoring the
+    /// budget out lets tests drive the non-convergence path deterministically
+    /// (e.g. with a budget of zero) without ever weakening the production
+    /// tolerance or the production iteration limit.
+    fn bidiagonal_svd_qr_with_limit(
+        d: &[T],
+        e: &[T],
+        max_iter_per_value: usize,
+    ) -> Result<(Mat<T>, Vec<T>, Mat<T>), QrSvdError> {
         let n = d.len();
         if n == 0 {
             return Ok((Mat::zeros(0, 0), vec![], Mat::zeros(0, 0)));
@@ -185,7 +210,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         let mut d_work: Vec<T> = d.to_vec();
         let mut e_work: Vec<T> = e.to_vec();
 
-        // Initialize U and V^T as identity
+        // Initialize U and Vᵀ as identity.
         let mut u = Mat::zeros(n, n);
         let mut vt = Mat::zeros(n, n);
         for i in 0..n {
@@ -196,40 +221,47 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         let eps = <T as Scalar>::epsilon();
         let tol = eps * T::from_f64(100.0).unwrap_or(T::one());
 
-        // Implicit QR iteration (Golub-Kahan SVD step)
-        for _iter in 0..Self::MAX_BIDIAG_ITER * n {
-            // Check for convergence
-            let mut converged = true;
-            for i in 0..e_work.len() {
-                if Scalar::abs(e_work[i])
-                    > tol * (Scalar::abs(d_work[i]) + Scalar::abs(d_work[i + 1]))
-                {
-                    converged = false;
-                    break;
-                }
-            }
-            if converged {
-                break;
-            }
-
-            // Find the largest unreduced block from the bottom
-            let mut p = e_work.len();
-            while p > 0
-                && Scalar::abs(e_work[p - 1])
-                    <= tol * (Scalar::abs(d_work[p - 1]) + Scalar::abs(d_work[p]))
+        // Implicit-shift Golub–Kahan iteration.
+        for _iter in 0..max_iter_per_value.saturating_mul(n) {
+            // Deflate the trailing corner: locate the maximal unreduced block
+            // spanning diagonal indices [lo, hi] that touches the bottom of the
+            // matrix. `hi` is the last diagonal index still coupled by a
+            // non-negligible super-diagonal.
+            let mut hi = e_work.len();
+            while hi > 0
+                && is_negligible_superdiag(e_work[hi - 1], d_work[hi - 1], d_work[hi], tol)
             {
-                p -= 1;
+                hi -= 1;
             }
-
-            if p == 0 {
+            if hi == 0 {
+                // Every super-diagonal is negligible -> fully converged.
                 break;
             }
+            let mut lo = hi - 1;
+            while lo > 0
+                && !is_negligible_superdiag(e_work[lo - 1], d_work[lo - 1], d_work[lo], tol)
+            {
+                lo -= 1;
+            }
 
-            // Apply Golub-Kahan SVD step to the unreduced block [0..p+1]
-            Self::golub_kahan_step(&mut d_work, &mut e_work, &mut u, &mut vt, 0, p + 1);
+            // Apply one Wilkinson-shifted Golub–Kahan step to rows/cols [lo, hi].
+            // Isolating the maximal trailing block (rather than always starting at
+            // row 0) keeps the Wilkinson shift focused on the sub-problem that is
+            // actually converging, which is what makes the shift effective.
+            Self::golub_kahan_step(&mut d_work, &mut e_work, &mut u, &mut vt, lo, hi + 1);
         }
 
-        // Make all diagonal elements positive
+        // Honest non-convergence reporting: `NotConverged` was previously dead
+        // code (constructed nowhere) and the routine silently returned a
+        // not-fully-reduced result. Re-check the working bidiagonal independently
+        // of how the loop exited and fail with the real unconverged count.
+        let num_unconverged = count_unconverged_superdiags(&d_work, &e_work, tol);
+        if num_unconverged > 0 {
+            return Err(QrSvdError::NotConverged { num_unconverged });
+        }
+
+        // Make all diagonal elements positive by flipping the sign of the
+        // corresponding left singular vector (Σ must be non-negative).
         for i in 0..n {
             if d_work[i] < T::zero() {
                 d_work[i] = -d_work[i];
@@ -239,7 +271,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
             }
         }
 
-        // Sort singular values in descending order
+        // Sort singular values in descending order.
         let mut indices: Vec<usize> = (0..n).collect();
         indices.sort_by(|&a, &b| {
             if d_work[b] > d_work[a] {
@@ -266,7 +298,18 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         Ok((u_sorted, sigma, vt_sorted))
     }
 
-    /// Golub-Kahan SVD step (implicit zero-shift QR).
+    /// One implicit **Wilkinson-shifted** Golub–Kahan SVD step over the active
+    /// block `d[start..end]` / `e[start..end-1]`.
+    ///
+    /// The step forms the shift μ from the trailing 2×2 of `T = Bᵀ·B`
+    /// ([`wilkinson_shift`]) and starts the bulge chase from the shifted vector
+    /// `(f, g) = (d[start]² − μ, d[start]·e[start])`. By the implicit-Q theorem the
+    /// resulting sequence of Givens rotations is equivalent to one explicitly
+    /// shifted symmetric-QR step on `T`, yet it is applied directly to the
+    /// bidiagonal `B` (never forming `Bᵀ·B`), which preserves the high relative
+    /// accuracy of the small singular values. Setting μ = 0 would recover the
+    /// classical zero-shift step; the shift is what restores fast (asymptotically
+    /// cubic) convergence on tightly clustered singular values.
     fn golub_kahan_step(
         d: &mut [T],
         e: &mut [T],
@@ -276,12 +319,12 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         end: usize,
     ) {
         let n = u.nrows();
-
-        // Initial rotation using Wilkinson shift on B^T * B
         let last = end - 1;
 
-        // Initial values for bulge chase
-        let mut f = d[start] * d[start];
+        // Wilkinson shift from the trailing 2×2 of Bᵀ·B, then the shifted start
+        // vector (t11 - μ, t12) that seeds the bulge chase.
+        let mu = wilkinson_shift(d, e, start, end);
+        let mut f = d[start] * d[start] - mu;
         let mut g = d[start] * e[start];
 
         for k in start..last {
@@ -369,25 +412,118 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
         result
     }
 
-    /// Returns the condition number (ratio of largest to smallest singular value).
+    /// Returns the 2-norm condition number κ₂ = σ_max / σ_min.
+    ///
+    /// For a singular (rank-deficient) matrix σ_min is zero, so the condition
+    /// number is mathematically infinite; we return `+∞` (IEEE-754) rather than
+    /// panicking or returning a finite sentinel, matching the documented contract
+    /// of [`crate::utils::cond`]. An empty spectrum (0×0 map) is reported as `1`.
+    ///
+    /// The failure case is handled by pattern-matching on the spectrum endpoints
+    /// instead of `unwrap`/`expect`, so this production path can never panic.
     pub fn condition_number(&self) -> T {
-        if self.sigma.is_empty() {
-            return T::one();
-        }
-
-        let max_sv = self.sigma[0];
-        let min_sv = *self.sigma.last().expect("collection should be non-empty");
-
-        if min_sv > T::zero() {
-            max_sv / min_sv
-        } else {
-            <T as Scalar>::max_value()
+        match (self.sigma.first(), self.sigma.last()) {
+            (Some(&max_sv), Some(&min_sv)) => {
+                if min_sv > T::zero() {
+                    max_sv / min_sv
+                } else {
+                    T::infinity()
+                }
+            }
+            _ => T::one(),
         }
     }
 
     /// Returns the numerical rank with given tolerance.
     pub fn rank(&self, tol: T) -> usize {
         self.sigma.iter().filter(|&&s| s > tol).count()
+    }
+}
+
+/// Returns `true` when the super-diagonal entry `e_i` (which couples the diagonal
+/// entries `d_i` and `d_ip1`) is negligible relative to its neighbours and may be
+/// treated as an exact zero for deflation.
+///
+/// WHY a plain `<=` comparison: for a NaN super-diagonal `NaN <= x` is `false`, so
+/// the entry is reported as *non*-negligible. This is deliberate — it prevents an
+/// IEEE-754 NaN from being silently classified as a converged (zero) super-diagonal
+/// and dropped from the result. Instead the NaN blocks convergence and is surfaced
+/// as an honest [`QrSvdError::NotConverged`] rather than as plausible-looking
+/// garbage singular values.
+#[inline]
+fn is_negligible_superdiag<T: Field + Real>(e_i: T, d_i: T, d_ip1: T, tol: T) -> bool {
+    Scalar::abs(e_i) <= tol * (Scalar::abs(d_i) + Scalar::abs(d_ip1))
+}
+
+/// Counts the super-diagonal entries that are *not* negligible, i.e. the number of
+/// singular values that have not yet deflated. Zero means the bidiagonal has fully
+/// converged; a positive count is exactly what LAPACK `DBDSQR` reports in `INFO`.
+fn count_unconverged_superdiags<T: Field + Real>(d: &[T], e: &[T], tol: T) -> usize {
+    e.iter()
+        .enumerate()
+        .filter(|&(i, &ev)| !is_negligible_superdiag(ev, d[i], d[i + 1], tol))
+        .count()
+}
+
+/// Computes the Wilkinson shift μ for one implicit Golub–Kahan SVD step over the
+/// active block `d[start..end]` / `e[start..end-1]`.
+///
+/// μ is the eigenvalue of the trailing 2×2 submatrix of the symmetric tridiagonal
+/// `T = Bᵀ·B` (restricted to the block) that lies closest to `T[last,last]`.
+///
+/// WHY use a shift at all: the zero-shift (μ = 0) step converges only *linearly*
+/// on tightly clustered singular values, so a cluster can exhaust the iteration
+/// budget — the very failure mode whose (previously silent) mishandling this file
+/// also fixes. The Wilkinson shift restores the asymptotically cubic convergence
+/// of shifted QR. Because `T = Bᵀ·B` is symmetric positive-semidefinite, its
+/// trailing eigenvalue is real and ≥ 0, so μ ≥ 0 and the singular values produced
+/// by the step stay real and non-negative.
+///
+/// The formula is written in the cancellation-avoiding form
+/// `μ = t22 − t12² / (δ + sign(δ)·√(δ² + t12²))`, `δ = (t11 − t22)/2`
+/// (Golub & Van Loan, *Matrix Computations*, 4th ed., Alg. 8.6.1 and §8.3.5),
+/// which is numerically safer than `t22 + δ − sign(δ)·√(δ² + t12²)` when the two
+/// trailing eigenvalues are close.
+///
+/// Precondition: the block has at least two diagonal entries (`end >= start + 2`),
+/// which the deflation logic in [`Self::bidiagonal_svd_qr_with_limit`] guarantees.
+fn wilkinson_shift<T: Field + Real>(d: &[T], e: &[T], start: usize, end: usize) -> T {
+    let last = end - 1;
+
+    // Trailing 2×2 of T = Bᵀ·B over the block:
+    //   T[i,i]   = d[i]² + e[i-1]²   (a super-diagonal index below `start` lies
+    //                                 outside the block and contributes 0)
+    //   T[i,i+1] = d[i] · e[i]
+    let e_last = e[last - 1]; // couples d[last-1] and d[last]
+    let e_above = if last - 1 > start {
+        e[last - 2]
+    } else {
+        T::zero()
+    };
+    let t22 = d[last] * d[last] + e_last * e_last;
+    let t11 = d[last - 1] * d[last - 1] + e_above * e_above;
+    let t12 = d[last - 1] * e_last;
+
+    // Diagonal (or negligibly-coupled) trailing 2×2: the closest eigenvalue is t22.
+    if Scalar::abs(t12) <= <T as Scalar>::epsilon() * (Scalar::abs(t11) + Scalar::abs(t22)) {
+        return t22;
+    }
+
+    let two = T::one() + T::one();
+    let delta = (t11 - t22) / two;
+    // sign(0) is taken as +1 so the denominator never cancels to zero here.
+    let sign_delta = if delta >= T::zero() {
+        T::one()
+    } else {
+        -T::one()
+    };
+    let denom = delta + sign_delta * Real::sqrt(delta * delta + t12 * t12);
+    if Scalar::abs(denom) <= <T as Scalar>::min_positive() {
+        // Degenerate denominator (only reachable under extreme underflow):
+        // fall back to the unshifted trailing eigenvalue estimate.
+        t22
+    } else {
+        t22 - t12 * t12 / denom
     }
 }
 
@@ -607,5 +743,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Reconstructs a dense matrix from a bidiagonal SVD factorization
+    /// `B = U · diag(sigma) · Vᵀ` for verification.
+    fn reconstruct_bidiag(u: &Mat<f64>, sigma: &[f64], vt: &Mat<f64>) -> Mat<f64> {
+        let n = sigma.len();
+        let mut b = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for l in 0..n {
+                    s += u[(i, l)] * sigma[l] * vt[(l, j)];
+                }
+                b[(i, j)] = s;
+            }
+        }
+        b
+    }
+
+    /// Regression for finding #3: the step now applies a real Wilkinson shift.
+    /// A bidiagonal with a tight cluster of singular values near 2 is exactly the
+    /// case where the previous zero-shift step converges only linearly. With the
+    /// shift it converges within the standard budget; we verify the factorization
+    /// reconstructs B and that Σ is a valid (non-negative, descending) spectrum.
+    #[test]
+    fn test_qr_svd_bidiagonal_clustered_converges() {
+        let d = vec![2.0f64, 2.0, 2.0, 2.0, 2.0];
+        let e = vec![1e-7f64, 1e-7, 1e-7, 1e-7];
+
+        let (u, sigma, vt) = QrSvd::<f64>::bidiagonal_svd_qr(&d, &e)
+            .expect("clustered bidiagonal must converge with the Wilkinson shift");
+
+        // Build the original bidiagonal B = diag(d) + superdiag(e).
+        let n = d.len();
+        let mut b = Mat::zeros(n, n);
+        for i in 0..n {
+            b[(i, i)] = d[i];
+        }
+        for i in 0..n - 1 {
+            b[(i, i + 1)] = e[i];
+        }
+
+        let recon = reconstruct_bidiag(&u, &sigma, &vt);
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    approx_eq(recon[(i, j)], b[(i, j)], 1e-10),
+                    "reconstruct mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    recon[(i, j)],
+                    b[(i, j)]
+                );
+            }
+        }
+
+        for w in sigma.windows(2) {
+            assert!(w[0] >= w[1], "sigma not descending: {:?}", sigma);
+        }
+        for &s in &sigma {
+            assert!(s >= 0.0, "negative singular value: {}", s);
+            assert!(
+                (s - 2.0).abs() < 1e-3,
+                "singular value not near the cluster: {}",
+                s
+            );
+        }
+    }
+
+    /// Regression for finding #1: `NotConverged` used to be dead code. With a zero
+    /// iteration budget on a genuinely non-diagonal bidiagonal, the routine must
+    /// report `NotConverged` with the exact count of non-negligible super-diagonals
+    /// instead of silently returning a partially-reduced (garbage) factorization.
+    #[test]
+    fn test_qr_svd_not_converged_reported() {
+        let d = vec![2.0f64, 2.0, 2.0, 2.0];
+        let e = vec![1.0f64, 1.0, 1.0];
+
+        let result = QrSvd::<f64>::bidiagonal_svd_qr_with_limit(&d, &e, 0);
+        match result {
+            Err(QrSvdError::NotConverged { num_unconverged }) => {
+                assert_eq!(
+                    num_unconverged, 3,
+                    "expected all 3 super-diagonals reported unconverged"
+                );
+            }
+            other => panic!("expected NotConverged, got {:?}", other),
+        }
+
+        // An already-diagonal bidiagonal has nothing left to reduce, so even a zero
+        // budget must NOT produce a false NotConverged.
+        let d_diag = vec![3.0f64, 2.0, 1.0];
+        let e_diag = vec![0.0f64, 0.0];
+        let (_, sigma, _) = QrSvd::<f64>::bidiagonal_svd_qr_with_limit(&d_diag, &e_diag, 0)
+            .expect("already-diagonal input must not report NotConverged");
+        assert!(approx_eq(sigma[0], 3.0, 1e-12));
+        assert!(approx_eq(sigma[1], 2.0, 1e-12));
+        assert!(approx_eq(sigma[2], 1.0, 1e-12));
+    }
+
+    /// Regression for finding #2: `condition_number()` no longer uses `expect()`,
+    /// and a singular matrix (exact zero smallest singular value) yields `+∞`
+    /// instead of panicking or returning a finite sentinel.
+    #[test]
+    fn test_qr_svd_condition_number_singular() {
+        // Diagonal rank-deficient matrix -> the bidiagonal is already diagonal with
+        // an exact zero, so the smallest singular value is exactly 0.
+        let a = Mat::from_rows(&[&[2.0f64, 0.0], &[0.0, 0.0]]);
+        let svd = QrSvd::compute(a.as_ref()).unwrap();
+        let cond = svd.condition_number();
+        assert!(
+            cond.is_infinite() && cond > 0.0,
+            "condition number of a singular matrix must be +inf, got {}",
+            cond
+        );
+
+        // The all-zero matrix is likewise singular; must not panic.
+        let z = Mat::from_rows(&[&[0.0f64, 0.0], &[0.0, 0.0]]);
+        let svd_z = QrSvd::compute(z.as_ref()).unwrap();
+        assert!(
+            svd_z.condition_number().is_infinite(),
+            "condition number of the zero matrix must be +inf"
+        );
     }
 }

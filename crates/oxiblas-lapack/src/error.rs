@@ -599,6 +599,12 @@ impl IntoLapackError for QrError {
                 expected: 1,
                 actual: 0,
             },
+            QrError::DimensionMismatch { expected, actual } => ErrorCode::InvalidDimension {
+                argument: 2,
+                expected,
+                actual,
+            },
+            QrError::NearlySingular { index: _ } => ErrorCode::NearlySingular { rcond: 0.0 },
         };
         LapackError::new(code, operation)
     }

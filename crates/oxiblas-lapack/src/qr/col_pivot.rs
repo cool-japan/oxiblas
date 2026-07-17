@@ -175,10 +175,20 @@ impl<T: Field + Real + bytemuck::Zeroable> QrPivot<T> {
                 first_diag_abs = diag_abs;
             }
 
-            // Check for numerical rank deficiency using relative tolerance
-            // Use max(m,n) * eps * |R[0,0]| as default tolerance (LAPACK-style)
+            // Check for numerical rank deficiency using relative tolerance.
+            // Use max(m,n) * eps * |R[0,0]| as default tolerance (LAPACK-style).
+            //
+            // The comparison must also fire at `j == 0`: for an all-zero matrix
+            // the largest pivot `first_diag_abs` is exactly 0, so the default
+            // tolerance is `base_tol * 0 == 0` and the first pivot `diag_abs == 0`
+            // satisfies `0 <= 0`, giving the correct rank 0. A previous `&& j > 0`
+            // guard suppressed this case and reported rank 1 for the zero matrix.
+            // The guard is unnecessary for well-conditioned input because at
+            // `j == 0` the relative test reduces to `first_diag_abs <= base_tol *
+            // first_diag_abs`, i.e. `1 <= base_tol`, which is never true for a
+            // nonzero pivot (base_tol = eps * max(m,n) << 1).
             let tolerance = user_tol.unwrap_or(base_tol * first_diag_abs);
-            if diag_abs <= tolerance && j > 0 {
+            if diag_abs <= tolerance {
                 rank = j;
                 // Fill remaining tau with zeros
                 for idx in j..k {
@@ -709,6 +719,46 @@ mod tests {
 
         let result = QrPivot::compute(a.as_ref());
         assert!(matches!(result, Err(QrPivotError::EmptyMatrix)));
+    }
+
+    #[test]
+    fn test_qr_pivot_zero_matrix_rank_zero() {
+        // An all-zero matrix has numerical rank 0. This exercises the rank
+        // boundary at j == 0: the largest pivot is exactly zero, so the loop
+        // must break on the very first column with rank 0 (previously a
+        // `j > 0` guard suppressed this and reported rank 1).
+        for (rows, cols) in [(3usize, 4usize), (4, 3), (1, 1), (2, 2)] {
+            let a: Mat<f64> = Mat::zeros(rows, cols);
+            let qr = QrPivot::compute(a.as_ref()).unwrap();
+            assert_eq!(
+                qr.rank(),
+                0,
+                "zero {rows}x{cols} matrix must have rank 0, got {}",
+                qr.rank()
+            );
+        }
+    }
+
+    #[test]
+    fn test_qr_pivot_rank_one_via_pivot_swap() {
+        // Only the third column is nonzero, so column pivoting must swap it to
+        // the front. Numerical rank is exactly 1; the loop must break at j == 1
+        // (the second pivot is zero) and report rank 1 -- verifying the fixed
+        // boundary logic still terminates correctly after a genuine swap.
+        let a = Mat::from_rows(&[
+            &[0.0f64, 0.0, 3.0],
+            &[0.0, 0.0, 4.0],
+            &[0.0, 0.0, 0.0],
+        ]);
+
+        let qr = QrPivot::compute(a.as_ref()).unwrap();
+        assert_eq!(qr.rank(), 1, "rank should be 1, got {}", qr.rank());
+        // The single nonzero column (index 2) must be pivoted to position 0.
+        assert_eq!(
+            qr.column_permutation()[0],
+            2,
+            "nonzero column should be pivoted first"
+        );
     }
 
     #[test]

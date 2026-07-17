@@ -6,7 +6,7 @@
 //!
 //! PAQ = LU where P is the row permutation and Q is the column permutation.
 
-use num_traits::{FromPrimitive, One};
+use num_traits::{FromPrimitive, One, Zero};
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -147,7 +147,19 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
             * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
         let tolerance = tol.unwrap_or(default_tol);
 
-        let rank = n;
+        // Norm of the original matrix (max absolute entry), captured before `lu`
+        // is overwritten by the elimination. Used below to build a *relative*
+        // tolerance for rank detection, since an absolute epsilon threshold is
+        // meaningless once A is scaled away from O(1) magnitude.
+        let mut norm_a = <T::Real as Zero>::zero();
+        for j in 0..n {
+            for i in 0..n {
+                let val = Scalar::abs(a[(i, j)]);
+                if val > norm_a {
+                    norm_a = val;
+                }
+            }
+        }
 
         // Doolittle algorithm with full pivoting
         for k in 0..n {
@@ -212,6 +224,21 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
             }
         }
 
+        // Numerical rank: count diagonal entries of the completed U factor whose
+        // magnitude exceeds a tolerance relative to the norm of the original
+        // matrix (not a bare absolute epsilon, which would be meaningless for
+        // matrices scaled far away from O(1) magnitude). This mirrors the
+        // classic LU-based numerical rank estimate `tol = n * eps * ||A||`.
+        let rank_tolerance = T::epsilon()
+            * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one())
+            * norm_a;
+        let mut rank = 0usize;
+        for i in 0..n {
+            if Scalar::abs(lu[(i, i)]) > rank_tolerance {
+                rank += 1;
+            }
+        }
+
         Ok(LuFullPiv {
             lu,
             row_pivot,
@@ -229,6 +256,11 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
     }
 
     /// Returns the numerical rank detected during factorization.
+    ///
+    /// The rank is the number of diagonal entries of the completed U factor
+    /// whose magnitude exceeds a tolerance relative to the norm of the
+    /// original matrix (`n * eps * ||A||`), not merely the matrix dimension.
+    /// For a rank-deficient matrix this is strictly less than [`Self::size`].
     #[inline]
     pub fn rank(&self) -> usize {
         self.rank
@@ -662,6 +694,88 @@ mod tests {
                 assert!((inv[(i, j)] - expected).abs() < 1e-10);
             }
         }
+    }
+
+    #[test]
+    fn test_lu_full_piv_rank_deficient_duplicate_rows() {
+        // Row 3 is an exact duplicate of row 0, so the true rank is 3, not 4
+        // (verified independently: the 3x3 minor formed by rows 0..2 and
+        // columns 0..2 has determinant -25, so rows 0..2 are independent).
+        //
+        // Under exact arithmetic, full pivoting drives the pivot at the
+        // dependent step to *exactly* zero (dividing a row by an identical
+        // row's pivot gives a multiplier of exactly 1.0, and subtracting two
+        // bit-identical rows gives exactly 0.0 in IEEE-754). The default
+        // tolerance treats that as a hard singularity (a separate, existing
+        // contract this fix does not change — LuFullPivError::Singular must
+        // keep firing for `compute()`'s default tolerance, since the FFI
+        // layer (oblas_dgetc2/sgetc2) relies on it to report LAPACK-style
+        // singular-matrix INFO codes). Here we pass a permissive tolerance
+        // purely to obtain the completed factorization so the *rank
+        // computation itself* (the thing this test targets) can be checked
+        // against the diagonal of U.
+        let a: Mat<f64> = Mat::from_rows(&[
+            &[4.0, 2.0, 7.0, 1.0],
+            &[1.0, 5.0, 2.0, 3.0],
+            &[6.0, 1.0, 9.0, 4.0],
+            &[4.0, 2.0, 7.0, 1.0],
+        ]);
+
+        // Sanity: the default (strict) tolerance still reports singularity,
+        // exactly as before this fix.
+        let default_result = LuFullPiv::compute(a.as_ref());
+        assert!(
+            default_result.is_err(),
+            "default tolerance must still hard-fail on this singular matrix"
+        );
+
+        let lu = LuFullPiv::compute_with_tol(a.as_ref(), Some(-1.0))
+            .expect("permissive tolerance should bypass the hard singularity check");
+
+        assert_eq!(lu.size(), 4);
+        assert_eq!(
+            lu.rank(),
+            3,
+            "a matrix with a duplicated row has rank 3, not the fabricated n=4"
+        );
+    }
+
+    #[test]
+    fn test_lu_full_piv_rank_deficient_outer_product() {
+        // A = u * v^T is a rank-1 matrix by construction. Both u and v are
+        // chosen as exact powers of two so every entry, and every ratio
+        // formed during elimination, is exactly representable in binary
+        // floating point -- guaranteeing the sub-diagonal pivots collapse to
+        // *exactly* zero rather than some ambiguous near-zero noise-floor
+        // value, making the expected rank deterministic across platforms.
+        let u = [1.0f64, 2.0, 4.0, 8.0];
+        let v = [1.0f64, 2.0, 4.0, 8.0];
+        let rows: Vec<Vec<f64>> = u
+            .iter()
+            .map(|ui| v.iter().map(|vj| ui * vj).collect())
+            .collect();
+        let row_refs: Vec<&[f64]> = rows.iter().map(|r| r.as_slice()).collect();
+        let a: Mat<f64> = Mat::from_rows(&row_refs);
+
+        let lu = LuFullPiv::compute_with_tol(a.as_ref(), Some(-1.0))
+            .expect("permissive tolerance should bypass the hard singularity check");
+
+        assert_eq!(lu.size(), 4);
+        assert_eq!(lu.rank(), 1, "rank-1 outer product must report rank 1");
+    }
+
+    #[test]
+    fn test_lu_full_piv_rank_full_rank_unaffected() {
+        // Sanity guard: well-conditioned, genuinely full-rank matrices must
+        // still report rank() == n after this fix (i.e. the new relative
+        // tolerance must not be so aggressive that it flags healthy pivots).
+        let a: Mat<f64> = Mat::from_rows(&[&[2.0, 1.0, 1.0], &[4.0, 3.0, 3.0], &[8.0, 7.0, 9.0]]);
+        let lu = LuFullPiv::compute(a.as_ref()).expect("Should not be singular");
+        assert_eq!(lu.rank(), 3);
+
+        let eye: Mat<f64> = Mat::eye(5);
+        let lu_eye = LuFullPiv::compute(eye.as_ref()).expect("Identity should not be singular");
+        assert_eq!(lu_eye.rank(), 5);
     }
 
     #[test]

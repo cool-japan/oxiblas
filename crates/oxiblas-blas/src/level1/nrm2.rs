@@ -1076,7 +1076,11 @@ mod tests {
         let mut x = vec![1.0f64; 128];
         x[64] = f64::NAN;
         let norm = nrm2_f64(&x);
-        assert!(norm.is_nan(), "SIMD f64 nrm2 must propagate NaN, got {}", norm);
+        assert!(
+            norm.is_nan(),
+            "SIMD f64 nrm2 must propagate NaN, got {}",
+            norm
+        );
 
         let mut x32 = vec![1.0f32; 256];
         x32[100] = f32::NAN;

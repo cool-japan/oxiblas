@@ -448,10 +448,7 @@ impl<T: Scalar> BandedMat<T> {
     ///
     /// `uplo` selects whether the resulting [`SymmetricBandedMat`] stores the
     /// upper (`row <= col`) or lower (`row >= col`) triangle of `self`.
-    pub fn to_symmetric_banded(
-        &self,
-        uplo: super::packed::TriangularKind,
-    ) -> SymmetricBandedMat<T>
+    pub fn to_symmetric_banded(&self, uplo: super::packed::TriangularKind) -> SymmetricBandedMat<T>
     where
         T: bytemuck::Zeroable,
     {

@@ -499,11 +499,9 @@ mod tests {
 
         let first = candidates[0];
         assert!(
-            candidates
-                .iter()
-                .any(|c| c.block_m != first.block_m
-                    || c.block_n != first.block_n
-                    || c.block_k != first.block_k),
+            candidates.iter().any(|c| c.block_m != first.block_m
+                || c.block_n != first.block_n
+                || c.block_k != first.block_k),
             "all generated candidates were identical; nothing would actually be tuned"
         );
     }

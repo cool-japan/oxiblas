@@ -770,9 +770,6 @@ mod tests {
         // silent saturation to a finite value).
         let mut a_inf = a.clone();
         a_inf[10] = f64::INFINITY;
-        assert!(
-            simd_dot(&a_inf, &b).is_infinite(),
-            "Inf did not propagate"
-        );
+        assert!(simd_dot(&a_inf, &b).is_infinite(), "Inf did not propagate");
     }
 }

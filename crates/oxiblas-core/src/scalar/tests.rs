@@ -215,7 +215,11 @@ fn test_f128_rounding_double_double() {
     assert_eq!(int_of(NumF::trunc(above_neg3)), -2.0, "trunc toward zero");
 
     // Half-integer ties broken by the low word (hi is the half-integer 2.5).
-    assert_eq!(int_of(NumF::round(QuadFloat::from(2.5))), 3.0, "tie away from 0");
+    assert_eq!(
+        int_of(NumF::round(QuadFloat::from(2.5))),
+        3.0,
+        "tie away from 0"
+    );
     assert_eq!(
         int_of(NumF::round(QuadFloat::from(2.5) - tiny)),
         2.0,
@@ -314,7 +318,10 @@ fn test_f128_cbrt_negative() {
     let cbrt_neg27 = NumF::cbrt(QuadFloat::from(-27.0));
     assert!(!cbrt_neg27.is_nan(), "cbrt(-27) must not be NaN");
     assert!(qabs(cbrt_neg27 - QuadFloat::from(-3.0)) < tol);
-    assert!(cbrt_neg27.inner().is_sign_negative(), "cbrt(-27) is negative");
+    assert!(
+        cbrt_neg27.inner().is_sign_negative(),
+        "cbrt(-27) is negative"
+    );
 
     assert!(qabs(NumF::cbrt(QuadFloat::from(-8.0)) - QuadFloat::from(-2.0)) < tol);
 

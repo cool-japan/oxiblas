@@ -70,7 +70,17 @@ pub unsafe extern "C" fn cblas_cgemv(
         return;
     }
     gemv_c(
-        layout, trans, m as usize, n as usize, *alpha, a, lda as usize, x, incx as isize, *beta, y,
+        layout,
+        trans,
+        m as usize,
+        n as usize,
+        *alpha,
+        a,
+        lda as usize,
+        x,
+        incx as isize,
+        *beta,
+        y,
         incy as isize,
     );
 }
@@ -95,7 +105,17 @@ pub unsafe extern "C" fn cblas_zgemv(
         return;
     }
     gemv_c(
-        layout, trans, m as usize, n as usize, *alpha, a, lda as usize, x, incx as isize, *beta, y,
+        layout,
+        trans,
+        m as usize,
+        n as usize,
+        *alpha,
+        a,
+        lda as usize,
+        x,
+        incx as isize,
+        *beta,
+        y,
         incy as isize,
     );
 }
@@ -176,7 +196,16 @@ pub unsafe extern "C" fn cblas_chemv(
         return;
     }
     hemv_c(
-        layout, uplo, n as usize, *alpha, a, lda as usize, x, incx as isize, *beta, y,
+        layout,
+        uplo,
+        n as usize,
+        *alpha,
+        a,
+        lda as usize,
+        x,
+        incx as isize,
+        *beta,
+        y,
         incy as isize,
     );
 }
@@ -200,7 +229,16 @@ pub unsafe extern "C" fn cblas_zhemv(
         return;
     }
     hemv_c(
-        layout, uplo, n as usize, *alpha, a, lda as usize, x, incx as isize, *beta, y,
+        layout,
+        uplo,
+        n as usize,
+        *alpha,
+        a,
+        lda as usize,
+        x,
+        incx as isize,
+        *beta,
+        y,
         incy as isize,
     );
 }
@@ -248,7 +286,13 @@ unsafe fn hemv_c<F: Float + oxiblas_core::scalar::Real>(
     }
 }
 
-unsafe fn scatter_c<F: Float>(dst: *mut Complex<F>, src: &[Complex<F>], n: usize, inc: isize, conj: bool) {
+unsafe fn scatter_c<F: Float>(
+    dst: *mut Complex<F>,
+    src: &[Complex<F>],
+    n: usize,
+    inc: isize,
+    conj: bool,
+) {
     for (i, &val) in src.iter().enumerate().take(n) {
         *dst.offset(vec_offset(i, n, inc)) = if conj { val.conj() } else { val };
     }

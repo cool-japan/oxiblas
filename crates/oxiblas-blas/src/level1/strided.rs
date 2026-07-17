@@ -778,7 +778,11 @@ mod tests {
         for i in 0..n {
             expected[ref_offset(i, n, 2)] += 2.0 * xbuf[ref_offset(i, n, 3)];
         }
-        axpy_strided(2.0, slice_view(&xbuf, n, 3), slice_view_mut(&mut ybuf, n, 2));
+        axpy_strided(
+            2.0,
+            slice_view(&xbuf, n, 3),
+            slice_view_mut(&mut ybuf, n, 2),
+        );
         for k in 0..ybuf.len() {
             assert!((ybuf[k] - expected[k]).abs() < 1e-12, "index {k}");
         }
@@ -793,7 +797,11 @@ mod tests {
         for i in 0..n {
             expected[ref_offset(i, n, -1)] += 3.0 * xbuf[ref_offset(i, n, -1)];
         }
-        axpy_strided(3.0, slice_view(&xbuf, n, -1), slice_view_mut(&mut ybuf, n, -1));
+        axpy_strided(
+            3.0,
+            slice_view(&xbuf, n, -1),
+            slice_view_mut(&mut ybuf, n, -1),
+        );
         for k in 0..3 {
             assert!((ybuf[k] - expected[k]).abs() < 1e-12);
         }

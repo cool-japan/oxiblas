@@ -128,14 +128,13 @@ unsafe fn symv_impl<T: Field>(
 ) {
     let n = n as usize;
     let lda = lda as usize;
-    let uplo_internal = match (layout, uplo) {
-        (CblasLayout::ColMajor, CblasUplo::Upper) | (CblasLayout::RowMajor, CblasUplo::Lower) => {
-            level2::SymvUplo::Upper
-        }
-        (CblasLayout::ColMajor, CblasUplo::Lower) | (CblasLayout::RowMajor, CblasUplo::Upper) => {
-            level2::SymvUplo::Lower
-        }
-    };
+    let uplo_internal =
+        match (layout, uplo) {
+            (CblasLayout::ColMajor, CblasUplo::Upper)
+            | (CblasLayout::RowMajor, CblasUplo::Lower) => level2::SymvUplo::Upper,
+            (CblasLayout::ColMajor, CblasUplo::Lower)
+            | (CblasLayout::RowMajor, CblasUplo::Upper) => level2::SymvUplo::Lower,
+        };
 
     let x_vec = gather(x, n, incx as isize);
     let mut y_vec = gather(y, n, incy as isize);
@@ -199,14 +198,13 @@ unsafe fn syr_impl<T: Real>(
 ) {
     let n = n as usize;
     let lda = lda as usize;
-    let uplo_internal = match (layout, uplo) {
-        (CblasLayout::ColMajor, CblasUplo::Upper) | (CblasLayout::RowMajor, CblasUplo::Lower) => {
-            level2::SyrUplo::Upper
-        }
-        (CblasLayout::ColMajor, CblasUplo::Lower) | (CblasLayout::RowMajor, CblasUplo::Upper) => {
-            level2::SyrUplo::Lower
-        }
-    };
+    let uplo_internal =
+        match (layout, uplo) {
+            (CblasLayout::ColMajor, CblasUplo::Upper)
+            | (CblasLayout::RowMajor, CblasUplo::Lower) => level2::SyrUplo::Upper,
+            (CblasLayout::ColMajor, CblasUplo::Lower)
+            | (CblasLayout::RowMajor, CblasUplo::Upper) => level2::SyrUplo::Lower,
+        };
     let x_vec = gather(x, n, incx as isize);
     let a_mut = MatMut::<T>::new(a, n, n, lda);
     let _ = level2::syr(uplo_internal, alpha, &x_vec, a_mut);
@@ -271,14 +269,13 @@ unsafe fn syr2_impl<T: Real>(
 ) {
     let n = n as usize;
     let lda = lda as usize;
-    let uplo_internal = match (layout, uplo) {
-        (CblasLayout::ColMajor, CblasUplo::Upper) | (CblasLayout::RowMajor, CblasUplo::Lower) => {
-            level2::Syr2Uplo::Upper
-        }
-        (CblasLayout::ColMajor, CblasUplo::Lower) | (CblasLayout::RowMajor, CblasUplo::Upper) => {
-            level2::Syr2Uplo::Lower
-        }
-    };
+    let uplo_internal =
+        match (layout, uplo) {
+            (CblasLayout::ColMajor, CblasUplo::Upper)
+            | (CblasLayout::RowMajor, CblasUplo::Lower) => level2::Syr2Uplo::Upper,
+            (CblasLayout::ColMajor, CblasUplo::Lower)
+            | (CblasLayout::RowMajor, CblasUplo::Upper) => level2::Syr2Uplo::Lower,
+        };
     let x_vec = gather(x, n, incx as isize);
     let y_vec = gather(y, n, incy as isize);
     let a_mut = MatMut::<T>::new(a, n, n, lda);

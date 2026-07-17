@@ -8,11 +8,11 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use core::arch::x86_64::*;
 use crate::simd::SimdRegister;
+use core::arch::x86_64::*;
 
-use super::types::F32x4Sse;
 use super::functions::lane_index_out_of_range;
+use super::types::F32x4Sse;
 
 impl SimdRegister for F32x4Sse {
     type Scalar = f32;

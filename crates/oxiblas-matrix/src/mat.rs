@@ -157,7 +157,11 @@ impl<T: Scalar> Mat<T> {
         T: bytemuck::Zeroable,
     {
         let expected_len = checked_dim_mul(nrows, ncols, "matrix element count (nrows * ncols)");
-        assert_eq!(data.len(), expected_len, "Slice length must equal nrows * ncols");
+        assert_eq!(
+            data.len(),
+            expected_len,
+            "Slice length must equal nrows * ncols"
+        );
 
         let row_stride = compute_row_stride::<T>(nrows);
 
@@ -905,7 +909,10 @@ mod tests {
         // around (letting a mismatched `data` length slip through) or,
         // after the `Mat::from_slice` overflow guard was added, panic
         // instead of returning `Err` for malformed/untrusted input.
-        let malicious_json = format!(r#"{{"nrows":{},"ncols":3,"data":[1.0,2.0,3.0]}}"#, usize::MAX);
+        let malicious_json = format!(
+            r#"{{"nrows":{},"ncols":3,"data":[1.0,2.0,3.0]}}"#,
+            usize::MAX
+        );
 
         let result: Result<Mat<f64>, _> = serde_json::from_str(&malicious_json);
         assert!(

@@ -1441,7 +1441,10 @@ mod tests {
         let hint = NumaAllocHint::first_touch();
         let ptr = unsafe { numa_alloc(layout, &hint) }.expect("alloc");
         let res = unsafe { bind_memory_policy(ptr.as_ptr(), layout.size(), &hint) };
-        assert!(res.is_ok(), "first-touch binding must be a successful no-op");
+        assert!(
+            res.is_ok(),
+            "first-touch binding must be a successful no-op"
+        );
         unsafe { numa_dealloc(ptr, layout, &hint) };
     }
 

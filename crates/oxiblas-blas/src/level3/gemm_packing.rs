@@ -1368,9 +1368,9 @@ mod tests {
         // hardware. Elsewhere this validates the identical fallback.
         let cases = [
             (8usize, 8usize, 4usize),
-            (3, 4, 4),  // total 12 -> three full lanes, no tail
-            (3, 6, 4),  // partial second block (jb=2, zero-padded), total 24
-            (5, 5, 6),  // nr > ncols -> single partial block, total 30 (tail 2)
+            (3, 4, 4), // total 12 -> three full lanes, no tail
+            (3, 6, 4), // partial second block (jb=2, zero-padded), total 24
+            (5, 5, 6), // nr > ncols -> single partial block, total 30 (tail 2)
             (16, 12, 8),
         ];
         for (nrows, ncols, nr) in cases {
@@ -1434,7 +1434,15 @@ mod tests {
         let total = reference.len();
 
         let mut pack_stream: AlignedVec<f64> = AlignedVec::zeros(total);
-        pack_b_streaming(&b_ref, row_start, col_start, nrows, ncols, &mut pack_stream, nr);
+        pack_b_streaming(
+            &b_ref,
+            row_start,
+            col_start,
+            nrows,
+            ncols,
+            &mut pack_stream,
+            nr,
+        );
 
         for k in 0..total {
             assert!(

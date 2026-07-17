@@ -226,11 +226,7 @@ mod tests {
         // det() must return the true (small but nonzero) value rather than
         // clamping to 0.0.
         let scale = 1.0e-8f64;
-        let a = Mat::from_rows(&[
-            &[scale, 0.0, 0.0],
-            &[0.0, scale, 0.0],
-            &[0.0, 0.0, scale],
-        ]);
+        let a = Mat::from_rows(&[&[scale, 0.0, 0.0], &[0.0, scale, 0.0], &[0.0, 0.0, scale]]);
 
         let d = det(a.as_ref()).expect("well-conditioned small-magnitude matrix must not error");
         let expected = scale * scale * scale;

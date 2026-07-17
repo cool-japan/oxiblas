@@ -677,7 +677,15 @@ mod tests {
         let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
 
         let mut c_trans = Mat::zeros(3, 3);
-        syrk(Uplo::Lower, Trans::Trans, 1.0, a.as_ref(), 0.0, c_trans.as_mut()).unwrap();
+        syrk(
+            Uplo::Lower,
+            Trans::Trans,
+            1.0,
+            a.as_ref(),
+            0.0,
+            c_trans.as_mut(),
+        )
+        .unwrap();
 
         let mut c_conj = Mat::zeros(3, 3);
         syrk(

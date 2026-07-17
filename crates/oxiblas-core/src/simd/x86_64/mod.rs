@@ -28,8 +28,8 @@ mod f64x2sse_traits;
 mod f64x4_traits;
 mod f64x8_traits;
 pub mod functions;
-pub mod types;
 pub mod type_aliases;
+pub mod types;
 
 // Re-export the public register types so the API stays `simd::x86_64::TypeName`.
 pub use type_aliases::*;

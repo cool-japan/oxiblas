@@ -1960,8 +1960,14 @@ mod tests {
             .collect();
 
         // f64 reference for accuracy, then compare in f32 magnitudes.
-        let x64: Vec<Complex64> = x.iter().map(|c| Complex64::new(c.re as f64, c.im as f64)).collect();
-        let y64: Vec<Complex64> = y.iter().map(|c| Complex64::new(c.re as f64, c.im as f64)).collect();
+        let x64: Vec<Complex64> = x
+            .iter()
+            .map(|c| Complex64::new(c.re as f64, c.im as f64))
+            .collect();
+        let y64: Vec<Complex64> = y
+            .iter()
+            .map(|c| Complex64::new(c.re as f64, c.im as f64))
+            .collect();
         let expected = dotu_c64_reference(&x64, &y64);
 
         let simd = dotu_c32(&x, &y);

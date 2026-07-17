@@ -372,10 +372,7 @@ mod tests {
             for &nrhs in &[0usize, 1, 4, 8] {
                 let block = trsm_block_size::<f64>(n, nrhs);
                 assert!(block <= n, "block {block} exceeds n={n} (nrhs={nrhs})");
-                assert!(
-                    block <= nrhs,
-                    "block {block} exceeds nrhs={nrhs} (n={n})"
-                );
+                assert!(block <= nrhs, "block {block} exceeds nrhs={nrhs} (n={n})");
             }
         }
 

@@ -228,8 +228,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
             // matrix. `hi` is the last diagonal index still coupled by a
             // non-negligible super-diagonal.
             let mut hi = e_work.len();
-            while hi > 0
-                && is_negligible_superdiag(e_work[hi - 1], d_work[hi - 1], d_work[hi], tol)
+            while hi > 0 && is_negligible_superdiag(e_work[hi - 1], d_work[hi - 1], d_work[hi], tol)
             {
                 hi -= 1;
             }

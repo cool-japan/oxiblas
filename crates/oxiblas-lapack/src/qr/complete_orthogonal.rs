@@ -622,7 +622,11 @@ mod tests {
         let b = Mat::from_rows(&[&[1.0f64], &[0.0], &[2.0], &[1.0], &[3.0]]);
 
         let cod = CompleteOrthogonalDecomp::compute(a.as_ref(), 1e-9).unwrap();
-        assert_eq!(cod.rank(), 2, "constructed matrix must be detected as rank 2");
+        assert_eq!(
+            cod.rank(),
+            2,
+            "constructed matrix must be detected as rank 2"
+        );
 
         let x = cod.solve(b.as_ref()).unwrap();
 

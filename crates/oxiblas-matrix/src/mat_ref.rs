@@ -204,9 +204,7 @@ impl<'a, T: Scalar> MatRef<'a, T> {
         if max_offset < slice.len() {
             // SAFETY: `max_offset < slice.len()` and offsets are monotonic in
             // both indices, so every `(i, j)` maps inside `slice`.
-            Some(unsafe {
-                Self::new_strided(slice.as_ptr(), nrows, ncols, row_stride, col_stride)
-            })
+            Some(unsafe { Self::new_strided(slice.as_ptr(), nrows, ncols, row_stride, col_stride) })
         } else {
             None
         }

@@ -383,12 +383,7 @@ mod tests {
     fn test_lq_tall_reconstruction() {
         // Tall matrix (m > n): L is m×n lower-triangular in its top n rows,
         // Q is n×n. Exercises the k = n < m branch.
-        let a = Mat::from_rows(&[
-            &[1.0f64, 2.0],
-            &[3.0, 4.0],
-            &[5.0, 6.0],
-            &[7.0, 9.0],
-        ]);
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0], &[7.0, 9.0]]);
 
         let lq = Lq::compute(a.as_ref()).unwrap();
         let l = lq.l_factor();

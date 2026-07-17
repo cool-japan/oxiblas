@@ -425,8 +425,7 @@ impl<T: Field + Real> BandLu<T> {
                 for i in 1..=lm {
                     let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
                     for col in 0..nrhs {
-                        x[(j + i) * ldb + col] =
-                            x[(j + i) * ldb + col] - l_elem * x[j * ldb + col];
+                        x[(j + i) * ldb + col] = x[(j + i) * ldb + col] - l_elem * x[j * ldb + col];
                     }
                 }
             }

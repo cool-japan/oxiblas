@@ -4,7 +4,7 @@
 
 use crate::simd::SimdScalar;
 
-use super::types::{F32x16, F32x8, F64x4, F64x8};
+use super::types::{F32x8, F32x16, F64x4, F64x8};
 
 // Test-only switch that forces the scalar fallback path so the (otherwise dead
 // on a SIMD-capable CI host) `else` branches are actually executed by the
@@ -182,7 +182,11 @@ pub(super) unsafe fn scalar_store<R: Copy, S: Copy, const N: usize>(value: R, pt
 
 /// Applies `f` lane-wise to two registers without a SIMD instruction.
 #[inline]
-pub(super) unsafe fn scalar_binop<R: Copy, S: Copy, const N: usize>(a: R, b: R, f: impl Fn(S, S) -> S) -> R {
+pub(super) unsafe fn scalar_binop<R: Copy, S: Copy, const N: usize>(
+    a: R,
+    b: R,
+    f: impl Fn(S, S) -> S,
+) -> R {
     let aa: [S; N] = core::mem::transmute_copy(&a);
     let bb: [S; N] = core::mem::transmute_copy(&b);
     let rr: [S; N] = core::array::from_fn(|i| f(aa[i], bb[i]));
@@ -210,7 +214,10 @@ pub(super) unsafe fn scalar_ternop<R: Copy, S: Copy, const N: usize>(
 /// tree reduction in the last ULP, and for `max`/`min` the caller-supplied
 /// closure defines the NaN policy. This only runs when the feature is absent.
 #[inline]
-pub(super) unsafe fn scalar_reduce<R: Copy, S: Copy, const N: usize>(a: R, f: impl Fn(S, S) -> S) -> S {
+pub(super) unsafe fn scalar_reduce<R: Copy, S: Copy, const N: usize>(
+    a: R,
+    f: impl Fn(S, S) -> S,
+) -> S {
     let aa: [S; N] = core::mem::transmute_copy(&a);
     let mut acc = aa[0];
     for i in 1..N {
@@ -691,4 +698,3 @@ pub(super) mod tests {
         set_force_scalar_fallback(false);
     }
 }
-

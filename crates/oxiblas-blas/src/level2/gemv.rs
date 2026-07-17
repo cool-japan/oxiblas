@@ -1019,7 +1019,13 @@ pub fn gemv_add<T: Field>(
 /// assert!((y[0] - 13.0).abs() < 1e-10);
 /// assert!((y[1] - 27.0).abs() < 1e-10);
 /// ```
-pub fn gemv_add_inplace<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], y: &mut [T]) {
+pub fn gemv_add_inplace<T: Field>(
+    trans: GemvTrans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    x: &[T],
+    y: &mut [T],
+) {
     let (m, n) = (a.nrows(), a.ncols());
 
     let (rows, cols) = match trans {

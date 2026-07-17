@@ -109,8 +109,7 @@ fn matrix_inf_norm<T: Field>(a: MatRef<'_, T>) -> T::Real {
 /// zero pivot in the zero matrix (`||A||_inf == 0`, hence `tol == 0`) is still
 /// reported singular instead of driving a division by zero.
 fn singular_tol<T: Field>(anorm: T::Real, n: usize) -> T::Real {
-    let n_real =
-        <T::Real as FromPrimitive>::from_usize(n).unwrap_or_else(<T::Real as One>::one);
+    let n_real = <T::Real as FromPrimitive>::from_usize(n).unwrap_or_else(<T::Real as One>::one);
     T::epsilon() * anorm * n_real
 }
 
@@ -1446,8 +1445,7 @@ mod tests {
         let lu_unblocked = Lu::compute(a.as_ref()).expect("unblocked must not flag singular");
         check(&lu_unblocked, "unblocked");
 
-        let lu_blocked =
-            Lu::compute_blocked(a.as_ref()).expect("blocked must not flag singular");
+        let lu_blocked = Lu::compute_blocked(a.as_ref()).expect("blocked must not flag singular");
         check(&lu_blocked, "blocked");
 
         let lu_recursive =
@@ -1481,15 +1479,17 @@ mod tests {
 
         let x_true = [1.0, 2.0, 3.0, 4.0];
         let b_vec = matvec(&a, &x_true);
-        let b: Mat<f64> =
-            Mat::from_rows(&[&[b_vec[0]], &[b_vec[1]], &[b_vec[2]], &[b_vec[3]]]);
+        let b: Mat<f64> = Mat::from_rows(&[&[b_vec[0]], &[b_vec[1]], &[b_vec[2]], &[b_vec[3]]]);
 
         let lu = Lu::compute(a.as_ref()).expect("should not be singular");
 
         // The permutation must be non-trivial (at least one swap), otherwise the
         // test would not exercise the permutation path at all.
         let swapped = lu.pivot().iter().enumerate().any(|(k, &pk)| k != pk);
-        assert!(swapped, "test matrix should force at least one row interchange");
+        assert!(
+            swapped,
+            "test matrix should force at least one row interchange"
+        );
 
         let x = lu.solve(b.as_ref()).expect("should solve");
         for i in 0..4 {

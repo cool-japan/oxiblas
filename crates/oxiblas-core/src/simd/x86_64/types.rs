@@ -2,9 +2,11 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use super::functions::{
+    has_avx512bw, has_avx512dq, has_avx512f, has_avx512vbmi, has_avx512vl, has_avx512vnni,
+    lane_index_out_of_range,
+};
 use core::arch::x86_64::*;
-use super::functions::{has_avx512bw, has_avx512dq, has_avx512f, has_avx512vbmi, has_avx512vl, has_avx512vnni, lane_index_out_of_range};
-
 
 /// 512-bit SIMD register for i8 (64 lanes) using AVX-512BW.
 #[derive(Clone, Copy)]

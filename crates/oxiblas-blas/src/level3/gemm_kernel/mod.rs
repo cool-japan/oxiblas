@@ -11,11 +11,11 @@
 // We gate these with runtime CPU feature detection
 #![allow(clippy::incompatible_msrv)]
 
+#[cfg(target_arch = "x86_64")]
+use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
 use num_complex::{Complex32, Complex64};
 use oxiblas_core::scalar::Field;
 use oxiblas_core::simd::dispatch::GemmKernelKind;
-#[cfg(target_arch = "x86_64")]
-use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
 /// Describes the shape of a micro-kernel.
 #[derive(Debug, Clone, Copy)]
 pub struct MicroKernelShape {
@@ -43,11 +43,13 @@ pub struct MicroKernelShape {
 /// clamp the SIMD width (see [`cap_kernel_kind`]).
 #[inline]
 fn selected_kernel_kind() -> GemmKernelKind {
-    #[cfg(feature = "force-scalar")] { GemmKernelKind::Scalar }
+    #[cfg(feature = "force-scalar")]
+    {
+        GemmKernelKind::Scalar
+    }
     #[cfg(not(feature = "force-scalar"))]
     {
-        let detected = oxiblas_core::simd::dispatch::KernelSelector::select()
-            .gemm_f64_kernel;
+        let detected = oxiblas_core::simd::dispatch::KernelSelector::select().gemm_f64_kernel;
         cap_kernel_kind(detected)
     }
 }
@@ -63,8 +65,14 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
     {
         match kind {
             GemmKernelKind::Avx512 | GemmKernelKind::Avx2 => {
-                #[cfg(target_arch = "x86_64")] { GemmKernelKind::Sse42 }
-                #[cfg(not(target_arch = "x86_64"))] { GemmKernelKind::Scalar }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    GemmKernelKind::Sse42
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    GemmKernelKind::Scalar
+                }
             }
             other => other,
         }
@@ -76,7 +84,10 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
             other => other,
         }
     }
-    #[cfg(not(any(feature = "max-simd-128", feature = "max-simd-256")))] { kind }
+    #[cfg(not(any(feature = "max-simd-128", feature = "max-simd-256")))]
+    {
+        kind
+    }
 }
 /// Trait for types that have GEMM micro-kernel implementations.
 pub trait GemmKernel: Field {
@@ -138,21 +149,13 @@ impl GemmKernel for f64 {
     ) {
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => {
-                micro_kernel_f64_avx512(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Avx512 => micro_kernel_f64_avx512(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => {
-                micro_kernel_f64_avx2(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Avx2 => micro_kernel_f64_avx2(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => {
-                micro_kernel_f64_sse42(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Sse42 => micro_kernel_f64_sse42(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => {
-                micro_kernel_f64_neon(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Neon => micro_kernel_f64_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f64_scalar(k, alpha, a, b, beta, c, c_stride),
         }
     }
@@ -230,22 +233,30 @@ unsafe fn micro_kernel_f64_avx2(
     let mut acc5_lo = _mm256_setzero_pd();
     let mut acc5_hi = _mm256_setzero_pd();
     macro_rules! fma_iter {
-        ($offset:expr) => {
-            { let a_ptr = a.add($offset * MR); let b_ptr = b.add($offset * NR); let a_lo
-            = _mm256_loadu_pd(a_ptr); let a_hi = _mm256_loadu_pd(a_ptr.add(4)); let b0 =
-            _mm256_broadcast_sd(&* b_ptr); acc0_lo = _mm256_fmadd_pd(a_lo, b0, acc0_lo);
-            acc0_hi = _mm256_fmadd_pd(a_hi, b0, acc0_hi); let b1 = _mm256_broadcast_sd(&*
-            b_ptr.add(1)); acc1_lo = _mm256_fmadd_pd(a_lo, b1, acc1_lo); acc1_hi =
-            _mm256_fmadd_pd(a_hi, b1, acc1_hi); let b2 = _mm256_broadcast_sd(&* b_ptr
-            .add(2)); acc2_lo = _mm256_fmadd_pd(a_lo, b2, acc2_lo); acc2_hi =
-            _mm256_fmadd_pd(a_hi, b2, acc2_hi); let b3 = _mm256_broadcast_sd(&* b_ptr
-            .add(3)); acc3_lo = _mm256_fmadd_pd(a_lo, b3, acc3_lo); acc3_hi =
-            _mm256_fmadd_pd(a_hi, b3, acc3_hi); let b4 = _mm256_broadcast_sd(&* b_ptr
-            .add(4)); acc4_lo = _mm256_fmadd_pd(a_lo, b4, acc4_lo); acc4_hi =
-            _mm256_fmadd_pd(a_hi, b4, acc4_hi); let b5 = _mm256_broadcast_sd(&* b_ptr
-            .add(5)); acc5_lo = _mm256_fmadd_pd(a_lo, b5, acc5_lo); acc5_hi =
-            _mm256_fmadd_pd(a_hi, b5, acc5_hi); }
-        };
+        ($offset:expr) => {{
+            let a_ptr = a.add($offset * MR);
+            let b_ptr = b.add($offset * NR);
+            let a_lo = _mm256_loadu_pd(a_ptr);
+            let a_hi = _mm256_loadu_pd(a_ptr.add(4));
+            let b0 = _mm256_broadcast_sd(&*b_ptr);
+            acc0_lo = _mm256_fmadd_pd(a_lo, b0, acc0_lo);
+            acc0_hi = _mm256_fmadd_pd(a_hi, b0, acc0_hi);
+            let b1 = _mm256_broadcast_sd(&*b_ptr.add(1));
+            acc1_lo = _mm256_fmadd_pd(a_lo, b1, acc1_lo);
+            acc1_hi = _mm256_fmadd_pd(a_hi, b1, acc1_hi);
+            let b2 = _mm256_broadcast_sd(&*b_ptr.add(2));
+            acc2_lo = _mm256_fmadd_pd(a_lo, b2, acc2_lo);
+            acc2_hi = _mm256_fmadd_pd(a_hi, b2, acc2_hi);
+            let b3 = _mm256_broadcast_sd(&*b_ptr.add(3));
+            acc3_lo = _mm256_fmadd_pd(a_lo, b3, acc3_lo);
+            acc3_hi = _mm256_fmadd_pd(a_hi, b3, acc3_hi);
+            let b4 = _mm256_broadcast_sd(&*b_ptr.add(4));
+            acc4_lo = _mm256_fmadd_pd(a_lo, b4, acc4_lo);
+            acc4_hi = _mm256_fmadd_pd(a_hi, b4, acc4_hi);
+            let b5 = _mm256_broadcast_sd(&*b_ptr.add(5));
+            acc5_lo = _mm256_fmadd_pd(a_lo, b5, acc5_lo);
+            acc5_hi = _mm256_fmadd_pd(a_hi, b5, acc5_hi);
+        }};
     }
     let k_unroll = k / 4;
     let k_remainder = k % 4;
@@ -296,11 +307,14 @@ unsafe fn micro_kernel_f64_avx2(
         _mm256_storeu_pd(c.add(5 * c_stride + 4), acc5_hi);
     } else if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); _mm256_storeu_pd(c_col,
-                _mm256_add_pd($acc_lo, _mm256_loadu_pd(c_col))); _mm256_storeu_pd(c_col
-                .add(4), _mm256_add_pd($acc_hi, _mm256_loadu_pd(c_col.add(4))),); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                _mm256_storeu_pd(c_col, _mm256_add_pd($acc_lo, _mm256_loadu_pd(c_col)));
+                _mm256_storeu_pd(
+                    c_col.add(4),
+                    _mm256_add_pd($acc_hi, _mm256_loadu_pd(c_col.add(4))),
+                );
+            }};
         }
         store_add!(0, acc0_lo, acc0_hi);
         store_add!(1, acc1_lo, acc1_hi);
@@ -311,12 +325,13 @@ unsafe fn micro_kernel_f64_avx2(
     } else {
         let beta_vec = _mm256_set1_pd(beta);
         macro_rules! store_fma {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); let c_lo = _mm256_loadu_pd(c_col);
-                let c_hi = _mm256_loadu_pd(c_col.add(4)); _mm256_storeu_pd(c_col,
-                _mm256_fmadd_pd(c_lo, beta_vec, $acc_lo)); _mm256_storeu_pd(c_col.add(4),
-                _mm256_fmadd_pd(c_hi, beta_vec, $acc_hi)); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                let c_lo = _mm256_loadu_pd(c_col);
+                let c_hi = _mm256_loadu_pd(c_col.add(4));
+                _mm256_storeu_pd(c_col, _mm256_fmadd_pd(c_lo, beta_vec, $acc_lo));
+                _mm256_storeu_pd(c_col.add(4), _mm256_fmadd_pd(c_hi, beta_vec, $acc_hi));
+            }};
         }
         store_fma!(0, acc0_lo, acc0_hi);
         store_fma!(1, acc1_lo, acc1_hi);
@@ -359,22 +374,30 @@ unsafe fn micro_kernel_f64_avx512(
     let mut acc5_lo = _mm512_setzero_pd();
     let mut acc5_hi = _mm512_setzero_pd();
     macro_rules! fma_iter {
-        ($offset:expr) => {
-            { let a_ptr = a.add($offset * MR); let b_ptr = b.add($offset * NR); let a_lo
-            = _mm512_loadu_pd(a_ptr); let a_hi = _mm512_loadu_pd(a_ptr.add(8)); let b0 =
-            _mm512_set1_pd(* b_ptr); acc0_lo = _mm512_fmadd_pd(a_lo, b0, acc0_lo);
-            acc0_hi = _mm512_fmadd_pd(a_hi, b0, acc0_hi); let b1 = _mm512_set1_pd(* b_ptr
-            .add(1)); acc1_lo = _mm512_fmadd_pd(a_lo, b1, acc1_lo); acc1_hi =
-            _mm512_fmadd_pd(a_hi, b1, acc1_hi); let b2 = _mm512_set1_pd(* b_ptr.add(2));
-            acc2_lo = _mm512_fmadd_pd(a_lo, b2, acc2_lo); acc2_hi = _mm512_fmadd_pd(a_hi,
-            b2, acc2_hi); let b3 = _mm512_set1_pd(* b_ptr.add(3)); acc3_lo =
-            _mm512_fmadd_pd(a_lo, b3, acc3_lo); acc3_hi = _mm512_fmadd_pd(a_hi, b3,
-            acc3_hi); let b4 = _mm512_set1_pd(* b_ptr.add(4)); acc4_lo =
-            _mm512_fmadd_pd(a_lo, b4, acc4_lo); acc4_hi = _mm512_fmadd_pd(a_hi, b4,
-            acc4_hi); let b5 = _mm512_set1_pd(* b_ptr.add(5)); acc5_lo =
-            _mm512_fmadd_pd(a_lo, b5, acc5_lo); acc5_hi = _mm512_fmadd_pd(a_hi, b5,
-            acc5_hi); }
-        };
+        ($offset:expr) => {{
+            let a_ptr = a.add($offset * MR);
+            let b_ptr = b.add($offset * NR);
+            let a_lo = _mm512_loadu_pd(a_ptr);
+            let a_hi = _mm512_loadu_pd(a_ptr.add(8));
+            let b0 = _mm512_set1_pd(*b_ptr);
+            acc0_lo = _mm512_fmadd_pd(a_lo, b0, acc0_lo);
+            acc0_hi = _mm512_fmadd_pd(a_hi, b0, acc0_hi);
+            let b1 = _mm512_set1_pd(*b_ptr.add(1));
+            acc1_lo = _mm512_fmadd_pd(a_lo, b1, acc1_lo);
+            acc1_hi = _mm512_fmadd_pd(a_hi, b1, acc1_hi);
+            let b2 = _mm512_set1_pd(*b_ptr.add(2));
+            acc2_lo = _mm512_fmadd_pd(a_lo, b2, acc2_lo);
+            acc2_hi = _mm512_fmadd_pd(a_hi, b2, acc2_hi);
+            let b3 = _mm512_set1_pd(*b_ptr.add(3));
+            acc3_lo = _mm512_fmadd_pd(a_lo, b3, acc3_lo);
+            acc3_hi = _mm512_fmadd_pd(a_hi, b3, acc3_hi);
+            let b4 = _mm512_set1_pd(*b_ptr.add(4));
+            acc4_lo = _mm512_fmadd_pd(a_lo, b4, acc4_lo);
+            acc4_hi = _mm512_fmadd_pd(a_hi, b4, acc4_hi);
+            let b5 = _mm512_set1_pd(*b_ptr.add(5));
+            acc5_lo = _mm512_fmadd_pd(a_lo, b5, acc5_lo);
+            acc5_hi = _mm512_fmadd_pd(a_hi, b5, acc5_hi);
+        }};
     }
     let k_unroll = k / 4;
     let k_remainder = k % 4;
@@ -425,11 +448,14 @@ unsafe fn micro_kernel_f64_avx512(
         _mm512_storeu_pd(c.add(5 * c_stride + 8), acc5_hi);
     } else if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); _mm512_storeu_pd(c_col,
-                _mm512_add_pd($acc_lo, _mm512_loadu_pd(c_col))); _mm512_storeu_pd(c_col
-                .add(8), _mm512_add_pd($acc_hi, _mm512_loadu_pd(c_col.add(8))),); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                _mm512_storeu_pd(c_col, _mm512_add_pd($acc_lo, _mm512_loadu_pd(c_col)));
+                _mm512_storeu_pd(
+                    c_col.add(8),
+                    _mm512_add_pd($acc_hi, _mm512_loadu_pd(c_col.add(8))),
+                );
+            }};
         }
         store_add!(0, acc0_lo, acc0_hi);
         store_add!(1, acc1_lo, acc1_hi);
@@ -440,12 +466,13 @@ unsafe fn micro_kernel_f64_avx512(
     } else {
         let beta_vec = _mm512_set1_pd(beta);
         macro_rules! store_fma {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); let c_lo = _mm512_loadu_pd(c_col);
-                let c_hi = _mm512_loadu_pd(c_col.add(8)); _mm512_storeu_pd(c_col,
-                _mm512_fmadd_pd(c_lo, beta_vec, $acc_lo)); _mm512_storeu_pd(c_col.add(8),
-                _mm512_fmadd_pd(c_hi, beta_vec, $acc_hi)); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                let c_lo = _mm512_loadu_pd(c_col);
+                let c_hi = _mm512_loadu_pd(c_col.add(8));
+                _mm512_storeu_pd(c_col, _mm512_fmadd_pd(c_lo, beta_vec, $acc_lo));
+                _mm512_storeu_pd(c_col.add(8), _mm512_fmadd_pd(c_hi, beta_vec, $acc_hi));
+            }};
         }
         store_fma!(0, acc0_lo, acc0_hi);
         store_fma!(1, acc1_lo, acc1_hi);
@@ -479,9 +506,7 @@ unsafe fn micro_kernel_f64_neon(
     c: *mut f64,
     c_stride: usize,
 ) {
-    use core::arch::aarch64::{
-        vaddq_f64, vdupq_n_f64, vfmaq_f64, vld1q_f64, vmulq_f64, vst1q_f64,
-    };
+    use core::arch::aarch64::{vaddq_f64, vdupq_n_f64, vfmaq_f64, vld1q_f64, vmulq_f64, vst1q_f64};
     const MR: usize = 8;
     const NR: usize = 6;
     const PREFETCH_DIST: usize = 10;
@@ -510,26 +535,44 @@ unsafe fn micro_kernel_f64_neon(
     let mut acc52 = vdupq_n_f64(0.0);
     let mut acc53 = vdupq_n_f64(0.0);
     macro_rules! fma_iter {
-        ($offset:expr) => {
-            { let a_ptr = a.add($offset * MR); let b_ptr = b.add($offset * NR); let a0 =
-            vld1q_f64(a_ptr); let a1 = vld1q_f64(a_ptr.add(2)); let a2 = vld1q_f64(a_ptr
-            .add(4)); let a3 = vld1q_f64(a_ptr.add(6)); let b0 = vdupq_n_f64(* b_ptr);
-            acc00 = vfmaq_f64(acc00, a0, b0); acc01 = vfmaq_f64(acc01, a1, b0); let b1 =
-            vdupq_n_f64(* b_ptr.add(1)); acc02 = vfmaq_f64(acc02, a2, b0); acc03 =
-            vfmaq_f64(acc03, a3, b0); acc10 = vfmaq_f64(acc10, a0, b1); acc11 =
-            vfmaq_f64(acc11, a1, b1); let b2 = vdupq_n_f64(* b_ptr.add(2)); acc12 =
-            vfmaq_f64(acc12, a2, b1); acc13 = vfmaq_f64(acc13, a3, b1); acc20 =
-            vfmaq_f64(acc20, a0, b2); acc21 = vfmaq_f64(acc21, a1, b2); let b3 =
-            vdupq_n_f64(* b_ptr.add(3)); acc22 = vfmaq_f64(acc22, a2, b2); acc23 =
-            vfmaq_f64(acc23, a3, b2); acc30 = vfmaq_f64(acc30, a0, b3); acc31 =
-            vfmaq_f64(acc31, a1, b3); let b4 = vdupq_n_f64(* b_ptr.add(4)); acc32 =
-            vfmaq_f64(acc32, a2, b3); acc33 = vfmaq_f64(acc33, a3, b3); acc40 =
-            vfmaq_f64(acc40, a0, b4); acc41 = vfmaq_f64(acc41, a1, b4); let b5 =
-            vdupq_n_f64(* b_ptr.add(5)); acc42 = vfmaq_f64(acc42, a2, b4); acc43 =
-            vfmaq_f64(acc43, a3, b4); acc50 = vfmaq_f64(acc50, a0, b5); acc51 =
-            vfmaq_f64(acc51, a1, b5); acc52 = vfmaq_f64(acc52, a2, b5); acc53 =
-            vfmaq_f64(acc53, a3, b5); }
-        };
+        ($offset:expr) => {{
+            let a_ptr = a.add($offset * MR);
+            let b_ptr = b.add($offset * NR);
+            let a0 = vld1q_f64(a_ptr);
+            let a1 = vld1q_f64(a_ptr.add(2));
+            let a2 = vld1q_f64(a_ptr.add(4));
+            let a3 = vld1q_f64(a_ptr.add(6));
+            let b0 = vdupq_n_f64(*b_ptr);
+            acc00 = vfmaq_f64(acc00, a0, b0);
+            acc01 = vfmaq_f64(acc01, a1, b0);
+            let b1 = vdupq_n_f64(*b_ptr.add(1));
+            acc02 = vfmaq_f64(acc02, a2, b0);
+            acc03 = vfmaq_f64(acc03, a3, b0);
+            acc10 = vfmaq_f64(acc10, a0, b1);
+            acc11 = vfmaq_f64(acc11, a1, b1);
+            let b2 = vdupq_n_f64(*b_ptr.add(2));
+            acc12 = vfmaq_f64(acc12, a2, b1);
+            acc13 = vfmaq_f64(acc13, a3, b1);
+            acc20 = vfmaq_f64(acc20, a0, b2);
+            acc21 = vfmaq_f64(acc21, a1, b2);
+            let b3 = vdupq_n_f64(*b_ptr.add(3));
+            acc22 = vfmaq_f64(acc22, a2, b2);
+            acc23 = vfmaq_f64(acc23, a3, b2);
+            acc30 = vfmaq_f64(acc30, a0, b3);
+            acc31 = vfmaq_f64(acc31, a1, b3);
+            let b4 = vdupq_n_f64(*b_ptr.add(4));
+            acc32 = vfmaq_f64(acc32, a2, b3);
+            acc33 = vfmaq_f64(acc33, a3, b3);
+            acc40 = vfmaq_f64(acc40, a0, b4);
+            acc41 = vfmaq_f64(acc41, a1, b4);
+            let b5 = vdupq_n_f64(*b_ptr.add(5));
+            acc42 = vfmaq_f64(acc42, a2, b4);
+            acc43 = vfmaq_f64(acc43, a3, b4);
+            acc50 = vfmaq_f64(acc50, a0, b5);
+            acc51 = vfmaq_f64(acc51, a1, b5);
+            acc52 = vfmaq_f64(acc52, a2, b5);
+            acc53 = vfmaq_f64(acc53, a3, b5);
+        }};
     }
     let k_unroll = k / 4;
     let k_remainder = k % 4;
@@ -579,30 +622,35 @@ unsafe fn micro_kernel_f64_neon(
         acc53 = vmulq_f64(acc53, alpha_vec);
     }
     macro_rules! store_column {
-        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr) => {
-            { let c_col = c.add($col * c_stride); vst1q_f64(c_col, $acc0);
-            vst1q_f64(c_col.add(2), $acc1); vst1q_f64(c_col.add(4), $acc2);
-            vst1q_f64(c_col.add(6), $acc3); }
-        };
+        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr) => {{
+            let c_col = c.add($col * c_stride);
+            vst1q_f64(c_col, $acc0);
+            vst1q_f64(c_col.add(2), $acc1);
+            vst1q_f64(c_col.add(4), $acc2);
+            vst1q_f64(c_col.add(6), $acc3);
+        }};
     }
     macro_rules! store_column_add {
-        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr) => {
-            { let c_col = c.add($col * c_stride); vst1q_f64(c_col, vaddq_f64($acc0,
-            vld1q_f64(c_col))); vst1q_f64(c_col.add(2), vaddq_f64($acc1, vld1q_f64(c_col
-            .add(2)))); vst1q_f64(c_col.add(4), vaddq_f64($acc2, vld1q_f64(c_col
-            .add(4)))); vst1q_f64(c_col.add(6), vaddq_f64($acc3, vld1q_f64(c_col
-            .add(6)))); }
-        };
+        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr) => {{
+            let c_col = c.add($col * c_stride);
+            vst1q_f64(c_col, vaddq_f64($acc0, vld1q_f64(c_col)));
+            vst1q_f64(c_col.add(2), vaddq_f64($acc1, vld1q_f64(c_col.add(2))));
+            vst1q_f64(c_col.add(4), vaddq_f64($acc2, vld1q_f64(c_col.add(4))));
+            vst1q_f64(c_col.add(6), vaddq_f64($acc3, vld1q_f64(c_col.add(6))));
+        }};
     }
     macro_rules! store_column_fma {
-        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr, $beta_vec:expr) => {
-            { let c_col = c.add($col * c_stride); let c0 = vld1q_f64(c_col); let c1 =
-            vld1q_f64(c_col.add(2)); let c2 = vld1q_f64(c_col.add(4)); let c3 =
-            vld1q_f64(c_col.add(6)); vst1q_f64(c_col, vfmaq_f64($acc0, c0, $beta_vec));
-            vst1q_f64(c_col.add(2), vfmaq_f64($acc1, c1, $beta_vec)); vst1q_f64(c_col
-            .add(4), vfmaq_f64($acc2, c2, $beta_vec)); vst1q_f64(c_col.add(6),
-            vfmaq_f64($acc3, c3, $beta_vec)); }
-        };
+        ($col:expr, $acc0:expr, $acc1:expr, $acc2:expr, $acc3:expr, $beta_vec:expr) => {{
+            let c_col = c.add($col * c_stride);
+            let c0 = vld1q_f64(c_col);
+            let c1 = vld1q_f64(c_col.add(2));
+            let c2 = vld1q_f64(c_col.add(4));
+            let c3 = vld1q_f64(c_col.add(6));
+            vst1q_f64(c_col, vfmaq_f64($acc0, c0, $beta_vec));
+            vst1q_f64(c_col.add(2), vfmaq_f64($acc1, c1, $beta_vec));
+            vst1q_f64(c_col.add(4), vfmaq_f64($acc2, c2, $beta_vec));
+            vst1q_f64(c_col.add(6), vfmaq_f64($acc3, c3, $beta_vec));
+        }};
     }
     if beta == 0.0 {
         store_column!(0, acc00, acc01, acc02, acc03);
@@ -654,21 +702,13 @@ impl GemmKernel for f32 {
     ) {
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => {
-                micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Avx512 => micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => {
-                micro_kernel_f32_avx2(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Avx2 => micro_kernel_f32_avx2(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => {
-                micro_kernel_f32_sse42(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Sse42 => micro_kernel_f32_sse42(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => {
-                micro_kernel_f32_neon(k, alpha, a, b, beta, c, c_stride)
-            }
+            GemmKernelKind::Neon => micro_kernel_f32_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f32_scalar(k, alpha, a, b, beta, c, c_stride),
         }
     }
@@ -741,20 +781,27 @@ unsafe fn micro_kernel_f32_avx2(
     let mut acc6 = _mm256_setzero_ps();
     let mut acc7 = _mm256_setzero_ps();
     macro_rules! fma_iter {
-        ($offset:expr) => {
-            { let a_ptr = a.add($offset * MR); let b_ptr = b.add($offset * NR); let a_vec
-            = _mm256_loadu_ps(a_ptr); let b0 = _mm256_broadcast_ss(&* b_ptr); acc0 =
-            _mm256_fmadd_ps(a_vec, b0, acc0); let b1 = _mm256_broadcast_ss(&* b_ptr
-            .add(1)); acc1 = _mm256_fmadd_ps(a_vec, b1, acc1); let b2 =
-            _mm256_broadcast_ss(&* b_ptr.add(2)); acc2 = _mm256_fmadd_ps(a_vec, b2,
-            acc2); let b3 = _mm256_broadcast_ss(&* b_ptr.add(3)); acc3 =
-            _mm256_fmadd_ps(a_vec, b3, acc3); let b4 = _mm256_broadcast_ss(&* b_ptr
-            .add(4)); acc4 = _mm256_fmadd_ps(a_vec, b4, acc4); let b5 =
-            _mm256_broadcast_ss(&* b_ptr.add(5)); acc5 = _mm256_fmadd_ps(a_vec, b5,
-            acc5); let b6 = _mm256_broadcast_ss(&* b_ptr.add(6)); acc6 =
-            _mm256_fmadd_ps(a_vec, b6, acc6); let b7 = _mm256_broadcast_ss(&* b_ptr
-            .add(7)); acc7 = _mm256_fmadd_ps(a_vec, b7, acc7); }
-        };
+        ($offset:expr) => {{
+            let a_ptr = a.add($offset * MR);
+            let b_ptr = b.add($offset * NR);
+            let a_vec = _mm256_loadu_ps(a_ptr);
+            let b0 = _mm256_broadcast_ss(&*b_ptr);
+            acc0 = _mm256_fmadd_ps(a_vec, b0, acc0);
+            let b1 = _mm256_broadcast_ss(&*b_ptr.add(1));
+            acc1 = _mm256_fmadd_ps(a_vec, b1, acc1);
+            let b2 = _mm256_broadcast_ss(&*b_ptr.add(2));
+            acc2 = _mm256_fmadd_ps(a_vec, b2, acc2);
+            let b3 = _mm256_broadcast_ss(&*b_ptr.add(3));
+            acc3 = _mm256_fmadd_ps(a_vec, b3, acc3);
+            let b4 = _mm256_broadcast_ss(&*b_ptr.add(4));
+            acc4 = _mm256_fmadd_ps(a_vec, b4, acc4);
+            let b5 = _mm256_broadcast_ss(&*b_ptr.add(5));
+            acc5 = _mm256_fmadd_ps(a_vec, b5, acc5);
+            let b6 = _mm256_broadcast_ss(&*b_ptr.add(6));
+            acc6 = _mm256_fmadd_ps(a_vec, b6, acc6);
+            let b7 = _mm256_broadcast_ss(&*b_ptr.add(7));
+            acc7 = _mm256_fmadd_ps(a_vec, b7, acc7);
+        }};
     }
     let k_unroll = k / 4;
     let k_remainder = k % 4;
@@ -798,10 +845,10 @@ unsafe fn micro_kernel_f32_avx2(
     }
     if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc:expr) => {
-                { let c_col = c.add($col * c_stride); _mm256_storeu_ps(c_col,
-                _mm256_add_ps($acc, _mm256_loadu_ps(c_col))); }
-            };
+            ($col:expr, $acc:expr) => {{
+                let c_col = c.add($col * c_stride);
+                _mm256_storeu_ps(c_col, _mm256_add_ps($acc, _mm256_loadu_ps(c_col)));
+            }};
         }
         store_add!(0, acc0);
         store_add!(1, acc1);
@@ -815,10 +862,12 @@ unsafe fn micro_kernel_f32_avx2(
     }
     let beta_vec = _mm256_set1_ps(beta);
     macro_rules! store_col {
-        ($col:expr, $acc:expr) => {
-            { let c_col = c.add($col * c_stride); let c_vec = _mm256_loadu_ps(c_col); let
-            res = _mm256_fmadd_ps(c_vec, beta_vec, $acc); _mm256_storeu_ps(c_col, res); }
-        };
+        ($col:expr, $acc:expr) => {{
+            let c_col = c.add($col * c_stride);
+            let c_vec = _mm256_loadu_ps(c_col);
+            let res = _mm256_fmadd_ps(c_vec, beta_vec, $acc);
+            _mm256_storeu_ps(c_col, res);
+        }};
     }
     store_col!(0, acc0);
     store_col!(1, acc1);
@@ -865,29 +914,43 @@ unsafe fn micro_kernel_f32_avx512(
     let mut acc14 = _mm512_setzero_ps();
     let mut acc15 = _mm512_setzero_ps();
     macro_rules! fma_iter {
-        ($offset:expr) => {
-            { let a_ptr = a.add($offset * MR); let b_ptr = b.add($offset * NR); let a_vec
-            = _mm512_loadu_ps(a_ptr); let b0 = _mm512_set1_ps(* b_ptr); acc0 =
-            _mm512_fmadd_ps(a_vec, b0, acc0); let b1 = _mm512_set1_ps(* b_ptr.add(1));
-            acc1 = _mm512_fmadd_ps(a_vec, b1, acc1); let b2 = _mm512_set1_ps(* b_ptr
-            .add(2)); acc2 = _mm512_fmadd_ps(a_vec, b2, acc2); let b3 = _mm512_set1_ps(*
-            b_ptr.add(3)); acc3 = _mm512_fmadd_ps(a_vec, b3, acc3); let b4 =
-            _mm512_set1_ps(* b_ptr.add(4)); acc4 = _mm512_fmadd_ps(a_vec, b4, acc4); let
-            b5 = _mm512_set1_ps(* b_ptr.add(5)); acc5 = _mm512_fmadd_ps(a_vec, b5, acc5);
-            let b6 = _mm512_set1_ps(* b_ptr.add(6)); acc6 = _mm512_fmadd_ps(a_vec, b6,
-            acc6); let b7 = _mm512_set1_ps(* b_ptr.add(7)); acc7 = _mm512_fmadd_ps(a_vec,
-            b7, acc7); let b8 = _mm512_set1_ps(* b_ptr.add(8)); acc8 =
-            _mm512_fmadd_ps(a_vec, b8, acc8); let b9 = _mm512_set1_ps(* b_ptr.add(9));
-            acc9 = _mm512_fmadd_ps(a_vec, b9, acc9); let b10 = _mm512_set1_ps(* b_ptr
-            .add(10)); acc10 = _mm512_fmadd_ps(a_vec, b10, acc10); let b11 =
-            _mm512_set1_ps(* b_ptr.add(11)); acc11 = _mm512_fmadd_ps(a_vec, b11, acc11);
-            let b12 = _mm512_set1_ps(* b_ptr.add(12)); acc12 = _mm512_fmadd_ps(a_vec,
-            b12, acc12); let b13 = _mm512_set1_ps(* b_ptr.add(13)); acc13 =
-            _mm512_fmadd_ps(a_vec, b13, acc13); let b14 = _mm512_set1_ps(* b_ptr
-            .add(14)); acc14 = _mm512_fmadd_ps(a_vec, b14, acc14); let b15 =
-            _mm512_set1_ps(* b_ptr.add(15)); acc15 = _mm512_fmadd_ps(a_vec, b15, acc15);
-            }
-        };
+        ($offset:expr) => {{
+            let a_ptr = a.add($offset * MR);
+            let b_ptr = b.add($offset * NR);
+            let a_vec = _mm512_loadu_ps(a_ptr);
+            let b0 = _mm512_set1_ps(*b_ptr);
+            acc0 = _mm512_fmadd_ps(a_vec, b0, acc0);
+            let b1 = _mm512_set1_ps(*b_ptr.add(1));
+            acc1 = _mm512_fmadd_ps(a_vec, b1, acc1);
+            let b2 = _mm512_set1_ps(*b_ptr.add(2));
+            acc2 = _mm512_fmadd_ps(a_vec, b2, acc2);
+            let b3 = _mm512_set1_ps(*b_ptr.add(3));
+            acc3 = _mm512_fmadd_ps(a_vec, b3, acc3);
+            let b4 = _mm512_set1_ps(*b_ptr.add(4));
+            acc4 = _mm512_fmadd_ps(a_vec, b4, acc4);
+            let b5 = _mm512_set1_ps(*b_ptr.add(5));
+            acc5 = _mm512_fmadd_ps(a_vec, b5, acc5);
+            let b6 = _mm512_set1_ps(*b_ptr.add(6));
+            acc6 = _mm512_fmadd_ps(a_vec, b6, acc6);
+            let b7 = _mm512_set1_ps(*b_ptr.add(7));
+            acc7 = _mm512_fmadd_ps(a_vec, b7, acc7);
+            let b8 = _mm512_set1_ps(*b_ptr.add(8));
+            acc8 = _mm512_fmadd_ps(a_vec, b8, acc8);
+            let b9 = _mm512_set1_ps(*b_ptr.add(9));
+            acc9 = _mm512_fmadd_ps(a_vec, b9, acc9);
+            let b10 = _mm512_set1_ps(*b_ptr.add(10));
+            acc10 = _mm512_fmadd_ps(a_vec, b10, acc10);
+            let b11 = _mm512_set1_ps(*b_ptr.add(11));
+            acc11 = _mm512_fmadd_ps(a_vec, b11, acc11);
+            let b12 = _mm512_set1_ps(*b_ptr.add(12));
+            acc12 = _mm512_fmadd_ps(a_vec, b12, acc12);
+            let b13 = _mm512_set1_ps(*b_ptr.add(13));
+            acc13 = _mm512_fmadd_ps(a_vec, b13, acc13);
+            let b14 = _mm512_set1_ps(*b_ptr.add(14));
+            acc14 = _mm512_fmadd_ps(a_vec, b14, acc14);
+            let b15 = _mm512_set1_ps(*b_ptr.add(15));
+            acc15 = _mm512_fmadd_ps(a_vec, b15, acc15);
+        }};
     }
     let k_unroll = k / 4;
     let k_remainder = k % 4;
@@ -945,10 +1008,10 @@ unsafe fn micro_kernel_f32_avx512(
         _mm512_storeu_ps(c.add(15 * c_stride), acc15);
     } else if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc:expr) => {
-                { let c_col = c.add($col * c_stride); _mm512_storeu_ps(c_col,
-                _mm512_add_ps($acc, _mm512_loadu_ps(c_col))); }
-            };
+            ($col:expr, $acc:expr) => {{
+                let c_col = c.add($col * c_stride);
+                _mm512_storeu_ps(c_col, _mm512_add_ps($acc, _mm512_loadu_ps(c_col)));
+            }};
         }
         store_add!(0, acc0);
         store_add!(1, acc1);
@@ -969,10 +1032,11 @@ unsafe fn micro_kernel_f32_avx512(
     } else {
         let beta_vec = _mm512_set1_ps(beta);
         macro_rules! store_fma {
-            ($col:expr, $acc:expr) => {
-                { let c_col = c.add($col * c_stride); let c_vec = _mm512_loadu_ps(c_col);
-                _mm512_storeu_ps(c_col, _mm512_fmadd_ps(c_vec, beta_vec, $acc)); }
-            };
+            ($col:expr, $acc:expr) => {{
+                let c_col = c.add($col * c_stride);
+                let c_vec = _mm512_loadu_ps(c_col);
+                _mm512_storeu_ps(c_col, _mm512_fmadd_ps(c_vec, beta_vec, $acc));
+            }};
         }
         store_fma!(0, acc0);
         store_fma!(1, acc1);
@@ -1005,9 +1069,7 @@ unsafe fn micro_kernel_f32_neon(
     c: *mut f32,
     c_stride: usize,
 ) {
-    use core::arch::aarch64::{
-        vaddq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmulq_f32, vst1q_f32,
-    };
+    use core::arch::aarch64::{vaddq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmulq_f32, vst1q_f32};
     const MR: usize = 8;
     const NR: usize = 8;
     const PREFETCH_DIST: usize = 10;
@@ -1030,22 +1092,34 @@ unsafe fn micro_kernel_f32_neon(
     let k_unroll = k / 4;
     let k_remainder = k % 4;
     macro_rules! fma_iteration {
-        ($a_ptr:expr, $b_ptr:expr) => {
-            { let a_lo = vld1q_f32($a_ptr); let a_hi = vld1q_f32($a_ptr .add(4)); let b0
-            = vdupq_n_f32(*$b_ptr); acc0_lo = vfmaq_f32(acc0_lo, a_lo, b0); acc0_hi =
-            vfmaq_f32(acc0_hi, a_hi, b0); let b1 = vdupq_n_f32(*$b_ptr .add(1)); acc1_lo
-            = vfmaq_f32(acc1_lo, a_lo, b1); acc1_hi = vfmaq_f32(acc1_hi, a_hi, b1); let
-            b2 = vdupq_n_f32(*$b_ptr .add(2)); acc2_lo = vfmaq_f32(acc2_lo, a_lo, b2);
-            acc2_hi = vfmaq_f32(acc2_hi, a_hi, b2); let b3 = vdupq_n_f32(*$b_ptr
-            .add(3)); acc3_lo = vfmaq_f32(acc3_lo, a_lo, b3); acc3_hi =
-            vfmaq_f32(acc3_hi, a_hi, b3); let b4 = vdupq_n_f32(*$b_ptr .add(4)); acc4_lo
-            = vfmaq_f32(acc4_lo, a_lo, b4); acc4_hi = vfmaq_f32(acc4_hi, a_hi, b4); let
-            b5 = vdupq_n_f32(*$b_ptr .add(5)); acc5_lo = vfmaq_f32(acc5_lo, a_lo, b5);
-            acc5_hi = vfmaq_f32(acc5_hi, a_hi, b5); let b6 = vdupq_n_f32(*$b_ptr
-            .add(6)); acc6_lo = vfmaq_f32(acc6_lo, a_lo, b6); acc6_hi =
-            vfmaq_f32(acc6_hi, a_hi, b6); let b7 = vdupq_n_f32(*$b_ptr .add(7)); acc7_lo
-            = vfmaq_f32(acc7_lo, a_lo, b7); acc7_hi = vfmaq_f32(acc7_hi, a_hi, b7); }
-        };
+        ($a_ptr:expr, $b_ptr:expr) => {{
+            let a_lo = vld1q_f32($a_ptr);
+            let a_hi = vld1q_f32($a_ptr.add(4));
+            let b0 = vdupq_n_f32(*$b_ptr);
+            acc0_lo = vfmaq_f32(acc0_lo, a_lo, b0);
+            acc0_hi = vfmaq_f32(acc0_hi, a_hi, b0);
+            let b1 = vdupq_n_f32(*$b_ptr.add(1));
+            acc1_lo = vfmaq_f32(acc1_lo, a_lo, b1);
+            acc1_hi = vfmaq_f32(acc1_hi, a_hi, b1);
+            let b2 = vdupq_n_f32(*$b_ptr.add(2));
+            acc2_lo = vfmaq_f32(acc2_lo, a_lo, b2);
+            acc2_hi = vfmaq_f32(acc2_hi, a_hi, b2);
+            let b3 = vdupq_n_f32(*$b_ptr.add(3));
+            acc3_lo = vfmaq_f32(acc3_lo, a_lo, b3);
+            acc3_hi = vfmaq_f32(acc3_hi, a_hi, b3);
+            let b4 = vdupq_n_f32(*$b_ptr.add(4));
+            acc4_lo = vfmaq_f32(acc4_lo, a_lo, b4);
+            acc4_hi = vfmaq_f32(acc4_hi, a_hi, b4);
+            let b5 = vdupq_n_f32(*$b_ptr.add(5));
+            acc5_lo = vfmaq_f32(acc5_lo, a_lo, b5);
+            acc5_hi = vfmaq_f32(acc5_hi, a_hi, b5);
+            let b6 = vdupq_n_f32(*$b_ptr.add(6));
+            acc6_lo = vfmaq_f32(acc6_lo, a_lo, b6);
+            acc6_hi = vfmaq_f32(acc6_hi, a_hi, b6);
+            let b7 = vdupq_n_f32(*$b_ptr.add(7));
+            acc7_lo = vfmaq_f32(acc7_lo, a_lo, b7);
+            acc7_hi = vfmaq_f32(acc7_hi, a_hi, b7);
+        }};
     }
     for p in 0..k_unroll {
         let base = p * 4;
@@ -1087,10 +1161,11 @@ unsafe fn micro_kernel_f32_neon(
     }
     if beta == 0.0 {
         macro_rules! store_direct {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); vst1q_f32(c_col, $acc_lo);
-                vst1q_f32(c_col.add(4), $acc_hi); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                vst1q_f32(c_col, $acc_lo);
+                vst1q_f32(c_col.add(4), $acc_hi);
+            }};
         }
         store_direct!(0, acc0_lo, acc0_hi);
         store_direct!(1, acc1_lo, acc1_hi);
@@ -1104,11 +1179,13 @@ unsafe fn micro_kernel_f32_neon(
     }
     if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-                { let c_col = c.add($col * c_stride); let c_lo = vld1q_f32(c_col); let
-                c_hi = vld1q_f32(c_col.add(4)); vst1q_f32(c_col, vaddq_f32($acc_lo,
-                c_lo)); vst1q_f32(c_col.add(4), vaddq_f32($acc_hi, c_hi)); }
-            };
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                let c_lo = vld1q_f32(c_col);
+                let c_hi = vld1q_f32(c_col.add(4));
+                vst1q_f32(c_col, vaddq_f32($acc_lo, c_lo));
+                vst1q_f32(c_col.add(4), vaddq_f32($acc_hi, c_hi));
+            }};
         }
         store_add!(0, acc0_lo, acc0_hi);
         store_add!(1, acc1_lo, acc1_hi);
@@ -1122,11 +1199,13 @@ unsafe fn micro_kernel_f32_neon(
     }
     let beta_vec = vdupq_n_f32(beta);
     macro_rules! scale_and_store {
-        ($col:expr, $acc_lo:expr, $acc_hi:expr) => {
-            { let c_col = c.add($col * c_stride); let c_lo = vld1q_f32(c_col); let c_hi =
-            vld1q_f32(c_col.add(4)); vst1q_f32(c_col, vfmaq_f32($acc_lo, c_lo,
-            beta_vec)); vst1q_f32(c_col.add(4), vfmaq_f32($acc_hi, c_hi, beta_vec)); }
-        };
+        ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+            let c_col = c.add($col * c_stride);
+            let c_lo = vld1q_f32(c_col);
+            let c_hi = vld1q_f32(c_col.add(4));
+            vst1q_f32(c_col, vfmaq_f32($acc_lo, c_lo, beta_vec));
+            vst1q_f32(c_col.add(4), vfmaq_f32($acc_hi, c_hi, beta_vec));
+        }};
     }
     scale_and_store!(0, acc0_lo, acc0_hi);
     scale_and_store!(1, acc1_lo, acc1_hi);

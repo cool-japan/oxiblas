@@ -8,11 +8,14 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use core::arch::x86_64::*;
 use crate::simd::SimdRegister;
+use core::arch::x86_64::*;
 
+use super::functions::{
+    has_avx2_fma, lane_index_out_of_range, scalar_binop, scalar_load, scalar_reduce, scalar_splat,
+    scalar_store, scalar_ternop,
+};
 use super::types::F32x8;
-use super::functions::{has_avx2_fma, lane_index_out_of_range, scalar_binop, scalar_load, scalar_reduce, scalar_splat, scalar_store, scalar_ternop};
 
 impl SimdRegister for F32x8 {
     type Scalar = f32;

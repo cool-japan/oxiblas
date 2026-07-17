@@ -1011,11 +1011,7 @@ mod tests {
 
     #[test]
     fn test_aasen_f32() {
-        let a = Mat::from_rows(&[
-            &[2.0f32, 1.0, 0.0],
-            &[1.0, -3.0, 2.0],
-            &[0.0, 2.0, 1.0],
-        ]);
+        let a = Mat::from_rows(&[&[2.0f32, 1.0, 0.0], &[1.0, -3.0, 2.0], &[0.0, 2.0, 1.0]]);
         let aasen = Aasen::compute(a.as_ref()).expect("compute");
 
         let b = Mat::from_rows(&[&[3.0f32], &[0.0], &[3.0]]);
@@ -1026,7 +1022,10 @@ mod tests {
             for j in 0..3 {
                 ax += a[(i, j)] * x[(j, 0)];
             }
-            assert!(approx_eq(ax as f64, b[(i, 0)] as f64, 1e-4), "Ax[{i}] = {ax}");
+            assert!(
+                approx_eq(ax as f64, b[(i, 0)] as f64, 1e-4),
+                "Ax[{i}] = {ax}"
+            );
         }
     }
 
@@ -1047,11 +1046,7 @@ mod tests {
     #[test]
     fn test_aasen_nan_propagates() {
         // A NaN in the data must propagate through the solve, not be clamped.
-        let a = Mat::from_rows(&[
-            &[f64::NAN, 1.0, 0.0],
-            &[1.0, 2.0, 1.0],
-            &[0.0, 1.0, 3.0],
-        ]);
+        let a = Mat::from_rows(&[&[f64::NAN, 1.0, 0.0], &[1.0, 2.0, 1.0], &[0.0, 1.0, 3.0]]);
         let aasen = Aasen::compute(a.as_ref()).expect("compute");
         let b = Mat::from_rows(&[&[1.0], &[1.0], &[1.0]]);
         // Either the solve returns a result containing NaN, or an honest error

@@ -1281,10 +1281,16 @@ mod tests {
             caps.vector_width_bytes
         );
         if ceiling < 64 {
-            assert!(!caps.has_avx512f, "AVX-512 must be masked below a 64-byte ceiling");
+            assert!(
+                !caps.has_avx512f,
+                "AVX-512 must be masked below a 64-byte ceiling"
+            );
         }
         if ceiling < 32 {
-            assert!(!caps.has_avx2, "AVX2 must be masked below a 32-byte ceiling");
+            assert!(
+                !caps.has_avx2,
+                "AVX2 must be masked below a 32-byte ceiling"
+            );
         }
         if ceiling == 0 {
             assert_eq!(caps.optimal_level(), SimdLevel::Scalar);

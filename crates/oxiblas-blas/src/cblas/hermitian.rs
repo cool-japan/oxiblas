@@ -183,12 +183,7 @@ unsafe fn hemm_impl<T: HemmScalar>(
 
     // Map layout: for row-major, swap Side and Uplo and transpose the B/C extents.
     let (side_internal, uplo_internal, bm, bn) = match layout {
-        CblasLayout::ColMajor => (
-            map_side(side),
-            map_uplo(uplo),
-            m,
-            n,
-        ),
+        CblasLayout::ColMajor => (map_side(side), map_uplo(uplo), m, n),
         CblasLayout::RowMajor => (
             match side {
                 CblasSide::Left => level3::Side::Right,
@@ -388,7 +383,9 @@ pub unsafe extern "C" fn cblas_cher2k(
     if n <= 0 {
         return;
     }
-    her2k_impl(layout, uplo, trans, n, k, *alpha, a, lda, b, ldb, beta, c, ldc);
+    her2k_impl(
+        layout, uplo, trans, n, k, *alpha, a, lda, b, ldb, beta, c, ldc,
+    );
 }
 
 /// Complex double precision HER2K:
@@ -413,7 +410,9 @@ pub unsafe extern "C" fn cblas_zher2k(
     if n <= 0 {
         return;
     }
-    her2k_impl(layout, uplo, trans, n, k, *alpha, a, lda, b, ldb, beta, c, ldc);
+    her2k_impl(
+        layout, uplo, trans, n, k, *alpha, a, lda, b, ldb, beta, c, ldc,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

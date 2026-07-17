@@ -51,8 +51,16 @@ mod tests_2 {
 
         let s64 = f64::micro_kernel_shape();
         let s32 = f32::micro_kernel_shape();
-        assert_eq!((s64.mr, s64.nr), expected_f64, "f64 shape/dispatch mismatch");
-        assert_eq!((s32.mr, s32.nr), expected_f32, "f32 shape/dispatch mismatch");
+        assert_eq!(
+            (s64.mr, s64.nr),
+            expected_f64,
+            "f64 shape/dispatch mismatch"
+        );
+        assert_eq!(
+            (s32.mr, s32.nr),
+            expected_f32,
+            "f32 shape/dispatch mismatch"
+        );
     }
 
     // Generates an end-to-end round-trip test helper for a floating-point type:
@@ -560,7 +568,6 @@ mod tests_2 {
         assert!((c[3].im - 19.0).abs() < tol, "C[1,1].im got {}", c[3].im);
     }
 
-
     #[test]
     fn test_micro_kernel_c64_beta_zero_does_not_read_c() {
         use num_complex::Complex64;
@@ -631,5 +638,4 @@ mod tests_2 {
         assert!((c[0].re - 10.0).abs() < tol);
         assert!((c[0].im - 6.0).abs() < tol);
     }
-
 }

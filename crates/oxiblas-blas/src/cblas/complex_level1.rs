@@ -31,7 +31,12 @@ fn vec_offset(i: usize, n: usize, inc: isize) -> isize {
 
 /// Complex single precision scaling by a complex scalar.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cblas_cscal(n: i32, alpha: *const Complex32, x: *mut Complex32, incx: i32) {
+pub unsafe extern "C" fn cblas_cscal(
+    n: i32,
+    alpha: *const Complex32,
+    x: *mut Complex32,
+    incx: i32,
+) {
     if n <= 0 {
         return;
     }
@@ -40,7 +45,12 @@ pub unsafe extern "C" fn cblas_cscal(n: i32, alpha: *const Complex32, x: *mut Co
 
 /// Complex double precision scaling by a complex scalar.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cblas_zscal(n: i32, alpha: *const Complex64, x: *mut Complex64, incx: i32) {
+pub unsafe extern "C" fn cblas_zscal(
+    n: i32,
+    alpha: *const Complex64,
+    x: *mut Complex64,
+    incx: i32,
+) {
     if n <= 0 {
         return;
     }

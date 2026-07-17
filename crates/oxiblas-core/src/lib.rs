@@ -119,9 +119,9 @@ pub mod prelude {
         MatNuma, NumaAllocHint, NumaAllocator, NumaTopology, NumaVec, numa_distribute_work,
     };
     #[cfg(feature = "std")]
-    pub use crate::parallel::global_num_threads;
-    #[cfg(feature = "std")]
     pub use crate::parallel::OxiblasThreadConfig;
+    #[cfg(feature = "std")]
+    pub use crate::parallel::global_num_threads;
     pub use crate::parallel::{Par, ParThreshold, with_thread_count};
     pub use crate::scalar::{
         C32, C64, ComplexExt, ComplexScalar, ExtendedPrecision, Field, HasFastFma, I32, I64,

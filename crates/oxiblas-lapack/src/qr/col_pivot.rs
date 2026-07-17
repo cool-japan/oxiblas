@@ -745,11 +745,7 @@ mod tests {
         // the front. Numerical rank is exactly 1; the loop must break at j == 1
         // (the second pivot is zero) and report rank 1 -- verifying the fixed
         // boundary logic still terminates correctly after a genuine swap.
-        let a = Mat::from_rows(&[
-            &[0.0f64, 0.0, 3.0],
-            &[0.0, 0.0, 4.0],
-            &[0.0, 0.0, 0.0],
-        ]);
+        let a = Mat::from_rows(&[&[0.0f64, 0.0, 3.0], &[0.0, 0.0, 4.0], &[0.0, 0.0, 0.0]]);
 
         let qr = QrPivot::compute(a.as_ref()).unwrap();
         assert_eq!(qr.rank(), 1, "rank should be 1, got {}", qr.rank());

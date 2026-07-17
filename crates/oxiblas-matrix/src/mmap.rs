@@ -1043,8 +1043,8 @@ mod tests {
         data_bytes: usize,
     ) {
         use std::io::Write;
-        let header = Header::new::<f64>(nrows, ncols, row_stride)
-            .expect("f64 is a supported element type");
+        let header =
+            Header::new::<f64>(nrows, ncols, row_stride).expect("f64 is a supported element type");
         let mut file = std::fs::File::create(path).expect("create temp file");
         file.write_all(&header.to_bytes()).expect("write header");
         file.write_all(&vec![0u8; data_bytes])

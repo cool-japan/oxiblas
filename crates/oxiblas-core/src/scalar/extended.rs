@@ -410,11 +410,7 @@ impl QuadFloat {
         r = r * ((four - x * (r * r * r)) / 3.0_f64);
         r = r * ((four - x * (r * r * r)) / 3.0_f64);
         let result = QuadFloat(x * r * r);
-        if negative {
-            -result
-        } else {
-            result
-        }
+        if negative { -result } else { result }
     }
 }
 
@@ -531,10 +527,7 @@ impl Rem for QuadFloat {
         // twofloat does not define operations on non-finite values, so match
         // f64 `%` on the special cases explicitly:
         //   x % 0 = NaN, inf % y = NaN, x % inf = x, NaN propagates.
-        if self.0.is_nan()
-            || rhs.0.is_nan()
-            || self.0.is_infinite()
-            || rhs == QuadFloat::from(0.0)
+        if self.0.is_nan() || rhs.0.is_nan() || self.0.is_infinite() || rhs == QuadFloat::from(0.0)
         {
             return QuadFloat(TwoFloat::NAN);
         }

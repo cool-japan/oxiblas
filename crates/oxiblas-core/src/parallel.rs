@@ -835,7 +835,9 @@ fn cached_pool(n: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
     // Poisoning only means a *previous* builder panicked; the map itself stays
     // structurally consistent, so recover the guard instead of propagating a
     // panic into an unrelated caller.
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(pool) = guard.get(&n) {
         return Some(Arc::clone(pool));
     }
@@ -1352,7 +1354,11 @@ mod tests {
             .expect("build named global pool");
         assert_eq!(pool.num_threads(), 3);
         set_global_thread_pool(pool);
-        assert_eq!(global_num_threads(), 3, "registered pool size not reflected");
+        assert_eq!(
+            global_num_threads(),
+            3,
+            "registered pool size not reflected"
+        );
 
         let names = std::sync::Mutex::new(std::collections::HashSet::new());
         run_in_pool(Par::Rayon, || {
@@ -1407,9 +1413,9 @@ mod tests {
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(
-            names
-                .iter()
-                .all(|n| n.as_deref().is_some_and(|n| n.starts_with("oxiblas-scope-test"))),
+            names.iter().all(|n| n
+                .as_deref()
+                .is_some_and(|n| n.starts_with("oxiblas-scope-test"))),
             "ranges executed off-pool (likely on the caller thread): {names:?}"
         );
         assert_eq!(

@@ -467,7 +467,11 @@ mod tests {
 
         assert_eq!(vec.capacity(), 37);
         assert_eq!(vec.len(), 0);
-        assert_eq!(vec.as_ptr() as usize % ALIGN, 0, "buffer must be ALIGN-aligned");
+        assert_eq!(
+            vec.as_ptr() as usize % ALIGN,
+            0,
+            "buffer must be ALIGN-aligned"
+        );
     }
 
     #[test]

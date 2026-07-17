@@ -1038,10 +1038,7 @@ fn execute_single_gemm_c32(
 
 /// Creates a transposed copy of a matrix (columns become rows), optionally
 /// conjugating each element in the process (used for `Transpose::ConjTrans`).
-fn transpose_to_mat<T: Field + bytemuck::Zeroable>(
-    src: &MatRef<'_, T>,
-    conjugate: bool,
-) -> Mat<T> {
+fn transpose_to_mat<T: Field + bytemuck::Zeroable>(src: &MatRef<'_, T>, conjugate: bool) -> Mat<T> {
     let m = src.nrows();
     let n = src.ncols();
     let mut dst = Mat::<T>::zeros(n, m);

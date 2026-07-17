@@ -9,4 +9,3 @@ pub type Simd128F64 = F64x2Sse;
 
 /// 128-bit SIMD register type alias for compatibility.
 pub type Simd128F32 = F32x4Sse;
-

@@ -1615,8 +1615,18 @@ mod tests {
         let (alpha, beta) = (0.5, 2.0);
 
         gemm(alpha, a.as_ref(), b.as_ref(), beta, c.as_mut());
-        let expected =
-            naive_trans_f64(Trans::NoTrans, Trans::NoTrans, alpha, &a, &b, beta, &c_init, m, k, n);
+        let expected = naive_trans_f64(
+            Trans::NoTrans,
+            Trans::NoTrans,
+            alpha,
+            &a,
+            &b,
+            beta,
+            &c_init,
+            m,
+            k,
+            n,
+        );
 
         for i in 0..m {
             for j in 0..n {
@@ -1652,8 +1662,18 @@ mod tests {
             gemm(alpha, a.as_ref(), b.as_ref(), beta, c.as_mut());
         }
 
-        let expected =
-            naive_trans_f64(Trans::NoTrans, Trans::NoTrans, alpha, &a, &b, beta, &c_init, m, k, n);
+        let expected = naive_trans_f64(
+            Trans::NoTrans,
+            Trans::NoTrans,
+            alpha,
+            &a,
+            &b,
+            beta,
+            &c_init,
+            m,
+            k,
+            n,
+        );
         for i in 0..m {
             for j in 0..n {
                 let (got, exp) = (c[(i, j)], expected[(i, j)]);
@@ -1872,8 +1892,18 @@ mod tests {
         let mut c = pattern_f64(m, n, 3);
 
         gemm_with_blocking(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut(), Par::Seq, &deg);
-        let expected =
-            naive_trans_f64(Trans::NoTrans, Trans::NoTrans, 1.0, &a, &b, 0.0, &c_init, m, k, n);
+        let expected = naive_trans_f64(
+            Trans::NoTrans,
+            Trans::NoTrans,
+            1.0,
+            &a,
+            &b,
+            0.0,
+            &c_init,
+            m,
+            k,
+            n,
+        );
 
         for i in 0..m {
             for j in 0..n {

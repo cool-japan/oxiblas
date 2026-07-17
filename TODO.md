@@ -11,11 +11,11 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [x] `crates/oxiblas-blas/src/level1/dot.rs:1234` — **dotu_c64_avx2 / dotu_c32_avx2 return the NEGATED real part (sign mask lane order reversed)** _(bug, easy)_
   - Fix: Swap the mask lane order: `_mm256_set_pd(-1.0, 1.0, -1.0, 1.0)` and `_mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0)` so the im*im lanes are negated, or replace the mul-by-mask with `_mm256_addsub_pd`/`fmsubadd`-style computation.
-- [ ] `crates/oxiblas-lapack/src/cholesky/aasen.rs:201` — **Aasen factorization is mathematically wrong for general n>=3 matrices; code comments admit it and tests dodge it** _(fabrication, hard)_
+- [x] `crates/oxiblas-lapack/src/cholesky/aasen.rs:201` — **Aasen factorization is mathematically wrong for general n>=3 matrices; code comments admit it and tests dodge it** _(fabrication, hard)_
   - Fix: Implement the real Aasen recurrence (update H, or compute the working column as h = A[:,j] - L(:,0:j) * T(0:j,0:j) * L(j,0:j)^T per Aasen 1971 / LAPACK dsytrf_aa), or delete the module / route Aasen::compute to BunchKaufman with an honest error until correct.
-- [ ] `crates/oxiblas-lapack/src/lu/band.rs:232` — **BandLu returns silently wrong factorization/solution whenever a pivot row swap actually occurs** _(bug, hard)_
+- [x] `crates/oxiblas-lapack/src/lu/band.rs:232` — **BandLu returns silently wrong factorization/solution whenever a pivot row swap actually occurs** _(bug, hard)_
   - Fix: Rewrite compute/solve to follow LAPACK dgbtf2/dgbtrs exactly: do NOT swap previous L columns; store L multipliers relative to the row order at elimination time, and interleave pivot application with the L sweep in solve (swap x[j]<->x[ipiv[j]] immediately …
-- [ ] `crates/oxiblas-lapack/src/qr/complete_orthogonal.rs:301` — **CompleteOrthogonalDecomp::solve uses Z instead of Z^T, returning wrong solutions in exactly the rank-deficient/underdetermined cases COD exists for** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/complete_orthogonal.rs:301` — **CompleteOrthogonalDecomp::solve uses Z instead of Z^T, returning wrong solutions in exactly the rank-deficient/underdetermined cases COD exists for** _(bug, easy)_
   - Fix: In solve() step 3, index Z transposed: `sum = sum + self.z[(n - r + k, i)] * y[(k, j)]` (or fix the comment convention and reconstruct consistently).
 - [ ] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:544` — **Divide-and-conquer SVD merge produces wrong U/V/Σ for matrices larger than 25** _(fabrication, hard)_
   - Fix: Implement a correct bidiagonal D&C merge (Gu-Eisenstat): after solving the secular equation, form the true singular vectors by multiplying the deflated/secular eigenvector matrix by the block-diagonal [[U1,0],[0,U2]] and [[V1,0],[0,V2]] respectively, with …
@@ -58,17 +58,17 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Make construction of feature-gated register types unsafe (unsafe fn zero/splat/new) with a documented safety contract, or gate construction behind a runtime-checked capability token …
 **oxiblas-lapack**
 
-- [ ] `crates/oxiblas-lapack/src/cholesky/aasen.rs:283` — **Aasen factorization uses an admittedly-broken L computation and returns wrong solves for n>=3** _(bug, hard)_
+- [x] `crates/oxiblas-lapack/src/cholesky/aasen.rs:283` — **Aasen factorization uses an admittedly-broken L computation and returns wrong solves for n>=3** _(bug, hard)_
   - Fix: Replace the simplified L-column update with the correct Aasen recurrence (L[i,j] = (H[i,j-1] - sum_k L[i,k]*(T[k,j-1] + L[j,k]*T[j-1,j-1]))/T[j-1,j]) with proper H updating, or return an honest 'unsupported' error.
-- [ ] `crates/oxiblas-lapack/src/evd/hermitian.rs:302` — **Complex Hermitian EVD returns wrong eigenvectors (missing diagonal phase correction)** _(bug, hard)_
+- [x] `crates/oxiblas-lapack/src/evd/hermitian.rs:302` — **Complex Hermitian EVD returns wrong eigenvectors (missing diagonal phase correction)** _(bug, hard)_
   - Fix: Track the complex phase of each reduced sub-diagonal element (as LAPACK ZHETRD/ZSTEQR does): accumulate the diagonal unitary D during reduction and multiply the final eigenvector matrix U by D so that A*u = lambda*u holds.
-- [ ] `crates/oxiblas-lapack/src/evd/hermitian_dc.rs:302` — **Hermitian divide-and-conquer EVD has the same missing-phase eigenvector bug** _(bug, hard)_
+- [x] `crates/oxiblas-lapack/src/evd/hermitian_dc.rs:302` — **Hermitian divide-and-conquer EVD has the same missing-phase eigenvector bug** _(bug, hard)_
   - Fix: Same as hermitian.rs: propagate and apply the sub-diagonal phase (diagonal unitary D) to the eigenvector matrix. Consider sharing a single corrected tridiagonalization routine between hermitian.rs and hermitian_dc.rs.
-- [ ] `crates/oxiblas-lapack/src/evd/schur.rs:204` — **Real Schur QR iteration silently returns non-converged garbage; NotConverged never raised** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/evd/schur.rs:204` — **Real Schur QR iteration silently returns non-converged garbage; NotConverged never raised** _(bug, medium)_
   - Fix: After the loop, if iter_count >= MAX_ITERATIONS*n and the active block has not deflated (p > 2, or the remaining sub-diagonals are not negligible), return Err(SchurError::NotConverged).
-- [ ] `crates/oxiblas-lapack/src/qr/ortho.rs:371` — **unmqr Side::Left has NoTrans and Trans semantics swapped: returns Q^H*C when asked for Q*C and vice versa** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/ortho.rs:371` — **unmqr Side::Left has NoTrans and Trans semantics swapped: returns Q^H*C when asked for Q*C and vice versa** _(bug, easy)_
   - Fix: Make the order depend on (side, trans) exactly as in ormqr: Left+NoTrans and Right+Trans => backward; Left+Trans and Right+NoTrans => forward (keeping tau conjugation for the Hermitian-transpose cases).
-- [ ] `crates/oxiblas-lapack/src/qr/rq.rs:146` — **Rq::r_factor zeroes the dense top (m-n)xn block of R for tall matrices, so A != R*Q when m > n** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/rq.rs:146` — **Rq::r_factor zeroes the dense top (m-n)xn block of R for tall matrices, so A != R*Q when m > n** _(bug, easy)_
   - Fix: In the tall branch, copy the full rows for i < m-n (`for j in 0..n { r[(i,j)] = factors[(i,j)] }`) and keep the trapezoidal cut only for i >= m-n. Add a tall-matrix reconstruction test (A = R*Q).
 - [ ] `crates/oxiblas-lapack/src/svd/complex_dc.rs:531` — **Complex D&C SVD merge has the same broken merge (wrong U/V for min dim > 25)** _(fabrication, hard)_
   - Fix: Apply the same correct Gu-Eisenstat merge as needed for divide_conquer.rs (multiply secular eigenvectors by block-diagonal subproblem vectors, with deflation), or route through real_bidiagonal_svd_qr for all sizes until fixed.
@@ -170,12 +170,12 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:722` — **AArch64 SVE kernels are gated only on target_feature="sve" and cannot build on the stable toolchain** _(bug, hard)_
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:1091` — **sve_dot_f64/f32 tail reduction reads unspecified inactive lanes (_x-predicated FMLA then full-predicate reduce)** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/simd/multiver.rs:356` — **multiver duplicates dispatch.rs types with divergent semantics; its dispatch() and KernelSelector silently drop the SSE4.2 tier** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/evd/general.rs:167` — **GeneralEvd never reports non-convergence (dead NotConverged variant)** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:157` — **Absolute singularity/positive-definiteness tolerance (eps*n) falsely rejects well-conditioned small-magnitude matrices across all LU and Cholesky variants** _(bug, medium)_
-- [ ] `crates/oxiblas-lapack/src/qr/col_pivot.rs:181` — **QrPivot reports rank 1 for a zero matrix due to `j > 0` guard** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/qr/lq.rs:175` — **Lq::compute accepts empty matrices but l_factor() then panics (usize underflow / index out of bounds)** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/evd/general.rs:167` — **GeneralEvd never reports non-convergence (dead NotConverged variant)** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:157` — **Absolute singularity/positive-definiteness tolerance (eps*n) falsely rejects well-conditioned small-magnitude matrices across all LU and Cholesky variants** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/qr/col_pivot.rs:181` — **QrPivot reports rank 1 for a zero matrix due to `j > 0` guard** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/lq.rs:175` — **Lq::compute accepts empty matrices but l_factor() then panics (usize underflow / index out of bounds)** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:285` — **SvdDc bidiagonal QR: silent non-convergence, dead error variants, and discarded Wilkinson shift** _(bug, medium)_
-- [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:200` — **QrSvd bidiagonal QR silently returns garbage on non-convergence; NotConverged{num_unconverged} is dead** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/svd/qr_based.rs:200` — **QrSvd bidiagonal QR silently returns garbage on non-convergence; NotConverged{num_unconverged} is dead** _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/condition.rs:289` — **rcond_estimate advertises LAPACK/Hager-Higham but omits the transpose solves, can overestimate rcond** _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/matfun/functions.rs:1135` — **solve_sylvester_same builds I⊗A + A⊗I instead of I⊗A + A^T⊗I; frechet_sqrtm wrong for non-symmetric A** _(bug, medium)_
 - [x] `crates/oxiblas-matrix/src/mat.rs:75` — **Unchecked allocation-size arithmetic (row_stride*ncols, n*(n+1)/2, ldab*ncols) can wrap in release, producing under-sized buffers behind raw-pointer views** _(bug, easy)_
@@ -201,7 +201,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/simd/dispatch.rs:266` — **SVE support is advertised but structurally unreachable (dead branch, compile-time-only detection, hardcoded false)** _(fabrication, easy)_
 - [x] `crates/oxiblas-core/src/simd/dispatch.rs:607` — **Orphaned oxiblas-core::simd dispatch/KernelSelector layer is advertised but never drives GEMM** _(fabrication, medium)_
 - [ ] `crates/oxiblas-lapack/src/info.rs:671` — **LuInfo pivot_growth and rcond_estimate are fabricated/mislabeled diagnostics** _(fabrication, medium)_
-- [ ] `crates/oxiblas-lapack/src/lu/full_piv.rs:150` — **LuFullPiv::rank() is fabricated: hardcoded to n, never computed** _(fabrication, medium)_
+- [x] `crates/oxiblas-lapack/src/lu/full_piv.rs:150` — **LuFullPiv::rank() is fabricated: hardcoded to n, never computed** _(fabrication, medium)_
 - [ ] `crates/oxiblas-lapack/src/solve/expert_cholesky.rs:262` — **Expert Cholesky/symmetric rcond estimator only samples first 5 columns, silently misreports conditioning** _(fabrication, medium)_
 - [x] `crates/oxiblas-matrix/src/banded.rs:297` — **BandedMat::get_band returns raw interleaved storage, not the requested diagonal, and can underflow** _(fabrication, easy)_
 - [x] `crates/oxiblas-matrix/src/lazy.rs:44` — **Lazy-evaluation module advertises fusion and 'no intermediate allocations' but every node allocates a full temporary** _(fabrication, hard)_
@@ -227,7 +227,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-blas/src/level3/batched.rs:113` — **Batched GEMM Transpose enum lacks ConjTrans — complex batched A^H*B is inexpressible** _(missing-feature, easy)_
 - [x] `crates/oxiblas-blas/src/level3/gemm.rs:285` — **Level-3 GEMM has no transpose parameters; every consumer materializes full transposed/expanded copies** _(missing-feature, hard)_
 - [ ] `crates/oxiblas-core/src/simd/complex.rs:660` — **Complex SIMD exists only for aarch64; x86_64 silently gets scalar despite 256-bit claims in module docs** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-lapack/src/qr/lq.rs:81` — **No complex support for LQ/RQ/QL/pivoted QR/COD, and no orglq/ormlq-family helpers** _(missing-feature, hard)_
+- [x] `crates/oxiblas-lapack/src/qr/lq.rs:81` — **No complex support for LQ/RQ/QL/pivoted QR/COD, and no orglq/ormlq-family helpers** _(missing-feature, hard)_
 - [x] `crates/oxiblas-matrix/src/mat.rs:446` — **Custom-allocator Mat<T, A> is advertised but unusable: no accessors, indexing, or views outside Global** _(missing-feature, medium)_
 - [x] `crates/oxiblas-matrix/src/mat_ref.rs:340` — **TransposeRef is a dead-end type and MatRef cannot represent strided/transposed data at all** _(missing-feature, hard)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1113` — **arnoldi_generalized performs a single Arnoldi pass with no implicit restart** _(missing-feature, hard)_
@@ -267,7 +267,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **test-gap** (4)
 
 - [x] `crates/oxiblas-blas/src/level3/gemm.rs:923` — **Blocked and parallel gemm() paths validated only with constant-filled matrices** _(test-gap, easy)_
-- [ ] `crates/oxiblas-lapack/src/lu/band.rs:966` — **Systematic test gap: every test matrix avoids the code paths that are broken** _(test-gap, medium)_
+- [x] `crates/oxiblas-lapack/src/lu/band.rs:966` — **Systematic test gap: every test matrix avoids the code paths that are broken** _(test-gap, medium)_
 - [ ] `crates/oxiblas-lapack/tests/lapack_compat.rs:1` — **No NaN/Inf-propagation or extreme-magnitude adversarial tests in LAPACK/solver integration suites** _(test-gap, medium)_
 - [x] `crates/oxiblas-matrix/tests/property_tests.rs:1` — **"Property-based tests" cover only storage/structural invariants, no numerical-kernel algebra** _(test-gap, medium)_
 
@@ -294,9 +294,9 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/memory/numa.rs:374` — **get_page_size casts sysconf(-1) failure to a huge usize** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/scalar/traits.rs:109` — **Real::signum behavior inconsistent across implementations (and doc wrong for f32/f64)** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:129` — **F64x2Sse/F32x4Sse reduce_sum uses SSE3 haddpd/haddps but the 128-bit tier is granted on bare SSE2** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:288` — **Lu::solve contains dead duplicated permutation code with an in-code admission that the first attempt 'doesn't work correctly'** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/qr/householder.rs:239` — **Qr::solve_least_squares silently zeroes solution components on tiny R diagonals and returns EmptyMatrix for dimension mismatch** _(bug, easy)_
-- [ ] `crates/oxiblas-lapack/src/qr/householder.rs:852` — **Householder vector norms computed as sqrt(sum of squares) without scaling: overflow/underflow for extreme magnitudes** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:288` — **Lu::solve contains dead duplicated permutation code with an in-code admission that the first attempt 'doesn't work correctly'** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/householder.rs:239` — **Qr::solve_least_squares silently zeroes solution components on tiny R diagonals and returns EmptyMatrix for dimension mismatch** _(bug, easy)_
+- [x] `crates/oxiblas-lapack/src/qr/householder.rs:852` — **Householder vector norms computed as sqrt(sum of squares) without scaling: overflow/underflow for extreme magnitudes** _(bug, medium)_
 - [x] `crates/oxiblas-matrix/src/banded.rs:538` — **SymmetricBandedMat::from_banded hardcodes Upper storage, ignoring the documented upper/lower choice** _(bug, easy)_
 - [x] `crates/oxiblas-matrix/src/symmetric.rs:744` — **HermitianMat::scale accepts complex alpha despite doc requiring real, silently breaking the Hermitian invariant** _(bug, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/shift_invert.rs:276` — **build_shifted_matrix inserts a missing diagonal at the end of the row, breaking CSR column-sort order** _(bug, easy)_
@@ -316,8 +316,8 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **stub** (6)
 
 - [x] `crates/oxiblas-core/Cargo.toml:31` — **Declared `nightly` feature is dead — referenced nowhere in the code** _(stub, easy)_
-- [ ] `crates/oxiblas-lapack/src/lu/band.rs:807` — **band_idx_extended is an exact duplicate of band_idx** _(stub, easy)_
-- [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:267` — **Dead, self-admitted-broken permutation block left in Lu::solve** _(stub, easy)_
+- [x] `crates/oxiblas-lapack/src/lu/band.rs:807` — **band_idx_extended is an exact duplicate of band_idx** _(stub, easy)_
+- [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:267` — **Dead, self-admitted-broken permutation block left in Lu::solve** _(stub, easy)_
 - [ ] `crates/oxiblas-lapack/src/workspace.rs:173` — **workspace.rs is an orphaned advisory module — no routine in the crate consumes its lwork sizes** _(stub, medium)_
 - [x] `crates/oxiblas-matrix/src/prefetch.rs:168` — **prefetch module is orphaned, duplicates oxiblas-core, hardcodes CACHE_LINE_SIZE=64 contradicting core's arch-dependent value, and its strided path covers ~1/8 of lines** _(stub, medium)_
 - [ ] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_
@@ -329,7 +329,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:790` — **Unused variable `pred` in SveF64::zero triggers a warning under SVE builds (zero-warnings policy)** _(policy, easy)_
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:156` — **extract()/insert() can panic on out-of-range index in release builds (no-panic policy)** _(policy, easy)_
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:1989` — **Production source files approaching the 2000-line refactor limit** _(policy, medium)_
-- [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:379` — **expect() in production API path (condition_number) violates no-unwrap/expect policy** _(policy, easy)_
+- [x] `crates/oxiblas-lapack/src/svd/qr_based.rs:379` — **expect() in production API path (condition_number) violates no-unwrap/expect policy** _(policy, easy)_
 - [x] `crates/oxiblas-matrix/Cargo.toml:26` — **Test/bench tooling deps are hard-pinned instead of workspace-inherited (Workspace Policy)** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/csr.rs:448` — **Index impl panics on structurally-zero elements via expect() (surprising API + no-unwrap policy)** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/utils.rs:139` — **expect()/panic reachable in production matrix-construction and residual paths (zero-expect policy)** _(policy, easy)_
@@ -366,7 +366,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/scalar/batch.rs:92` — **ScalarBatch claims 'leveraging SIMD where available' but all impls are serial scalar loops; dot_batch has bogus '# Safety' section** _(docs, easy)_
 - [x] `crates/oxiblas-core/src/scalar/batch.rs:495` — **ExtendedPrecision for f64 provides no extension (Accumulator = f64) even with f128 available** _(docs, medium)_
 - [ ] `crates/oxiblas-core/src/simd/wasm32.rs:81` — **mul_add is documented as fused but is unfused (double rounding) on WASM and on SSE without compile-time fma** _(docs, easy)_
-- [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:280` — **Comment claims Wilkinson shift but code uses zero-shift Golub-Kahan** _(docs, easy)_
+- [x] `crates/oxiblas-lapack/src/svd/qr_based.rs:280` — **Comment claims Wilkinson shift but code uses zero-shift Golub-Kahan** _(docs, easy)_
 - [ ] `crates/oxiblas-lapack/src/utils/equilibrate.rs:147` — **geequ row_cond/col_cond use max/min, inverting LAPACK DGEEQU's ROWCND/COLCND (min/max in [0,1]) convention** _(docs, easy)_
 - [x] `crates/oxiblas-matrix/src/mat_ref.rs:215` — **col_as_slice / col_as_slice_mut advertise a contiguity check via Option but unconditionally return Some** _(docs, easy)_
 - [x] `crates/oxiblas-matrix/src/nalgebra_compat.rs:8` — **Module doc promises zero-copy nalgebra views; every conversion copies** _(docs, easy)_
@@ -378,6 +378,35 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [ ] `crates/oxiblas/src/lib.rs:434` — **features::NO_STD is derived from the facade's own `default` feature, not from oxiblas-core/std as its name and docs imply** _(docs, easy)_
 - [ ] `crates/oxiblas-core/src/simd/complex.rs:660` — **Complex SIMD exists only for aarch64; x86_64 silently gets scalar despite 256-bit claims in module docs** _(missing-feature, medium)_ — not covered by Iter1 core batch, carry to a core follow-up
 - [ ] `crates/oxiblas-core/src/simd/wasm32.rs:81` — **mul_add is documented as fused but is unfused (double rounding) on WASM and on SSE without compile-time fma** _(docs, easy)_ — not covered by Iter1 core batch, carry to a core follow-up
+
+## Orchestration status / resume point (updated 2026-07-17, session cut short)
+
+Progress so far (all committed to branch `0.2.2`, working tree clean, full workspace build+clippy+3267 tests green as of commit `1daee06`):
+- **Iteration 1 (oxiblas-core, 42 findings) — DONE.**
+- **Iteration 2a (oxiblas-matrix, 25 findings) — DONE.**
+- **Iteration 2b (oxiblas-blas, 57 findings) — DONE.**
+- **Iteration 3a (oxiblas-lapack + oxiblas-ndarray) — PARTIAL: 12/22 done, 10 outstanding (session limit hit mid-run).**
+- **Iteration 3b (oxiblas-sparse, ~35 findings) — NOT STARTED.**
+- **Iteration 4 (oxiblas facade + workspace cleanup: CI re-enable, oxiblas-ffi disposition, docs.rs metadata, examples/, README/CHANGELOG staleness, version bump to 0.2.2) — NOT STARTED.**
+- **Iteration 5 (final full-workspace verification + report) — NOT STARTED.**
+
+### Iteration 3a — 10 findings NOT completed this pass (still `- [ ]` below in their normal sections), resume these first:
+- [ ] `crates/oxiblas-lapack/src/evd/mrrr.rs:489` — MRRR fabrication (see gap-sweep section below for full text) — HARD
+- [ ] `crates/oxiblas-lapack/src/evd/symmetric_dc.rs:52` — D&C merge untested/broken for n>100 (see gap-sweep section below) — HARD
+- [ ] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:544` + `:551` + `:285` and `crates/oxiblas-lapack/src/svd/complex_dc.rs:531` — D&C SVD merge wrong for n>25, real+complex — CRITICAL, HARD (still unchecked below)
+- [ ] `crates/oxiblas-lapack/src/svd/bidiag_reduce.rs:1374` — unmbr/ungbr fake complex aliases (see gap-sweep section) — HARD
+- [ ] `crates/oxiblas-lapack/src/utils/condition.rs:289` + `utils/matfun/functions.rs:1135` + `utils/equilibrate.rs:147` — rcond Hager-Higham transpose solves, Sylvester Kronecker sign, geequ inverted convention (still unchecked below)
+- [ ] `crates/oxiblas-lapack/src/info.rs:671` + `solve/expert_cholesky.rs:262` — fabricated pivot_growth/rcond diagnostics (still unchecked below)
+- [ ] `crates/oxiblas-lapack/src/workspace.rs:173` — orphaned advisory module (still unchecked below)
+- [ ] `crates/oxiblas-ndarray/src/lapack.rs:78,117,1085` + gap-sweep `:1124,:1162` — CRITICAL lu_ndarray().solve() pivot misinterpretation, det() sign, tridiag n=0 underflow (still unchecked below + in gap-sweep section)
+- [ ] `crates/oxiblas-ndarray/src/conversions.rs:56` + gap-sweep `:178,:32,:297` — fabricated zero-copy, empty-array panic, negative-stride UB (still unchecked below + in gap-sweep section)
+- [ ] `crates/oxiblas-ndarray/src/sparse.rs:69` + `blas.rs:480` (gap-sweep) — epsilon-based sparsification drops small/NaN values, overflow-prone norms (in gap-sweep section)
+
+### Next orchestrator: how to resume
+1. Re-run the 10 items above as a fresh Iter3a-completion batch (same `isolation: 'worktree'` pattern, one agent per file-group — the prompts used are recoverable from this session's Iter3a workflow script if still on disk under `.claude/workflows/scripts/`, or just re-derive from the finding text below).
+2. Then Iter3b (oxiblas-sparse): the full finding list is in the main audit section below (search `oxiblas-sparse`), ~35 findings across ~28 files, plus 2 gap-sweep findings (`ops/functions.rs:441` spmv_hermitian, `bsr.rs:225` frobenius_norm_sq) — group into ~20 non-overlapping file-cluster units per the established pattern.
+3. Then Iter4 (facade + workspace cleanup) and Iter5 (final verify) as originally planned.
+4. **Lesson learned this session, apply again**: `isolation: 'worktree'` agents' worktrees branch from a STALE base commit (observed: `00dcf64`, several commits behind live HEAD) — do NOT `git merge` their branches directly (brings in a revert of everything since that stale point). Instead extract each agent's changed files via `git show <commit>:<path> > <path>` (scoped to `crates/oxiblas-<X>` to filter out the stale-base noise), then rebuild/reconcile by hand. Also: always `git add -A && git commit` promptly after each iteration's merge-and-verify — this session went 3 full iterations before committing anything, which was risky (worktree teardown at session end almost caused data loss; only the fact that `/notebooks/` working-tree edits happen outside the worktrees saved it).
 
 ## Iteration 1 gap-sweep — new findings (added 2026-07-17, orchestrated re-audit)
 
@@ -403,7 +432,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **oxiblas-lapack (4, queued for Iter3):**
 - [ ] `crates/oxiblas-lapack/src/evd/mrrr.rs:489` — MrrrEvd advertises real MRRR (O(n^2), no reorthogonalization) but the reachable path is bisection + inverse iteration + O(n^3) Gram-Schmidt; the real twisted-factorization code is dead _(fabrication, high, hard)_
 - [ ] `crates/oxiblas-lapack/src/evd/symmetric_dc.rs:52` — SymmetricEvdDc's D&C merge path is reachable for n>100 but untested/unstable (developers' own comment: "until D&C merge is fixed"); DC_THRESHOLD=100 forces QR fallback below that _(stub, medium, hard)_
-- [ ] `crates/oxiblas-lapack/src/utils/determinant.rs:32` — det() returns Err(Singular) instead of 0.0 for singular matrices, breaking the standard det()==0 singularity idiom _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/utils/determinant.rs:32` — det() returns Err(Singular) instead of 0.0 for singular matrices, breaking the standard det()==0 singularity idiom _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/svd/bidiag_reduce.rs:1374` — unmbr/ungbr are fake complex aliases forwarding to the real ormbr/orgbr (bounded T: Real, cannot even instantiate for complex) _(fabrication, low)_
 
 **oxiblas-ndarray (6, queued for Iter3):**

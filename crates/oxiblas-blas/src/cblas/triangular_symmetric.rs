@@ -119,14 +119,21 @@ pub unsafe extern "C" fn cblas_dtrsm(
     }
 
     // Call internal TRSM
-    let _ = level3::trsm_in_place(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A void C ABI cannot surface a `Result`, so — matching the
+    // no-op-on-error convention of the wrappers in `basic.rs` (reference BLAS's
+    // xerbla-then-return) — an error leaves B as the internal routine left it
+    // and the routine returns. In practice only a singular triangular factor is
+    // reachable here (the dimensions are correct by construction), which matches
+    // reference (x)TRSM: it likewise makes no guarantee about B for singular A.
+    if let Err(_err) = level3::trsm_in_place(
         side_internal,
         uplo_internal,
         trans_internal,
         diag_internal,
         a_ref,
         b_mut,
-    );
+    ) {}
 }
 
 /// Single precision TRSM: op(A) * X = alpha * B or X * op(A) = alpha * B.
@@ -216,14 +223,21 @@ pub unsafe extern "C" fn cblas_strsm(
         }
     }
 
-    let _ = level3::trsm_in_place(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A void C ABI cannot surface a `Result`, so — matching the
+    // no-op-on-error convention of the wrappers in `basic.rs` (reference BLAS's
+    // xerbla-then-return) — an error leaves B as the internal routine left it
+    // and the routine returns. In practice only a singular triangular factor is
+    // reachable here (the dimensions are correct by construction), which matches
+    // reference (x)TRSM: it likewise makes no guarantee about B for singular A.
+    if let Err(_err) = level3::trsm_in_place(
         side_internal,
         uplo_internal,
         trans_internal,
         diag_internal,
         a_ref,
         b_mut,
-    );
+    ) {}
 }
 
 // =============================================================================
@@ -312,7 +326,11 @@ pub unsafe extern "C" fn cblas_dtrmm(
     };
     let b_mut = MatMut::<f64>::new(b, bm, bn, ldb);
 
-    let _ = level3::trmm_in_place(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave B untouched.
+    if let Err(_err) = level3::trmm_in_place(
         side_internal,
         uplo_internal,
         trans_internal,
@@ -320,7 +338,7 @@ pub unsafe extern "C" fn cblas_dtrmm(
         alpha,
         a_ref,
         b_mut,
-    );
+    ) {}
 }
 
 /// Single precision TRMM: B = alpha * op(A) * B or B = alpha * B * op(A).
@@ -405,7 +423,11 @@ pub unsafe extern "C" fn cblas_strmm(
     };
     let b_mut = MatMut::<f32>::new(b, bm, bn, ldb);
 
-    let _ = level3::trmm_in_place(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave B untouched.
+    if let Err(_err) = level3::trmm_in_place(
         side_internal,
         uplo_internal,
         trans_internal,
@@ -413,7 +435,7 @@ pub unsafe extern "C" fn cblas_strmm(
         alpha,
         a_ref,
         b_mut,
-    );
+    ) {}
 }
 
 // =============================================================================
@@ -479,7 +501,11 @@ pub unsafe extern "C" fn cblas_dsyrk(
     let a_ref = MatRef::<f64>::new(a, a_rows, a_cols, lda);
     let c_mut = MatMut::<f64>::new(c, n, n, ldc);
 
-    let _ = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut);
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut) {}
 }
 
 /// Single precision SYRK: C = alpha * A * A^T + beta * C or C = alpha * A^T * A + beta * C.
@@ -539,7 +565,11 @@ pub unsafe extern "C" fn cblas_ssyrk(
     let a_ref = MatRef::<f32>::new(a, a_rows, a_cols, lda);
     let c_mut = MatMut::<f32>::new(c, n, n, ldc);
 
-    let _ = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut);
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut) {}
 }
 
 // =============================================================================
@@ -607,7 +637,11 @@ pub unsafe extern "C" fn cblas_dsyr2k(
     let b_ref = MatRef::<f64>::new(b, ab_rows, ab_cols, ldb);
     let c_mut = MatMut::<f64>::new(c, n, n, ldc);
 
-    let _ = level3::syr2k(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::syr2k(
         uplo_internal,
         trans_internal,
         alpha,
@@ -615,7 +649,7 @@ pub unsafe extern "C" fn cblas_dsyr2k(
         b_ref,
         beta,
         c_mut,
-    );
+    ) {}
 }
 
 /// Single precision SYR2K: C = alpha * A * B^T + alpha * B * A^T + beta * C.
@@ -679,7 +713,11 @@ pub unsafe extern "C" fn cblas_ssyr2k(
     let b_ref = MatRef::<f32>::new(b, ab_rows, ab_cols, ldb);
     let c_mut = MatMut::<f32>::new(c, n, n, ldc);
 
-    let _ = level3::syr2k(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::syr2k(
         uplo_internal,
         trans_internal,
         alpha,
@@ -687,7 +725,7 @@ pub unsafe extern "C" fn cblas_ssyr2k(
         b_ref,
         beta,
         c_mut,
-    );
+    ) {}
 }
 
 // =============================================================================
@@ -761,7 +799,11 @@ pub unsafe extern "C" fn cblas_dsymm(
     let b_ref = MatRef::<f64>::new(b, bm, bn, ldb);
     let c_mut = MatMut::<f64>::new(c, bm, bn, ldc);
 
-    let _ = level3::symm(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::symm(
         side_internal,
         uplo_internal,
         alpha,
@@ -769,7 +811,7 @@ pub unsafe extern "C" fn cblas_dsymm(
         b_ref,
         beta,
         c_mut,
-    );
+    ) {}
 }
 
 /// Single precision SYMM: C = alpha * A * B + beta * C or C = alpha * B * A + beta * C.
@@ -839,7 +881,11 @@ pub unsafe extern "C" fn cblas_ssymm(
     let b_ref = MatRef::<f32>::new(b, bm, bn, ldb);
     let c_mut = MatMut::<f32>::new(c, bm, bn, ldc);
 
-    let _ = level3::symm(
+    // Inspect the internal result instead of discarding it with a bare
+    // `let _ =`. A dimension error is impossible by construction; if one ever
+    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // cannot surface a `Result`) and leave C untouched.
+    if let Err(_err) = level3::symm(
         side_internal,
         uplo_internal,
         alpha,
@@ -847,7 +893,7 @@ pub unsafe extern "C" fn cblas_ssymm(
         b_ref,
         beta,
         c_mut,
-    );
+    ) {}
 }
 
 #[cfg(test)]

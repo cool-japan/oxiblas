@@ -1230,8 +1230,17 @@ unsafe fn dotu_c64_avx2(x: &[Complex64], y: &[Complex64]) -> Complex64 {
     let x_ptr = x.as_ptr() as *const f64;
     let y_ptr = y.as_ptr() as *const f64;
 
-    // Sign mask for negating imaginary products in real calculation
-    let sign_mask = _mm256_set_pd(1.0, -1.0, 1.0, -1.0);
+    // Sign mask for the real part of x*y = re*re - im*im.
+    //
+    // WHY the exact literal order matters: after `_mm256_loadu_pd` of the
+    // interleaved [re, im, re, im] layout the lanes are lane0=re, lane1=im,
+    // lane2=re, lane3=im, so `prod = x*y` holds [re*re, im*im, re*re, im*im].
+    // Only the im*im lanes (odd lanes 1 and 3) may be negated. `_mm256_set_pd`
+    // fills lanes in reverse argument order (e3, e2, e1, e0), so this literal
+    // yields per-lane multipliers [lane0=+1, lane1=-1, lane2=+1, lane3=-1].
+    // Reversing it negates the re*re lanes instead and flips the sign of the
+    // entire real part (historic ZDOTU/CDOTU correctness bug on AVX2).
+    let sign_mask = _mm256_set_pd(-1.0, 1.0, -1.0, 1.0);
 
     for i in 0..chunks {
         let base = i * 8;
@@ -1300,7 +1309,11 @@ unsafe fn dotu_c32_avx2(x: &[Complex32], y: &[Complex32]) -> Complex32 {
     let x_ptr = x.as_ptr() as *const f32;
     let y_ptr = y.as_ptr() as *const f32;
 
-    let sign_mask = _mm256_set_ps(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
+    // See dotu_c64_avx2 for the rationale: `_mm256_set_ps` fills lanes in
+    // reverse argument order, so this literal yields per-lane multipliers
+    // [+1, -1, +1, -1, +1, -1, +1, -1], negating exactly the odd (im*im) lanes
+    // of the interleaved [re, im, ...] layout so the real part stays re*re-im*im.
+    let sign_mask = _mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0);
 
     for i in 0..chunks {
         let base = i * 16;
@@ -1788,5 +1801,192 @@ mod tests {
                 n
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Regression: reversed sign-mask lane order in the AVX2 ZDOTU/CDOTU kernels
+    // negated the real part of the unconjugated complex dot product. These tests
+    // pin the kernels against an independent reference using GENUINELY ASYMMETRIC
+    // complex vectors (re and im differ in sign and magnitude, with negatives).
+    // A symmetric or real-only test vector would NOT expose a flipped real sign,
+    // which is why the historic bug went unnoticed.
+    // -------------------------------------------------------------------------
+
+    /// Independent, straightforward reference for the unconjugated complex dot
+    /// product: `Σ x[i] * y[i]` with re = re*re - im*im, im = re*im + im*re.
+    fn dotu_c64_reference(x: &[Complex64], y: &[Complex64]) -> Complex64 {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for (a, b) in x.iter().zip(y.iter()) {
+            re += a.re * b.re - a.im * b.im;
+            im += a.re * b.im + a.im * b.re;
+        }
+        Complex64::new(re, im)
+    }
+
+    /// Independent reference for the conjugated complex dot product:
+    /// `Σ conj(x[i]) * y[i]` with re = re*re + im*im, im = re*im - im*re.
+    fn dotc_c64_reference(x: &[Complex64], y: &[Complex64]) -> Complex64 {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for (a, b) in x.iter().zip(y.iter()) {
+            re += a.re * b.re + a.im * b.im;
+            im += a.re * b.im - a.im * b.re;
+        }
+        Complex64::new(re, im)
+    }
+
+    /// Build asymmetric Complex64 test vectors of length `n`: components mix
+    /// positive and negative values and re/im magnitudes differ per element.
+    fn asymmetric_c64(n: usize) -> (Vec<Complex64>, Vec<Complex64>) {
+        let x: Vec<Complex64> = (0..n)
+            .map(|i| {
+                let ii = i as f64;
+                let re = if i % 2 == 0 { ii + 1.0 } else { -(ii + 1.0) };
+                let im = ii - 13.0; // spans negative and positive
+                Complex64::new(re, im)
+            })
+            .collect();
+        let y: Vec<Complex64> = (0..n)
+            .map(|i| {
+                let ii = i as f64;
+                let re = ii - 7.0; // spans negative and positive
+                let im = if i % 3 == 0 {
+                    -(2.0 * ii + 1.0)
+                } else {
+                    2.0 * ii + 1.0
+                };
+                Complex64::new(re, im)
+            })
+            .collect();
+        (x, y)
+    }
+
+    #[test]
+    fn test_dotu_c64_avx2_asymmetric_signs() {
+        // n odd and > 16 so the AVX2 path runs (chunks + scalar remainder).
+        let (x, y) = asymmetric_c64(37);
+
+        let expected = dotu_c64_reference(&x, &y);
+        let simd = dotu_c64(&x, &y);
+        let scalar = dotu_c64_scalar(&x, &y);
+
+        // Guard the test itself: the real part must be large and non-zero so a
+        // flipped sign (the historic bug) is unambiguously observable.
+        assert!(
+            expected.re.abs() > 100.0,
+            "test data too weak to catch a sign flip: re={}",
+            expected.re
+        );
+
+        assert!(
+            (simd.re - expected.re).abs() < 1e-8,
+            "re: simd={}, expected={}",
+            simd.re,
+            expected.re
+        );
+        assert!(
+            (simd.im - expected.im).abs() < 1e-8,
+            "im: simd={}, expected={}",
+            simd.im,
+            expected.im
+        );
+        assert!(
+            (scalar.re - expected.re).abs() < 1e-8,
+            "scalar re: {} vs expected {}",
+            scalar.re,
+            expected.re
+        );
+        assert!(
+            (scalar.im - expected.im).abs() < 1e-8,
+            "scalar im: {} vs expected {}",
+            scalar.im,
+            expected.im
+        );
+    }
+
+    #[test]
+    fn test_dotc_c64_avx2_asymmetric_signs() {
+        // Independently guard the conjugated kernel against the same bug class.
+        let (x, y) = asymmetric_c64(37);
+
+        let expected = dotc_c64_reference(&x, &y);
+        let simd = dotc_c64(&x, &y);
+
+        assert!(
+            expected.im.abs() > 100.0,
+            "test data too weak to catch an imag sign flip: im={}",
+            expected.im
+        );
+
+        assert!(
+            (simd.re - expected.re).abs() < 1e-8,
+            "re: simd={}, expected={}",
+            simd.re,
+            expected.re
+        );
+        assert!(
+            (simd.im - expected.im).abs() < 1e-8,
+            "im: simd={}, expected={}",
+            simd.im,
+            expected.im
+        );
+    }
+
+    #[test]
+    fn test_dotu_c32_avx2_asymmetric_signs() {
+        // n > 32 so the CDOTU AVX2 path runs. Keep magnitudes modest and use a
+        // relative tolerance because f32 accumulation order differs across the
+        // SIMD, scalar, and reference paths; the historic sign flip produces a
+        // ~200% error, far above this tolerance.
+        let n = 41usize;
+        let x: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ii = i as f32;
+                let re = if i % 2 == 0 { ii + 1.0 } else { -(ii + 1.0) };
+                Complex32::new(re, ii - 13.0)
+            })
+            .collect();
+        let y: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let ii = i as f32;
+                let im = if i % 3 == 0 {
+                    -(2.0 * ii + 1.0)
+                } else {
+                    2.0 * ii + 1.0
+                };
+                Complex32::new(ii - 7.0, im)
+            })
+            .collect();
+
+        // f64 reference for accuracy, then compare in f32 magnitudes.
+        let x64: Vec<Complex64> = x.iter().map(|c| Complex64::new(c.re as f64, c.im as f64)).collect();
+        let y64: Vec<Complex64> = y.iter().map(|c| Complex64::new(c.re as f64, c.im as f64)).collect();
+        let expected = dotu_c64_reference(&x64, &y64);
+
+        let simd = dotu_c32(&x, &y);
+
+        assert!(
+            expected.re.abs() > 100.0,
+            "test data too weak to catch a sign flip: re={}",
+            expected.re
+        );
+
+        let re_err = (simd.re as f64 - expected.re).abs() / expected.re.abs();
+        let im_err = (simd.im as f64 - expected.im).abs() / expected.im.abs().max(1.0);
+        assert!(
+            re_err < 1e-3,
+            "re: simd={}, expected={}, rel_err={}",
+            simd.re,
+            expected.re,
+            re_err
+        );
+        assert!(
+            im_err < 1e-3,
+            "im: simd={}, expected={}, rel_err={}",
+            simd.im,
+            expected.im,
+            im_err
+        );
     }
 }

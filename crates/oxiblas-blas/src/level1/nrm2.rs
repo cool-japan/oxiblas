@@ -32,28 +32,62 @@ pub fn nrm2<T: Real>(x: &[T]) -> T {
     }
 
     if n == 1 {
+        // `abs` propagates NaN and maps ±Inf to +Inf, matching reference BLAS.
         return Scalar::abs(x[0]);
     }
 
-    // Use the "Blue's algorithm" approach for numerical stability:
-    // Scale by the largest element to prevent overflow/underflow
-    let mut scale = T::zero();
-    let mut ssq = T::one();
-
+    // Blue's / dlassq-style scaled accumulation: carry a running `(scale, ssq)`
+    // pair whose invariant is `Σ|x[i]|² == scale² · ssq`. Scaling by the running
+    // maximum magnitude keeps every squared term in `[0, 1]`, which prevents both
+    // overflow and underflow regardless of the dynamic range of the input.
+    let mut state = (T::zero(), T::one());
     for &xi in x {
-        let abs_xi = Scalar::abs(xi);
-        if abs_xi > T::zero() {
-            if scale < abs_xi {
-                let t = scale / abs_xi;
-                ssq = T::one() + ssq * t * t;
-                scale = abs_xi;
-            } else {
-                let t = abs_xi / scale;
-                ssq += t * t;
-            }
-        }
+        state = nrm2_fold(state, xi);
     }
+    nrm2_finalize(state)
+}
 
+/// Folds one value `xi` into a running `(scale, ssq)` accumulator using Blue's
+/// scaling rule. Invariant: the accumulated `Σ|x|²` equals `scale² · ssq`.
+///
+/// WHY `!= zero` and not `> zero`: NaN satisfies `NaN != 0` yet fails every
+/// ordered comparison, so a `> 0` guard would silently *drop* a NaN input and
+/// return a finite norm. Entering on `!= 0` routes NaN through `abs_xi / scale`
+/// (= NaN), so it propagates to the result exactly as reference BLAS requires.
+///
+/// WHY the `scale == abs_xi` guard in the else branch: when both are `+Inf`,
+/// `abs_xi / scale` would be `Inf / Inf = NaN`; two equal-magnitude infinities
+/// really contribute a ratio of exactly `1`, so the guard keeps the norm `+Inf`
+/// instead of spuriously turning an all-infinite input into NaN.
+#[inline]
+pub(crate) fn nrm2_fold<T: Real>(state: (T, T), xi: T) -> (T, T) {
+    let (scale, ssq) = state;
+    let abs_xi = Scalar::abs(xi);
+    if abs_xi != T::zero() {
+        if scale < abs_xi {
+            // New magnitude dominates: rescale the accumulated sum down to it.
+            // `scale < abs_xi` guarantees `scale` is finite here, so `t` is well
+            // defined (it is `0` when `abs_xi` is `+Inf`).
+            let t = scale / abs_xi;
+            (abs_xi, T::one() + ssq * t * t)
+        } else {
+            // `abs_xi <= scale`, or `abs_xi` is NaN (every comparison is false).
+            let t = if scale == abs_xi {
+                T::one()
+            } else {
+                abs_xi / scale
+            };
+            (scale, ssq + t * t)
+        }
+    } else {
+        state
+    }
+}
+
+/// Collapses a `(scale, ssq)` accumulator into the final norm `scale · √ssq`.
+#[inline]
+pub(crate) fn nrm2_finalize<T: Real>(state: (T, T)) -> T {
+    let (scale, ssq) = state;
     scale * Real::sqrt(ssq)
 }
 
@@ -172,48 +206,60 @@ pub fn nrm2_f32(x: &[f32]) -> f32 {
     nrm2_f32_scaled(x)
 }
 
-/// Scaled nrm2 for f64 using Blue's algorithm.
+/// Scaled nrm2 for f64 using Blue's algorithm (small-vector fallback).
+///
+/// Delegates to the shared `nrm2_fold` accumulator so the small-vector path is
+/// bit-for-bit consistent with the generic scalar path — including NaN
+/// propagation and `+Inf` handling.
 fn nrm2_f64_scaled(x: &[f64]) -> f64 {
-    let mut scale = 0.0f64;
-    let mut ssq = 1.0f64;
-
+    let mut state = (0.0f64, 1.0f64);
     for &xi in x {
-        let abs_xi = xi.abs();
-        if abs_xi > 0.0 {
-            if scale < abs_xi {
-                let t = scale / abs_xi;
-                ssq = (ssq * t).mul_add(t, 1.0);
-                scale = abs_xi;
-            } else {
-                let t = abs_xi / scale;
-                ssq += t * t;
-            }
-        }
+        state = nrm2_fold(state, xi);
     }
-
-    scale * ssq.sqrt()
+    nrm2_finalize(state)
 }
 
-/// Scaled nrm2 for f32 using Blue's algorithm.
+/// Scaled nrm2 for f32 using Blue's algorithm (small-vector fallback).
+///
+/// Delegates to the shared `nrm2_fold` accumulator so the small-vector path is
+/// bit-for-bit consistent with the generic scalar path — including NaN
+/// propagation and `+Inf` handling.
 fn nrm2_f32_scaled(x: &[f32]) -> f32 {
-    let mut scale = 0.0f32;
-    let mut ssq = 1.0f32;
-
+    let mut state = (0.0f32, 1.0f32);
     for &xi in x {
-        let abs_xi = xi.abs();
-        if abs_xi > 0.0 {
-            if scale < abs_xi {
-                let t = scale / abs_xi;
-                ssq = (ssq * t).mul_add(t, 1.0);
-                scale = abs_xi;
-            } else {
-                let t = abs_xi / scale;
-                ssq += t * t;
-            }
-        }
+        state = nrm2_fold(state, xi);
     }
+    nrm2_finalize(state)
+}
 
-    scale * ssq.sqrt()
+/// Resolves the norm when the maximum magnitude found in the first SIMD pass is
+/// non-finite.
+///
+/// WHY this is needed: the SIMD paths scale every element by `1 / max_val`. When
+/// `max_val` is `+Inf`, that factor is `0`, so `Inf · 0 == NaN` poisons the
+/// second-pass sum and the function would return NaN for a purely infinite input
+/// — a distinct, wrong outcome. Resolve the exceptional case directly, matching
+/// IEEE / reference DNRM2: any NaN input yields NaN; otherwise an infinity is
+/// present and the Euclidean norm is `+Inf`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn nrm2_nonfinite_f64(x: &[f64]) -> f64 {
+    if x.iter().any(|v| v.is_nan()) {
+        f64::NAN
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// f32 counterpart of [`nrm2_nonfinite_f64`]; see that function for rationale.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn nrm2_nonfinite_f32(x: &[f32]) -> f32 {
+    if x.iter().any(|v| v.is_nan()) {
+        f32::NAN
+    } else {
+        f32::INFINITY
+    }
 }
 
 /// NEON SIMD nrm2 for f64 with overflow protection.
@@ -278,6 +324,12 @@ fn nrm2_f64_simd_safe(x: &[f64]) -> f64 {
         }
 
         max_val = max_val_local;
+    }
+
+    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
+    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
+    if !max_val.is_finite() {
+        return nrm2_nonfinite_f64(x);
     }
 
     if max_val == 0.0 {
@@ -399,6 +451,12 @@ fn nrm2_f32_simd_safe(x: &[f32]) -> f32 {
         max_val = max_val_local;
     }
 
+    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
+    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
+    if !max_val.is_finite() {
+        return nrm2_nonfinite_f32(x);
+    }
+
     if max_val == 0.0 {
         return 0.0;
     }
@@ -508,6 +566,12 @@ unsafe fn nrm2_f64_avx2_safe(x: &[f64]) -> f64 {
         }
     }
 
+    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
+    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
+    if !max_val.is_finite() {
+        return nrm2_nonfinite_f64(x);
+    }
+
     if max_val == 0.0 {
         return 0.0;
     }
@@ -610,6 +674,12 @@ unsafe fn nrm2_f32_avx2_safe(x: &[f32]) -> f32 {
         if abs_xi > max_val {
             max_val = abs_xi;
         }
+    }
+
+    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
+    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
+    if !max_val.is_finite() {
+        return nrm2_nonfinite_f32(x);
     }
 
     if max_val == 0.0 {
@@ -959,26 +1029,168 @@ mod tests {
 
     #[test]
     fn test_nrm2_nan_handling() {
-        // Note: The Blue's algorithm implementation treats NaN as 0
-        // because NaN > 0 is false. This is a known limitation for performance.
-        // For vectors where NaN is the dominant value, it should still propagate.
+        // A NaN anywhere in the input must make the whole norm NaN, matching
+        // IEEE-754 propagation and reference BLAS. The accumulation enters on
+        // `abs != 0` (not `> 0`), so NaN is never silently skipped.
         let x = vec![f64::NAN];
         let norm = nrm2(&x);
-        // Single element takes abs() which propagates NaN
         assert!(
             norm.is_nan(),
             "Norm of single NaN should be NaN, got {}",
             norm
         );
 
-        // For mixed values, Blue's algorithm may not propagate NaN
-        // Test that at least the algorithm doesn't crash
+        // NaN in the middle of finite values must still propagate.
         let x = vec![1.0, f64::NAN, 2.0];
         let norm = nrm2(&x);
-        // The result may or may not be NaN depending on implementation
         assert!(
-            norm.is_finite() || norm.is_nan(),
-            "Norm should be finite or NaN, got {}",
+            norm.is_nan(),
+            "Norm of vector containing NaN should be NaN, got {}",
+            norm
+        );
+
+        // NaN as the leading element (before any scale is established).
+        let x = vec![f64::NAN, 3.0, 4.0];
+        let norm = nrm2(&x);
+        assert!(
+            norm.is_nan(),
+            "Norm with leading NaN should be NaN, got {}",
+            norm
+        );
+
+        // NaN alongside an infinity: NaN wins over Inf.
+        let x = vec![f64::INFINITY, f64::NAN];
+        let norm = nrm2(&x);
+        assert!(
+            norm.is_nan(),
+            "Norm of {{Inf, NaN}} should be NaN, got {}",
+            norm
+        );
+    }
+
+    #[test]
+    fn test_nrm2_nan_simd_path() {
+        // Drive the SIMD entry points (n >= 64) with a NaN and require NaN out.
+        // Regression for the scalar-vs-SIMD inconsistency where the scalar path
+        // could drop NaN via a `> 0` guard.
+        let mut x = vec![1.0f64; 128];
+        x[64] = f64::NAN;
+        let norm = nrm2_f64(&x);
+        assert!(norm.is_nan(), "SIMD f64 nrm2 must propagate NaN, got {}", norm);
+
+        let mut x32 = vec![1.0f32; 256];
+        x32[100] = f32::NAN;
+        let norm32 = nrm2_f32(&x32);
+        assert!(
+            norm32.is_nan(),
+            "SIMD f32 nrm2 must propagate NaN, got {}",
+            norm32
+        );
+
+        // The small-vector fallback (n < 64) must behave identically.
+        let x_small = vec![1.0f64, f64::NAN, 2.0, 3.0];
+        assert!(
+            nrm2_f64(&x_small).is_nan(),
+            "small-vector f64 nrm2 must propagate NaN"
+        );
+    }
+
+    #[test]
+    fn test_nrm2_inf_yields_positive_infinity() {
+        // +Inf (not NaN) is the correct Euclidean norm of a vector with an
+        // infinite element. Cover scalar, SIMD f64, and SIMD f32 paths.
+        let x = vec![f64::INFINITY, 1.0, 2.0];
+        assert!(
+            nrm2(&x).is_infinite() && nrm2(&x) > 0.0,
+            "scalar nrm2 of Inf must be +Inf, got {}",
+            nrm2(&x)
+        );
+
+        // SIMD f64 path (n >= 64). Before the fix this returned NaN because the
+        // second pass computed Inf * (1/Inf) == Inf * 0 == NaN.
+        let mut xf = vec![1.0f64; 128];
+        xf[70] = f64::INFINITY;
+        let norm = nrm2_f64(&xf);
+        assert!(
+            norm.is_infinite() && norm > 0.0,
+            "SIMD f64 nrm2 of Inf must be +Inf, got {}",
+            norm
+        );
+
+        // Negative infinity has the same magnitude and must also yield +Inf.
+        let mut xn = vec![1.0f64; 128];
+        xn[10] = f64::NEG_INFINITY;
+        let norm_neg = nrm2_f64(&xn);
+        assert!(
+            norm_neg.is_infinite() && norm_neg > 0.0,
+            "SIMD f64 nrm2 of -Inf must be +Inf, got {}",
+            norm_neg
+        );
+
+        // Multiple infinities must still give +Inf, not Inf/Inf = NaN.
+        let mut xm = vec![1.0f64; 128];
+        xm[5] = f64::INFINITY;
+        xm[90] = f64::INFINITY;
+        let norm_multi = nrm2_f64(&xm);
+        assert!(
+            norm_multi.is_infinite() && norm_multi > 0.0,
+            "SIMD f64 nrm2 of multiple Inf must be +Inf, got {}",
+            norm_multi
+        );
+
+        // SIMD f32 path (n >= 64).
+        let mut xf32 = vec![1.0f32; 256];
+        xf32[120] = f32::INFINITY;
+        let norm32 = nrm2_f32(&xf32);
+        assert!(
+            norm32.is_infinite() && norm32 > 0.0,
+            "SIMD f32 nrm2 of Inf must be +Inf, got {}",
+            norm32
+        );
+    }
+
+    #[test]
+    fn test_nrm2_overflow_1e200_scalar() {
+        // 1e200² == 1e400 overflows f64 (max ≈ 1.8e308), so a naive sum of
+        // squares would return +Inf. Blue's scaling must return the correct
+        // finite value.
+        let x = vec![1e200f64, 1.0, 1.0];
+        let norm = nrm2(&x);
+        assert!(norm.is_finite(), "norm must be finite, got {}", norm);
+        // The 1e200 term dominates; the two unit terms are below f64 precision
+        // relative to it, so the norm rounds to exactly 1e200.
+        assert!(
+            (norm - 1e200).abs() / 1e200 < 1e-10,
+            "expected ≈1e200, got {}",
+            norm
+        );
+
+        // Three equal 1e200 values: sqrt(3) * 1e200, still overflow-prone naively.
+        let x3 = vec![1e200f64; 3];
+        let norm3 = nrm2(&x3);
+        let expected = (3.0f64).sqrt() * 1e200;
+        assert!(norm3.is_finite(), "norm must be finite, got {}", norm3);
+        assert!(
+            (norm3 - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
+            norm3
+        );
+    }
+
+    #[test]
+    fn test_nrm2_overflow_1e200_simd() {
+        // Same overflow guard, but forced through the SIMD entry point (n >= 64).
+        let mut x = vec![0.0f64; 128];
+        x[0] = 1e200;
+        x[64] = 1e200;
+        let norm = nrm2_f64(&x);
+        let expected = (2.0f64).sqrt() * 1e200;
+        assert!(norm.is_finite(), "SIMD norm must be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
             norm
         );
     }

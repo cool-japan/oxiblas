@@ -354,7 +354,7 @@ pub use oxiblas_core::{
 pub use oxiblas_core::{C32, C64, ComplexExt, I32, I64, ToComplex, c32, c64};
 
 // Re-export matrix types
-pub use oxiblas_matrix::{DiagRef, Mat, MatMut, MatRef, TransposeRef};
+pub use oxiblas_matrix::{DiagRef, Mat, MatMut, MatRef};
 
 // Re-export memory-mapped matrix types (requires `mmap` feature)
 #[cfg(feature = "mmap")]

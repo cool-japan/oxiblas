@@ -170,9 +170,11 @@ pub fn hpmv<T: Field>(
                     temp2 += ap[kij].conj() * x[i];
                 }
 
-                // Diagonal element (real for Hermitian)
+                // Diagonal element. The Hermitian contract fixes A[j,j] real; take
+                // only its real part so any imaginary garbage a caller left in the
+                // packed diagonal cannot leak into the output (matches reference BLAS).
                 let kjj = upper_packed_index(j, j);
-                y[j] = y[j] + temp1 * ap[kjj] + alpha * temp2;
+                y[j] = y[j] + temp1 * T::from_real(ap[kjj].real()) + alpha * temp2;
             }
         }
         HpmvUplo::Lower => {
@@ -181,9 +183,10 @@ pub fn hpmv<T: Field>(
                 let temp1 = alpha * x[j];
                 let mut temp2 = T::zero();
 
-                // Diagonal element
+                // Diagonal element. Real part only: A[j,j] is real by the Hermitian
+                // contract and reference BLAS ignores any stored imaginary part.
                 let kjj = lower_packed_index(j, j, n);
-                y[j] += temp1 * ap[kjj];
+                y[j] += temp1 * T::from_real(ap[kjj].real());
 
                 // Elements below diagonal (i > j)
                 for i in (j + 1)..n {
@@ -604,5 +607,46 @@ mod tests {
 
         assert!(approx_eq_c(y[0], c(2.0, 4.0)));
         assert!(approx_eq_c(y[1], c(5.0, 3.0)));
+    }
+
+    #[test]
+    fn test_hpmv_ignores_diagonal_imaginary_part() {
+        // Regression: the packed diagonal of a Hermitian matrix is real, but callers
+        // are NOT required to zero its stored imaginary part. Reference BLAS uses only
+        // the real part; the imaginary garbage must not leak into y.
+        let x = [c(1.0, 0.0), c(1.0, 0.0)];
+
+        // Upper packed [a11, a12, a22] with garbage imaginary parts on the diagonal.
+        let ap_upper = [c(2.0, 7.0), c(1.0, 1.0), c(3.0, -5.0)];
+        let mut y_upper = [c(0.0, 0.0); 2];
+        hpmv(
+            HpmvUplo::Upper,
+            2,
+            c(1.0, 0.0),
+            &ap_upper,
+            &x,
+            c(0.0, 0.0),
+            &mut y_upper,
+        )
+        .unwrap();
+        // Same result as if the diagonal were exactly [2, 3]: [3+i, 4-i].
+        assert!(approx_eq_c(y_upper[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_upper[1], c(4.0, -1.0)));
+
+        // Lower packed [a11, a21, a22] with the same garbage diagonal.
+        let ap_lower = [c(2.0, 7.0), c(1.0, -1.0), c(3.0, -5.0)];
+        let mut y_lower = [c(0.0, 0.0); 2];
+        hpmv(
+            HpmvUplo::Lower,
+            2,
+            c(1.0, 0.0),
+            &ap_lower,
+            &x,
+            c(0.0, 0.0),
+            &mut y_lower,
+        )
+        .unwrap();
+        assert!(approx_eq_c(y_lower[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_lower[1], c(4.0, -1.0)));
     }
 }

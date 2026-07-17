@@ -207,7 +207,10 @@ pub fn array_viewd_to_mat_ref<'a, T: Field>(arr: &'a ArrayViewD<'a, T>) -> Optio
     if strides[0] == 1 {
         let col_stride = strides[1] as usize;
         let ptr = arr.as_ptr();
-        Some(MatRef::new(ptr, nrows, ncols, col_stride))
+        // SAFETY: `ptr` comes from a 2-D ndarray view validated as column-major
+        // (row stride 1); `col_stride` is its column stride and the view borrows
+        // for `'a`, so every in-bounds element offset is valid.
+        Some(unsafe { MatRef::new(ptr, nrows, ncols, col_stride) })
     } else {
         None
     }
@@ -235,12 +238,17 @@ pub fn array_viewd_to_mat_ref_or_transposed<'a, T: Field>(
         // Column-major
         let col_stride = strides[1] as usize;
         let ptr = arr.as_ptr();
-        Some((MatRef::new(ptr, nrows, ncols, col_stride), false))
+        // SAFETY: column-major 2-D ndarray view (row stride 1); `col_stride` is
+        // its column stride and it borrows for `'a`, so all offsets are valid.
+        Some((unsafe { MatRef::new(ptr, nrows, ncols, col_stride) }, false))
     } else if strides[1] == 1 {
         // Row-major: treat as transposed column-major
         let row_stride = strides[0] as usize;
         let ptr = arr.as_ptr();
-        Some((MatRef::new(ptr, ncols, nrows, row_stride), true))
+        // SAFETY: row-major 2-D ndarray view (col stride 1) reinterpreted as a
+        // transposed column-major view with dims (ncols, nrows) and leading
+        // dimension `row_stride`; it borrows for `'a`, so all offsets are valid.
+        Some((unsafe { MatRef::new(ptr, ncols, nrows, row_stride) }, true))
     } else {
         None
     }
@@ -296,7 +304,10 @@ pub fn array_view_to_mat_ref<'a, T: Field>(arr: &'a ArrayView2<'a, T>) -> Option
     if strides[0] == 1 {
         let col_stride = strides[1] as usize;
         let ptr = arr.as_ptr();
-        Some(MatRef::new(ptr, nrows, ncols, col_stride))
+        // SAFETY: `ptr` comes from a 2-D ndarray view validated as column-major
+        // (row stride 1); `col_stride` is its column stride and the view borrows
+        // for `'a`, so every in-bounds element offset is valid.
+        Some(unsafe { MatRef::new(ptr, nrows, ncols, col_stride) })
     } else {
         None
     }
@@ -319,13 +330,18 @@ pub fn array_view_to_mat_ref_or_transposed<'a, T: Field>(
         // Column-major
         let col_stride = strides[1] as usize;
         let ptr = arr.as_ptr();
-        Some((MatRef::new(ptr, nrows, ncols, col_stride), false))
+        // SAFETY: column-major 2-D ndarray view (row stride 1); `col_stride` is
+        // its column stride and it borrows for `'a`, so all offsets are valid.
+        Some((unsafe { MatRef::new(ptr, nrows, ncols, col_stride) }, false))
     } else if strides[1] == 1 {
         // Row-major: treat as transposed column-major
         let row_stride = strides[0] as usize;
         let ptr = arr.as_ptr();
         // Return transposed dimensions
-        Some((MatRef::new(ptr, ncols, nrows, row_stride), true))
+        // SAFETY: row-major 2-D ndarray view (col stride 1) reinterpreted as a
+        // transposed column-major view with dims (ncols, nrows) and leading
+        // dimension `row_stride`; it borrows for `'a`, so all offsets are valid.
+        Some((unsafe { MatRef::new(ptr, ncols, nrows, row_stride) }, true))
     } else {
         // Non-contiguous
         None

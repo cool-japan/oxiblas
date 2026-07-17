@@ -20,7 +20,7 @@ half = { workspace = true, optional = true, features = ["num-traits", "bytemuck"
 twofloat = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
@@ -28,7 +28,12 @@ std = ["libc"]
 parallel = ["rayon", "std"]
 f16 = ["half"]  # Half-precision (16-bit float) support
 f128 = ["dep:twofloat"]  # Quad-precision (double-double) support
-nightly = []  # Enable nightly-only optimizations
+# ARM SVE (Scalable Vector Extension) kernels. OFF by default and NIGHTLY-ONLY:
+# the SVE intrinsics live behind the unstable `stdarch_aarch64_sve` feature gate,
+# and the code additionally requires the target to enable SVE (e.g. via
+# `-C target-feature=+sve`). On stable, or without this feature, OxiBLAS uses the
+# always-available NEON / emulated-256-bit fallbacks.
+sve-nightly = []
 
 # SIMD control features
 force-scalar = []  # Force scalar operations, disable all SIMD (useful for debugging)

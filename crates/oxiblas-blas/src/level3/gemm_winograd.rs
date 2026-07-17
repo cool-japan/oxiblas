@@ -236,19 +236,36 @@ fn gemm_winograd_block<T>(
 {
     let block_k = k_end - k_start;
     let half_k = block_k / 2;
+    let block_m = i_end - i_start;
+    let block_n = j_end - j_start;
 
-    for i in i_start..i_end {
-        for j in j_start..j_end {
-            // Compute row and column factors for this specific i,j pair
-            let mut row_factor = T::zero();
-            let mut col_factor = T::zero();
+    // Precompute row factors ONCE per block (reused across every column of
+    // this block), rather than recomputing them for each (i, j) pair. This
+    // is what makes blocked Winograd actually save multiplications relative
+    // to naive multiplication instead of merely paying its numerical cost.
+    let mut row_factors = vec![T::zero(); block_m];
+    for (row_idx, i) in (i_start..i_end).enumerate() {
+        let mut sum = T::zero();
+        for l in 0..half_k {
+            sum += a[(i, k_start + 2 * l)] * a[(i, k_start + 2 * l + 1)];
+        }
+        row_factors[row_idx] = sum;
+    }
 
-            for l in 0..half_k {
-                row_factor += a[(i, k_start + 2 * l)] * a[(i, k_start + 2 * l + 1)];
-                col_factor += b[(k_start + 2 * l, j)] * b[(k_start + 2 * l + 1, j)];
-            }
+    // Precompute column factors ONCE per block (reused across every row of
+    // this block).
+    let mut col_factors = vec![T::zero(); block_n];
+    for (col_idx, j) in (j_start..j_end).enumerate() {
+        let mut sum = T::zero();
+        for l in 0..half_k {
+            sum += b[(k_start + 2 * l, j)] * b[(k_start + 2 * l + 1, j)];
+        }
+        col_factors[col_idx] = sum;
+    }
 
-            let mut sum = -row_factor - col_factor;
+    for (row_idx, i) in (i_start..i_end).enumerate() {
+        for (col_idx, j) in (j_start..j_end).enumerate() {
+            let mut sum = -row_factors[row_idx] - col_factors[col_idx];
 
             for l in 0..half_k {
                 let temp1 = a[(i, k_start + 2 * l)] + b[(k_start + 2 * l + 1, j)];
@@ -431,6 +448,58 @@ mod tests {
                 assert!(
                     diff.abs() < 1e-8,
                     "Blocked mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    c_blocked[(i, j)],
+                    c_standard[(i, j)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_winograd_blocked_rectangular_multi_block() {
+        // Regression test for the factor-reuse fix in gemm_winograd_block:
+        // row/column factors must be precomputed ONCE per block and reused
+        // across every element of that block, not recomputed per (i, j).
+        // Uses a rectangular, non-power-of-two shape with a block size that
+        // does NOT evenly divide any dimension, forcing several full blocks
+        // plus ragged remainder blocks in every direction (m, n, and k) so
+        // any off-by-one in the per-block row/col index bookkeeping (e.g.
+        // reusing the wrong row_factors/col_factors slot across blocks)
+        // would show up as a numerical mismatch against the naive reference.
+        let m = 20;
+        let k = 14;
+        let n = 18;
+
+        let mut a_data = vec![0.0f64; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                a_data[i * k + j] = ((i * 3 + j * 7) % 11) as f64 - 5.0;
+            }
+        }
+        let mut b_data = vec![0.0f64; k * n];
+        for i in 0..k {
+            for j in 0..n {
+                b_data[i * n + j] = ((i * 5 + j * 2) % 13) as f64 - 6.0;
+            }
+        }
+
+        let a = Mat::from_slice(m, k, &a_data);
+        let b = Mat::from_slice(k, n, &b_data);
+        let mut c_blocked = Mat::zeros(m, n);
+        let mut c_standard = Mat::zeros(m, n);
+
+        // block_size = 6 does not evenly divide m=20, k=14, or n=18.
+        gemm_winograd_blocked(1.0, a.as_ref(), b.as_ref(), 0.0, &mut c_blocked.as_mut(), 6);
+        gemm_standard(1.0, a.as_ref(), b.as_ref(), 0.0, &mut c_standard.as_mut());
+
+        for i in 0..m {
+            for j in 0..n {
+                let diff: f64 = c_blocked[(i, j)] - c_standard[(i, j)];
+                assert!(
+                    diff.abs() < 1e-8,
+                    "Multi-block mismatch at ({}, {}): {} vs {}",
                     i,
                     j,
                     c_blocked[(i, j)],

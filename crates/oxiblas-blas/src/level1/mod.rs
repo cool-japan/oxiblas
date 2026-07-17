@@ -10,11 +10,14 @@
 //! - `swap` - Swap two vectors
 //! - `nrm2` - Euclidean (L2) norm
 //! - `asum` - Sum of absolute values (L1 norm)
+//! - `casum`/`scasum`/`dzasum` - Complex ASUM (`|Re|+|Im|` metric)
 //! - `iamax` - Index of maximum absolute value
 //! - `rotg` - Generate a Givens plane rotation
 //! - `rot` - Apply a plane rotation
 //! - `rotmg` - Generate a modified Givens rotation
 //! - `rotm` - Apply a modified Givens rotation
+//! - `crotg` - Generate a complex Givens plane rotation (`ZROTG`/`CROTG`)
+//! - `zdrot` - Apply a real-valued Givens rotation to complex vectors
 //!
 //! # Example
 //!
@@ -47,8 +50,9 @@ mod nrm2;
 pub mod parallel;
 mod rot;
 mod scal;
+mod strided;
 
-pub use asum::asum;
+pub use asum::{ComplexRotgResult, asum, casum, crotg, dzasum, scasum, zdrot};
 pub use axpy::{axpy, axpy_f32, axpy_f64};
 pub use copy::copy;
 pub use dot::{dot, dot_f32, dot_f64, dotc, dotc_c32, dotc_c64, dotu_c32, dotu_c64};
@@ -58,6 +62,11 @@ pub use nrm2::{nrm2, nrm2_f32, nrm2_f64, nrm2_sq};
 pub use parallel::{asum_par, axpy_par, dot_par, nrm2_par, scal_par};
 pub use rot::{RotgResult, RotmParams, rot, rotg, rotm, rotmg};
 pub use scal::scal;
+pub use strided::{
+    StridedSlice, StridedSliceMut, asum_strided, axpy_strided, copy_strided, dot_strided,
+    dotc_strided, iamax_strided, iamin_strided, nrm2_strided, rot_strided, scal_strided,
+    swap_strided,
+};
 
 /// Swaps two vectors.
 ///

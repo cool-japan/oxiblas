@@ -148,8 +148,10 @@ pub fn hbmv<T: Field>(
             for j in 0..n {
                 let alpha_xj = alpha * x[j];
 
-                // Diagonal element (assumed real, but we use it as-is)
-                y[j] += alpha_xj * ab[(k, j)];
+                // Diagonal element. The Hermitian contract fixes A[j,j] real; take
+                // only its real part so any imaginary garbage in the stored diagonal
+                // band cannot leak into the output (matches reference BLAS).
+                y[j] += alpha_xj * T::from_real(ab[(k, j)].real());
 
                 // Off-diagonal elements (i < j)
                 let i_start = j.saturating_sub(k);
@@ -169,8 +171,9 @@ pub fn hbmv<T: Field>(
             for j in 0..n {
                 let alpha_xj = alpha * x[j];
 
-                // Diagonal element
-                y[j] += alpha_xj * ab[(0, j)];
+                // Diagonal element. Real part only: A[j,j] is real by the Hermitian
+                // contract and reference BLAS ignores any stored imaginary part.
+                y[j] += alpha_xj * T::from_real(ab[(0, j)].real());
 
                 // Off-diagonal elements (i > j)
                 let i_end = (j + k + 1).min(n);
@@ -540,5 +543,59 @@ mod tests {
         // y[1] = (1-2i)*1 + 4*i = 1 - 2i + 4i = 1 + 2i
         assert!(approx_eq_c(y[0], c(1.0, 1.0)));
         assert!(approx_eq_c(y[1], c(1.0, 2.0)));
+    }
+
+    #[test]
+    fn test_hbmv_ignores_diagonal_imaginary_part() {
+        // Regression: the stored diagonal band of a Hermitian matrix is real, but
+        // callers are NOT required to zero its imaginary part. Reference BLAS uses
+        // only the real part; the imaginary garbage must not leak into y.
+        //
+        // Same tridiagonal A as test_hbmv_upper_tridiagonal_complex, but with garbage
+        // imaginary parts (9i, -8i, 4i) stored on the main diagonal band.
+        let x = [c(1.0, 0.0), c(1.0, 0.0), c(1.0, 0.0)];
+
+        // Upper band storage: row k=1 is the main diagonal.
+        let ab_upper = Mat::from_rows(&[
+            &[c(0.0, 0.0), c(2.0, 1.0), c(4.0, 2.0)],
+            &[c(1.0, 9.0), c(3.0, -8.0), c(5.0, 4.0)],
+        ]);
+        let mut y_upper = [c(0.0, 0.0); 3];
+        hbmv(
+            HbmvUplo::Upper,
+            3,
+            1,
+            c(1.0, 0.0),
+            ab_upper.as_ref(),
+            &x,
+            c(0.0, 0.0),
+            &mut y_upper,
+        )
+        .unwrap();
+        // Same result as if the diagonal were real [1, 3, 5].
+        assert!(approx_eq_c(y_upper[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_upper[1], c(9.0, 1.0)));
+        assert!(approx_eq_c(y_upper[2], c(9.0, -2.0)));
+
+        // Lower band storage: row 0 is the main diagonal, carrying the same garbage.
+        let ab_lower = Mat::from_rows(&[
+            &[c(1.0, 9.0), c(3.0, -8.0), c(5.0, 4.0)],
+            &[c(2.0, -1.0), c(4.0, -2.0), c(0.0, 0.0)],
+        ]);
+        let mut y_lower = [c(0.0, 0.0); 3];
+        hbmv(
+            HbmvUplo::Lower,
+            3,
+            1,
+            c(1.0, 0.0),
+            ab_lower.as_ref(),
+            &x,
+            c(0.0, 0.0),
+            &mut y_lower,
+        )
+        .unwrap();
+        assert!(approx_eq_c(y_lower[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_lower[1], c(9.0, 1.0)));
+        assert!(approx_eq_c(y_lower[2], c(9.0, -2.0)));
     }
 }

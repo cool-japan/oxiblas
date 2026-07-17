@@ -88,13 +88,20 @@ impl SimdCompatible for Complex64 {
 
 /// Batch operations on scalar arrays for performance-critical code.
 ///
-/// This trait provides optimized implementations of common operations on
-/// contiguous arrays of scalars, leveraging SIMD where available.
+/// This trait provides straightforward serial-loop implementations of
+/// common operations on contiguous arrays of scalars. The loops are written
+/// so that LLVM's auto-vectorizer can pack them into SIMD instructions where
+/// the target and operation allow it, but there are no hand-written SIMD
+/// intrinsics behind these methods — for explicit, architecture-specific
+/// SIMD kernels see the `oxiblas_core::simd` module instead.
 pub trait ScalarBatch: Scalar + SimdCompatible {
     /// Computes the dot product of two slices.
     ///
-    /// # Safety
-    /// Both slices must have the same length.
+    /// # Panics
+    /// In debug builds, panics (via `debug_assert_eq!`) if `x` and `y`
+    /// differ in length. In release builds this check is compiled out, so
+    /// a length mismatch will instead cause an out-of-bounds index panic
+    /// when the shorter slice is exhausted. No unsafe code is involved.
     fn dot_batch(x: &[Self], y: &[Self]) -> Self;
 
     /// Computes the sum of all elements.
@@ -139,15 +146,21 @@ impl ScalarBatch for f32 {
 
     #[inline]
     fn iamax_batch(x: &[Self]) -> usize {
-        x.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.abs()
-                    .partial_cmp(&b.abs())
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // Mirrors reference BLAS ISAMAX: first index wins on ties, and a
+        // strict `>` comparison means NaN never displaces the running
+        // maximum (NaN comparisons are always false under IEEE-754).
+        let Some(mut max_val) = x.first().map(|v| v.abs()) else {
+            return 0;
+        };
+        let mut max_idx = 0;
+        for (i, xi) in x.iter().enumerate().skip(1) {
+            let val = xi.abs();
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        max_idx
     }
 
     #[inline]
@@ -199,15 +212,21 @@ impl ScalarBatch for f64 {
 
     #[inline]
     fn iamax_batch(x: &[Self]) -> usize {
-        x.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.abs()
-                    .partial_cmp(&b.abs())
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // Mirrors reference BLAS IDAMAX: first index wins on ties, and a
+        // strict `>` comparison means NaN never displaces the running
+        // maximum (NaN comparisons are always false under IEEE-754).
+        let Some(mut max_val) = x.first().map(|v| v.abs()) else {
+            return 0;
+        };
+        let mut max_idx = 0;
+        for (i, xi) in x.iter().enumerate().skip(1) {
+            let val = xi.abs();
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        max_idx
     }
 
     #[inline]
@@ -259,15 +278,22 @@ impl ScalarBatch for Complex32 {
 
     #[inline]
     fn iamax_batch(x: &[Self]) -> usize {
-        x.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                (a.re.abs() + a.im.abs())
-                    .partial_cmp(&(b.re.abs() + b.im.abs()))
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // Mirrors reference BLAS ICAMAX/IZAMAX: magnitude is approximated by
+        // |re| + |im| (CABS1), first index wins on ties, and a strict `>`
+        // comparison means NaN never displaces the running maximum (NaN
+        // comparisons are always false under IEEE-754).
+        let Some(mut max_val) = x.first().map(|z| z.re.abs() + z.im.abs()) else {
+            return 0;
+        };
+        let mut max_idx = 0;
+        for (i, z) in x.iter().enumerate().skip(1) {
+            let val = z.re.abs() + z.im.abs();
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        max_idx
     }
 
     #[inline]
@@ -319,15 +345,22 @@ impl ScalarBatch for Complex64 {
 
     #[inline]
     fn iamax_batch(x: &[Self]) -> usize {
-        x.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                (a.re.abs() + a.im.abs())
-                    .partial_cmp(&(b.re.abs() + b.im.abs()))
-                    .unwrap_or(core::cmp::Ordering::Equal)
-            })
-            .map(|(i, _)| i)
-            .unwrap_or(0)
+        // Mirrors reference BLAS ICAMAX/IZAMAX: magnitude is approximated by
+        // |re| + |im| (CABS1), first index wins on ties, and a strict `>`
+        // comparison means NaN never displaces the running maximum (NaN
+        // comparisons are always false under IEEE-754).
+        let Some(mut max_val) = x.first().map(|z| z.re.abs() + z.im.abs()) else {
+            return 0;
+        };
+        let mut max_idx = 0;
+        for (i, z) in x.iter().enumerate().skip(1) {
+            let val = z.re.abs() + z.im.abs();
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        max_idx
     }
 
     #[inline]
@@ -490,8 +523,38 @@ impl ExtendedPrecision for f32 {
     }
 }
 
+/// With the `f128` feature enabled, f64 gets genuine extended-precision
+/// accumulation via the crate's double-double `QuadFloat` type (~106 bits
+/// of mantissa versus f64's 53), so intermediate sums/products retain
+/// precision well beyond what a plain `f64` accumulator could preserve.
+#[cfg(feature = "f128")]
 impl ExtendedPrecision for f64 {
-    // For f64, we use the same type (or could use f128 if available)
+    type Accumulator = QuadFloat;
+
+    #[inline]
+    fn to_accumulator(self) -> QuadFloat {
+        QuadFloat::from(self)
+    }
+
+    #[inline]
+    fn from_accumulator(acc: QuadFloat) -> f64 {
+        // Round the double-double value back to the nearest f64: adding the
+        // low limb into the high limb performs correctly-rounded
+        // reconstruction for a normalized double-double pair.
+        let tf = acc.inner();
+        tf.hi() + tf.lo()
+    }
+}
+
+/// Without the `f128` feature, no higher-than-`f64` scalar type exists in
+/// this build, so accumulation deliberately stays at `f64`. This is a
+/// documented trade-off, not an oversight: genuine extended accumulation
+/// (via `QuadFloat`) costs roughly 2x the arithmetic per accumulate step,
+/// which is not worth paying unconditionally for every `f64` caller.
+/// Enable the `f128` feature to opt into true double-double accumulation
+/// for `f64` inputs.
+#[cfg(not(feature = "f128"))]
+impl ExtendedPrecision for f64 {
     type Accumulator = f64;
 
     #[inline]

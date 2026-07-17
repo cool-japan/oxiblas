@@ -128,7 +128,10 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     /// with a shorter lifetime, allowing temporary immutable access.
     #[inline]
     pub fn rb(&self) -> MatRef<'_, T> {
-        MatRef::new(self.ptr, self.nrows, self.ncols, self.row_stride)
+        // SAFETY: `self` already guarantees `ptr` is valid for `nrows * ncols`
+        // (padded to `row_stride`) initialized elements for the borrow's lifetime;
+        // the immutable reborrow only narrows access, so all offsets stay valid.
+        unsafe { MatRef::new(self.ptr, self.nrows, self.ncols, self.row_stride) }
     }
 
     /// Mutable reborrow - creates a new mutable view with a shorter lifetime.

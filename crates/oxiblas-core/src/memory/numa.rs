@@ -102,10 +102,10 @@ impl NumaTopology {
         for entry in fs::read_dir(node_path)? {
             let entry = entry?;
             let name = entry.file_name();
-            if let Some(name_str) = name.to_str() {
-                if name_str.starts_with("node") {
-                    count += 1;
-                }
+            if let Some(name_str) = name.to_str()
+                && name_str.starts_with("node")
+            {
+                count += 1;
             }
         }
 
@@ -248,33 +248,97 @@ impl NumaAllocHint {
     }
 }
 
+/// Returns `true` when a strategy needs an explicit kernel NUMA policy
+/// (i.e. anything other than the kernel-default first-touch behaviour).
+#[inline]
+fn requires_mbind(strategy: NumaInterleavingStrategy) -> bool {
+    !matches!(strategy, NumaInterleavingStrategy::FirstTouch)
+}
+
+/// Rounds `value` up to the next multiple of `page`.
+///
+/// `page` must be a non-zero power of two (guaranteed by [`get_page_size`]).
+/// Returns `None` on overflow rather than wrapping to a bogus small value.
+#[inline]
+fn round_up_to(value: usize, page: usize) -> Option<usize> {
+    debug_assert!(page.is_power_of_two() && page != 0);
+    value.checked_add(page - 1).map(|v| v & !(page - 1))
+}
+
+/// Computes the *effective* layout used for a NUMA allocation.
+///
+/// `mbind(2)` operates at page granularity and requires a page-aligned start
+/// address, so any allocation that will carry an explicit NUMA policy must be
+/// page-aligned and sized to a whole number of pages. This transform is
+/// deterministic in `(layout, hint)`, so [`numa_alloc`] and [`numa_dealloc`]
+/// derive the identical layout and stay allocator-consistent.
+///
+/// Zero-sized and first-touch allocations pass through unchanged.
+fn effective_layout(layout: Layout, hint: &NumaAllocHint) -> Option<Layout> {
+    if layout.size() == 0 || !requires_mbind(hint.strategy) {
+        return Some(layout);
+    }
+    let page = get_page_size();
+    if page == 0 || !page.is_power_of_two() {
+        // Can't reason about pages; skip the bump (binding then becomes a
+        // no-op, which the best-effort contract already tolerates).
+        return Some(layout);
+    }
+    let align = layout.align().max(page);
+    let size = round_up_to(layout.size(), page)?;
+    Layout::from_size_align(size, align).ok()
+}
+
 /// Allocates memory with NUMA awareness.
 ///
-/// This function allocates memory and optionally applies NUMA hints.
-/// On systems without NUMA support, falls back to standard allocation.
+/// The allocation is placed according to `hint`. For any strategy other than
+/// first-touch the region is page-aligned and page-sized so that the kernel
+/// NUMA policy (applied via [`bind_memory_policy`]) provably covers exactly the
+/// allocation. On systems without NUMA support the binding is a best-effort
+/// no-op and this degrades to a plain (still page-aligned) allocation.
 ///
 /// # Arguments
 /// * `layout` - Memory layout to allocate
 /// * `hint` - NUMA allocation hint
 ///
 /// # Safety
-/// The returned pointer must be deallocated with `dealloc` using the same layout.
+/// The returned pointer must be released with [`numa_dealloc`] using the **same**
+/// `layout` and `hint`; deallocating with a different layout/hint (e.g. the raw
+/// [`std::alloc::dealloc`]) is undefined behaviour because the real allocation
+/// may have been page-aligned and rounded up.
 pub unsafe fn numa_alloc(layout: Layout, hint: &NumaAllocHint) -> Option<NonNull<u8>> {
-    // Allocate memory using standard allocator
-    let ptr = alloc(layout);
+    // Zero-sized allocations must never reach the global allocator: calling
+    // `alloc` with a zero-size layout is undefined behaviour. Mirror the
+    // `GlobalAlloc`/ZST convention and hand back a dangling-but-aligned pointer
+    // (a valid, non-null, correctly-aligned address that is never dereferenced).
+    if layout.size() == 0 {
+        return NonNull::new(core::ptr::without_provenance_mut::<u8>(layout.align()));
+    }
+
+    let effective = effective_layout(layout, hint)?;
+    // Safety: `effective` has non-zero size (>= layout.size() > 0) and a valid
+    // power-of-two alignment.
+    let ptr = unsafe { alloc(effective) };
     if ptr.is_null() {
         return None;
     }
 
-    // Apply NUMA policy if available
-    #[cfg(target_os = "linux")]
-    {
-        apply_linux_numa_policy(ptr, layout.size(), hint);
+    if requires_mbind(hint.strategy) {
+        // Best-effort NUMA binding. A failure here (no NUMA hardware, running
+        // inside a container, a seccomp filter blocking `mbind(2)`, ...) does
+        // NOT invalidate the allocation, so we deliberately keep the memory
+        // rather than break the documented non-NUMA fallback. The errno is not
+        // silently lost: `bind_memory_policy` materialises it into an
+        // `io::Error` that callers needing certainty can observe directly.
+        if let Err(_bind_err) = unsafe { bind_memory_policy(ptr, effective.size(), hint) } {
+            // Intentionally ignored (see rationale above).
+        }
     }
 
-    // Pre-fault pages if requested
+    // Pre-fault pages if requested (faults them in under the freshly-applied
+    // policy).
     if hint.prefault {
-        prefault_pages(ptr, layout.size());
+        prefault_pages(ptr, effective.size());
     }
 
     NonNull::new(ptr)
@@ -282,29 +346,60 @@ pub unsafe fn numa_alloc(layout: Layout, hint: &NumaAllocHint) -> Option<NonNull
 
 /// Allocates zeroed memory with NUMA awareness.
 ///
+/// Note on placement: the binding is applied *after* zero-initialisation. If
+/// the underlying allocator eagerly faults pages while zeroing, the policy only
+/// affects pages that are not yet resident (`mbind` without `MPOL_MF_MOVE` does
+/// not migrate present pages). When strict placement of zeroed memory is
+/// required, prefer [`numa_alloc`] followed by explicit zeroing so the zeroing
+/// writes fault pages in under the policy.
+///
 /// # Safety
 ///
-/// The caller must ensure that:
-/// - The layout's size and alignment are valid (non-zero alignment, size doesn't overflow)
-/// - The returned memory must be properly deallocated when no longer needed
+/// The returned pointer must be released with [`numa_dealloc`] using the **same**
+/// `layout` and `hint` (see [`numa_alloc`]).
 pub unsafe fn numa_alloc_zeroed(layout: Layout, hint: &NumaAllocHint) -> Option<NonNull<u8>> {
-    let ptr = alloc_zeroed(layout);
+    // Zero-sized layouts: see `numa_alloc`.
+    if layout.size() == 0 {
+        return NonNull::new(core::ptr::without_provenance_mut::<u8>(layout.align()));
+    }
+
+    let effective = effective_layout(layout, hint)?;
+    // Safety: `effective` has non-zero size and a valid power-of-two alignment.
+    let ptr = unsafe { alloc_zeroed(effective) };
     if ptr.is_null() {
         return None;
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        apply_linux_numa_policy(ptr, layout.size(), hint);
+    if requires_mbind(hint.strategy) {
+        // Best-effort binding; see `numa_alloc` for why failures are tolerated.
+        if let Err(_bind_err) = unsafe { bind_memory_policy(ptr, effective.size(), hint) } {
+            // Intentionally ignored.
+        }
     }
 
-    // Suppress warning on non-Linux platforms
-    #[cfg(not(target_os = "linux"))]
-    let _ = hint;
-
-    // Note: zeroing already touches all pages, so prefault is implicit
+    // Zeroing already touches all pages, so prefault is implicit.
 
     NonNull::new(ptr)
+}
+
+/// Releases memory obtained from [`numa_alloc`] / [`numa_alloc_zeroed`].
+///
+/// # Safety
+///
+/// * `ptr` must have been returned by [`numa_alloc`] or [`numa_alloc_zeroed`]
+///   for exactly this `layout` and `hint`.
+/// * After this call `ptr` must not be used.
+pub unsafe fn numa_dealloc(ptr: NonNull<u8>, layout: Layout, hint: &NumaAllocHint) {
+    if layout.size() == 0 {
+        // ZST: `numa_alloc` returned a dangling pointer without touching the
+        // allocator, so there is nothing to free.
+        return;
+    }
+    if let Some(effective) = effective_layout(layout, hint) {
+        // Safety: `effective` is byte-for-byte the layout used to allocate this
+        // pointer (identical `layout` + `hint` yield the identical transform).
+        unsafe { dealloc(ptr.as_ptr(), effective) };
+    }
 }
 
 /// Pre-faults (touches) all pages in a memory region.
@@ -323,55 +418,226 @@ fn prefault_pages(ptr: *mut u8, size: usize) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn apply_linux_numa_policy(ptr: *mut u8, size: usize, hint: &NumaAllocHint) {
-    use std::os::raw::c_int;
-
-    // NUMA policy constants (from numaif.h)
-    const _MPOL_DEFAULT: c_int = 0;
-    const MPOL_PREFERRED: c_int = 1;
-    const MPOL_BIND: c_int = 2;
-    const MPOL_INTERLEAVE: c_int = 3;
-
-    // SYS_mbind syscall number on x86_64
-    const SYS_MBIND: libc::c_long = 237;
-
-    let (mode, node_mask, max_node) = match hint.strategy {
-        NumaInterleavingStrategy::FirstTouch => return, // Default behavior
-        NumaInterleavingStrategy::Interleave => {
-            // Set all nodes in mask
-            let mask: usize = !0;
-            (MPOL_INTERLEAVE, mask, 64)
-        }
-        NumaInterleavingStrategy::PreferNode(node) => {
-            let mask: usize = 1 << node;
-            (MPOL_PREFERRED, mask, node + 1)
-        }
-        NumaInterleavingStrategy::BindNode(node) => {
-            let mask: usize = 1 << node;
-            (MPOL_BIND, mask, node + 1)
-        }
-    };
-
-    unsafe {
-        // Use syscall directly to avoid libnuma dependency
-        let _ = libc::syscall(
-            SYS_MBIND,
-            ptr as *mut libc::c_void,
-            size,
-            mode,
-            &node_mask as *const usize,
-            max_node,
-            0u32,
-        );
+/// Applies a NUMA memory policy to a page-aligned region via `mbind(2)`.
+///
+/// This is the honest, error-returning primitive underpinning the NUMA
+/// allocators. Unlike a fire-and-forget syscall it does not swallow the errno:
+/// on any failure it returns the corresponding [`std::io::Error`]. The higher
+/// level [`numa_alloc`] treats binding as best-effort, but callers that need
+/// certainty can invoke this directly and inspect the result.
+///
+/// First-touch always succeeds as a no-op. On non-Linux targets this is a
+/// no-op returning `Ok(())` (no `mbind` equivalent exists).
+///
+/// # Safety
+///
+/// `ptr` must point to a caller-owned mapping of at least `len` bytes. For any
+/// strategy other than first-touch `ptr` must additionally be page-aligned
+/// (`mbind` returns `EINVAL` otherwise, which this function surfaces as an
+/// error). Passing a range the caller does not own could alter the NUMA policy
+/// of unrelated memory.
+pub unsafe fn bind_memory_policy(
+    ptr: *mut u8,
+    len: usize,
+    hint: &NumaAllocHint,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_bind_memory_policy(ptr, len, hint)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No `mbind` equivalent: first-touch is the only meaningful policy and
+        // it is already the platform default, so this is a genuine no-op.
+        let _ = (ptr, len, hint);
+        Ok(())
     }
 }
 
-/// Gets the current system's page size.
+/// Parses a Linux `cpulist`/`nodelist` string (e.g. `"0-1,4"`) into node ids.
+///
+/// Malformed fragments are skipped rather than panicking; the caller decides
+/// what an empty result means.
+#[cfg(target_os = "linux")]
+fn parse_node_list(text: &str) -> Vec<usize> {
+    let mut nodes = Vec::new();
+    for part in text.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(start), Ok(end)) =
+                (start.trim().parse::<usize>(), end.trim().parse::<usize>())
+            {
+                for node in start..=end {
+                    nodes.push(node);
+                }
+            }
+        } else if let Ok(node) = part.parse::<usize>() {
+            nodes.push(node);
+        }
+    }
+    nodes
+}
+
+/// Reads the set of online NUMA nodes from
+/// `/sys/devices/system/node/online`. Returns `None` if the file is absent or
+/// unreadable (e.g. a kernel built without `CONFIG_NUMA`, or a restricted
+/// container), or if it lists no nodes.
+#[cfg(target_os = "linux")]
+fn read_online_nodes() -> Option<Vec<usize>> {
+    let content = std::fs::read_to_string("/sys/devices/system/node/online").ok()?;
+    let nodes = parse_node_list(&content);
+    if nodes.is_empty() { None } else { Some(nodes) }
+}
+
+/// Upper bound on NUMA node ids we are willing to encode. Matches the common
+/// kernel `MAX_NUMNODES` ceiling and guards against building an absurdly large
+/// bitmask from a bogus node id.
+#[cfg(target_os = "linux")]
+const MAX_NUMA_NODES: usize = 1024;
+
+/// Validates a requested node id: it must be within [`MAX_NUMA_NODES`] and,
+/// when the online set is known, actually online.
+#[cfg(target_os = "linux")]
+fn validate_numa_node(node: usize) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if node >= MAX_NUMA_NODES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "NUMA node id exceeds supported maximum",
+        ));
+    }
+    if let Some(online) = read_online_nodes()
+        && !online.contains(&node)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "requested NUMA node is not online",
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the `mbind` node bitmask (array of `unsigned long`) plus the
+/// `maxnode` argument for the given node ids.
+///
+/// `maxnode` follows the libnuma convention of `highest_node + 2`: the kernel
+/// decrements it internally (`--maxnode` in `get_nodes`), so this makes the
+/// kernel read exactly the words we provide and keep the top set bit, avoiding
+/// the classic final-partial-word off-by-one. Correct for both 64-bit
+/// (`c_ulong` = 64 bits) and 32-bit (`c_ulong` = 32 bits) Linux.
+#[cfg(target_os = "linux")]
+fn build_node_mask(nodes: &[usize]) -> (Vec<libc::c_ulong>, usize) {
+    let bits_per_word = core::mem::size_of::<libc::c_ulong>() * 8;
+    let highest = nodes.iter().copied().max().unwrap_or(0);
+    let num_words = highest / bits_per_word + 1;
+    let mut mask: Vec<libc::c_ulong> = vec![0; num_words];
+    for &node in nodes {
+        let word = node / bits_per_word;
+        let bit = node % bits_per_word;
+        let bit_mask: libc::c_ulong = 1 << bit;
+        mask[word] |= bit_mask;
+    }
+    (mask, highest + 2)
+}
+
+/// Linux implementation of [`bind_memory_policy`].
+#[cfg(target_os = "linux")]
+fn linux_bind_memory_policy(ptr: *mut u8, len: usize, hint: &NumaAllocHint) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    // NUMA policy modes (from numaif.h).
+    const MPOL_PREFERRED: libc::c_int = 1;
+    const MPOL_BIND: libc::c_int = 2;
+    const MPOL_INTERLEAVE: libc::c_int = 3;
+
+    let (mode, nodes): (libc::c_int, Vec<usize>) = match hint.strategy {
+        // First-touch is the kernel default; nothing to bind.
+        NumaInterleavingStrategy::FirstTouch => return Ok(()),
+        NumaInterleavingStrategy::Interleave => {
+            // A full !0 mask (the previous behaviour) names offline nodes and
+            // is rejected with EINVAL. Restrict interleaving to actually-online
+            // nodes so the policy is accepted and effective.
+            let online = read_online_nodes().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unsupported,
+                    "cannot determine online NUMA nodes for interleaving",
+                )
+            })?;
+            (MPOL_INTERLEAVE, online)
+        }
+        NumaInterleavingStrategy::PreferNode(node) => {
+            validate_numa_node(node)?;
+            (MPOL_PREFERRED, vec![node])
+        }
+        NumaInterleavingStrategy::BindNode(node) => {
+            validate_numa_node(node)?;
+            (MPOL_BIND, vec![node])
+        }
+    };
+
+    let page = get_page_size();
+    if page == 0 || !page.is_power_of_two() {
+        return Err(Error::other("invalid system page size"));
+    }
+    // `mbind` requires a page-aligned start address (the kernel rounds the
+    // length up to a page multiple itself, but we do it explicitly so the
+    // policy provably spans the whole region).
+    if (ptr as usize) % page != 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "mbind requires a page-aligned address",
+        ));
+    }
+    let len_aligned = round_up_to(len, page)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "length overflow"))?;
+    if len_aligned == 0 {
+        return Ok(());
+    }
+
+    let (mask, maxnode) = build_node_mask(&nodes);
+
+    // Safety: `libc::syscall` forwards to the C `syscall(2)` wrapper, which
+    // sets `errno` and returns -1 on failure. `libc::SYS_mbind` is the
+    // arch-correct syscall number the libc crate provides for the target (a
+    // `c_long` on every supported architecture). `ptr` refers to a
+    // caller-owned, page-aligned mapping of at least `len_aligned` bytes, and
+    // `mask`/`maxnode` describe a valid nodemask.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            ptr as *mut libc::c_void,
+            len_aligned as libc::c_ulong,
+            mode,
+            mask.as_ptr(),
+            maxnode as libc::c_ulong,
+            0 as libc::c_uint,
+        )
+    };
+    if ret < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Gets the current system's page size in bytes.
+///
+/// Falls back to the near-universal 4 KiB default when the size cannot be
+/// determined.
 pub fn get_page_size() -> usize {
     #[cfg(unix)]
     {
-        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+        // `sysconf` returns -1 (as `c_long`) on error and leaves `errno` set.
+        // Casting that negative value straight to `usize` would yield an
+        // enormous bogus "page size" (~1.8e19 on 64-bit), which then poisons
+        // every page-alignment computation. Check the sign first and fall back
+        // to 4 KiB — the smallest and by far most common page size, and a valid
+        // power of two — when the query fails or reports a non-positive size.
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if raw > 0 { raw as usize } else { 4096 }
     }
     #[cfg(not(unix))]
     {
@@ -390,10 +656,10 @@ pub fn get_huge_page_size() -> Option<usize> {
             for line in content.lines() {
                 if line.starts_with("Hugepagesize:") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        if let Ok(kb) = parts[1].parse::<usize>() {
-                            return Some(kb * 1024);
-                        }
+                    if parts.len() >= 2
+                        && let Ok(kb) = parts[1].parse::<usize>()
+                    {
+                        return Some(kb * 1024);
                     }
                 }
             }
@@ -499,7 +765,9 @@ impl<T> NumaAllocator<T> {
             return;
         }
         if let Ok(layout) = Layout::array::<T>(count) {
-            unsafe { dealloc(ptr.cast::<u8>().as_ptr(), layout) };
+            // Must mirror `numa_alloc`'s effective layout: route through
+            // `numa_dealloc` with the same hint rather than the raw allocator.
+            unsafe { numa_dealloc(ptr.cast::<u8>(), layout, &self.hint) };
         }
     }
 }
@@ -682,9 +950,10 @@ impl<T> NumaVec<T> {
             unsafe {
                 core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
             }
-            // Free old allocation.
+            // Free old allocation (via the NUMA-aware deallocator so the
+            // effective layout matches the one `numa_alloc` used).
             if let Ok(old_layout) = Layout::array::<T>(self.cap) {
-                unsafe { dealloc(self.ptr.cast::<u8>().as_ptr(), old_layout) };
+                unsafe { numa_dealloc(self.ptr.cast::<u8>(), old_layout, &self.hint) };
             }
         }
 
@@ -709,9 +978,9 @@ impl<T> Drop for NumaVec<T> {
         for i in 0..self.len {
             unsafe { core::ptr::drop_in_place(self.ptr.as_ptr().add(i)) };
         }
-        // Deallocate backing store.
+        // Deallocate backing store (matching `numa_alloc`'s effective layout).
         if let Ok(layout) = Layout::array::<T>(self.cap) {
-            unsafe { dealloc(self.ptr.cast::<u8>().as_ptr(), layout) };
+            unsafe { numa_dealloc(self.ptr.cast::<u8>(), layout, &self.hint) };
         }
     }
 }
@@ -1079,5 +1348,200 @@ mod tests {
         for &v in mat.as_slice() {
             assert_eq!(v, 0.0f32);
         }
+    }
+
+    // ----- page-alignment arithmetic (finding: mbind alignment) --------------
+
+    #[test]
+    fn test_round_up_to_page_math() {
+        assert_eq!(round_up_to(0, 4096), Some(0));
+        assert_eq!(round_up_to(1, 4096), Some(4096));
+        assert_eq!(round_up_to(4095, 4096), Some(4096));
+        assert_eq!(round_up_to(4096, 4096), Some(4096));
+        assert_eq!(round_up_to(4097, 4096), Some(8192));
+        assert_eq!(round_up_to(12288, 4096), Some(12288));
+        // A non-4096 (but power-of-two) page size.
+        assert_eq!(round_up_to(1, 16384), Some(16384));
+        assert_eq!(round_up_to(16384, 16384), Some(16384));
+        // Overflow must yield None, never wrap to a bogus small value.
+        assert_eq!(round_up_to(usize::MAX, 4096), None);
+        assert_eq!(round_up_to(usize::MAX - 10, 4096), None);
+    }
+
+    #[test]
+    fn test_effective_layout_first_touch_unchanged() {
+        let layout = Layout::from_size_align(100, 8).expect("valid layout");
+        let eff = effective_layout(layout, &NumaAllocHint::first_touch()).expect("some layout");
+        assert_eq!(eff.size(), 100);
+        assert_eq!(eff.align(), 8);
+    }
+
+    #[test]
+    fn test_effective_layout_bind_is_page_aligned() {
+        let page = get_page_size();
+        let layout = Layout::from_size_align(100, 8).expect("valid layout");
+        let eff = effective_layout(layout, &NumaAllocHint::bind_node(0)).expect("some layout");
+        assert!(eff.align() >= page);
+        assert_eq!(eff.size() % page, 0);
+        assert!(eff.size() >= 100);
+
+        // Zero-size stays zero-size even for a binding strategy.
+        let zero = Layout::from_size_align(0, 8).expect("valid layout");
+        let eff_zero = effective_layout(zero, &NumaAllocHint::bind_node(0)).expect("some layout");
+        assert_eq!(eff_zero.size(), 0);
+    }
+
+    // ----- zero-size / ZST handling (finding: ZST alloc UB) ------------------
+
+    #[test]
+    fn test_numa_alloc_zero_size_layout_is_dangling_not_ub() {
+        // A zero-size layout must NOT reach the global allocator (UB); it must
+        // return a valid, aligned, non-null dangling pointer instead.
+        let layout = Layout::from_size_align(0, 16).expect("valid layout");
+        let hint = NumaAllocHint::first_touch();
+        let ptr = unsafe { numa_alloc(layout, &hint) }.expect("zero-size alloc -> dangling ptr");
+        assert_eq!(ptr.as_ptr() as usize % 16, 0);
+        // Deallocation of a dangling ZST pointer must be a no-op, not a crash.
+        unsafe { numa_dealloc(ptr, layout, &hint) };
+
+        // Same for the zeroed variant.
+        let ptr2 = unsafe { numa_alloc_zeroed(layout, &hint) }.expect("zero-size zeroed -> ptr");
+        assert_eq!(ptr2.as_ptr() as usize % 16, 0);
+        unsafe { numa_dealloc(ptr2, layout, &hint) };
+    }
+
+    #[test]
+    fn test_numa_allocator_zst_count() {
+        // A zero-sized T with non-zero count yields a zero-size layout: must not
+        // hit the allocator, must round-trip cleanly.
+        let alloc: NumaAllocator<()> = NumaAllocator::first_touch();
+        let ptr = alloc.allocate(8).expect("zst alloc -> dangling ptr");
+        unsafe { alloc.deallocate(ptr, 8) };
+    }
+
+    #[test]
+    fn test_numa_vec_zst() {
+        let mut v: NumaVec<()> = NumaVec::new();
+        for _ in 0..10 {
+            v.push(()).expect("push zst");
+        }
+        assert_eq!(v.len(), 10);
+        for _ in 0..10 {
+            assert_eq!(v.pop(), Some(()));
+        }
+        assert!(v.is_empty());
+    }
+
+    // ----- bind_memory_policy error propagation (finding: swallowed errno) ---
+
+    #[test]
+    fn test_bind_memory_policy_first_touch_is_noop_ok() {
+        let page = get_page_size();
+        let layout = Layout::from_size_align(page, page).expect("valid layout");
+        let hint = NumaAllocHint::first_touch();
+        let ptr = unsafe { numa_alloc(layout, &hint) }.expect("alloc");
+        let res = unsafe { bind_memory_policy(ptr.as_ptr(), layout.size(), &hint) };
+        assert!(res.is_ok(), "first-touch binding must be a successful no-op");
+        unsafe { numa_dealloc(ptr, layout, &hint) };
+    }
+
+    #[test]
+    fn test_numa_alloc_bind_roundtrip_memory_valid() {
+        // The page-aligned binding path must yield fully usable memory whether
+        // or not the kernel actually applied the policy, and it must be
+        // page-aligned.
+        let count = 1000usize;
+        let alloc: NumaAllocator<f64> = NumaAllocator::on_node(0);
+        let ptr = alloc.allocate(count).expect("alloc");
+        assert_eq!(ptr.as_ptr() as usize % get_page_size(), 0);
+        unsafe {
+            for i in 0..count {
+                core::ptr::write(ptr.as_ptr().add(i), i as f64);
+            }
+            for i in 0..count {
+                assert!((core::ptr::read(ptr.as_ptr().add(i)) - i as f64).abs() < f64::EPSILON);
+            }
+            alloc.deallocate(ptr, count);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bind_memory_policy_rejects_invalid_node() {
+        // Binding to a node id beyond the supported maximum must return an
+        // error (never silently "succeed" doing nothing).
+        let page = get_page_size();
+        let layout = Layout::from_size_align(page, page).expect("valid layout");
+        let ft = NumaAllocHint::first_touch();
+        let ptr = unsafe { numa_alloc(layout, &ft) }.expect("alloc");
+        let hint = NumaAllocHint::bind_node(9999);
+        let res = unsafe { bind_memory_policy(ptr.as_ptr(), layout.size(), &hint) };
+        assert!(res.is_err(), "binding to an invalid node must error");
+        unsafe { numa_dealloc(ptr, layout, &ft) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_bind_memory_policy_rejects_unaligned_address() {
+        // A non-page-aligned start address must be rejected with an error
+        // rather than issuing an mbind that the kernel would EINVAL silently.
+        let page = get_page_size();
+        let layout = Layout::from_size_align(page * 2, page).expect("valid layout");
+        let ft = NumaAllocHint::first_touch();
+        let ptr = unsafe { numa_alloc(layout, &ft) }.expect("alloc");
+        let unaligned = unsafe { ptr.as_ptr().add(1) };
+        let hint = NumaAllocHint::bind_node(0);
+        let res = unsafe { bind_memory_policy(unaligned, page, &hint) };
+        assert!(res.is_err(), "unaligned address must be rejected");
+        unsafe { numa_dealloc(ptr, layout, &ft) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_node_list() {
+        assert_eq!(parse_node_list("0"), vec![0]);
+        assert_eq!(parse_node_list("0-3"), vec![0, 1, 2, 3]);
+        assert_eq!(parse_node_list("0,2-3"), vec![0, 2, 3]);
+        assert_eq!(parse_node_list("0-1\n"), vec![0, 1]);
+        assert_eq!(parse_node_list(" 1 , 4 "), vec![1, 4]);
+        assert!(parse_node_list("").is_empty());
+        assert!(parse_node_list("garbage").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_build_node_mask() {
+        let bits_per_word = core::mem::size_of::<libc::c_ulong>() * 8;
+        let one: libc::c_ulong = 1;
+
+        let (mask, maxnode) = build_node_mask(&[0]);
+        assert_eq!(mask, vec![1]);
+        assert_eq!(maxnode, 2);
+
+        let (mask, maxnode) = build_node_mask(&[0, 1]);
+        assert_eq!(mask, vec![0b11]);
+        assert_eq!(maxnode, 3);
+
+        // Highest bit inside the first word.
+        let top = bits_per_word - 1;
+        let (mask, maxnode) = build_node_mask(&[top]);
+        assert_eq!(mask.len(), 1);
+        assert_eq!(mask[0], one << top);
+        assert_eq!(maxnode, top + 2);
+
+        // A node that lands in the second word.
+        let (mask, maxnode) = build_node_mask(&[bits_per_word]);
+        assert_eq!(mask.len(), 2);
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[1], 1);
+        assert_eq!(maxnode, bits_per_word + 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_numa_node_bounds() {
+        // Beyond the supported maximum is always rejected.
+        assert!(validate_numa_node(MAX_NUMA_NODES).is_err());
+        assert!(validate_numa_node(MAX_NUMA_NODES + 1).is_err());
     }
 }

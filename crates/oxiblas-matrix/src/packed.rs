@@ -33,6 +33,39 @@ pub enum TriangularKind {
     Lower,
 }
 
+/// Error returned when an index falls outside the triangle stored by a
+/// [`PackedMat`] (or one of the packed view types [`PackedRef`]/[`PackedMut`]).
+///
+/// A packed triangular matrix only stores the upper or lower triangle
+/// (including the diagonal); the complementary triangle is never
+/// materialized. Attempting to write to an index outside the stored
+/// triangle -- or outside the matrix bounds -- returns this error instead
+/// of panicking, so callers can decide how to handle invalid indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfTriangleError {
+    /// The row index that was requested.
+    pub row: usize,
+    /// The column index that was requested.
+    pub col: usize,
+    /// The matrix dimension (`n x n`) at the time of the request.
+    pub dim: usize,
+    /// Which triangle is stored.
+    pub kind: TriangularKind,
+}
+
+impl core::fmt::Display for OutOfTriangleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "index ({}, {}) is outside the stored {:?} triangle of a {}x{} packed matrix",
+            self.row, self.col, self.kind, self.dim, self.dim
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for OutOfTriangleError {}
+
 /// A packed matrix storing only the triangular portion.
 ///
 /// This is useful for symmetric, Hermitian, and triangular matrices
@@ -47,12 +80,12 @@ pub enum TriangularKind {
 /// let mut p: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
 ///
 /// // Set diagonal and upper triangle
-/// p.set(0, 0, 1.0);
-/// p.set(0, 1, 2.0);
-/// p.set(0, 2, 3.0);
-/// p.set(1, 1, 4.0);
-/// p.set(1, 2, 5.0);
-/// p.set(2, 2, 6.0);
+/// p.set(0, 0, 1.0).unwrap();
+/// p.set(0, 1, 2.0).unwrap();
+/// p.set(0, 2, 3.0).unwrap();
+/// p.set(1, 1, 4.0).unwrap();
+/// p.set(1, 2, 5.0).unwrap();
+/// p.set(2, 2, 6.0).unwrap();
 ///
 /// // Access elements
 /// assert_eq!(p.get(0, 1), Some(&2.0));
@@ -192,14 +225,19 @@ impl<T: Scalar> PackedMat<T> {
 
     /// Sets the element at (row, col).
     ///
-    /// # Panics
-    /// Panics if the element is outside the stored triangle.
+    /// # Errors
+    /// Returns [`OutOfTriangleError`] if `(row, col)` lies outside the
+    /// stored triangle (this includes indices outside the matrix bounds).
     #[inline]
-    pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let idx = self
-            .packed_index(row, col)
-            .expect("Element outside stored triangle");
+    pub fn set(&mut self, row: usize, col: usize, value: T) -> Result<(), OutOfTriangleError> {
+        let idx = self.packed_index(row, col).ok_or(OutOfTriangleError {
+            row,
+            col,
+            dim: self.n,
+            kind: self.kind,
+        })?;
         self.data[idx] = value;
+        Ok(())
     }
 
     /// Returns a pointer to the packed data.
@@ -257,8 +295,8 @@ impl<T: Scalar> PackedMat<T> {
 
         for j in 0..n {
             for i in 0..n {
-                if packed.packed_index(i, j).is_some() {
-                    packed.set(i, j, mat[(i, j)]);
+                if let Some(idx) = packed.packed_index(i, j) {
+                    packed.data[idx] = mat[(i, j)];
                 }
             }
         }
@@ -266,14 +304,26 @@ impl<T: Scalar> PackedMat<T> {
         packed
     }
 
+    /// Computes the packed index of the diagonal element `(i, i)`.
+    ///
+    /// Diagonal elements are always part of the stored triangle for both
+    /// [`TriangularKind::Upper`] (`row <= col`) and [`TriangularKind::Lower`]
+    /// (`row >= col`), since `row == col` trivially satisfies both
+    /// conditions. This computes the index directly (bypassing
+    /// [`Self::packed_index`]'s `Option`) so callers never need to handle an
+    /// unreachable "not found" case -- the caller must ensure `i < self.n`.
+    #[inline]
+    fn diagonal_packed_index(&self, i: usize) -> usize {
+        match self.kind {
+            TriangularKind::Upper => i * (i + 1) / 2 + i,
+            TriangularKind::Lower => self.n * i - i * (i.saturating_sub(1)) / 2,
+        }
+    }
+
     /// Returns the diagonal elements as a vector.
     pub fn diagonal(&self) -> Vec<T> {
         (0..self.n)
-            .map(|i| {
-                *self
-                    .get(i, i)
-                    .expect("diagonal index should always be valid")
-            })
+            .map(|i| self.data[self.diagonal_packed_index(i)])
             .collect()
     }
 
@@ -285,7 +335,8 @@ impl<T: Scalar> PackedMat<T> {
             "Diagonal length must match matrix dimension"
         );
         for (i, &val) in diag.iter().enumerate() {
-            self.set(i, i, val);
+            let idx = self.diagonal_packed_index(i);
+            self.data[idx] = val;
         }
     }
 
@@ -321,8 +372,8 @@ impl<T: Scalar> PackedMat<T> {
             for i in 0..self.n {
                 if let Some(src_idx) = self.packed_index(i, j) {
                     // In transposed storage, (i,j) becomes (j,i)
-                    if result.packed_index(j, i).is_some() {
-                        result.set(j, i, self.data[src_idx]);
+                    if let Some(dst_idx) = result.packed_index(j, i) {
+                        result.data[dst_idx] = self.data[src_idx];
                     }
                 }
             }
@@ -546,14 +597,22 @@ impl<'a, T: Scalar> PackedMut<'a, T> {
     }
 
     /// Sets the element at (row, col).
+    ///
+    /// # Errors
+    /// Returns [`OutOfTriangleError`] if `(row, col)` lies outside the
+    /// stored triangle (this includes indices outside the matrix bounds).
     #[inline]
-    pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let idx = self
-            .packed_index(row, col)
-            .expect("Element outside stored triangle");
+    pub fn set(&mut self, row: usize, col: usize, value: T) -> Result<(), OutOfTriangleError> {
+        let idx = self.packed_index(row, col).ok_or(OutOfTriangleError {
+            row,
+            col,
+            dim: self.n,
+            kind: self.kind,
+        })?;
         unsafe {
             *self.ptr.add(idx) = value;
         }
+        Ok(())
     }
 
     /// Returns a pointer to the packed data.
@@ -611,12 +670,12 @@ mod tests {
         assert_eq!(p.packed_index(2, 1), None);
 
         // Set and get values
-        p.set(0, 0, 1.0);
-        p.set(0, 1, 2.0);
-        p.set(1, 1, 3.0);
-        p.set(0, 2, 4.0);
-        p.set(1, 2, 5.0);
-        p.set(2, 2, 6.0);
+        p.set(0, 0, 1.0).unwrap();
+        p.set(0, 1, 2.0).unwrap();
+        p.set(1, 1, 3.0).unwrap();
+        p.set(0, 2, 4.0).unwrap();
+        p.set(1, 2, 5.0).unwrap();
+        p.set(2, 2, 6.0).unwrap();
 
         assert_eq!(p.get(0, 0), Some(&1.0));
         assert_eq!(p.get(0, 1), Some(&2.0));
@@ -649,12 +708,12 @@ mod tests {
         assert_eq!(p.packed_index(1, 2), None);
 
         // Set and get values
-        p.set(0, 0, 1.0);
-        p.set(1, 0, 2.0);
-        p.set(2, 0, 3.0);
-        p.set(1, 1, 4.0);
-        p.set(2, 1, 5.0);
-        p.set(2, 2, 6.0);
+        p.set(0, 0, 1.0).unwrap();
+        p.set(1, 0, 2.0).unwrap();
+        p.set(2, 0, 3.0).unwrap();
+        p.set(1, 1, 4.0).unwrap();
+        p.set(2, 1, 5.0).unwrap();
+        p.set(2, 2, 6.0).unwrap();
 
         assert_eq!(p.get(0, 0), Some(&1.0));
         assert_eq!(p.get(1, 0), Some(&2.0));
@@ -677,12 +736,12 @@ mod tests {
     #[test]
     fn test_packed_to_dense() {
         let mut p: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
-        p.set(0, 0, 1.0);
-        p.set(0, 1, 2.0);
-        p.set(1, 1, 3.0);
-        p.set(0, 2, 4.0);
-        p.set(1, 2, 5.0);
-        p.set(2, 2, 6.0);
+        p.set(0, 0, 1.0).unwrap();
+        p.set(0, 1, 2.0).unwrap();
+        p.set(1, 1, 3.0).unwrap();
+        p.set(0, 2, 4.0).unwrap();
+        p.set(1, 2, 5.0).unwrap();
+        p.set(2, 2, 6.0).unwrap();
 
         let dense = p.to_dense();
         assert_eq!(dense[(0, 0)], 1.0);
@@ -724,12 +783,12 @@ mod tests {
     #[test]
     fn test_packed_diagonal() {
         let mut p: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
-        p.set(0, 0, 1.0);
-        p.set(0, 1, 10.0);
-        p.set(1, 1, 2.0);
-        p.set(0, 2, 20.0);
-        p.set(1, 2, 30.0);
-        p.set(2, 2, 3.0);
+        p.set(0, 0, 1.0).unwrap();
+        p.set(0, 1, 10.0).unwrap();
+        p.set(1, 1, 2.0).unwrap();
+        p.set(0, 2, 20.0).unwrap();
+        p.set(1, 2, 30.0).unwrap();
+        p.set(2, 2, 3.0).unwrap();
 
         let diag = p.diagonal();
         assert_eq!(diag, vec![1.0, 2.0, 3.0]);
@@ -743,12 +802,12 @@ mod tests {
     #[test]
     fn test_packed_transpose() {
         let mut upper: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
-        upper.set(0, 0, 1.0);
-        upper.set(0, 1, 2.0);
-        upper.set(1, 1, 3.0);
-        upper.set(0, 2, 4.0);
-        upper.set(1, 2, 5.0);
-        upper.set(2, 2, 6.0);
+        upper.set(0, 0, 1.0).unwrap();
+        upper.set(0, 1, 2.0).unwrap();
+        upper.set(1, 1, 3.0).unwrap();
+        upper.set(0, 2, 4.0).unwrap();
+        upper.set(1, 2, 5.0).unwrap();
+        upper.set(2, 2, 6.0).unwrap();
 
         let lower = upper.transpose();
         assert_eq!(lower.kind(), TriangularKind::Lower);
@@ -781,12 +840,12 @@ mod tests {
         let mut data = [0.0f64; 6];
         let mut pmut = PackedMut::from_slice(&mut data, 3, TriangularKind::Lower);
 
-        pmut.set(0, 0, 1.0);
-        pmut.set(1, 0, 2.0);
-        pmut.set(2, 0, 3.0);
-        pmut.set(1, 1, 4.0);
-        pmut.set(2, 1, 5.0);
-        pmut.set(2, 2, 6.0);
+        pmut.set(0, 0, 1.0).unwrap();
+        pmut.set(1, 0, 2.0).unwrap();
+        pmut.set(2, 0, 3.0).unwrap();
+        pmut.set(1, 1, 4.0).unwrap();
+        pmut.set(2, 1, 5.0).unwrap();
+        pmut.set(2, 2, 6.0).unwrap();
 
         assert_eq!(data, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
@@ -794,14 +853,68 @@ mod tests {
     #[test]
     fn test_packed_scale() {
         let mut p: PackedMat<f64> = PackedMat::zeros(2, TriangularKind::Upper);
-        p.set(0, 0, 1.0);
-        p.set(0, 1, 2.0);
-        p.set(1, 1, 3.0);
+        p.set(0, 0, 1.0).unwrap();
+        p.set(0, 1, 2.0).unwrap();
+        p.set(1, 1, 3.0).unwrap();
 
         p.scale(2.0);
 
         assert_eq!(p.get(0, 0), Some(&2.0));
         assert_eq!(p.get(0, 1), Some(&4.0));
         assert_eq!(p.get(1, 1), Some(&6.0));
+    }
+
+    // Regression test for finding #1: `PackedMat::set` used to `.expect()`
+    // (panic) on an out-of-triangle index instead of returning a typed
+    // error. A caller passing a below-diagonal index into upper-triangular
+    // storage (or vice versa) must get `Err(OutOfTriangleError)` back, not
+    // a panic.
+    #[test]
+    fn test_packed_mat_set_out_of_triangle_returns_error_not_panic() {
+        let mut upper: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
+        let err = upper
+            .set(1, 0, 99.0)
+            .expect_err("(1, 0) is below the diagonal of upper-triangular storage");
+        assert_eq!(
+            err,
+            OutOfTriangleError {
+                row: 1,
+                col: 0,
+                dim: 3,
+                kind: TriangularKind::Upper,
+            }
+        );
+        // Display must not panic and should surface the offending index.
+        let message = err.to_string();
+        assert!(message.contains("(1, 0)"), "message was: {message}");
+
+        let mut lower: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Lower);
+        assert!(lower.set(0, 2, 1.0).is_err());
+
+        // Out-of-bounds indices (>= n) must also be a typed error, not a panic.
+        assert!(upper.set(5, 5, 1.0).is_err());
+
+        // The matrix must be left untouched by a failed `set`.
+        assert_eq!(upper.get(0, 0), Some(&0.0));
+    }
+
+    // Same regression, but for the raw-pointer `PackedMut` view, which has
+    // its own independent `packed_index().expect(...)` call site.
+    #[test]
+    fn test_packed_mut_set_out_of_triangle_returns_error_not_panic() {
+        let mut data = [0.0f64; 6];
+        let mut pmut = PackedMut::from_slice(&mut data, 3, TriangularKind::Lower);
+
+        let err = pmut
+            .set(0, 1, 42.0)
+            .expect_err("(0, 1) is above the diagonal of lower-triangular storage");
+        assert_eq!(err.row, 0);
+        assert_eq!(err.col, 1);
+        assert_eq!(err.dim, 3);
+        assert_eq!(err.kind, TriangularKind::Lower);
+
+        // A valid index still succeeds and writes through the pointer.
+        pmut.set(0, 0, 7.0).unwrap();
+        assert_eq!(data[0], 7.0);
     }
 }

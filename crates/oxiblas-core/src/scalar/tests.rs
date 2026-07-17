@@ -109,6 +109,229 @@ fn test_f128_scalar() {
     assert!(Scalar::abs(b / c - QuadFloat::from(5.0 / 3.0)) < QuadFloat::from(1e-15));
 }
 
+#[cfg(feature = "f128")]
+#[test]
+fn test_f128_rem_truncated() {
+    // `%` on QuadFloat must follow Rust's truncated-division semantics (result
+    // carries the sign of the dividend), NOT floored modulo (sign of divisor).
+    use num_traits::Float as NumF;
+    let qabs = |x: QuadFloat| QuadFloat::from(x.inner().abs());
+    let tol = QuadFloat::from(1e-28);
+
+    // Operands exactly representable => remainder is exact at DD precision.
+    let cases = [
+        (7.0_f64, 2.5_f64, 2.0_f64),
+        (-7.0, 2.5, -2.0), // truncated: trunc(-2.8) = -2 => -7 - (-5) = -2
+        (7.0, -2.5, 2.0),
+        (-7.0, -2.5, -2.0),
+        (5.0, 2.0, 1.0),
+        (-5.0, 2.0, -1.0), // floored modulo would (wrongly) give +1.0
+        (5.0, -2.0, 1.0),
+        (-5.0, -2.0, -1.0),
+    ];
+    for (a, b, expected) in cases {
+        let r = QuadFloat::from(a) % QuadFloat::from(b);
+        assert!(
+            qabs(r - QuadFloat::from(expected)) < tol,
+            "{a} % {b} = {r} (expected {expected})"
+        );
+        // Sign of the result must match the dividend.
+        if r != QuadFloat::from(0.0) {
+            assert_eq!(
+                r.inner().is_sign_negative(),
+                a < 0.0,
+                "{a} % {b} = {r} has wrong sign"
+            );
+        }
+    }
+
+    // Defining invariants of the truncated remainder for a value whose quotient
+    // is not exactly representable (1/0.1) — exercises the boundary correction:
+    // sign(r) == sign(a), |r| < |b|, and r agrees with f64's exact fmod.
+    let a = 1.0_f64;
+    let b = 0.1_f64;
+    let r = QuadFloat::from(a) % QuadFloat::from(b);
+    assert!(
+        qabs(r) < QuadFloat::from(QuadFloat::from(b).inner().abs()),
+        "|1.0 % 0.1| = {r} must be < 0.1"
+    );
+    assert!(!r.inner().is_sign_negative(), "1.0 % 0.1 must be positive");
+    assert!(
+        (r.inner().hi() - (a % b)).abs() < 1e-13,
+        "1.0 % 0.1 = {r} disagrees with f64 fmod {}",
+        a % b
+    );
+
+    // Special values, matching f64 `%`.
+    let inf: QuadFloat = NumF::infinity();
+    assert!((QuadFloat::from(1.0) % QuadFloat::from(0.0)).is_nan());
+    assert!((inf % QuadFloat::from(2.0)).is_nan());
+    let finite_mod_inf = QuadFloat::from(3.0) % inf;
+    assert!(qabs(finite_mod_inf - QuadFloat::from(3.0)) < tol);
+}
+
+#[cfg(feature = "f128")]
+#[test]
+fn test_f128_rounding_double_double() {
+    // floor/ceil/round/trunc/fract must respect the low (correction) word, not
+    // just the high f64 component. We build values that straddle an integer or
+    // half-integer boundary by an amount far below one f64 ULP, so the high word
+    // alone gives the wrong answer.
+    use num_traits::Float as NumF;
+    let qabs = |x: QuadFloat| QuadFloat::from(x.inner().abs());
+    let tol = QuadFloat::from(1e-28);
+    let tiny = QuadFloat::from(1e-30);
+    let int_of = |x: QuadFloat| x.inner().hi(); // integer results have lo == 0
+
+    // Value just BELOW the integer 3 (hi == 3.0, lo < 0): true value is < 3.
+    let below_3 = QuadFloat::from(3.0) - tiny;
+    assert_eq!(int_of(NumF::floor(below_3)), 2.0, "floor(3-eps) must be 2");
+    assert_eq!(int_of(NumF::ceil(below_3)), 3.0, "ceil(3-eps) must be 3");
+    assert_eq!(int_of(NumF::round(below_3)), 3.0, "round(3-eps) must be 3");
+    assert_eq!(int_of(NumF::trunc(below_3)), 2.0, "trunc(3-eps) must be 2");
+    // fract(3-eps) = (3-eps) - 2 = 1 - eps.
+    assert!(qabs(NumF::fract(below_3) - (QuadFloat::from(1.0) - tiny)) < tol);
+
+    // Value just ABOVE the integer 3 (hi == 3.0, lo > 0).
+    let above_3 = QuadFloat::from(3.0) + tiny;
+    assert_eq!(int_of(NumF::floor(above_3)), 3.0);
+    assert_eq!(int_of(NumF::ceil(above_3)), 4.0);
+    assert_eq!(int_of(NumF::round(above_3)), 3.0);
+    assert_eq!(int_of(NumF::trunc(above_3)), 3.0);
+    assert!(qabs(NumF::fract(above_3) - tiny) < tol);
+
+    // Negative value just BELOW -3 in magnitude (hi == -3.0, lo < 0): < -3.
+    let below_neg3 = QuadFloat::from(-3.0) - tiny;
+    assert_eq!(int_of(NumF::floor(below_neg3)), -4.0);
+    assert_eq!(int_of(NumF::ceil(below_neg3)), -3.0);
+    assert_eq!(int_of(NumF::round(below_neg3)), -3.0);
+    assert_eq!(int_of(NumF::trunc(below_neg3)), -3.0, "trunc toward zero");
+
+    // Negative value just ABOVE -3 (hi == -3.0, lo > 0): value is -2.999...
+    let above_neg3 = QuadFloat::from(-3.0) + tiny;
+    assert_eq!(int_of(NumF::floor(above_neg3)), -3.0);
+    assert_eq!(int_of(NumF::ceil(above_neg3)), -2.0);
+    assert_eq!(int_of(NumF::round(above_neg3)), -3.0);
+    assert_eq!(int_of(NumF::trunc(above_neg3)), -2.0, "trunc toward zero");
+
+    // Half-integer ties broken by the low word (hi is the half-integer 2.5).
+    assert_eq!(int_of(NumF::round(QuadFloat::from(2.5))), 3.0, "tie away from 0");
+    assert_eq!(
+        int_of(NumF::round(QuadFloat::from(2.5) - tiny)),
+        2.0,
+        "2.5-eps rounds down"
+    );
+    assert_eq!(
+        int_of(NumF::round(QuadFloat::from(2.5) + tiny)),
+        3.0,
+        "2.5+eps rounds up"
+    );
+    assert_eq!(
+        int_of(NumF::round(QuadFloat::from(-2.5) + tiny)),
+        -2.0,
+        "-2.5+eps rounds toward zero"
+    );
+    assert_eq!(
+        int_of(NumF::round(QuadFloat::from(-2.5) - tiny)),
+        -3.0,
+        "-2.5-eps rounds away"
+    );
+
+    // Large-magnitude ties where the fractional 0.5 lives in the LOW word and
+    // the integer part is in the HIGH word (verified normalizations below).
+    let two_pow_52 = QuadFloat::from((2.0_f64).powi(52));
+    let two_pow_53 = QuadFloat::from((2.0_f64).powi(53));
+
+    // 2^52 + 0.5 => (hi=2^52, lo=+0.5): low word's sign matches the whole,
+    // so the tie rounds away from zero to 2^52 + 1.
+    let tie_high = two_pow_52 + QuadFloat::from(0.5);
+    assert!(
+        qabs(NumF::round(tie_high) - (two_pow_52 + QuadFloat::from(1.0))) < QuadFloat::from(0.5),
+        "round(2^52 + 0.5) must be 2^52 + 1"
+    );
+
+    // 2^53 - 0.5 => (hi=2^53, lo=-0.5): the low word's local away-from-zero
+    // direction (down) DISAGREES with the positive whole's (up). The whole value
+    // is the genuine tie 2^53 - 0.5 and must round away from zero to 2^53, NOT
+    // down to 2^53 - 1. This exercises the sign-flip tie correction.
+    let tie_flip = two_pow_53 - QuadFloat::from(0.5);
+    assert!(
+        qabs(NumF::round(tie_flip) - two_pow_53) < QuadFloat::from(0.5),
+        "round(2^53 - 0.5) must be 2^53"
+    );
+
+    // 2^52 - 0.5 is exactly representable, so it normalizes to a half-integer
+    // high word (lo == 0); the non-integer-hi tie path must round it away to
+    // 2^52.
+    let tie_half_hi = two_pow_52 - QuadFloat::from(0.5);
+    assert!(
+        qabs(NumF::round(tie_half_hi) - two_pow_52) < QuadFloat::from(0.5),
+        "round(2^52 - 0.5) must be 2^52"
+    );
+}
+
+#[cfg(feature = "f128")]
+#[test]
+fn test_f128_hypot_no_overflow() {
+    // hypot must not overflow when the true result is finite (scale-then-sqrt).
+    use num_traits::Float as NumF;
+    let qabs = |x: QuadFloat| QuadFloat::from(x.inner().abs());
+
+    // 3-4-5 sanity check.
+    let h = NumF::hypot(QuadFloat::from(3.0), QuadFloat::from(4.0));
+    assert!(qabs(h - QuadFloat::from(5.0)) < QuadFloat::from(1e-28));
+
+    // Both operands square to +inf individually (1e200^2 = 1e400) yet the true
+    // hypot ~ 1.414e200 is finite. The naive sqrt(a*a + b*b) would return inf.
+    let big = QuadFloat::from(1e200);
+    let h_big = NumF::hypot(big, big);
+    assert!(NumF::is_finite(h_big), "hypot(1e200, 1e200) overflowed");
+    let expected = 1e200_f64.hypot(1e200_f64);
+    assert!(
+        ((h_big.inner().hi() - expected) / expected).abs() < 1e-13,
+        "hypot(1e200,1e200) = {h_big} (expected ~{expected})"
+    );
+
+    // Degenerate legs are handled without spurious NaN/overflow.
+    let h_zero = NumF::hypot(big, QuadFloat::from(0.0));
+    assert!(qabs(h_zero - big) < QuadFloat::from(1e185));
+    let h_zero2 = NumF::hypot(QuadFloat::from(0.0), big);
+    assert!(qabs(h_zero2 - big) < QuadFloat::from(1e185));
+    assert!(NumF::hypot(QuadFloat::from(0.0), QuadFloat::from(0.0)) == QuadFloat::from(0.0));
+}
+
+#[cfg(feature = "f128")]
+#[test]
+fn test_f128_cbrt_negative() {
+    // cbrt of a negative real is a well-defined negative real, not NaN.
+    use num_traits::Float as NumF;
+    let qabs = |x: QuadFloat| QuadFloat::from(x.inner().abs());
+    let tol = QuadFloat::from(1e-28);
+
+    assert!(qabs(NumF::cbrt(QuadFloat::from(27.0)) - QuadFloat::from(3.0)) < tol);
+    assert!(qabs(NumF::cbrt(QuadFloat::from(8.0)) - QuadFloat::from(2.0)) < tol);
+
+    let cbrt_neg27 = NumF::cbrt(QuadFloat::from(-27.0));
+    assert!(!cbrt_neg27.is_nan(), "cbrt(-27) must not be NaN");
+    assert!(qabs(cbrt_neg27 - QuadFloat::from(-3.0)) < tol);
+    assert!(cbrt_neg27.inner().is_sign_negative(), "cbrt(-27) is negative");
+
+    assert!(qabs(NumF::cbrt(QuadFloat::from(-8.0)) - QuadFloat::from(-2.0)) < tol);
+
+    // cbrt(-x) == -cbrt(x), and the result cubes back to the input at DD
+    // precision (validates the Newton refinement, not just an f64 seed).
+    for v in [2.0_f64, 10.0, 1234.5, 1e100, 1e-100] {
+        let pos = NumF::cbrt(QuadFloat::from(v));
+        let neg = NumF::cbrt(QuadFloat::from(-v));
+        assert!(qabs(neg + pos) < qabs(pos) * QuadFloat::from(1e-28));
+        let cubed = pos * pos * pos;
+        assert!(
+            qabs(cubed - QuadFloat::from(v)) < qabs(QuadFloat::from(v)) * QuadFloat::from(1e-28),
+            "cbrt({v})^3 = {cubed}"
+        );
+    }
+}
+
 // Complex ergonomics tests
 #[test]
 fn test_complex_constructors() {
@@ -358,4 +581,197 @@ fn test_kbk_sum() {
     let result = kbk.sum();
     // KBK should give very accurate results
     assert!((result - 1000.0).abs() < 1e-8);
+}
+// =============================================================================
+// Regression tests for TODO.md audit findings
+// =============================================================================
+
+/// Finding: `Field::powi` for `Complex32` returned ~1.0 for every negative
+/// exponent because it multiplied `self.powu(|n|)` by
+/// `self.recip().powu(|n|)` instead of choosing one or the other based on
+/// the sign of `n`.
+///
+/// Note: `num_complex::Complex<T>` also defines its *own* inherent
+/// `powi(&self, i32)` method (already correct, backed by `num_traits::Pow`),
+/// and inherent methods always win over trait methods in dot-call method
+/// resolution for a concrete type. So `Complex32::new(..).powi(-2)` was
+/// silently calling the correct inherent method all along and would NOT
+/// have caught this bug. The only way to reach the buggy code is through
+/// the `Field` trait itself — either via explicit UFCS, or (the realistic
+/// failure mode) through code generic over `T: Field` calling `x.powi(n)`,
+/// where the compiler can only resolve to the trait method. This test
+/// exercises both paths explicitly.
+#[test]
+fn test_complex32_powi_negative_exponent() {
+    use num_complex::Complex32;
+
+    let z = Complex32::new(2.0, 1.0);
+    let z_squared = z * z;
+    let expected = Complex32::new(1.0, 0.0) / z_squared;
+
+    // Exercise the trait method directly via UFCS -- this is what was
+    // actually broken, and is bypassed by ordinary dot-call syntax on a
+    // concrete Complex32 due to num_complex's own inherent `powi`.
+    let actual = Field::powi(z, -2);
+    assert!(
+        (actual.re - expected.re).abs() < 1e-5,
+        "re mismatch: actual={actual:?} expected={expected:?}"
+    );
+    assert!(
+        (actual.im - expected.im).abs() < 1e-5,
+        "im mismatch: actual={actual:?} expected={expected:?}"
+    );
+
+    // Regression guard against the historical bug: the buggy
+    // implementation collapsed to ~(1.0, 0.0) for every negative exponent.
+    assert!(
+        (actual.re - 1.0).abs() > 1e-3 || actual.im.abs() > 1e-3,
+        "Field::powi(-2) collapsed to ~1.0, the historical bug: {actual:?}"
+    );
+
+    // Exercise the realistic failure mode: a function generic over
+    // `T: Field`, which can only resolve `.powi()` to the trait method.
+    fn generic_powi<T: Field>(x: T, n: i32) -> T {
+        x.powi(n)
+    }
+    let generic_actual = generic_powi(z, -2);
+    assert!((generic_actual.re - expected.re).abs() < 1e-5);
+    assert!((generic_actual.im - expected.im).abs() < 1e-5);
+
+    // Field::powi(-1) must equal Field::recip().
+    let inv = Field::powi(z, -1);
+    let recip = Field::recip(z);
+    assert!((inv.re - recip.re).abs() < 1e-6);
+    assert!((inv.im - recip.im).abs() < 1e-6);
+
+    // Field::powi(0) == 1, Field::powi(positive) unaffected by the fix.
+    assert_eq!(Field::powi(z, 0), Complex32::new(1.0, 0.0));
+    let cubed = Field::powi(z, 3);
+    let cubed_expected = z * z * z;
+    assert!((cubed.re - cubed_expected.re).abs() < 1e-4);
+    assert!((cubed.im - cubed_expected.im).abs() < 1e-4);
+
+    // Complex32 must now match the (already-correct) Complex64 behavior
+    // for the same exponent, up to the precision difference.
+    use num_complex::Complex64;
+    let z64 = Complex64::new(2.0, 1.0);
+    let actual64 = Field::powi(z64, -2);
+    assert!((actual.re as f64 - actual64.re).abs() < 1e-5);
+    assert!((actual.im as f64 - actual64.im).abs() < 1e-5);
+}
+
+/// Finding: `Real::signum` doc claimed `0.0 if zero`, which does not match
+/// Rust's f32/f64 `signum` (IEEE-754 style: sign of zero is preserved as
+/// +/-1.0, never a literal 0.0, and NaN propagates). This test pins down
+/// the corrected, documented semantics for the f32/f64 impls.
+#[test]
+fn test_real_signum_matches_ieee754_semantics() {
+    // f32
+    assert_eq!(<f32 as Real>::signum(3.5), 1.0);
+    assert_eq!(<f32 as Real>::signum(-3.5), -1.0);
+    assert_eq!(<f32 as Real>::signum(0.0), 1.0);
+    assert_eq!(<f32 as Real>::signum(-0.0), -1.0);
+    assert!(<f32 as Real>::signum(-0.0_f32).is_sign_negative());
+    assert_eq!(<f32 as Real>::signum(f32::INFINITY), 1.0);
+    assert_eq!(<f32 as Real>::signum(f32::NEG_INFINITY), -1.0);
+    assert!(<f32 as Real>::signum(f32::NAN).is_nan());
+
+    // f64
+    assert_eq!(<f64 as Real>::signum(3.5), 1.0);
+    assert_eq!(<f64 as Real>::signum(-3.5), -1.0);
+    assert_eq!(<f64 as Real>::signum(0.0), 1.0);
+    assert_eq!(<f64 as Real>::signum(-0.0), -1.0);
+    assert!(<f64 as Real>::signum(-0.0_f64).is_sign_negative());
+    assert_eq!(<f64 as Real>::signum(f64::INFINITY), 1.0);
+    assert_eq!(<f64 as Real>::signum(f64::NEG_INFINITY), -1.0);
+    assert!(<f64 as Real>::signum(f64::NAN).is_nan());
+}
+
+/// Finding: `iamax_batch` used `Iterator::max_by`, which returns the LAST
+/// maximum on ties and treats incomparable (NaN) values as `Equal`. This
+/// diverges from reference BLAS IxAMAX, which keeps the FIRST index on
+/// ties (via a strict `>` comparison) and never lets a NaN comparison
+/// displace the running maximum.
+#[test]
+fn test_iamax_batch_first_index_wins_ties() {
+    use num_complex::{Complex32, Complex64};
+
+    // f32: three-way tie at abs value 3.0 -> first index (0) wins.
+    let x = [3.0f32, -3.0, 1.0, 3.0];
+    assert_eq!(f32::iamax_batch(&x), 0);
+
+    // f64: tie at index 1 and 2 -> first of the tied indices (1) wins.
+    let y = [1.0f64, 5.0, 5.0, 2.0];
+    assert_eq!(f64::iamax_batch(&y), 1);
+
+    // Complex32: |1|+|2| == |-2|+|-1| == 3.0 -> first index (0) wins.
+    let zc32 = [
+        Complex32::new(1.0, 2.0),
+        Complex32::new(-2.0, -1.0),
+        Complex32::new(0.5, 0.5),
+    ];
+    assert_eq!(Complex32::iamax_batch(&zc32), 0);
+
+    // Complex64: |2|+|0| == |0|+|2| == 2.0 -> first index (0) wins.
+    let zc64 = [
+        Complex64::new(2.0, 0.0),
+        Complex64::new(0.0, 2.0),
+        Complex64::new(1.0, 0.5),
+    ];
+    assert_eq!(Complex64::iamax_batch(&zc64), 0);
+}
+
+#[test]
+fn test_iamax_batch_nan_matches_reference_blas() {
+    // Reference BLAS IxAMAX only updates the running maximum on a strict
+    // `>` comparison, which is always false against NaN. If the FIRST
+    // element is NaN, nothing can ever beat it, so index 0 sticks even
+    // though later elements have a well-defined, larger magnitude.
+    let x = [f32::NAN, 10.0, 20.0];
+    assert_eq!(f32::iamax_batch(&x), 0);
+
+    // A NaN appearing after a genuine finite maximum must not be selected.
+    let y = [1.0f64, 9.0, f64::NAN, 3.0];
+    assert_eq!(f64::iamax_batch(&y), 1);
+
+    // A NaN appearing before the true maximum must not suppress it either.
+    let z = [1.0f64, f64::NAN, 9.0, 3.0];
+    assert_eq!(f64::iamax_batch(&z), 2);
+}
+
+/// Finding: `ExtendedPrecision for f64` always used `Accumulator = f64`
+/// even when the crate's `f128` (double-double) type was available,
+/// silently discarding the opportunity for genuinely higher-precision
+/// accumulation. With the `f128` feature enabled, the accumulator must
+/// now be `QuadFloat` and must be materially more accurate than plain
+/// `f64` summation for a case with significant f64 rounding error.
+#[test]
+#[cfg(feature = "f128")]
+fn test_extended_precision_f64_uses_quadfloat_with_f128_feature() {
+    // Lossless round trip for a value that is not exactly representable
+    // in binary floating point.
+    let x: f64 = 1.0 / 3.0;
+    let acc: QuadFloat = x.to_accumulator();
+    let back: f64 = f64::from_accumulator(acc);
+    assert_eq!(back, x);
+
+    // Summing 0.1 ten thousand times accumulates significant f64 rounding
+    // error; accumulating in QuadFloat space and rounding back to f64 at
+    // the end must be at least as accurate as summing directly in f64.
+    let mut extended_sum = QuadFloat::from(0.0);
+    let mut naive_sum = 0.0f64;
+    let term = 0.1f64;
+    for _ in 0..10_000 {
+        extended_sum += QuadFloat::from(term);
+        naive_sum += term;
+    }
+    let extended_result = f64::from_accumulator(extended_sum);
+    let exact = 1000.0f64; // 10_000 * 0.1
+    let extended_error = (extended_result - exact).abs();
+    let naive_error = (naive_sum - exact).abs();
+    assert!(
+        extended_error <= naive_error,
+        "extended accumulation ({extended_result}, err={extended_error}) was not at least \
+         as accurate as naive f64 summation ({naive_sum}, err={naive_error})"
+    );
 }

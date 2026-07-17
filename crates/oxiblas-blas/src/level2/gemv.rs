@@ -740,9 +740,11 @@ fn gemv_parallel_trans<T: Field + Send + Sync>(
 
                 for i in ib..i_end {
                     let xi = x[i];
-                    if xi == T::zero() {
-                        continue;
-                    }
+                    // NOTE: x[i] is intentionally NOT special-cased when it is
+                    // zero. Reference BLAS (Netlib DGEMV) always computes
+                    // A[i,j] * x[i], so if A[i,j] is Inf/NaN the result must
+                    // propagate NaN even though x[i] == 0. Skipping the row
+                    // here would silently diverge from that behavior.
                     let alpha_xi = alpha * xi;
 
                     // 4-way unrolled inner loop
@@ -826,9 +828,9 @@ fn gemv_parallel_conjtrans<T: Field + Send + Sync>(
 
                 for i in ib..i_end {
                     let xi = x[i];
-                    if xi == T::zero() {
-                        continue;
-                    }
+                    // NOTE: intentionally not skipping xi == 0; see the
+                    // matching comment in `gemv_parallel_trans` for why this
+                    // must stay reference-exact for NaN/Inf propagation.
                     let alpha_xi = alpha * xi;
 
                     // 4-way unrolled inner loop with conjugate
@@ -980,7 +982,7 @@ pub fn gemv_add<T: Field>(
     }
 
     // Fused operation: compute y = α·A·x + z in place
-    gemv_add_inplace(trans, alpha, a, x, &mut z, m, n);
+    gemv_add_inplace(trans, alpha, a, x, &mut z);
 
     z
 }
@@ -988,6 +990,15 @@ pub fn gemv_add<T: Field>(
 /// In-place fused GEMV + vector addition: y += α·op(A)·x
 ///
 /// Adds α·op(A)·x to the existing contents of y.
+///
+/// The row/column counts used for the multiply are taken directly from `a`
+/// (`a.nrows()`/`a.ncols()`); `x` and `y` are validated against the effective
+/// dimensions of `op(A)`.
+///
+/// # Panics
+///
+/// Panics if `x.len()` does not match the number of columns of `op(A)`, or if
+/// `y.len()` does not match the number of rows of `op(A)`.
 ///
 /// # Example
 ///
@@ -1003,20 +1014,22 @@ pub fn gemv_add<T: Field>(
 /// let mut y = vec![10.0f64, 20.0];
 ///
 /// // y += 1.0 * A * x -> y = [10, 20] + [3, 7] = [13, 27]
-/// gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y, 2, 2);
+/// gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
 ///
 /// assert!((y[0] - 13.0).abs() < 1e-10);
 /// assert!((y[1] - 27.0).abs() < 1e-10);
 /// ```
-pub fn gemv_add_inplace<T: Field>(
-    trans: GemvTrans,
-    alpha: T,
-    a: MatRef<'_, T>,
-    x: &[T],
-    y: &mut [T],
-    m: usize,
-    n: usize,
-) {
+pub fn gemv_add_inplace<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], y: &mut [T]) {
+    let (m, n) = (a.nrows(), a.ncols());
+
+    let (rows, cols) = match trans {
+        GemvTrans::NoTrans => (m, n),
+        GemvTrans::Trans | GemvTrans::ConjTrans => (n, m),
+    };
+
+    assert_eq!(x.len(), cols, "x length must match columns of op(A)");
+    assert_eq!(y.len(), rows, "y length must match rows of op(A)");
+
     if alpha == T::zero() {
         return;
     }
@@ -1137,13 +1150,15 @@ fn gemv_add_unblocked_trans<T: Field>(
     m: usize,
     n: usize,
 ) {
+    // NOTE: x[i] is intentionally NOT special-cased when it is zero.
+    // Reference BLAS (Netlib DGEMV) always computes A[i,j] * x[i], so if
+    // A[i,j] is Inf/NaN the result must propagate NaN even though x[i] == 0.
+    // Skipping the row here would silently diverge from that behavior.
     for i in 0..m {
         let xi = x[i];
-        if xi != T::zero() {
-            let axi = alpha * xi;
-            for j in 0..n {
-                y[j] += a[(i, j)] * axi;
-            }
+        let axi = alpha * xi;
+        for j in 0..n {
+            y[j] += a[(i, j)] * axi;
         }
     }
 }
@@ -1158,6 +1173,8 @@ fn gemv_add_blocked_trans<T: Field>(
     m: usize,
     n: usize,
 ) {
+    // NOTE: see `gemv_add_unblocked_trans` — x[i] == 0 is intentionally not
+    // skipped, to keep NaN/Inf propagation reference-exact.
     for kc in (0..m).step_by(KC_BLOCK) {
         let kc_end = (kc + KC_BLOCK).min(m);
 
@@ -1166,11 +1183,9 @@ fn gemv_add_blocked_trans<T: Field>(
 
             for i in kc..kc_end {
                 let xi = x[i];
-                if xi != T::zero() {
-                    let axi = alpha * xi;
-                    for j in mc..mc_end {
-                        y[j] += a[(i, j)] * axi;
-                    }
+                let axi = alpha * xi;
+                for j in mc..mc_end {
+                    y[j] += a[(i, j)] * axi;
                 }
             }
         }
@@ -1187,13 +1202,13 @@ fn gemv_add_unblocked_conjtrans<T: Field>(
     m: usize,
     n: usize,
 ) {
+    // NOTE: see `gemv_add_unblocked_trans` — x[i] == 0 is intentionally not
+    // skipped, to keep NaN/Inf propagation reference-exact.
     for i in 0..m {
         let xi = x[i];
-        if xi != T::zero() {
-            let axi = alpha * xi;
-            for j in 0..n {
-                y[j] += a[(i, j)].conj() * axi;
-            }
+        let axi = alpha * xi;
+        for j in 0..n {
+            y[j] += a[(i, j)].conj() * axi;
         }
     }
 }
@@ -1208,6 +1223,8 @@ fn gemv_add_blocked_conjtrans<T: Field>(
     m: usize,
     n: usize,
 ) {
+    // NOTE: see `gemv_add_unblocked_trans` — x[i] == 0 is intentionally not
+    // skipped, to keep NaN/Inf propagation reference-exact.
     for kc in (0..m).step_by(KC_BLOCK) {
         let kc_end = (kc + KC_BLOCK).min(m);
 
@@ -1216,11 +1233,9 @@ fn gemv_add_blocked_conjtrans<T: Field>(
 
             for i in kc..kc_end {
                 let xi = x[i];
-                if xi != T::zero() {
-                    let axi = alpha * xi;
-                    for j in mc..mc_end {
-                        y[j] += a[(i, j)].conj() * axi;
-                    }
+                let axi = alpha * xi;
+                for j in mc..mc_end {
+                    y[j] += a[(i, j)].conj() * axi;
                 }
             }
         }
@@ -1269,12 +1284,12 @@ pub fn gemv_sum2<T: Field>(
 
     // Compute y = α·A·x
     if alpha != T::zero() {
-        gemv_add_inplace(GemvTrans::NoTrans, alpha, a, x, &mut y, m, n1);
+        gemv_add_inplace(GemvTrans::NoTrans, alpha, a, x, &mut y);
     }
 
     // Add y += β·B·z
     if beta != T::zero() {
-        gemv_add_inplace(GemvTrans::NoTrans, beta, b, z, &mut y, m, n2);
+        gemv_add_inplace(GemvTrans::NoTrans, beta, b, z, &mut y);
     }
 
     y
@@ -1650,7 +1665,7 @@ mod tests {
         let mut y = vec![10.0, 20.0];
 
         // y += 1.0 * A * x -> y = [10, 20] + [3, 7] = [13, 27]
-        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y, 2, 2);
+        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
 
         assert!((y[0] - 13.0).abs() < 1e-10);
         assert!((y[1] - 27.0).abs() < 1e-10);
@@ -1663,14 +1678,189 @@ mod tests {
         let mut y = vec![0.0, 0.0];
 
         // First: y = [0, 0] + [3, 7] = [3, 7]
-        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y, 2, 2);
+        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
         assert!((y[0] - 3.0).abs() < 1e-10);
         assert!((y[1] - 7.0).abs() < 1e-10);
 
         // Second: y = [3, 7] + [3, 7] = [6, 14]
-        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y, 2, 2);
+        gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
         assert!((y[0] - 6.0).abs() < 1e-10);
         assert!((y[1] - 14.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gemv_add_inplace_dimension_mismatch_x_panics() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]);
+        let x = [1.0, 1.0, 1.0]; // wrong length: A has 2 columns
+        let mut y = vec![0.0, 0.0];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
+        }));
+        assert!(
+            result.is_err(),
+            "gemv_add_inplace must reject x with the wrong length instead of reading out of bounds"
+        );
+    }
+
+    #[test]
+    fn test_gemv_add_inplace_dimension_mismatch_y_panics() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]);
+        let x = [1.0, 1.0];
+        let mut y = vec![0.0, 0.0, 0.0]; // wrong length: A has 2 rows
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gemv_add_inplace(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, &mut y);
+        }));
+        assert!(
+            result.is_err(),
+            "gemv_add_inplace must reject y with the wrong length instead of silently under/over-writing"
+        );
+    }
+
+    // ========================================================================
+    // NaN/Inf propagation regression tests (reference-BLAS exactness).
+    //
+    // Reference DGEMV never special-cases x[i] == 0: every row contributes
+    // A[i,j] * x[i], so a row with A[i,j] == Inf and x[i] == 0.0 must
+    // propagate NaN (IEEE 754: 0 * Inf = NaN) into y[j]. A "skip rows where
+    // x[i] == 0" sparsity optimization would silently produce a different
+    // (wrong) numeric result for such inputs. These tests pin down that the
+    // Trans/ConjTrans code paths do NOT skip zero rows.
+    // ========================================================================
+
+    #[test]
+    fn test_gemv_trans_zero_x_does_not_suppress_nan() {
+        // A = [[Inf, 1], [2, 3]], x = [0, 1]
+        // Reference: y[0] = Inf*0 + 2*1 = NaN + 2 = NaN
+        let a = Mat::from_rows(&[&[f64::INFINITY, 1.0f64], &[2.0, 3.0]]);
+        let x = [0.0f64, 1.0];
+        let mut y = [0.0f64, 0.0];
+
+        gemv(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.0, &mut y);
+
+        assert!(
+            y[0].is_nan(),
+            "y[0] must be NaN (0 * Inf) per reference DGEMV, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_gemv_add_inplace_trans_zero_x_does_not_suppress_nan_unblocked() {
+        // Small matrix -> exercises gemv_add_unblocked_trans.
+        let a = Mat::from_rows(&[&[f64::INFINITY, 1.0f64], &[2.0, 3.0]]);
+        let x = [0.0f64, 1.0];
+        let mut y = vec![0.0f64, 0.0];
+
+        gemv_add_inplace(GemvTrans::Trans, 1.0, a.as_ref(), &x, &mut y);
+
+        assert!(
+            y[0].is_nan(),
+            "unblocked gemv_add_inplace(Trans) must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_gemv_add_inplace_conjtrans_zero_x_does_not_suppress_nan_unblocked() {
+        let a = Mat::from_rows(&[&[f64::INFINITY, 1.0f64], &[2.0, 3.0]]);
+        let x = [0.0f64, 1.0];
+        let mut y = vec![0.0f64, 0.0];
+
+        gemv_add_inplace(GemvTrans::ConjTrans, 1.0, a.as_ref(), &x, &mut y);
+
+        assert!(
+            y[0].is_nan(),
+            "unblocked gemv_add_inplace(ConjTrans) must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_gemv_add_blocked_trans_zero_x_does_not_suppress_nan() {
+        // Directly exercise the blocked Trans kernel used for large matrices
+        // (m*n > 4096 in the public gemv_add_inplace dispatcher).
+        let m = 4;
+        let n = 4;
+        let mut a: Mat<f64> = Mat::zeros(m, n);
+        a[(0, 0)] = f64::INFINITY;
+        a[(1, 0)] = 2.0;
+        let mut x = vec![0.0f64; m];
+        x[1] = 1.0;
+        let mut y = vec![0.0f64; n];
+
+        gemv_add_blocked_trans(1.0, a.as_ref(), &x, &mut y, m, n);
+
+        assert!(
+            y[0].is_nan(),
+            "blocked gemv_add Trans kernel must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
+    }
+
+    #[test]
+    fn test_gemv_add_blocked_conjtrans_zero_x_does_not_suppress_nan() {
+        let m = 4;
+        let n = 4;
+        let mut a: Mat<f64> = Mat::zeros(m, n);
+        a[(0, 0)] = f64::INFINITY;
+        a[(1, 0)] = 2.0;
+        let mut x = vec![0.0f64; m];
+        x[1] = 1.0;
+        let mut y = vec![0.0f64; n];
+
+        gemv_add_blocked_conjtrans(1.0, a.as_ref(), &x, &mut y, m, n);
+
+        assert!(
+            y[0].is_nan(),
+            "blocked gemv_add ConjTrans kernel must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_gemv_parallel_trans_zero_x_does_not_suppress_nan() {
+        // Directly exercise the private thread-local-accumulator kernel to
+        // pin down that x[i] == 0 rows are not skipped during reduction.
+        let m = 8;
+        let n = 8;
+        let mut a: Mat<f64> = Mat::zeros(m, n);
+        a[(0, 0)] = f64::INFINITY;
+        a[(1, 0)] = 2.0;
+        let mut x = vec![0.0f64; m];
+        x[1] = 1.0;
+        let mut y = vec![0.0f64; n];
+
+        gemv_parallel_trans(1.0, a.as_ref(), &x, &mut y, m, n, Par::RayonWith(2));
+
+        assert!(
+            y[0].is_nan(),
+            "gemv_parallel_trans must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_gemv_parallel_conjtrans_zero_x_does_not_suppress_nan() {
+        let m = 8;
+        let n = 8;
+        let mut a: Mat<f64> = Mat::zeros(m, n);
+        a[(0, 0)] = f64::INFINITY;
+        a[(1, 0)] = 2.0;
+        let mut x = vec![0.0f64; m];
+        x[1] = 1.0;
+        let mut y = vec![0.0f64; n];
+
+        gemv_parallel_conjtrans(1.0, a.as_ref(), &x, &mut y, m, n, Par::RayonWith(2));
+
+        assert!(
+            y[0].is_nan(),
+            "gemv_parallel_conjtrans must propagate NaN from a zero-x row, got {}",
+            y[0]
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 ### P0 — CRITICAL (verified): wrong results or fake output in normal use
 
-- [ ] `crates/oxiblas-blas/src/level1/dot.rs:1234` — **dotu_c64_avx2 / dotu_c32_avx2 return the NEGATED real part (sign mask lane order reversed)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level1/dot.rs:1234` — **dotu_c64_avx2 / dotu_c32_avx2 return the NEGATED real part (sign mask lane order reversed)** _(bug, easy)_
   - Fix: Swap the mask lane order: `_mm256_set_pd(-1.0, 1.0, -1.0, 1.0)` and `_mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0)` so the im*im lanes are negated, or replace the mul-by-mask with `_mm256_addsub_pd`/`fmsubadd`-style computation.
 - [ ] `crates/oxiblas-lapack/src/cholesky/aasen.rs:201` — **Aasen factorization is mathematically wrong for general n>=3 matrices; code comments admit it and tests dodge it** _(fabrication, hard)_
   - Fix: Implement the real Aasen recurrence (update H, or compute the working column as h = A[:,j] - L(:,0:j) * T(0:j,0:j) * L(j,0:j)^T per Aasen 1971 / LAPACK dsytrf_aa), or delete the module / route Aasen::compute to BunchKaufman with an honest error until correct.
@@ -29,32 +29,32 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **oxiblas-blas**
 
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:59` — **CBLAS Level-1 routines read out of bounds (UB) for negative increments** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:59` — **CBLAS Level-1 routines read out of bounds (UB) for negative increments** _(bug, medium)_
   - Fix: Compute the CBLAS start index for each vector when its increment is negative (`let mut ix = if incx < 0 { ((1 - n as isize) * incx) as usize } else { 0 };` style) and advance by the signed increment, matching reference BLAS.
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:295` — **Single-increment Level-1 wrappers (scal/nrm2/asum/iamax) OOB on incx<0; reference is no-op/returns-0 for incx<=0** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:295` — **Single-increment Level-1 wrappers (scal/nrm2/asum/iamax) OOB on incx<0; reference is no-op/returns-0 for incx<=0** _(bug, easy)_
   - Fix: Guard `if incx <= 0 { return <0 or ()>; }` at the top of scal/nrm2/asum/iamax to match reference semantics (for idamax the fast path already handles incx==1; return 0 for incx<=0).
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:355` — **Two-increment Level-1 wrappers (dot/axpy/copy/swap) do OOB read/write on negative increments (a spec-valid input)** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:355` — **Two-increment Level-1 wrappers (dot/axpy/copy/swap) do OOB read/write on negative increments (a spec-valid input)** _(bug, medium)_
   - Fix: Compute the reference start index: `let mut ix = if incx < 0 { (1 - n as isize) * incx } else { 0 };` and `let mut iy = ...` similarly, then step `ix += incx; iy += incy;` each iteration instead of `i * incx`.
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:551` — **cblas_dgemv/sgemv OOB read/write on negative incx/incy** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:551` — **cblas_dgemv/sgemv OOB read/write on negative incx/incy** _(bug, medium)_
   - Fix: Precompute start offsets for x and y honoring negative increments (reference gemv convention) and step by the increment inside the loops rather than multiplying by the loop index.
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:938` — **Complex dot-product wrappers (zdotu/zdotc/cdotu/cdotc) OOB read on negative increments (no fast path, always strided)** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:938` — **Complex dot-product wrappers (zdotu/zdotc/cdotu/cdotc) OOB read on negative increments (no fast path, always strided)** _(bug, medium)_
   - Fix: Use reference start-offset indexing: `ix = if incx<0 {(1-n as isize)*incx} else {0}` stepping by incx, likewise iy, matching the reference cblas complex dot implementations.
-- [ ] `crates/oxiblas-blas/src/level1/parallel.rs:207` — **nrm2_par silently drops overflow/underflow protection: naive sum of squares in parallel path** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/level1/parallel.rs:207` — **nrm2_par silently drops overflow/underflow protection: naive sum of squares in parallel path** _(bug, medium)_
   - Fix: In nrm2_parallel, do a parallel max-abs reduction first, then a scaled parallel sum of squares (sum of (x/scale)^2), returning scale*sqrt(sum); or reduce per-chunk (scale, ssq) pairs Blue's-style.
-- [ ] `crates/oxiblas-blas/src/level3/trsm/complex64.rs:352` — **All TRSM paths divide by unconjugated diagonal for ConjTrans** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/trsm/complex64.rs:352` — **All TRSM paths divide by unconjugated diagonal for ConjTrans** _(bug, easy)_
   - Fix: At each diagonal-solve site, conjugate the diagonal when trans == Trans::ConjTrans: `let d = if trans == Trans::ConjTrans { a[(i,i)].conj() } else { a[(i,i)] };`.
-- [ ] `crates/oxiblas-blas/src/level3/trsm/generic.rs:1011` — **Generic trsm_naive performs NO conjugation for Trans::ConjTrans (complex solves wrong)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/trsm/generic.rs:1011` — **Generic trsm_naive performs NO conjugation for Trans::ConjTrans (complex solves wrong)** _(bug, easy)_
   - Fix: In trsm_naive, replicate the conjugation logic used in trsm_naive_submatrix: `let val = a[(k,i)]; if trans == Trans::ConjTrans { val.conj() } else { val }` in all four branches.
 
 **oxiblas-core**
 
-- [ ] `crates/oxiblas-core/src/memory/aligned_vec.rs:193` — **AlignedVec::layout_for uses unchecked `capacity * size_of::<T>()` — wrap yields undersized allocation with huge cap (heap overflow), plus .expect() in production path** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/aligned_vec.rs:193` — **AlignedVec::layout_for uses unchecked `capacity * size_of::<T>()` — wrap yields undersized allocation with huge cap (heap overflow), plus .expect() in production path** _(bug, easy)_
   - Fix: Use capacity.checked_mul(size_of::<T>()) and handle Layout errors by returning a Result or calling a cold capacity_overflow() abort like std's RawVec; add a compile-time (const) assertion that ALIGN is a power of two.
-- [ ] `crates/oxiblas-core/src/memory/arena.rs:98` — **Arena::reset/restore take &self while alloc hands out &mut slices — aliasing UB reachable from safe code** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/arena.rs:98` — **Arena::reset/restore take &self while alloc hands out &mut slices — aliasing UB reachable from safe code** _(bug, easy)_
   - Fix: Make reset() and restore() take &mut self (this forces all outstanding &self-borrowed slices to be dead), or brand allocations with an invariant lifetime token consumed by reset. Update the doc example accordingly.
-- [ ] `crates/oxiblas-core/src/scalar/complex_impl.rs:115` — **Complex32::powi returns ~1.0 for every negative exponent** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/complex_impl.rs:115` — **Complex32::powi returns ~1.0 for every negative exponent** _(bug, easy)_
   - Fix: Mirror the Complex64 implementation: `if n >= 0 { self.powu(n as u32) } else { self.recip().powu(n.unsigned_abs()) }`.
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:388` — **Safe SimdRegister methods execute AVX2/FMA/AVX-512 instructions with no feature guarantee (unsound safe API)** _(bug, medium)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:388` — **Safe SimdRegister methods execute AVX2/FMA/AVX-512 instructions with no feature guarantee (unsound safe API)** _(bug, medium)_
   - Fix: Make construction of feature-gated register types unsafe (unsafe fn zero/splat/new) with a documented safety contract, or gate construction behind a runtime-checked capability token …
 **oxiblas-lapack**
 
@@ -77,11 +77,11 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **oxiblas-matrix**
 
-- [ ] `crates/oxiblas-matrix/src/lazy.rs:128` — **Lazy expression shape checks are debug_assert-only: release builds silently compute truncated wrong results** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/lazy.rs:128` — **Lazy expression shape checks are debug_assert-only: release builds silently compute truncated wrong results** _(bug, easy)_
   - Fix: Replace debug_assert with assert! (or return Result) in add/sub/matmul/ExprFma::new/ExprGemm::new, and assert target.shape() == self.shape() at the top of every eval_into.
-- [ ] `crates/oxiblas-matrix/src/mat_ref.rs:54` — **Safe pub constructors over raw pointers (MatRef::new, MatMut::new, PackedRef/Mut::new, BandedRef/Mut::new) are unsound** _(bug, medium)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:54` — **Safe pub constructors over raw pointers (MatRef::new, MatMut::new, PackedRef/Mut::new, BandedRef/Mut::new) are unsound** _(bug, medium)_
   - Fix: Mark all raw-pointer constructors `pub unsafe fn new(...)` (their Safety docs already exist), add safe alternatives (from_slice with dims/stride validation), and remove the not_unsafe_ptr_arg_deref allow.
-- [ ] `crates/oxiblas-matrix/src/mmap.rs:305` — **MmapMat/MmapMatMut::open never validate file size or row_stride against header dims -> OOB reads/UB from safe code** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mmap.rs:305` — **MmapMat/MmapMatMut::open never validate file size or row_stride against header dims -> OOB reads/UB from safe code** _(bug, easy)_
   - Fix: In both open() paths: after Header::validate, compute expected = HEADER_SIZE + (row_stride as usize).checked_mul(ncols)?.checked_mul(size_of::<T>())? and return MmapError::InvalidDimensions if mmap.len() < expected or row_stride < nrows;
 
 **oxiblas-ndarray**
@@ -118,31 +118,31 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [ ] `.github/workflows.disabled/ci.yml:1` — **CI is entirely disabled — the whole workflows directory is renamed .disabled, so no automated validation runs** _(release, easy)_
   - Fix: Rename `.github/workflows.disabled/` back to `.github/workflows/` (after fixing the branch-trigger bug below), or explicitly document that CI is intentionally disabled and remove/adjust README-internal.md.
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:1065` — **beta==0 not special-cased: NaN/Inf in uninitialized C propagates (violates BLAS 'C need not be set when beta=0' contract)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:1065` — **beta==0 not special-cased: NaN/Inf in uninitialized C propagates (violates BLAS 'C need not be set when beta=0' contract)** _(bug, easy)_
   - Fix: Replace `*cp *= beta` with `if beta == 0 { *cp = <zero> } else { *cp *= beta }` in the beta-scaling loops of zgemm/cgemm/gemm-fallback and gemv (and confirm the level3::gemm fast path already zeroes on beta==0).
-- [ ] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:77` — **Kernel shape/dispatch mismatch: AVX2-without-FMA CPUs get garbage GEMM results** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:77` — **Kernel shape/dispatch mismatch: AVX2-without-FMA CPUs get garbage GEMM results** _(bug, easy)_
   - Fix: Make shape selection match dispatch exactly: in micro_kernel_shape(), require `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` before returning the 8x6/8x8 shapes, falling through to the 4x2/4x4 SSE shapes otherwise.
-- [ ] `crates/oxiblas-blas/src/level3/gemm_packing.rs:254` — **pack_a_contiguous produces wrong packed layout and uses wrong contiguity test** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:254` — **pack_a_contiguous produces wrong packed layout and uses wrong contiguity test** _(bug, easy)_
   - Fix: Either delete pack_a_contiguous (nothing uses it), or fix it: correct the check to `row_stride == a.nrows()` and only take the memcpy fast path when nrows == mr (single panel); otherwise always delegate to pack_a_optimized.
-- [ ] `crates/oxiblas-blas/src/level3/herk.rs:177` — **beta==0 still reads C (NaN/garbage propagation) in herk/her2k/syr2k via-GEMM and symm/hemm naive paths** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/herk.rs:177` — **beta==0 still reads C (NaN/garbage propagation) in herk/her2k/syr2k via-GEMM and symm/hemm naive paths** _(bug, easy)_
   - Fix: Add the beta==0 branch at each listed site, mirroring syrk_via_gemm: `let val = if beta == T::zero() { temp[(i,j)] } else { temp[(i,j)] + beta * c[(i,j)] };` (and for symm/hemm: skip the beta*c term when beta==0).
-- [ ] `crates/oxiblas-core/src/memory/arena.rs:126` — **Arena::alloc/try_alloc unchecked size arithmetic: overflow wraps and defeats the capacity check (OOB from safe code)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/arena.rs:126` — **Arena::alloc/try_alloc unchecked size arithmetic: overflow wraps and defeats the capacity check (OOB from safe code)** _(bug, easy)_
   - Fix: Use count.checked_mul(size_of::<T>()) and checked_add for the offset; panic/return None on overflow in both Arena (alloc, try_alloc) and MemStack::alloc.
-- [ ] `crates/oxiblas-core/src/memory/numa.rs:337` — **mbind syscall number hardcoded to x86_64 value (237) but compiled on all Linux architectures** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/numa.rs:337` — **mbind syscall number hardcoded to x86_64 value (237) but compiled on all Linux architectures** _(bug, easy)_
   - Fix: Use libc::SYS_mbind (arch-correct constant provided by the libc crate) instead of a hardcoded 237, or gate apply_linux_numa_policy on all(target_os = "linux", target_arch = "x86_64").
-- [ ] `crates/oxiblas-core/src/memory/numa.rs:358` — **NUMA binding silently never applies: mbind on non-page-aligned addresses and full-mask interleave both EINVAL, errors discarded** _(fabrication, medium)_
+- [x] `crates/oxiblas-core/src/memory/numa.rs:358` — **NUMA binding silently never applies: mbind on non-page-aligned addresses and full-mask interleave both EINVAL, errors discarded** _(fabrication, medium)_
   - Fix: Allocate page-aligned regions (Layout align = page size, or mmap) before calling mbind, round addr/len to page boundaries, restrict the interleave mask to online nodes (parse /sys/devices/system/node), and at minimum log/propagate mbind failure instead of …
-- [ ] `crates/oxiblas-core/src/parallel.rs:701` — **oxiblas-core fails to compile under no_std: OxiblasThreadConfig leaks std unconditionally** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/parallel.rs:701` — **oxiblas-core fails to compile under no_std: OxiblasThreadConfig leaks std unconditionally** _(bug, easy)_
   - Fix: Gate the std-dependent parts: either put `#[cfg(feature="std")]` on `OxiblasThreadConfig`/its impl (it is only used by build_pool which is already parallel/std-gated), or make it no_std-safe by `use alloc::string::String;` for the field/setter and gating only …
-- [ ] `crates/oxiblas-core/src/parallel.rs:732` — **no_std build is broken: OxiblasThreadConfig uses std::thread and unimported String without cfg gates** _(release, easy)_
+- [x] `crates/oxiblas-core/src/parallel.rs:732` — **no_std build is broken: OxiblasThreadConfig uses std::thread and unimported String without cfg gates** _(release, easy)_
   - Fix: Gate OxiblasThreadConfig (and its lib.rs/prelude re-exports) behind #[cfg(feature = "std")], or import alloc::string::String and cfg-gate only effective_threads; add a no_std check target (e.g. thumbv7em or --no-default-features build) to CI.
-- [ ] `crates/oxiblas-core/src/parallel.rs:809` — **set_global_thread_pool stores a pool that is never used to execute anything** _(fabrication, hard)_
+- [x] `crates/oxiblas-core/src/parallel.rs:809` — **set_global_thread_pool stores a pool that is never used to execute anything** _(fabrication, hard)_
   - Fix: Either route Par::Rayon execution through the registered pool (extend AnyPool with install/join/for_each and have for_each_range/map_reduce check GLOBAL_POOL first), or remove set_global_thread_pool/global_num_threads and direct users to …
-- [ ] `crates/oxiblas-core/src/simd/aarch64.rs:115` — **Safe extract()/insert() reach unreachable_unchecked() on out-of-range index in release builds (UB from safe code)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:115` — **Safe extract()/insert() reach unreachable_unchecked() on out-of-range index in release builds (UB from safe code)** _(bug, easy)_
   - Fix: Replace `_ => core::hint::unreachable_unchecked()` with a real `assert!(index < LANES)` (or return a Result / clamp), or make extract/insert unsafe fns in the SimdRegister trait with a documented index precondition.
-- [ ] `crates/oxiblas-core/src/simd/dispatch.rs:112` — **force-scalar / max-simd-128 / max-simd-256 features are silently ignored by the entire dispatch layer** _(fabrication, easy)_
+- [x] `crates/oxiblas-core/src/simd/dispatch.rs:112` — **force-scalar / max-simd-128 / max-simd-256 features are silently ignored by the entire dispatch layer** _(fabrication, easy)_
   - Fix: Apply the same feature gating in SimdCapabilities::compute() (and multiver's from_legacy): under force-scalar return an all-false capability set; under max-simd-128/256 mask has_avx2/has_avx512* and clamp vector_width_bytes.
-- [ ] `crates/oxiblas-matrix/src/mat_ref.rs:103` — **Legal empty boundary submatrices panic in debug builds via ptr_at debug_assert** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:103` — **Legal empty boundary submatrices panic in debug builds via ptr_at debug_assert** _(bug, easy)_
   - Fix: In submatrix, compute the pointer only when nrows>0 && ncols>0 (else reuse self.ptr), or relax ptr_at to allow one-past-the-end offsets for empty views (row <= nrows etc.) and guard the ptr.add with an emptiness check.
 
 ### P2b — Verified LOW
@@ -155,21 +155,21 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **bug** (34)
 
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:678` — **No parameter validation: negative k / undersized lda-ldb-ldc / null pointers cause OOB instead of an error** _(bug, medium)_
-- [ ] `crates/oxiblas-blas/src/level1/nrm2.rs:45` — **Scalar nrm2 silently swallows NaN (abs_xi > 0 test), inconsistent with SIMD path and with reference BLAS** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level1/nrm2.rs:515` — **SIMD nrm2 (AVX2 and NEON two-pass) returns NaN for vectors containing Infinity** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level2/hemv.rs:135` — **hemv/hbmv/hpmv use the complex diagonal as-is instead of its real part (reference BLAS ignores diagonal imaginary parts)** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/syrk.rs:103` — **syrk/syr2k silently accept Trans::ConjTrans and compute the unconjugated Trans operation** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/memory/arena.rs:123` — **Arena::alloc and MemStack::alloc can return misaligned slices for types with align_of > buffer ALIGN** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/memory/numa.rs:264` — **numa_alloc / NumaVec call std::alloc::alloc with a possibly zero-size layout (UB for ZSTs)** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/batch.rs:144` — **iamax_batch: last-index tie-breaking and NaN treated as Equal diverge from BLAS IxAMAX semantics** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/extended.rs:330` — **Rem for QuadFloat implements floored modulo, diverging from Rust % (truncated) semantics** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/extended.rs:438` — **QuadFloat floor/ceil/round/trunc/fract operate on the hi f64 component only — wrong results at quad precision** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/extended.rs:547` — **QuadFloat hypot overflows (violating the Real::hypot no-overflow contract) and cbrt returns NaN for negative inputs** _(bug, medium)_
-- [ ] `crates/oxiblas-core/src/simd/aarch64.rs:667` — **LANES_512 constant contradicts the actual Simd512 register width on aarch64 and wasm32 (latent OOB/stride trap)** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/simd/aarch64.rs:722` — **AArch64 SVE kernels are gated only on target_feature="sve" and cannot build on the stable toolchain** _(bug, hard)_
-- [ ] `crates/oxiblas-core/src/simd/aarch64.rs:1091` — **sve_dot_f64/f32 tail reduction reads unspecified inactive lanes (_x-predicated FMLA then full-predicate reduce)** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/simd/multiver.rs:356` — **multiver duplicates dispatch.rs types with divergent semantics; its dispatch() and KernelSelector silently drop the SSE4.2 tier** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:678` — **No parameter validation: negative k / undersized lda-ldb-ldc / null pointers cause OOB instead of an error** _(bug, medium)_
+- [x] `crates/oxiblas-blas/src/level1/nrm2.rs:45` — **Scalar nrm2 silently swallows NaN (abs_xi > 0 test), inconsistent with SIMD path and with reference BLAS** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level1/nrm2.rs:515` — **SIMD nrm2 (AVX2 and NEON two-pass) returns NaN for vectors containing Infinity** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level2/hemv.rs:135` — **hemv/hbmv/hpmv use the complex diagonal as-is instead of its real part (reference BLAS ignores diagonal imaginary parts)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/syrk.rs:103` — **syrk/syr2k silently accept Trans::ConjTrans and compute the unconjugated Trans operation** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/arena.rs:123` — **Arena::alloc and MemStack::alloc can return misaligned slices for types with align_of > buffer ALIGN** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/numa.rs:264` — **numa_alloc / NumaVec call std::alloc::alloc with a possibly zero-size layout (UB for ZSTs)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/batch.rs:144` — **iamax_batch: last-index tie-breaking and NaN treated as Equal diverge from BLAS IxAMAX semantics** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/extended.rs:330` — **Rem for QuadFloat implements floored modulo, diverging from Rust % (truncated) semantics** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/extended.rs:438` — **QuadFloat floor/ceil/round/trunc/fract operate on the hi f64 component only — wrong results at quad precision** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/extended.rs:547` — **QuadFloat hypot overflows (violating the Real::hypot no-overflow contract) and cbrt returns NaN for negative inputs** _(bug, medium)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:667` — **LANES_512 constant contradicts the actual Simd512 register width on aarch64 and wasm32 (latent OOB/stride trap)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:722` — **AArch64 SVE kernels are gated only on target_feature="sve" and cannot build on the stable toolchain** _(bug, hard)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:1091` — **sve_dot_f64/f32 tail reduction reads unspecified inactive lanes (_x-predicated FMLA then full-predicate reduce)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/simd/multiver.rs:356` — **multiver duplicates dispatch.rs types with divergent semantics; its dispatch() and KernelSelector silently drop the SSE4.2 tier** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/evd/general.rs:167` — **GeneralEvd never reports non-convergence (dead NotConverged variant)** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:157` — **Absolute singularity/positive-definiteness tolerance (eps*n) falsely rejects well-conditioned small-magnitude matrices across all LU and Cholesky variants** _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/qr/col_pivot.rs:181` — **QrPivot reports rank 1 for a zero matrix due to `j > 0` guard** _(bug, easy)_
@@ -178,9 +178,9 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:200` — **QrSvd bidiagonal QR silently returns garbage on non-convergence; NotConverged{num_unconverged} is dead** _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/condition.rs:289` — **rcond_estimate advertises LAPACK/Hager-Higham but omits the transpose solves, can overestimate rcond** _(bug, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/matfun/functions.rs:1135` — **solve_sylvester_same builds I⊗A + A⊗I instead of I⊗A + A^T⊗I; frechet_sqrtm wrong for non-symmetric A** _(bug, medium)_
-- [ ] `crates/oxiblas-matrix/src/mat.rs:75` — **Unchecked allocation-size arithmetic (row_stride*ncols, n*(n+1)/2, ldab*ncols) can wrap in release, producing under-sized buffers behind raw-pointer views** _(bug, easy)_
-- [ ] `crates/oxiblas-matrix/src/mat.rs:245` — **Mat::col_stride() contradicts its own doc and duplicates row_stride(); stride naming is inverted crate-wide** _(bug, easy)_
-- [ ] `crates/oxiblas-matrix/src/mat_ref.rs:140` — **submatrix bounds check `row_start + nrows <= self.nrows` can wrap in release, yielding views with huge dims -> OOB via safe Index** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mat.rs:75` — **Unchecked allocation-size arithmetic (row_stride*ncols, n*(n+1)/2, ldab*ncols) can wrap in release, producing under-sized buffers behind raw-pointer views** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mat.rs:245` — **Mat::col_stride() contradicts its own doc and duplicates row_stride(); stride naming is inverted crate-wide** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:140` — **submatrix bounds check `row_start + nrows <= self.nrows` can wrap in release, yielding views with huge dims -> OOB via safe Index** _(bug, easy)_
 - [ ] `crates/oxiblas-ndarray/src/lapack.rs:1085` — **Tridiagonal solvers compute n-1 on usize before checking n==0, panicking (subtract overflow) on empty input in debug builds** _(bug, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1459` — **Non-symmetric generalized eigen (hessenberg_qr) silently drops all imaginary parts** _(bug, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/iterative/minres.rs:248` — **pminres returns a spurious 'Preconditioner not positive definite' error when the initial residual is zero** _(bug, easy)_
@@ -192,19 +192,19 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **fabrication** (23)
 
-- [ ] `crates/oxiblas-blas/src/cblas/basic.rs:124` — **dnrm2/snrm2 strided fallback silently drops the advertised 'Blue's algorithm' and uses overflow-prone naive sum-of-squares** _(fabrication, medium)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:111` — **SIMD-control features (force-scalar / max-simd-128 / max-simd-256) are advertised but ignored by the actual BLAS kernels** _(fabrication, medium)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_packing.rs:371` — **pack_a_simd_* SIMD paths are dead code: guard `row_stride == 1` is never true** _(fabrication, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_winograd.rs:246` — **Blocked Winograd recomputes row/column factors per output element, negating the algorithm's claimed savings** _(fabrication, medium)_
-- [ ] `crates/oxiblas-core/src/parallel.rs:49` — **Par::RayonWith(n) does not run on n threads** _(fabrication, medium)_
-- [ ] `crates/oxiblas-core/src/parallel.rs:607` — **PoolScope::for_each_range 'parallel' branch runs sequentially on the caller thread** _(fabrication, easy)_
-- [ ] `crates/oxiblas-core/src/simd/dispatch.rs:266` — **SVE support is advertised but structurally unreachable (dead branch, compile-time-only detection, hardcoded false)** _(fabrication, easy)_
-- [ ] `crates/oxiblas-core/src/simd/dispatch.rs:607` — **Orphaned oxiblas-core::simd dispatch/KernelSelector layer is advertised but never drives GEMM** _(fabrication, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:124` — **dnrm2/snrm2 strided fallback silently drops the advertised 'Blue's algorithm' and uses overflow-prone naive sum-of-squares** _(fabrication, medium)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:111` — **SIMD-control features (force-scalar / max-simd-128 / max-simd-256) are advertised but ignored by the actual BLAS kernels** _(fabrication, medium)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:371` — **pack_a_simd_* SIMD paths are dead code: guard `row_stride == 1` is never true** _(fabrication, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_winograd.rs:246` — **Blocked Winograd recomputes row/column factors per output element, negating the algorithm's claimed savings** _(fabrication, medium)_
+- [x] `crates/oxiblas-core/src/parallel.rs:49` — **Par::RayonWith(n) does not run on n threads** _(fabrication, medium)_
+- [x] `crates/oxiblas-core/src/parallel.rs:607` — **PoolScope::for_each_range 'parallel' branch runs sequentially on the caller thread** _(fabrication, easy)_
+- [x] `crates/oxiblas-core/src/simd/dispatch.rs:266` — **SVE support is advertised but structurally unreachable (dead branch, compile-time-only detection, hardcoded false)** _(fabrication, easy)_
+- [x] `crates/oxiblas-core/src/simd/dispatch.rs:607` — **Orphaned oxiblas-core::simd dispatch/KernelSelector layer is advertised but never drives GEMM** _(fabrication, medium)_
 - [ ] `crates/oxiblas-lapack/src/info.rs:671` — **LuInfo pivot_growth and rcond_estimate are fabricated/mislabeled diagnostics** _(fabrication, medium)_
 - [ ] `crates/oxiblas-lapack/src/lu/full_piv.rs:150` — **LuFullPiv::rank() is fabricated: hardcoded to n, never computed** _(fabrication, medium)_
 - [ ] `crates/oxiblas-lapack/src/solve/expert_cholesky.rs:262` — **Expert Cholesky/symmetric rcond estimator only samples first 5 columns, silently misreports conditioning** _(fabrication, medium)_
-- [ ] `crates/oxiblas-matrix/src/banded.rs:297` — **BandedMat::get_band returns raw interleaved storage, not the requested diagonal, and can underflow** _(fabrication, easy)_
-- [ ] `crates/oxiblas-matrix/src/lazy.rs:44` — **Lazy-evaluation module advertises fusion and 'no intermediate allocations' but every node allocates a full temporary** _(fabrication, hard)_
+- [x] `crates/oxiblas-matrix/src/banded.rs:297` — **BandedMat::get_band returns raw interleaved storage, not the requested diagonal, and can underflow** _(fabrication, easy)_
+- [x] `crates/oxiblas-matrix/src/lazy.rs:44` — **Lazy-evaluation module advertises fusion and 'no intermediate allocations' but every node allocates a full temporary** _(fabrication, hard)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/arnoldi.rs:173` — **Arnoldi reports converged=true whenever the Krylov space filled, with no residual and no eigenpair validation** _(fabrication, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:741` — **GeneralizedEigenResult.residual_norms are transformed-operator residuals, not the documented ||A x - lambda B x||** _(fabrication, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/lanczos.rs:549` — **WhichEigenvalues::NearTarget silently falls back to SmallestMagnitude with no target parameter** _(fabrication, medium)_
@@ -218,58 +218,58 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **missing-feature** (13)
 
-- [ ] `crates/oxiblas-blas/src/accuracy.rs:8` — **accuracy module advertises backward-error analysis it never implements** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-blas/src/cblas/mod.rs:1` — **CBLAS layer claims spec/BLAS-TESTER compatibility but omits most of the CBLAS surface (all Hermitian L3, complex L1/L2, real L2 beyond gemv)** _(missing-feature, hard)_
-- [ ] `crates/oxiblas-blas/src/complex_interleaved.rs:686` — **nrm2_interleaved_f64 uses naive re^2+im^2 summation with no overflow/underflow scaling** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-blas/src/level1/asum.rs:22` — **Missing complex Level-1 routines: dzasum/scasum, complex rotg (crotg/zrotg), complex rot (zdrot)** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-blas/src/level1/mod.rs:40` — **No strided-vector (incx/incy) support anywhere in Level 1/2 — negative/zero-increment BLAS semantics unimplementable** _(missing-feature, hard)_
-- [ ] `crates/oxiblas-blas/src/level2/trsv.rs:90` — **trsv lacks ConjTrans (A^H solve) and unit-diagonal support; TriangularSide enum is dead code with wrong docs** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-blas/src/level3/batched.rs:113` — **Batched GEMM Transpose enum lacks ConjTrans — complex batched A^H*B is inexpressible** _(missing-feature, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm.rs:285` — **Level-3 GEMM has no transpose parameters; every consumer materializes full transposed/expanded copies** _(missing-feature, hard)_
+- [x] `crates/oxiblas-blas/src/accuracy.rs:8` — **accuracy module advertises backward-error analysis it never implements** _(missing-feature, medium)_
+- [x] `crates/oxiblas-blas/src/cblas/mod.rs:1` — **CBLAS layer claims spec/BLAS-TESTER compatibility but omits most of the CBLAS surface (all Hermitian L3, complex L1/L2, real L2 beyond gemv)** _(missing-feature, hard)_
+- [x] `crates/oxiblas-blas/src/complex_interleaved.rs:686` — **nrm2_interleaved_f64 uses naive re^2+im^2 summation with no overflow/underflow scaling** _(missing-feature, medium)_
+- [x] `crates/oxiblas-blas/src/level1/asum.rs:22` — **Missing complex Level-1 routines: dzasum/scasum, complex rotg (crotg/zrotg), complex rot (zdrot)** _(missing-feature, medium)_
+- [x] `crates/oxiblas-blas/src/level1/mod.rs:40` — **No strided-vector (incx/incy) support anywhere in Level 1/2 — negative/zero-increment BLAS semantics unimplementable** _(missing-feature, hard)_
+- [x] `crates/oxiblas-blas/src/level2/trsv.rs:90` — **trsv lacks ConjTrans (A^H solve) and unit-diagonal support; TriangularSide enum is dead code with wrong docs** _(missing-feature, medium)_
+- [x] `crates/oxiblas-blas/src/level3/batched.rs:113` — **Batched GEMM Transpose enum lacks ConjTrans — complex batched A^H*B is inexpressible** _(missing-feature, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm.rs:285` — **Level-3 GEMM has no transpose parameters; every consumer materializes full transposed/expanded copies** _(missing-feature, hard)_
 - [ ] `crates/oxiblas-core/src/simd/complex.rs:660` — **Complex SIMD exists only for aarch64; x86_64 silently gets scalar despite 256-bit claims in module docs** _(missing-feature, medium)_
 - [ ] `crates/oxiblas-lapack/src/qr/lq.rs:81` — **No complex support for LQ/RQ/QL/pivoted QR/COD, and no orglq/ormlq-family helpers** _(missing-feature, hard)_
-- [ ] `crates/oxiblas-matrix/src/mat.rs:446` — **Custom-allocator Mat<T, A> is advertised but unusable: no accessors, indexing, or views outside Global** _(missing-feature, medium)_
-- [ ] `crates/oxiblas-matrix/src/mat_ref.rs:340` — **TransposeRef is a dead-end type and MatRef cannot represent strided/transposed data at all** _(missing-feature, hard)_
+- [x] `crates/oxiblas-matrix/src/mat.rs:446` — **Custom-allocator Mat<T, A> is advertised but unusable: no accessors, indexing, or views outside Global** _(missing-feature, medium)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:340` — **TransposeRef is a dead-end type and MatRef cannot represent strided/transposed data at all** _(missing-feature, hard)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1113` — **arnoldi_generalized performs a single Arnoldi pass with no implicit restart** _(missing-feature, hard)_
 
 **stub** (7)
 
 - [ ] `Cargo.toml:31` — **Orphaned oxiblas-ffi crate (37,260 lines, 302 dead tests) sits in the tree but is excluded from the workspace** _(stub, medium)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_packing.rs:284` — **pack_b_streaming is a stub: advertised non-temporal streaming stores do not exist (AVX-512 TODO)** _(stub, medium)_
-- [ ] `crates/oxiblas-core/src/memory/arena.rs:403` — **BlasArenaConfig.auto_grow/max_capacity are dead knobs; arena APIs unused by any BLAS code despite umbrella-crate claims** _(stub, medium)_
-- [ ] `crates/oxiblas-core/src/simd.rs:27` — **Entire ~7,000-line SIMD abstraction layer is orphaned — no BLAS/LAPACK kernel uses it** _(stub, hard)_
-- [ ] `crates/oxiblas-core/src/tuning.rs:228` — **AutoTuner runs no benchmarks and tune_gemm poisons the global TuningCache** _(stub, medium)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:284` — **pack_b_streaming is a stub: advertised non-temporal streaming stores do not exist (AVX-512 TODO)** _(stub, medium)_
+- [x] `crates/oxiblas-core/src/memory/arena.rs:403` — **BlasArenaConfig.auto_grow/max_capacity are dead knobs; arena APIs unused by any BLAS code despite umbrella-crate claims** _(stub, medium)_
+- [x] `crates/oxiblas-core/src/simd.rs:27` — **Entire ~7,000-line SIMD abstraction layer is orphaned — no BLAS/LAPACK kernel uses it** _(stub, hard)_
+- [x] `crates/oxiblas-core/src/tuning.rs:228` — **AutoTuner runs no benchmarks and tune_gemm poisons the global TuningCache** _(stub, medium)_
 - [ ] `crates/oxiblas-ffi/Cargo.toml:4` — **Retired oxiblas-ffi crate (37k LOC) is orphaned: excluded from members but not in workspace.exclude, so it cannot build standalone and rots untested** _(stub, medium)_
 - [ ] `examples/basic_blas.rs:5` — **Orphaned root examples/ directory contains 4 broken example files referencing APIs/modules that no longer exist** _(stub, easy)_
 
 **policy** (6)
 
-- [ ] `crates/oxiblas-blas/src/accuracy.rs:47` — **Reachable assert!/assert_eq! panics across the public accuracy API (no-panic policy)** _(policy, medium)_
-- [ ] `crates/oxiblas-blas/src/complex_interleaved.rs:432` — **Reachable assert!/assert_eq! panics across the public interleaved-complex API (no-panic policy)** _(policy, medium)_
+- [x] `crates/oxiblas-blas/src/accuracy.rs:47` — **Reachable assert!/assert_eq! panics across the public accuracy API (no-panic policy)** _(policy, medium)_
+- [x] `crates/oxiblas-blas/src/complex_interleaved.rs:432` — **Reachable assert!/assert_eq! panics across the public interleaved-complex API (no-panic policy)** _(policy, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/norms.rs:207` — **Public trace() panics on non-square input (reachable panic in production API)** _(policy, easy)_
-- [ ] `crates/oxiblas-matrix/src/packed.rs:201` — **expect() calls in production API paths violate the zero-unwrap/expect policy** _(policy, easy)_
+- [x] `crates/oxiblas-matrix/src/packed.rs:201` — **expect() calls in production API paths violate the zero-unwrap/expect policy** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/precond/amg.rs:515` — **expect() in production constructor paths in AMG and SAMG (no-unwrap/expect policy)** _(policy, easy)_
 - [ ] `crates/oxiblas/src/auto.rs:403` — **auto_svd_f64/f32 and auto_eigenvalues_f64 call .expect() on decomposition Results, panicking on inputs users will hit (NaN, non-convergence)** _(policy, medium)_
 
 **release** (3)
 
 - [ ] `.github/workflows.disabled/release.yml:84` — **Release workflow still publishes retired oxiblas-ffi, which is not a workspace member and will fail cargo publish** _(release, easy)_
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:1433` — **no_std x86_64 build broken: is_x86_feature_detected! used unconditionally** _(release, easy)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:1433` — **no_std x86_64 build broken: is_x86_feature_detected! used unconditionally** _(release, easy)_
 - [ ] `crates/oxiblas/Cargo.toml:1` — **No [package.metadata.docs.rs] on any publishable crate — docs.rs will build with default features only, hiding f16/f128/sparse/ndarray/serde/mmap/nalgebra APIs** _(release, easy)_
 
 **performance** (4)
 
-- [ ] `crates/oxiblas-blas/src/level3/strassen.rs:134` — **Strassen pads all dims to next power of two of the max dim — up to ~8x more FLOPs and huge allocations** _(performance, medium)_
+- [x] `crates/oxiblas-blas/src/level3/strassen.rs:134` — **Strassen pads all dims to next power of two of the max dim — up to ~8x more FLOPs and huge allocations** _(performance, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/matfun/functions.rs:752` — **logm truncates log(I+X) at 8 Taylor terms with ||X|| up to 0.5, giving ~2e-4 error (sub-production accuracy)** _(performance, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/lobpcg.rs:415` — **LOBPCG search-direction block P grows unboundedly, defeating the fixed 3-block design** _(performance, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:825` — **permute_symmetric_csc scans all n columns per output column (≈O(n²)/O(n³)), defeating sparsity** _(performance, medium)_
 
 **test-gap** (4)
 
-- [ ] `crates/oxiblas-blas/src/level3/gemm.rs:923` — **Blocked and parallel gemm() paths validated only with constant-filled matrices** _(test-gap, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm.rs:923` — **Blocked and parallel gemm() paths validated only with constant-filled matrices** _(test-gap, easy)_
 - [ ] `crates/oxiblas-lapack/src/lu/band.rs:966` — **Systematic test gap: every test matrix avoids the code paths that are broken** _(test-gap, medium)_
 - [ ] `crates/oxiblas-lapack/tests/lapack_compat.rs:1` — **No NaN/Inf-propagation or extreme-magnitude adversarial tests in LAPACK/solver integration suites** _(test-gap, medium)_
-- [ ] `crates/oxiblas-matrix/tests/property_tests.rs:1` — **"Property-based tests" cover only storage/structural invariants, no numerical-kernel algebra** _(test-gap, medium)_
+- [x] `crates/oxiblas-matrix/tests/property_tests.rs:1` — **"Property-based tests" cover only storage/structural invariants, no numerical-kernel algebra** _(test-gap, medium)_
 
 **docs** (4)
 
@@ -283,22 +283,22 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **bug** (19)
 
-- [ ] `crates/oxiblas-blas/src/accuracy.rs:228` — **gemv_reference_f64/gemm_reference_f64 scale output by beta unconditionally, propagating NaN when beta=0** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/cblas/triangular_symmetric.rs:122` — **Internal Result silently discarded in trsm/trmm/syrk/syr2k/symm wrappers -> partial/no-op result on internal error** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level1/iamax.rs:33` — **iamax for complex uses modulus |z| instead of BLAS-standard |re|+|im| (cabs1)** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level2/gemv.rs:1011` — **Public gemv_add_inplace takes redundant m/n parameters and performs no dimension validation** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm.rs:216` — **GemmBlocking::custom with mc<mr, nc<nr, or kc=0 yields zero block sizes and panics in gemm** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_cache_oblivious.rs:204` — **gemm_cache_oblivious_with_threshold(threshold=0) recurses infinitely (stack overflow); base case is scalar-only** _(bug, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:1513` — **Complex and scalar-fallback GEMM microkernels ignore beta==0 'C not referenced' semantics** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/blocking.rs:92` — **trsm_block_size and factorization_panel_width return blocks larger than the matrix for small n** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/memory/numa.rs:374` — **get_page_size casts sysconf(-1) failure to a huge usize** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/traits.rs:109` — **Real::signum behavior inconsistent across implementations (and doc wrong for f32/f64)** _(bug, easy)_
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:129` — **F64x2Sse/F32x4Sse reduce_sum uses SSE3 haddpd/haddps but the 128-bit tier is granted on bare SSE2** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/accuracy.rs:228` — **gemv_reference_f64/gemm_reference_f64 scale output by beta unconditionally, propagating NaN when beta=0** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/triangular_symmetric.rs:122` — **Internal Result silently discarded in trsm/trmm/syrk/syr2k/symm wrappers -> partial/no-op result on internal error** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level1/iamax.rs:33` — **iamax for complex uses modulus |z| instead of BLAS-standard |re|+|im| (cabs1)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level2/gemv.rs:1011` — **Public gemv_add_inplace takes redundant m/n parameters and performs no dimension validation** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm.rs:216` — **GemmBlocking::custom with mc<mr, nc<nr, or kc=0 yields zero block sizes and panics in gemm** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_cache_oblivious.rs:204` — **gemm_cache_oblivious_with_threshold(threshold=0) recurses infinitely (stack overflow); base case is scalar-only** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:1513` — **Complex and scalar-fallback GEMM microkernels ignore beta==0 'C not referenced' semantics** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/blocking.rs:92` — **trsm_block_size and factorization_panel_width return blocks larger than the matrix for small n** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/memory/numa.rs:374` — **get_page_size casts sysconf(-1) failure to a huge usize** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/traits.rs:109` — **Real::signum behavior inconsistent across implementations (and doc wrong for f32/f64)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:129` — **F64x2Sse/F32x4Sse reduce_sum uses SSE3 haddpd/haddps but the 128-bit tier is granted on bare SSE2** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:288` — **Lu::solve contains dead duplicated permutation code with an in-code admission that the first attempt 'doesn't work correctly'** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/qr/householder.rs:239` — **Qr::solve_least_squares silently zeroes solution components on tiny R diagonals and returns EmptyMatrix for dimension mismatch** _(bug, easy)_
 - [ ] `crates/oxiblas-lapack/src/qr/householder.rs:852` — **Householder vector norms computed as sqrt(sum of squares) without scaling: overflow/underflow for extreme magnitudes** _(bug, medium)_
-- [ ] `crates/oxiblas-matrix/src/banded.rs:538` — **SymmetricBandedMat::from_banded hardcodes Upper storage, ignoring the documented upper/lower choice** _(bug, easy)_
-- [ ] `crates/oxiblas-matrix/src/symmetric.rs:744` — **HermitianMat::scale accepts complex alpha despite doc requiring real, silently breaking the Hermitian invariant** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/banded.rs:538` — **SymmetricBandedMat::from_banded hardcodes Upper storage, ignoring the documented upper/lower choice** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/symmetric.rs:744` — **HermitianMat::scale accepts complex alpha despite doc requiring real, silently breaking the Hermitian invariant** _(bug, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/shift_invert.rs:276` — **build_shifted_matrix inserts a missing diagonal at the end of the row, breaking CSR column-sort order** _(bug, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/precond/gauss_seidel.rs:352` — **SSOR omits the omega*(2-omega) scaling factor of the standard SSOR operator** _(bug, easy)_
 - [ ] `crates/oxiblas/src/builder.rs:236` — **MatBuilder::from_fn calls the user closure at (0,0) unconditionally, panicking for empty builders and double-invoking stateful closures** _(bug, easy)_
@@ -309,46 +309,46 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **missing-feature** (3)
 
-- [ ] `crates/oxiblas-blas/src/complex_interleaved.rs:580` — **axpy/scal/nrm2 interleaved kernels ship f64-only while dotc ships both f64 and f32** _(missing-feature, easy)_
-- [ ] `crates/oxiblas-core/src/simd/dispatch.rs:199` — **wasm32 SIMD128 types are invisible to the dispatch layer — wasm always dispatches scalar** _(missing-feature, easy)_
-- [ ] `crates/oxiblas-matrix/src/symmetric.rs:310` — **SymmetricMat::frobenius_norm_squared duplicated verbatim for f32/f64 only; unavailable for complex/generic scalars** _(missing-feature, easy)_
+- [x] `crates/oxiblas-blas/src/complex_interleaved.rs:580` — **axpy/scal/nrm2 interleaved kernels ship f64-only while dotc ships both f64 and f32** _(missing-feature, easy)_
+- [x] `crates/oxiblas-core/src/simd/dispatch.rs:199` — **wasm32 SIMD128 types are invisible to the dispatch layer — wasm always dispatches scalar** _(missing-feature, easy)_
+- [x] `crates/oxiblas-matrix/src/symmetric.rs:310` — **SymmetricMat::frobenius_norm_squared duplicated verbatim for f32/f64 only; unavailable for complex/generic scalars** _(missing-feature, easy)_
 
 **stub** (6)
 
-- [ ] `crates/oxiblas-core/Cargo.toml:31` — **Declared `nightly` feature is dead — referenced nowhere in the code** _(stub, easy)_
+- [x] `crates/oxiblas-core/Cargo.toml:31` — **Declared `nightly` feature is dead — referenced nowhere in the code** _(stub, easy)_
 - [ ] `crates/oxiblas-lapack/src/lu/band.rs:807` — **band_idx_extended is an exact duplicate of band_idx** _(stub, easy)_
 - [ ] `crates/oxiblas-lapack/src/lu/partial_piv.rs:267` — **Dead, self-admitted-broken permutation block left in Lu::solve** _(stub, easy)_
 - [ ] `crates/oxiblas-lapack/src/workspace.rs:173` — **workspace.rs is an orphaned advisory module — no routine in the crate consumes its lwork sizes** _(stub, medium)_
-- [ ] `crates/oxiblas-matrix/src/prefetch.rs:168` — **prefetch module is orphaned, duplicates oxiblas-core, hardcodes CACHE_LINE_SIZE=64 contradicting core's arch-dependent value, and its strided path covers ~1/8 of lines** _(stub, medium)_
+- [x] `crates/oxiblas-matrix/src/prefetch.rs:168` — **prefetch module is orphaned, duplicates oxiblas-core, hardcodes CACHE_LINE_SIZE=64 contradicting core's arch-dependent value, and its strided path covers ~1/8 of lines** _(stub, medium)_
 - [ ] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_
 
 **policy** (10)
 
-- [ ] `crates/oxiblas-core/Cargo.toml:23` — **libc dependency hardcodes version instead of workspace inheritance** _(policy, easy)_
-- [ ] `crates/oxiblas-core/src/parallel.rs:904` — **ThreadLocalAccum::reduce uses .expect(); 'thread-local' accumulators shared for non-pool threads** _(policy, easy)_
-- [ ] `crates/oxiblas-core/src/simd/aarch64.rs:790` — **Unused variable `pred` in SveF64::zero triggers a warning under SVE builds (zero-warnings policy)** _(policy, easy)_
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:156` — **extract()/insert() can panic on out-of-range index in release builds (no-panic policy)** _(policy, easy)_
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:1989` — **Production source files approaching the 2000-line refactor limit** _(policy, medium)_
+- [x] `crates/oxiblas-core/Cargo.toml:23` — **libc dependency hardcodes version instead of workspace inheritance** _(policy, easy)_
+- [x] `crates/oxiblas-core/src/parallel.rs:904` — **ThreadLocalAccum::reduce uses .expect(); 'thread-local' accumulators shared for non-pool threads** _(policy, easy)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:790` — **Unused variable `pred` in SveF64::zero triggers a warning under SVE builds (zero-warnings policy)** _(policy, easy)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:156` — **extract()/insert() can panic on out-of-range index in release builds (no-panic policy)** _(policy, easy)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:1989` — **Production source files approaching the 2000-line refactor limit** _(policy, medium)_
 - [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:379` — **expect() in production API path (condition_number) violates no-unwrap/expect policy** _(policy, easy)_
-- [ ] `crates/oxiblas-matrix/Cargo.toml:26` — **Test/bench tooling deps are hard-pinned instead of workspace-inherited (Workspace Policy)** _(policy, easy)_
+- [x] `crates/oxiblas-matrix/Cargo.toml:26` — **Test/bench tooling deps are hard-pinned instead of workspace-inherited (Workspace Policy)** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/csr.rs:448` — **Index impl panics on structurally-zero elements via expect() (surprising API + no-unwrap policy)** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/utils.rs:139` — **expect()/panic reachable in production matrix-construction and residual paths (zero-expect policy)** _(policy, easy)_
 - [ ] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:529` — **Public solve() methods panic (assert_eq!) on RHS length mismatch instead of returning an error** _(policy, easy)_
 
 **release** (2)
 
-- [ ] `crates/oxiblas-blas/src/level3/XX2vDM7e:1` — **Zero-byte junk file XX2vDM7e committed in level3 source directory** _(release, easy)_
+- [x] `crates/oxiblas-blas/src/level3/XX2vDM7e:1` — **Zero-byte junk file XX2vDM7e committed in level3 source directory** _(release, easy)_
 - [ ] `crates/oxiblas-ffi/Cargo.toml:1` — **Orphaned oxiblas-ffi crate remains in-tree but is excluded from the workspace** _(release, easy)_
 
 **performance** (2)
 
-- [ ] `crates/oxiblas-core/src/simd/x86_64.rs:658` — **Every AVX-512 op crosses a non-inlinable #[target_feature] boundary — one function call per vector instruction** _(performance, medium)_
-- [ ] `crates/oxiblas-matrix/src/cow.rs:133` — **CowMat::from_mat takes Mat by value but deep-copies element-wise instead of moving the buffer** _(performance, easy)_
+- [x] `crates/oxiblas-core/src/simd/x86_64.rs:658` — **Every AVX-512 op crosses a non-inlinable #[target_feature] boundary — one function call per vector instruction** _(performance, medium)_
+- [x] `crates/oxiblas-matrix/src/cow.rs:133` — **CowMat::from_mat takes Mat by value but deep-copies element-wise instead of moving the buffer** _(performance, easy)_
 
 **test-gap** (4)
 
-- [ ] `crates/oxiblas-matrix/tests/blas_compat_tests.rs:280` — **test_gemm_layout_requirements never calls gemm** _(test-gap, easy)_
-- [ ] `crates/oxiblas-matrix/tests/property_tests.rs:99` — **prop_mat_transpose_involutory tests a single transpose, not the involution it names** _(test-gap, easy)_
+- [x] `crates/oxiblas-matrix/tests/blas_compat_tests.rs:280` — **test_gemm_layout_requirements never calls gemm** _(test-gap, easy)_
+- [x] `crates/oxiblas-matrix/tests/property_tests.rs:99` — **prop_mat_transpose_involutory tests a single transpose, not the involution it names** _(test-gap, easy)_
 - [ ] `crates/oxiblas-sparse/tests/memory_usage_tests.rs:3` — **"Memory leak / memory usage" tests do not measure memory and cannot detect leaks** _(test-gap, medium)_
 - [ ] `crates/oxiblas-sparse/tests/suitesparse_matrices.rs:107` — **random_spd_matrix uses an entropy-seeded RNG with no fixed seed (non-reproducible test data)** _(test-gap, easy)_
 
@@ -357,25 +357,97 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [ ] `.github/README-internal.md:8` — **README-internal.md documents CI as active on main/develop while workflows are disabled and the branch is master** _(docs, easy)_
 - [ ] `CHANGELOG.md:270` — **Stale 'Release Checklist' in CHANGELOG references version 0.1.0 and leaves publish-readiness items unchecked** _(docs, easy)_
 - [ ] `README.md:696` — **README Project Status metrics are stale (Version 0.2.1, ~223,935 lines / 371 files) versus actual codebase** _(docs, easy)_
-- [ ] `crates/oxiblas-blas/src/accuracy.rs:26` — **Accuracy-bound doc table contradicts the implemented error-bound functions** _(docs, easy)_
-- [ ] `crates/oxiblas-blas/src/complex_interleaved.rs:357` — **'in-place' conversions allocate full auxiliary buffers, contradicting their doc claim** _(docs, medium)_
-- [ ] `crates/oxiblas-blas/src/level1/scal.rs:28` — **scal(0, x) memsets to zero, scrubbing NaN/Inf, unlike reference DSCAL which multiplies** _(docs, easy)_
-- [ ] `crates/oxiblas-blas/src/level2/gemv.rs:743` — **Trans/ConjTrans gemv paths skip x[i]==0 rows, changing NaN/Inf propagation vs reference DGEMV** _(docs, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/gemm_packing.rs:69` — **Minor dead code and misleading comments in hot paths** _(docs, easy)_
-- [ ] `crates/oxiblas-blas/src/level3/herk.rs:88` — **herk/her2k accept complex alpha/beta without enforcing the real-scalar contract; Hermitian invariants not enforced** _(docs, medium)_
-- [ ] `crates/oxiblas-core/src/scalar/batch.rs:92` — **ScalarBatch claims 'leveraging SIMD where available' but all impls are serial scalar loops; dot_batch has bogus '# Safety' section** _(docs, easy)_
-- [ ] `crates/oxiblas-core/src/scalar/batch.rs:495` — **ExtendedPrecision for f64 provides no extension (Accumulator = f64) even with f128 available** _(docs, medium)_
+- [x] `crates/oxiblas-blas/src/accuracy.rs:26` — **Accuracy-bound doc table contradicts the implemented error-bound functions** _(docs, easy)_
+- [x] `crates/oxiblas-blas/src/complex_interleaved.rs:357` — **'in-place' conversions allocate full auxiliary buffers, contradicting their doc claim** _(docs, medium)_
+- [x] `crates/oxiblas-blas/src/level1/scal.rs:28` — **scal(0, x) memsets to zero, scrubbing NaN/Inf, unlike reference DSCAL which multiplies** _(docs, easy)_
+- [x] `crates/oxiblas-blas/src/level2/gemv.rs:743` — **Trans/ConjTrans gemv paths skip x[i]==0 rows, changing NaN/Inf propagation vs reference DGEMV** _(docs, easy)_
+- [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:69` — **Minor dead code and misleading comments in hot paths** _(docs, easy)_
+- [x] `crates/oxiblas-blas/src/level3/herk.rs:88` — **herk/her2k accept complex alpha/beta without enforcing the real-scalar contract; Hermitian invariants not enforced** _(docs, medium)_
+- [x] `crates/oxiblas-core/src/scalar/batch.rs:92` — **ScalarBatch claims 'leveraging SIMD where available' but all impls are serial scalar loops; dot_batch has bogus '# Safety' section** _(docs, easy)_
+- [x] `crates/oxiblas-core/src/scalar/batch.rs:495` — **ExtendedPrecision for f64 provides no extension (Accumulator = f64) even with f128 available** _(docs, medium)_
 - [ ] `crates/oxiblas-core/src/simd/wasm32.rs:81` — **mul_add is documented as fused but is unfused (double rounding) on WASM and on SSE without compile-time fma** _(docs, easy)_
 - [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs:280` — **Comment claims Wilkinson shift but code uses zero-shift Golub-Kahan** _(docs, easy)_
 - [ ] `crates/oxiblas-lapack/src/utils/equilibrate.rs:147` — **geequ row_cond/col_cond use max/min, inverting LAPACK DGEEQU's ROWCND/COLCND (min/max in [0,1]) convention** _(docs, easy)_
-- [ ] `crates/oxiblas-matrix/src/mat_ref.rs:215` — **col_as_slice / col_as_slice_mut advertise a contiguity check via Option but unconditionally return Some** _(docs, easy)_
-- [ ] `crates/oxiblas-matrix/src/nalgebra_compat.rs:8` — **Module doc promises zero-copy nalgebra views; every conversion copies** _(docs, easy)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:215` — **col_as_slice / col_as_slice_mut advertise a contiguity check via Option but unconditionally return Some** _(docs, easy)_
+- [x] `crates/oxiblas-matrix/src/nalgebra_compat.rs:8` — **Module doc promises zero-copy nalgebra views; every conversion copies** _(docs, easy)_
 - [ ] `crates/oxiblas-sparse/src/graph/functions.rs:24` — **Public-API doctests marked ```ignore are never compiled or verified (64 total across the workspace)** _(docs, medium)_
 - [ ] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:696` — **Misleading algorithm docs: COLAMD forms A^T·A explicitly; 'AMD' is exact O(n²) minimum degree** _(docs, easy)_
 - [ ] `crates/oxiblas-sparse/src/test_matrices.rs:351` — **random_spd doc claims 'A = L*L^T + n*I' but constructs a different matrix** _(docs, easy)_
 - [ ] `crates/oxiblas/Cargo.toml:25` — **Published crates lack docs.rs all-features metadata, hiding feature-gated APIs from docs** _(docs, easy)_
 - [ ] `crates/oxiblas/README.md:132` — **Inconsistent oxiblas-ffi retirement version: crate README says v0.2.1, but CHANGELOG and workspace Cargo.toml say v0.2.0** _(docs, easy)_
 - [ ] `crates/oxiblas/src/lib.rs:434` — **features::NO_STD is derived from the facade's own `default` feature, not from oxiblas-core/std as its name and docs imply** _(docs, easy)_
+- [ ] `crates/oxiblas-core/src/simd/complex.rs:660` — **Complex SIMD exists only for aarch64; x86_64 silently gets scalar despite 256-bit claims in module docs** _(missing-feature, medium)_ — not covered by Iter1 core batch, carry to a core follow-up
+- [ ] `crates/oxiblas-core/src/simd/wasm32.rs:81` — **mul_add is documented as fused but is unfused (double rounding) on WASM and on SSE without compile-time fma** _(docs, easy)_ — not covered by Iter1 core batch, carry to a core follow-up
+
+## Iteration 1 gap-sweep — new findings (added 2026-07-17, orchestrated re-audit)
+
+9 Opus agents (one per crate + workspace-root) hunted for issues beyond the 227 catalogued above, with the existing findings list as a do-not-duplicate filter. 40 new findings confirmed. oxiblas-core's 4 are already fixed (folded into Iter1); the remaining 36 are queued for Iter2-4.
+
+**oxiblas-core (4/4 fixed in Iter1):**
+- [x] `crates/oxiblas-core/src/scalar/batch.rs:204` — iamax_batch last-index tie-break bug also present in f64/Complex32/Complex64 impls (not just f32) _(bug, medium)_
+- [x] `crates/oxiblas-core/src/blocking.rs:108` — factorization_panel_width applies .max(16) after .min(n), same class as trsm_block_size:92 _(bug, medium)_
+- [x] `crates/oxiblas-core/src/scalar/extended.rs:803` — Real-trait floor/ceil/round/trunc for QuadFloat also hi-limb-only (Float-trait counterpart already tracked at :438) _(bug, hard)_ — resolved by the Iter1 extended-precision fix (dd_floor/dd_ceil/dd_round/dd_trunc now shared by both trait impls)
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:688` — SveSupport::is_available() claims runtime detection but is compile-time-only _(stub, low)_
+
+**oxiblas-blas (4, queued for Iter2):**
+- [x] `crates/oxiblas-blas/src/level2/hpmv.rs:175` — HPMV uses full complex diagonal instead of real part (Upper+Lower) _(bug, medium, hard)_
+- [x] `crates/oxiblas-blas/src/level2/hbmv.rs:152` — HBMV same diagonal-realness bug (Upper+Lower) _(bug, medium, hard)_
+- [x] `crates/oxiblas-blas/src/level3/hemm.rs:292` — HEMM copies full complex diagonal of Hermitian A instead of forcing real _(bug, medium, hard)_
+- [x] `crates/oxiblas-blas/src/level3/her2k.rs:198` — HER2K never forces C's diagonal imaginary part to zero, contradicting its own doc _(bug, medium, hard)_
+
+**oxiblas-matrix (3, queued for Iter2):**
+- [x] `crates/oxiblas-matrix/src/symmetric.rs:814` — HermitianMat::to_dense / to_dense_f32(:754) return conj(A) instead of A for Lower-triangular storage _(bug, high, hard)_
+- [x] `crates/oxiblas-matrix/src/mmap.rs:459` — MmapMatMut::open (write path) never validates file size vs header dims — OOB read+write from safe code; also apply same fix to MmapMat::open:305 _(bug, high)_
+- [x] `crates/oxiblas-matrix/src/lazy.rs:97` — Expr::add/sub/ExprFma::new use debug_assert_eq! for shape checks — release builds silently discard RHS overflow _(bug, low)_
+
+**oxiblas-lapack (4, queued for Iter3):**
+- [ ] `crates/oxiblas-lapack/src/evd/mrrr.rs:489` — MrrrEvd advertises real MRRR (O(n^2), no reorthogonalization) but the reachable path is bisection + inverse iteration + O(n^3) Gram-Schmidt; the real twisted-factorization code is dead _(fabrication, high, hard)_
+- [ ] `crates/oxiblas-lapack/src/evd/symmetric_dc.rs:52` — SymmetricEvdDc's D&C merge path is reachable for n>100 but untested/unstable (developers' own comment: "until D&C merge is fixed"); DC_THRESHOLD=100 forces QR fallback below that _(stub, medium, hard)_
+- [ ] `crates/oxiblas-lapack/src/utils/determinant.rs:32` — det() returns Err(Singular) instead of 0.0 for singular matrices, breaking the standard det()==0 singularity idiom _(bug, medium)_
+- [ ] `crates/oxiblas-lapack/src/svd/bidiag_reduce.rs:1374` — unmbr/ungbr are fake complex aliases forwarding to the real ormbr/orgbr (bounded T: Real, cannot even instantiate for complex) _(fabrication, low)_
+
+**oxiblas-ndarray (6, queued for Iter3):**
+- [ ] `crates/oxiblas-ndarray/src/conversions.rs:178` — array2_to_arrayd panics on empty Array2 (indexes arr[[0,0]] as a template) _(bug, medium, hard)_
+- [ ] `crates/oxiblas-ndarray/src/sparse.rs:69` — array2_to_csr/csc(:128) drop nonzeros below machine epsilon (and NaN) instead of exact-zero sparsification _(bug, medium, hard)_
+- [ ] `crates/oxiblas-ndarray/src/conversions.rs:32` — array2_to_mat advertised "zero-copy path" is a full element-copy, same as headline lib.rs doc claim _(fabrication, medium)_
+- [ ] `crates/oxiblas-ndarray/src/lapack.rs:1124` — tridiag_solve_spd_ndarray/tridiag_solve_multiple_ndarray(:1162) compute n-1 before checking n==0 (empty-input panic), same class as already-tracked :1085 _(bug, low, hard)_
+- [ ] `crates/oxiblas-ndarray/src/blas.rs:480` — frobenius_norm and nrm2_c64/c32_ndarray(:165/:176) use naive sum-of-squares, overflow to inf for extreme magnitudes _(bug, low, hard)_
+- [ ] `crates/oxiblas-ndarray/src/conversions.rs:297` — array_view_to_mat_ref and friends cast a possibly-negative column stride to usize unchecked — safe API path to UB _(bug, low, hard)_
+
+**oxiblas-sparse (2, queued for Iter3):**
+- [ ] `crates/oxiblas-sparse/src/ops/functions.rs:441` — spmv_hermitian delegates to spmv_symmetric verbatim (no conjugation) — wrong for complex Hermitian matrices despite its own doc claim _(bug, high, hard)_
+- [ ] `crates/oxiblas-sparse/src/bsr.rs:225` — DenseBlock::frobenius_norm_sq sums val*val instead of |val|^2 (val*conj(val)) — wrong (complex-valued) result for complex T _(bug, low, hard)_
+
+**oxiblas (facade) (6, queued for Iter4):**
+- [ ] `crates/oxiblas/src/auto.rs:476` — auto_svd_f32/f64(DivideConquer branch:412)/auto_eigenvalues_f64 panic via .expect() on non-convergence/NaN/empty input; prior audit only caught :403 _(bug, high)_
+- [ ] `crates/oxiblas/src/auto.rs:284` — is_likely_spd_* only samples a 5x5 corner for symmetry — large non-symmetric matrices can wrongly route to Cholesky and return a silently wrong solve _(bug, medium, hard)_
+- [ ] `crates/oxiblas/README.md:159` — feature-flags table advertises nonexistent `ffi`/`nightly` (:161) Cargo features; `ffi` row also contradicts the "RETIRED" note at :132 _(docs, medium)_
+- [ ] `crates/oxiblas/README.md:112` — "Tensor Operations" example imports `oxiblas::prelude::*` then calls einsum/Tensor3/batched_matmul which the prelude does not re-export _(fabrication, medium)_
+- [ ] `crates/oxiblas/README.md:103` — sparse GMRES example calls gmres() with the wrong signature (missing x0, wrong arg order) _(docs, low)_
+- [ ] `crates/oxiblas/README.md:223` — Performance section presents specific OpenBLAS-ratio benchmark numbers (e.g. "80-172%") with no reproducible backing — reads as fabricated/cherry-picked _(fabrication, low)_
+
+**oxiblas-ffi (6 — decision needed, see below; queued for Iter4):**
+- [ ] `crates/oxiblas-ffi/src/lapack/orthogonal.rs:78` — oblas_s/dorgqr and oblas_z/cungqr(:172/:581/:693) right-multiply instead of left-multiply reflectors — returns an orthogonal but numerically WRONG Q (||QR-A||=10.4 in a verified repro) _(bug, CRITICAL, hard)_
+- [ ] `crates/oxiblas-ffi/src/lapack/factorization.rs:646` — oblas_s/dgeqrf(:708) fabricate tau (writes 1.0 "Placeholder") and never store reflectors — Q cannot be reconstructed _(fabrication, high, hard)_
+- [ ] `crates/oxiblas-ffi/src/lapack/qrpivot.rs:99` — oblas_s/dgeqp3(:181) fabricate tau (writes 0.0) — same class as above _(fabrication, high, hard)_
+- [ ] `crates/oxiblas-ffi/src/lapack/solve/refinement.rs:292` — oblas_s/dporfs(:398) ignore uplo/af/ldaf, always rebuild from the lower triangle and recompute the factorization _(bug, medium, hard)_
+- [ ] `crates/oxiblas-ffi/src/blas1/real.rs:28` — every BLAS-1 routine clamps negative increments to +1 instead of honoring reverse-traversal semantics _(bug, medium, hard)_
+- [ ] `crates/oxiblas-ffi/README.md:261` — claims "80-172% of OpenBLAS performance" while its GEMM is an unblocked naive triple loop _(fabrication, medium)_
+
+**workspace-root (5, queued for Iter4):**
+- [ ] `README.md:648` — Mixed-precision iterative refinement example imports nonexistent `oxiblas_lapack::refine` (real path: `oxiblas_lapack::solve`) _(docs, medium)_
+- [ ] `README.md:662` — Batched BLAS example imports nonexistent `oxiblas_blas::batched` (real path: `oxiblas_blas::level3::batched`) _(docs, medium)_
+- [ ] `.github/workflows.disabled/benchmarks.yml:64` — references a nonexistent `gemm` bench target(also :128); also fix the 3-names-in-one---bench bug at :72 _(release, medium)_
+- [ ] `.github/workflows.disabled/ci.yml:5` — triggers only on main/develop, but the repo's default branch is master (distinct from the "CI disabled" issue at :1) _(release, low)_
+- [ ] `examples/sparse_iterative.rs:1` — root examples/ is entirely orphaned (no owning package, never compiled by CI); same disposition as the already-tracked basic_blas.rs/eigenvalue.rs/lapack_solve.rs _(docs, low)_
+
+### oxiblas-ffi disposition (decision needed)
+
+The retired (`crates/oxiblas-ffi`, 37,260 lines, excluded from workspace members since v0.2.0's "Pure Rust ecosystem" pivot) crate now has **6** known defects including one **CRITICAL** numerically-wrong routine (`orgqr`). Recommendation: since it is unbuilt, untested by CI, and not part of the shipped pure-Rust product, do **not** sink further engineering into fixing 37k lines of dead C-FFI-shaped code — instead add it to `[workspace] exclude` (it currently isn't even there, which is itself tracked at `Cargo.toml:4`/`Cargo.toml:1`) and mark it prominently unmaintained/retired in its own README, rather than silently fixing or silently deleting it. Final call deferred to the user; see Iter4 planning.
+
+### Iteration 1 infrastructure incident (for future iteration authors)
+
+Running 22 Iter1 subagents concurrently against the **same shared git working tree** (no `isolation: 'worktree'`) caused at least one agent to repeatedly `git stash`/reset the tree mid-run (12+ resets between 12:58-13:31 UTC on 2026-07-17), wiping other agents' uncommitted work. ~10 of 13 core fix units' file changes were destroyed this way; recovered via a dangling `git stash` commit (`5828e76c`) plus an orphaned verification worktree, then re-verified clean (build/clippy/nextest/doctests/no_std, 3006 workspace tests passing). **All subsequent iterations must pass `isolation: 'worktree'` to every `agent()` call that edits source files.**
 
 ### Standard pre-release steps for 0.2.2 (not defects; flagged during audit)
 

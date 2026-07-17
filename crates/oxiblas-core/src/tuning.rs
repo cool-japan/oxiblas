@@ -6,6 +6,8 @@
 
 use crate::simd::{SimdLevel, detect_simd_level};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "std")]
+use std::time::{Duration, Instant};
 
 /// Default block size for M dimension in GEMM operations.
 pub const DEFAULT_BLOCK_M: usize = 64;
@@ -198,10 +200,155 @@ impl TuningCache {
     }
 }
 
-/// Micro-benchmark based auto-tuner (simplified version).
+/// Dimension of the fixed, representative square matrices used to time
+/// candidate block-size configurations in [`time_candidate`].
 ///
-/// In a production implementation, this would run actual benchmarks.
-/// For now, it uses heuristics based on architecture and cache sizes.
+/// This is intentionally small and independent of the caller's actual
+/// `(m, n, k)` so that `AutoTuner::tune_gemm` completes in bounded time
+/// regardless of how large the real workload is -- it is a timing *probe*,
+/// not the real computation. `96` keeps the working set (3 matrices of
+/// `96 * 96 * 8` bytes each, ~216 KiB total) close to [`L2_CACHE_SIZE`] so
+/// that different block sizes produce a genuine, measurable difference in
+/// cache behavior.
+#[cfg(feature = "std")]
+const BENCH_DIM: usize = 96;
+
+/// Number of untimed warm-up passes run before timing starts, to prime
+/// caches and pay one-time setup costs outside the measurement window.
+#[cfg(feature = "std")]
+const WARMUP_ITERS: u32 = 1;
+
+/// Number of timed passes per candidate. The minimum observed duration is
+/// kept, which is the standard way to filter out scheduler/OS noise in
+/// short micro-benchmarks.
+#[cfg(feature = "std")]
+const TIMED_ITERS: u32 = 3;
+
+/// Percentage scale factors (relative to the heuristic baseline) used to
+/// generate alternative block-size candidates for `tune_gemm` to measure.
+#[cfg(feature = "std")]
+const CANDIDATE_SCALE_FACTORS_PERCENT: [usize; 4] = [50, 75, 150, 200];
+
+/// Naive cache-blocked triple-loop matrix multiply (`C = A * B`) used only
+/// as a timing probe for the auto-tuner.
+///
+/// It deliberately avoids SIMD/parallelism so the *only* variable between
+/// runs is the block size under test -- this isolates the effect of
+/// blocking on cache behavior, which is exactly what [`time_candidate`]
+/// needs to measure. It is not, and is not meant to be, a production GEMM
+/// kernel (those live in `oxiblas-blas`, which depends on this crate, not
+/// the other way around).
+#[cfg(feature = "std")]
+fn blocked_matmul(a: &[f64], b: &[f64], c: &mut [f64], dim: usize, config: &TuningConfig) {
+    let block_m = config.block_m.clamp(1, dim);
+    let block_n = config.block_n.clamp(1, dim);
+    let block_k = config.block_k.clamp(1, dim);
+
+    for elem in c.iter_mut() {
+        *elem = 0.0;
+    }
+
+    let mut ii = 0;
+    while ii < dim {
+        let i_end = (ii + block_m).min(dim);
+        let mut kk = 0;
+        while kk < dim {
+            let k_end = (kk + block_k).min(dim);
+            let mut jj = 0;
+            while jj < dim {
+                let j_end = (jj + block_n).min(dim);
+                for i in ii..i_end {
+                    let a_row = i * dim;
+                    let c_row = i * dim;
+                    for k in kk..k_end {
+                        let a_ik = a[a_row + k];
+                        let b_row = k * dim;
+                        for j in jj..j_end {
+                            c[c_row + j] += a_ik * b[b_row + j];
+                        }
+                    }
+                }
+                jj = j_end;
+            }
+            kk = k_end;
+        }
+        ii = i_end;
+    }
+}
+
+/// Runs [`blocked_matmul`] with `config`'s block sizes over a fixed-size
+/// representative problem and returns the best (minimum) wall-clock time
+/// observed across [`TIMED_ITERS`] timed runs, after [`WARMUP_ITERS`]
+/// untimed warm-up runs.
+#[cfg(feature = "std")]
+fn time_candidate(config: &TuningConfig) -> Duration {
+    let dim = BENCH_DIM;
+    let a = vec![1.0_f64; dim * dim];
+    let b = vec![1.0_f64; dim * dim];
+    let mut c = vec![0.0_f64; dim * dim];
+
+    for _ in 0..WARMUP_ITERS {
+        blocked_matmul(&a, &b, &mut c, dim, config);
+    }
+
+    let mut best = Duration::MAX;
+    for _ in 0..TIMED_ITERS {
+        let start = Instant::now();
+        blocked_matmul(&a, &b, &mut c, dim, config);
+        let elapsed = start.elapsed();
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+
+    // Keep the optimizer from proving `c` is dead and eliding the loops
+    // above entirely.
+    std::hint::black_box(&c);
+    best
+}
+
+/// Generates the heuristic baseline (from [`TuningConfig::for_dimensions`])
+/// plus a handful of scaled variations for [`AutoTuner::tune_gemm`] to
+/// benchmark against each other. Candidates are deduplicated so time is
+/// never spent timing the same configuration twice.
+#[cfg(feature = "std")]
+fn generate_candidates(m: usize, n: usize, k: usize) -> Vec<TuningConfig> {
+    let baseline = TuningConfig::for_dimensions(m, n, k);
+    let mut candidates = Vec::with_capacity(CANDIDATE_SCALE_FACTORS_PERCENT.len() + 1);
+    candidates.push(baseline);
+
+    for &percent in &CANDIDATE_SCALE_FACTORS_PERCENT {
+        let scaled = TuningConfig {
+            block_m: (baseline.block_m * percent / 100).max(8),
+            block_n: (baseline.block_n * percent / 100).max(8),
+            block_k: (baseline.block_k * percent / 100).max(8),
+            ..baseline
+        };
+        let is_duplicate = candidates.iter().any(|existing: &TuningConfig| {
+            existing.block_m == scaled.block_m
+                && existing.block_n == scaled.block_n
+                && existing.block_k == scaled.block_k
+        });
+        if !is_duplicate {
+            candidates.push(scaled);
+        }
+    }
+
+    candidates
+}
+
+/// Runtime auto-tuner for GEMM block sizes.
+///
+/// `tune_gemm` runs a small, bounded set of *real* timed micro-benchmarks
+/// on the current machine (see [`generate_candidates`] and
+/// [`time_candidate`]) and keeps whichever candidate measured fastest.
+/// Only that genuinely-measured winner is written into the shared
+/// [`TuningCache`], so other code reading the cache never observes a
+/// value that was fabricated rather than measured.
+///
+/// On targets built without the `std` feature (`std::time::Instant` is
+/// unavailable there), no timing can be performed; see `tune_gemm` for the
+/// honest fallback used in that case.
 pub struct AutoTuner {
     config: TuningConfig,
 }
@@ -223,11 +370,48 @@ impl AutoTuner {
 
     /// Tunes for GEMM operations with the given dimensions.
     ///
-    /// This is a simplified version that uses heuristics. A full implementation
-    /// would run micro-benchmarks to find optimal parameters.
+    /// This runs real, timed micro-benchmarks (using `std::time::Instant`)
+    /// comparing the heuristic baseline from
+    /// [`TuningConfig::for_dimensions`] against a few scaled block-size
+    /// variations on a small representative problem, and keeps whichever
+    /// configuration measured fastest on this machine. Only that
+    /// genuinely-measured winner is written into the shared
+    /// [`TuningCache`].
+    ///
+    /// On targets built without the `std` feature, `std::time::Instant` is
+    /// unavailable, so no measurement can be performed. In that case this
+    /// falls back to the heuristic from [`TuningConfig::for_dimensions`]
+    /// and deliberately does **not** write to [`TuningCache`], so an
+    /// unmeasured value can never be presented as a measured one to other
+    /// code that relies on the shared cache.
     pub fn tune_gemm(&mut self, m: usize, n: usize, k: usize) -> &TuningConfig {
-        self.config = TuningConfig::for_dimensions(m, n, k);
-        TuningCache::set(&self.config);
+        #[cfg(feature = "std")]
+        {
+            let candidates = generate_candidates(m, n, k);
+            // `generate_candidates` always pushes the baseline first, so
+            // this is never empty.
+            let mut best_config = candidates[0];
+            let mut best_time = time_candidate(&best_config);
+            for candidate in candidates.into_iter().skip(1) {
+                let elapsed = time_candidate(&candidate);
+                if elapsed < best_time {
+                    best_time = elapsed;
+                    best_config = candidate;
+                }
+            }
+            self.config = best_config;
+            TuningCache::set(&self.config);
+        }
+
+        #[cfg(not(feature = "std"))]
+        {
+            // No `std::time::Instant` available on this target: we cannot
+            // measure anything, so we honestly fall back to the heuristic
+            // and skip `TuningCache::set` entirely rather than poisoning
+            // the shared cache with an unmeasured value.
+            self.config = TuningConfig::for_dimensions(m, n, k);
+        }
+
         &self.config
     }
 
@@ -291,6 +475,98 @@ mod tests {
         assert!(config.block_k > 0);
         assert!(config.block_m <= 512);
         assert!(config.block_n <= 512);
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests for the "AutoTuner runs no benchmarks / poisons the
+    // cache" bug: `tune_gemm` must perform genuine, measurable timing and
+    // must only ever write a genuinely-measured winner into the shared
+    // `TuningCache`.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_generate_candidates_produces_multiple_distinct_configs() {
+        let candidates = generate_candidates(512, 512, 512);
+
+        // A real auto-tuner needs at least two distinct options to choose
+        // between -- otherwise there is nothing to "tune".
+        assert!(
+            candidates.len() >= 2,
+            "expected multiple candidates to benchmark, got {}",
+            candidates.len()
+        );
+
+        let first = candidates[0];
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.block_m != first.block_m
+                    || c.block_n != first.block_n
+                    || c.block_k != first.block_k),
+            "all generated candidates were identical; nothing would actually be tuned"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_time_candidate_measures_nonzero_duration() {
+        let config = TuningConfig::default();
+        let elapsed = time_candidate(&config);
+
+        // A stub that never actually runs the benchmark workload would
+        // return instantly (zero, or an unmeasured constant). Real work
+        // over a 96x96x96 problem always takes a measurable, nonzero
+        // amount of wall-clock time.
+        assert!(
+            elapsed.as_nanos() > 0,
+            "expected a real, nonzero measured duration from time_candidate"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_auto_tuner_writes_only_measured_result_to_cache() {
+        // Seed the cache with a sentinel that no candidate generated by
+        // `generate_candidates` could ever naturally produce (candidates
+        // are always >= 8), so we can detect whether `tune_gemm` truly
+        // overwrote it with a real measurement rather than leaving stale
+        // or fabricated data behind.
+        let sentinel = TuningConfig {
+            block_m: 1,
+            block_n: 1,
+            block_k: 1,
+            ..TuningConfig::default()
+        };
+        TuningCache::set(&sentinel);
+
+        let mut tuner = AutoTuner::new();
+        let config = *tuner.tune_gemm(256, 256, 256);
+
+        assert_ne!(
+            (config.block_m, config.block_n, config.block_k),
+            (1, 1, 1),
+            "tune_gemm must overwrite the cache with a genuinely measured winner"
+        );
+        assert!(config.block_m > 0);
+        assert!(config.block_n > 0);
+        assert!(config.block_k > 0);
+
+        // The winning configuration must actually be one of the timed
+        // candidates, not an arbitrary/default value bolted on afterwards.
+        let candidates = generate_candidates(256, 256, 256);
+        assert!(
+            candidates.iter().any(|c| c.block_m == config.block_m
+                && c.block_n == config.block_n
+                && c.block_k == config.block_k),
+            "tune_gemm's result must be one of the benchmarked candidates"
+        );
+
+        // The shared cache must be kept in sync with the measured winner.
+        let cached = TuningCache::get();
+        assert_eq!(cached.block_m, config.block_m);
+        assert_eq!(cached.block_n, config.block_n);
+        assert_eq!(cached.block_k, config.block_k);
     }
 
     #[test]

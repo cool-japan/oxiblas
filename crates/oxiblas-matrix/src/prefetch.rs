@@ -1,7 +1,17 @@
 //! Prefetch utilities for improved cache performance.
 //!
-//! This module provides prefetch hints that can improve performance for
-//! large matrix operations by bringing data into cache before it's needed.
+//! This module provides matrix-shaped prefetch helpers ([`prefetch_column`],
+//! [`prefetch_block`], [`MatrixPrefetcher`]) built on top of the primitive
+//! prefetch intrinsics and cache-line-size constant defined in
+//! `oxiblas-core` ([`oxiblas_core::memory`]).
+//!
+//! The primitives ([`PrefetchLocality`], [`prefetch_read`],
+//! [`prefetch_write`], [`CACHE_LINE_SIZE`], [`prefetch_range_read`],
+//! [`prefetch_range_write`]) are re-exported/delegated here rather than
+//! reimplemented, so that this crate can never disagree with
+//! `oxiblas-core` about what a cache line is: `CACHE_LINE_SIZE` is
+//! architecture-dependent in `oxiblas-core` (128 bytes on Apple
+//! Silicon/aarch64, 64 bytes on x86_64 and elsewhere), not a hardcoded 64.
 //!
 //! # Cache Hierarchy
 //!
@@ -17,155 +27,32 @@
 //! - Access patterns are predictable (sequential or strided)
 //! - There's enough distance between prefetch and use
 //!
+//! # Status
+//!
+//! The matrix-shaped helpers in this module ([`prefetch_column`],
+//! [`prefetch_block`], [`MatrixPrefetcher`]) are available for downstream
+//! users of `oxiblas-matrix`, but they are **not** currently invoked by this
+//! crate's own kernels. The GEMM/packing kernels in `oxiblas-blas` call
+//! `oxiblas-core`'s prefetch primitives directly instead of going through
+//! this module.
+//!
 //! # Example
 //!
 //! ```ignore
-//! use oxiblas_matrix::prefetch::{prefetch_read, PrefetchLocality};
+//! use oxiblas_matrix::prefetch::{prefetch_read, PrefetchLocality, PREFETCH_DISTANCE_LINES};
 //!
 //! // Prefetch data for upcoming reads
 //! for i in (0..n).step_by(64 / size_of::<f64>()) {
-//!     prefetch_read(&data[i + PREFETCH_DISTANCE], PrefetchLocality::Medium);
+//!     prefetch_read(&data[i + PREFETCH_DISTANCE_LINES], PrefetchLocality::Medium);
 //! }
 //! ```
 
-/// Cache locality hint for prefetch operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefetchLocality {
-    /// Non-temporal: Data will be used once and not reused.
-    /// Prefetches to L1 but may be evicted quickly.
-    NonTemporal,
-    /// Low: Data will be used a few times.
-    /// Typically prefetches to L3.
-    Low,
-    /// Medium: Data will be used moderately.
-    /// Typically prefetches to L2.
-    Medium,
-    /// High: Data will be heavily reused.
-    /// Prefetches to L1 for fastest access.
-    High,
-}
-
-/// Prefetch data for reading.
-///
-/// Issues a prefetch hint to bring the cache line containing `ptr` into cache.
-/// This is a hint and may be ignored by the CPU.
-///
-/// # Safety
-///
-/// The pointer must be valid for at least one byte, but doesn't need to be
-/// aligned to a cache line. The CPU will prefetch the entire cache line
-/// containing the address.
-#[inline]
-pub fn prefetch_read<T>(ptr: *const T, locality: PrefetchLocality) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::x86_64::*;
-        unsafe {
-            match locality {
-                PrefetchLocality::NonTemporal => _mm_prefetch(ptr as *const i8, _MM_HINT_NTA),
-                PrefetchLocality::Low => _mm_prefetch(ptr as *const i8, _MM_HINT_T2),
-                PrefetchLocality::Medium => _mm_prefetch(ptr as *const i8, _MM_HINT_T1),
-                PrefetchLocality::High => _mm_prefetch(ptr as *const i8, _MM_HINT_T0),
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM NEON prefetch using inline assembly
-        // PRFM instruction with PLDL1KEEP, PLDL2KEEP, PLDL3KEEP
-        unsafe {
-            match locality {
-                PrefetchLocality::NonTemporal | PrefetchLocality::Low => {
-                    core::arch::asm!(
-                        "prfm pldl3keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                PrefetchLocality::Medium => {
-                    core::arch::asm!(
-                        "prfm pldl2keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                PrefetchLocality::High => {
-                    core::arch::asm!(
-                        "prfm pldl1keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        // No prefetch available - ignore
-        let _ = (ptr, locality);
-    }
-}
-
-/// Prefetch data for writing.
-///
-/// Similar to `prefetch_read` but hints that the data will be written.
-/// This can help avoid read-for-ownership overhead on some architectures.
-#[inline]
-pub fn prefetch_write<T>(ptr: *mut T, locality: PrefetchLocality) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use core::arch::x86_64::*;
-        // x86 prefetchw is not always available, use prefetcht0 as fallback
-        unsafe {
-            match locality {
-                PrefetchLocality::NonTemporal => _mm_prefetch(ptr as *const i8, _MM_HINT_NTA),
-                PrefetchLocality::Low => _mm_prefetch(ptr as *const i8, _MM_HINT_T2),
-                PrefetchLocality::Medium => _mm_prefetch(ptr as *const i8, _MM_HINT_T1),
-                PrefetchLocality::High => _mm_prefetch(ptr as *const i8, _MM_HINT_T0),
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM NEON prefetch for store using PSTL1KEEP, PSTL2KEEP, PSTL3KEEP
-        unsafe {
-            match locality {
-                PrefetchLocality::NonTemporal | PrefetchLocality::Low => {
-                    core::arch::asm!(
-                        "prfm pstl3keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                PrefetchLocality::Medium => {
-                    core::arch::asm!(
-                        "prfm pstl2keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-                PrefetchLocality::High => {
-                    core::arch::asm!(
-                        "prfm pstl1keep, [{0}]",
-                        in(reg) ptr,
-                        options(nostack, preserves_flags)
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        let _ = (ptr, locality);
-    }
-}
-
-/// Cache line size in bytes (typical for modern CPUs).
-pub const CACHE_LINE_SIZE: usize = 64;
+// The primitive prefetch intrinsics and the cache-line-size constant live in
+// oxiblas-core. Re-export them here instead of duplicating the unsafe,
+// architecture-specific code: duplicating it risks the two crates silently
+// drifting apart on cache-line size (oxiblas-core already accounts for
+// aarch64's 128-byte lines; a hardcoded local `64` would be wrong there).
+pub use oxiblas_core::memory::{CACHE_LINE_SIZE, PrefetchLocality, prefetch_read, prefetch_write};
 
 /// Suggested prefetch distance in cache lines for sequential access.
 ///
@@ -180,45 +67,47 @@ pub const PREFETCH_DISTANCE_BYTES: usize = PREFETCH_DISTANCE_LINES * CACHE_LINE_
 ///
 /// Prefetches cache lines covering the range `[ptr, ptr + len)`.
 /// Useful for preparing a contiguous block of data.
+///
+/// Delegates to `oxiblas_core::memory::prefetch_read_range`.
 #[inline]
 pub fn prefetch_range_read<T>(ptr: *const T, len: usize, locality: PrefetchLocality) {
-    if len == 0 {
-        return;
-    }
-
-    let elem_size = core::mem::size_of::<T>();
-    let byte_len = len * elem_size;
-    let num_lines = byte_len.div_ceil(CACHE_LINE_SIZE);
-
-    for i in 0..num_lines {
-        let offset = i * CACHE_LINE_SIZE;
-        let addr = unsafe { (ptr as *const u8).add(offset) };
-        prefetch_read(addr, locality);
-    }
+    oxiblas_core::memory::prefetch_read_range(ptr, len, locality);
 }
 
 /// Prefetch a range of memory for writing.
+///
+/// Delegates to `oxiblas_core::memory::prefetch_write_range`.
 #[inline]
 pub fn prefetch_range_write<T>(ptr: *mut T, len: usize, locality: PrefetchLocality) {
-    if len == 0 {
-        return;
-    }
+    oxiblas_core::memory::prefetch_write_range(ptr, len, locality);
+}
 
-    let elem_size = core::mem::size_of::<T>();
-    let byte_len = len * elem_size;
-    let num_lines = byte_len.div_ceil(CACHE_LINE_SIZE);
-
-    for i in 0..num_lines {
-        let offset = i * CACHE_LINE_SIZE;
-        let addr = unsafe { (ptr as *mut u8).add(offset) };
-        prefetch_write(addr, locality);
-    }
+/// Row indices that must be individually prefetched for a strided column
+/// access where consecutive rows do **not** share a cache line (i.e.
+/// `row_stride * size_of::<T>() > CACHE_LINE_SIZE`).
+///
+/// Every such row lands on a distinct cache line, so there is no way to
+/// "skip" rows without leaving cache lines unprefetched -- unlike the
+/// contiguous case, one prefetch instruction cannot cover several rows at
+/// once here. This is split out as its own function (rather than inlined
+/// into [`prefetch_column`]) so the coverage math can be regression-tested
+/// directly: a previous version of this loop computed
+/// `row = i * (CACHE_LINE_SIZE / elem_size)` while only iterating `i` up to
+/// `ceil(nrows * elem_size / CACHE_LINE_SIZE)`, which for `f64`
+/// (`elem_size == 8`, `CACHE_LINE_SIZE == 64`) only ever visited about 1/8
+/// of the rows in the column.
+#[inline]
+fn strided_prefetch_row_indices(nrows: usize) -> impl Iterator<Item = usize> {
+    0..nrows
 }
 
 /// Prefetch a column of a matrix for reading.
 ///
 /// For column-major storage, this prefetches contiguous memory.
 /// For row-major or strided access, this prefetches with the given stride.
+// Takes a raw pointer for strided address computation but only issues prefetch
+// hints (no actual dereference); scoped allow replaces the former crate-wide one.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline]
 pub fn prefetch_column<T>(
     ptr: *const T,
@@ -228,19 +117,17 @@ pub fn prefetch_column<T>(
 ) {
     let elem_size = core::mem::size_of::<T>();
 
-    // If contiguous (row_stride == nrows for column-major), prefetch as range
+    // If contiguous (row_stride == 1), or the stride is small enough that
+    // consecutive rows still fall within (or before) one cache line, the
+    // whole column can be prefetched as a single contiguous range.
     if row_stride == 1 || (row_stride * elem_size) <= CACHE_LINE_SIZE {
         prefetch_range_read(ptr, nrows, locality);
     } else {
-        // Strided access - prefetch individual cache lines
-        // Only prefetch if the stride is large enough to warrant it
-        let lines_per_column = (nrows * elem_size).div_ceil(CACHE_LINE_SIZE);
-        for i in 0..lines_per_column.min(nrows) {
-            let row = i * (CACHE_LINE_SIZE / elem_size).max(1);
-            if row < nrows {
-                let addr = unsafe { ptr.add(row * row_stride) };
-                prefetch_read(addr, locality);
-            }
+        // Strided access wider than a cache line: every row needs its own
+        // prefetch (see `strided_prefetch_row_indices`).
+        for row in strided_prefetch_row_indices(nrows) {
+            let addr = unsafe { ptr.add(row * row_stride) };
+            prefetch_read(addr, locality);
         }
     }
 }
@@ -249,6 +136,8 @@ pub fn prefetch_column<T>(
 ///
 /// Prefetches a rectangular block starting at `ptr` with dimensions
 /// `block_rows × block_cols`.
+// Raw pointer used only for strided address computation feeding prefetch hints.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[inline]
 pub fn prefetch_block<T>(
     ptr: *const T,
@@ -294,6 +183,8 @@ impl<T> MatrixPrefetcher<T> {
     /// - `row_stride`: Stride between rows (leading dimension)
     /// - `distance`: Number of columns to prefetch ahead
     /// - `locality`: Cache locality hint
+    // Raw pointer used only for strided address computation feeding prefetch hints.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     #[inline]
     pub fn new(
         ptr: *const T,
@@ -429,11 +320,63 @@ mod tests {
 
     #[test]
     fn test_cache_constants() {
-        assert_eq!(CACHE_LINE_SIZE, 64);
+        // CACHE_LINE_SIZE now comes from oxiblas-core and is
+        // architecture-dependent (128 on aarch64, 64 elsewhere) -- assert
+        // the invariants that must hold on any target rather than a
+        // hardcoded value that would be wrong on aarch64.
+        assert!(CACHE_LINE_SIZE.is_power_of_two());
+        assert_eq!(CACHE_LINE_SIZE, oxiblas_core::memory::CACHE_LINE_SIZE);
         const { assert!(PREFETCH_DISTANCE_LINES > 0) };
         assert_eq!(
             PREFETCH_DISTANCE_BYTES,
             PREFETCH_DISTANCE_LINES * CACHE_LINE_SIZE
         );
+    }
+
+    /// Regression test for the strided-column coverage bug: the old loop
+    /// computed `row = i * (CACHE_LINE_SIZE / elem_size)` while only
+    /// iterating `i` up to `ceil(nrows * elem_size / CACHE_LINE_SIZE)`. For
+    /// `f64` (`elem_size == 8`, `CACHE_LINE_SIZE == 64`) that stepped by 8
+    /// rows at a time but only ran for `nrows / 8` iterations, so it only
+    /// ever touched about 1/8 of the rows in the column (e.g. rows
+    /// `0, 8, 16, ...` up to `nrows / 8 * 8`, leaving the vast majority of
+    /// rows -- and the vast majority of cache lines -- never prefetched).
+    ///
+    /// The fixed strided path must visit every row exactly once, since each
+    /// row lies on its own cache line when the stride exceeds a cache line.
+    #[test]
+    fn test_strided_column_prefetch_covers_all_rows() {
+        for &nrows in &[0usize, 1, 7, 8, 9, 64, 100, 137, 1000] {
+            let rows: Vec<usize> = strided_prefetch_row_indices(nrows).collect();
+            assert_eq!(
+                rows.len(),
+                nrows,
+                "strided prefetch must visit every row, not a fraction of them (nrows = {nrows})"
+            );
+            assert_eq!(
+                rows,
+                (0..nrows).collect::<Vec<_>>(),
+                "strided prefetch must visit rows 0..nrows in order (nrows = {nrows})"
+            );
+        }
+    }
+
+    /// End-to-end version of the same regression: drive `prefetch_column`'s
+    /// strided branch (`row_stride * size_of::<T>() > CACHE_LINE_SIZE`)
+    /// directly with a large matrix so it exercises the real function, not
+    /// just the extracted row-index helper. This should not crash and
+    /// (indirectly, via `test_strided_column_prefetch_covers_all_rows`) is
+    /// backed by the same coverage math.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_prefetch_column_strided_large() {
+        // f64 is 8 bytes; a stride of CACHE_LINE_SIZE elements guarantees
+        // `row_stride * elem_size > CACHE_LINE_SIZE`, landing us in the
+        // strided branch for every row.
+        let row_stride = CACHE_LINE_SIZE + 1;
+        let nrows = 200;
+        let data = vec![1.0f64; nrows * row_stride];
+
+        prefetch_column(data.as_ptr(), nrows, row_stride, PrefetchLocality::Medium);
     }
 }

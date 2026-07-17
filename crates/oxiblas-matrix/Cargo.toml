@@ -23,8 +23,8 @@ nalgebra = { workspace = true, optional = true }
 [dev-dependencies]
 approx.workspace = true
 serde_json.workspace = true
-quickcheck = "1.1"
-quickcheck_macros = "1.2"
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
 
 [features]
 default = ["std"]

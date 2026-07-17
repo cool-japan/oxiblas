@@ -23,6 +23,21 @@ use super::alloc::*;
 // AlignedVec - Aligned heap allocation
 // =============================================================================
 
+/// Compile-time check that an alignment const generic is a power of two, as
+/// required by [`core::alloc::Layout::from_size_align`].
+///
+/// Call sites wrap the call in an inline `const { .. }` block (stable since
+/// Rust 1.79) so the assertion is evaluated at monomorphization time: if
+/// `ALIGN` is not a power of two, compilation fails with a clear message
+/// instead of `AlignedVec` producing an invalid `Layout` (or silently
+/// rounding up) the first time it is used.
+const fn assert_align_is_power_of_two<const ALIGN: usize>() {
+    assert!(
+        ALIGN.is_power_of_two(),
+        "AlignedVec: ALIGN const generic parameter must be a power of two"
+    );
+}
+
 /// A vector with guaranteed alignment and custom allocator support.
 ///
 /// Unlike `Vec<T>`, this type ensures the underlying buffer is aligned
@@ -59,6 +74,13 @@ impl<T, const ALIGN: usize> AlignedVec<T, ALIGN, Global> {
     /// Creates a new empty aligned vector.
     #[inline]
     pub const fn new() -> Self {
+        // Compile-time proof that `ALIGN` is a power of two, as required by
+        // `core::alloc::Layout`. Evaluated at monomorphization time, so an
+        // invalid `ALIGN` fails to compile rather than panicking (or worse,
+        // producing a malformed `Layout`) the first time an instance of this
+        // type is actually allocated.
+        const { assert_align_is_power_of_two::<ALIGN>() };
+
         AlignedVec {
             ptr: NonNull::dangling(),
             len: 0,
@@ -105,6 +127,8 @@ impl<T, const ALIGN: usize, A: Alloc> AlignedVec<T, ALIGN, A> {
     /// Creates a new empty aligned vector with the specified allocator.
     #[inline]
     pub fn new_in(alloc: A) -> Self {
+        const { assert_align_is_power_of_two::<ALIGN>() };
+
         AlignedVec {
             ptr: NonNull::dangling(),
             len: 0,
@@ -189,10 +213,58 @@ impl<T, const ALIGN: usize, A: Alloc> AlignedVec<T, ALIGN, A> {
     }
 
     /// Returns the layout for a given capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics (via [`Self::capacity_overflow`]) if `capacity * size_of::<T>()`
+    /// overflows `usize`, or if the resulting size -- rounded up to
+    /// `ALIGN.max(align_of::<T>())` -- would exceed `isize::MAX` bytes.
+    ///
+    /// A naive `capacity * size_of::<T>()` would silently wrap around on
+    /// overflow in release builds (multiplication overflow checks are
+    /// disabled outside of `debug_assertions`), yielding a small, wrong
+    /// `size` that produces a *successfully allocated but undersized*
+    /// buffer. Callers such as [`Self::with_capacity_in`] would then record
+    /// the huge, un-wrapped `capacity` in `self.cap`, so later writes up to
+    /// that bogus capacity (e.g. via [`Self::push`] past `self.len`) would
+    /// write past the real allocation: a heap-buffer overflow. Using
+    /// `checked_mul` turns that silent memory-corruption bug into a loud,
+    /// immediate panic instead.
     fn layout_for(capacity: usize) -> Layout {
-        let size = capacity * size_of::<T>();
+        const { assert_align_is_power_of_two::<ALIGN>() };
+
+        let size = match capacity.checked_mul(size_of::<T>()) {
+            Some(size) => size,
+            None => Self::capacity_overflow(),
+        };
         let align = ALIGN.max(align_of::<T>());
-        Layout::from_size_align(size, align).expect("Invalid layout")
+        match Layout::from_size_align(size, align) {
+            Ok(layout) => layout,
+            Err(_) => Self::capacity_overflow(),
+        }
+    }
+
+    /// Reports that `capacity` does not correspond to a valid, addressable
+    /// [`Layout`] for `T` and aborts via panic.
+    ///
+    /// This mirrors the strategy `alloc::raw_vec::RawVec` uses for oversized
+    /// capacities: rather than proceeding with a silently truncated
+    /// (wrapped) allocation size -- which would desynchronize the vector's
+    /// tracked capacity from its real allocation -- fail loudly and
+    /// immediately. Marked `#[cold]`/`#[inline(never)]` so the (exceedingly
+    /// rare) overflow path does not bloat the hot allocation path, and
+    /// implemented as a named function rather than `.unwrap()`/`.expect()`
+    /// so the panic message is specific to `AlignedVec` and its type/align
+    /// parameters.
+    #[cold]
+    #[inline(never)]
+    fn capacity_overflow() -> ! {
+        panic!(
+            "AlignedVec<{}>: capacity overflow -- requested capacity does not \
+             fit in a valid memory layout (capacity * size_of::<T>() overflows \
+             usize, or exceeds isize::MAX bytes when rounded up to align={ALIGN})",
+            core::any::type_name::<T>()
+        );
     }
 
     /// Returns the length of the vector.
@@ -383,3 +455,86 @@ impl<T, const ALIGN: usize, A: Alloc> core::ops::IndexMut<usize> for AlignedVec<
 // Safety: AlignedVec is Send/Sync if T and A are
 unsafe impl<T: Send, const ALIGN: usize, A: Alloc + Send> Send for AlignedVec<T, ALIGN, A> {}
 unsafe impl<T: Sync, const ALIGN: usize, A: Alloc + Sync> Sync for AlignedVec<T, ALIGN, A> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_capacity_allocates_correctly_aligned_and_sized_buffer() {
+        const ALIGN: usize = 64;
+        let vec: AlignedVec<f32, ALIGN> = AlignedVec::with_capacity(37);
+
+        assert_eq!(vec.capacity(), 37);
+        assert_eq!(vec.len(), 0);
+        assert_eq!(vec.as_ptr() as usize % ALIGN, 0, "buffer must be ALIGN-aligned");
+    }
+
+    #[test]
+    fn zeros_and_push_round_trip() {
+        let mut vec: AlignedVec<f64> = AlignedVec::zeros(4);
+        assert_eq!(vec.as_slice(), &[0.0, 0.0, 0.0, 0.0]);
+
+        vec.push(1.0);
+        vec.push(2.0);
+        assert_eq!(vec.len(), 6);
+        assert_eq!(&vec.as_slice()[4..], &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn reserve_and_grow_preserve_existing_elements() {
+        let mut vec: AlignedVec<u64> = AlignedVec::with_capacity(2);
+        vec.push(10);
+        vec.push(20);
+        // Forces `grow` -> `realloc` -> `layout_for` with a larger capacity.
+        vec.push(30);
+        vec.reserve(64);
+
+        assert!(vec.capacity() >= 67);
+        assert_eq!(vec.as_slice(), &[10, 20, 30]);
+    }
+
+    // Regression test for: `layout_for` computing
+    // `capacity * size_of::<T>()` with an unchecked multiplication. In a
+    // release build (where integer-overflow checks are compiled out), a
+    // capacity just large enough to overflow `usize` would silently wrap
+    // around to a small `size`, so the allocator would hand back a tiny
+    // buffer while `self.cap` kept recording the huge, un-wrapped capacity
+    // requested by the caller -- a heap-buffer-overflow-in-waiting the
+    // moment anything wrote up to that bogus capacity. It must now fail
+    // loudly via `capacity_overflow` instead.
+    #[test]
+    #[should_panic(expected = "capacity overflow")]
+    fn with_capacity_overflowing_size_panics_instead_of_wrapping() {
+        // For `f64` (8 bytes), `usize::MAX / 2` multiplied by 8 overflows
+        // `usize` by a wide margin, so the old unchecked multiplication
+        // would have wrapped rather than triggering `Layout::from_size_align`'s
+        // own (unrelated) `isize::MAX` check.
+        let huge_capacity = usize::MAX / 2;
+        let _vec: AlignedVec<f64> = AlignedVec::with_capacity(huge_capacity);
+    }
+
+    // Regression test for the same bug reached via `zeros_in`, which builds
+    // its `Layout` the same way as `with_capacity_in`.
+    #[test]
+    #[should_panic(expected = "capacity overflow")]
+    fn zeros_overflowing_size_panics_instead_of_wrapping() {
+        let huge_len = usize::MAX / 2;
+        let _vec: AlignedVec<f64> = AlignedVec::zeros(huge_len);
+    }
+
+    // A capacity that does not overflow the `checked_mul` but whose size,
+    // once rounded up to `ALIGN`, exceeds `isize::MAX` must also be rejected
+    // by `Layout::from_size_align` and surfaced as `capacity_overflow`
+    // rather than propagating an `Err` (or, previously, panicking via a
+    // generic `.expect("Invalid layout")`).
+    #[test]
+    #[should_panic(expected = "capacity overflow")]
+    fn with_capacity_isize_max_exceeded_panics() {
+        // `capacity * size_of::<u8>()` does not overflow `usize` here, but
+        // it does exceed `isize::MAX`, which `Layout::from_size_align`
+        // rejects.
+        let capacity = isize::MAX as usize;
+        let _vec: AlignedVec<u8> = AlignedVec::with_capacity(capacity);
+    }
+}

@@ -288,21 +288,34 @@ impl<T: Scalar> BandedMat<T> {
         self.data.as_mut_slice()
     }
 
-    /// Returns a specific band (diagonal) as a slice.
+    /// Returns a specific band (diagonal) as an owned, contiguous vector.
     ///
     /// `band_idx = 0` is the main diagonal, positive values are superdiagonals,
     /// negative values are subdiagonals.
     ///
-    /// Returns the elements of the diagonal along with the starting column index.
-    pub fn get_band(&self, band_idx: isize) -> Option<(&[T], usize)> {
+    /// Returns the elements of the diagonal (in row/column-increasing order)
+    /// along with the logical starting column index of the first returned
+    /// element. Returns `None` if `band_idx` is outside `[-kl, ku]`.
+    ///
+    /// # Notes
+    ///
+    /// In BLAS band storage, successive elements of a single diagonal are
+    /// `ldab` apart in the underlying flat, column-major array (one element
+    /// per column) -- they are not contiguous. This method gathers them
+    /// into a freshly allocated, contiguous `Vec` rather than exposing the
+    /// raw (interleaved) storage range.
+    pub fn get_band(&self, band_idx: isize) -> Option<(Vec<T>, usize)> {
         if band_idx < -(self.kl as isize) || band_idx > self.ku as isize {
             return None;
         }
 
-        // Band row in storage: ku - band_idx
+        // Band row in storage: ku - band_idx (row 0 of storage holds the
+        // highest superdiagonal, row ldab-1 holds the lowest subdiagonal).
         let storage_row = (self.ku as isize - band_idx) as usize;
 
-        // Determine the valid range
+        // Determine the valid range. Superdiagonals (band_idx >= 0) start
+        // at row 0, column `band_idx`. Subdiagonals (band_idx < 0) start at
+        // row `-band_idx`, column 0.
         let start_col = if band_idx >= 0 { band_idx as usize } else { 0 };
 
         let start_row = if band_idx >= 0 {
@@ -311,21 +324,29 @@ impl<T: Scalar> BandedMat<T> {
             (-band_idx) as usize
         };
 
-        let len = (self.nrows - start_row).min(self.ncols - start_col);
+        // `kl`/`ku` bound which band indices are *representable*, not
+        // whether the diagonal actually fits inside the matrix (a caller
+        // may legitimately construct a matrix where kl >= nrows or
+        // ku >= ncols). Use saturating_sub so such degenerate cases yield
+        // an empty diagonal instead of underflowing.
+        let len = self
+            .nrows
+            .saturating_sub(start_row)
+            .min(self.ncols.saturating_sub(start_col));
 
         if len == 0 {
-            return Some((&[], start_col));
+            return Some((Vec::new(), start_col));
         }
 
-        // Collect the diagonal elements
-        // Note: They're not contiguous in memory, so we can't return a simple slice
-        // Instead, we return the starting pointer and the caller can access with stride ldab
-        let start_idx = storage_row + start_col * self.ldab;
-        let end_idx = storage_row + (start_col + len - 1) * self.ldab + 1;
+        // Gather the strided diagonal elements (stride = ldab) into a
+        // contiguous, owned Vec -- the actual requested diagonal, not the
+        // raw interleaved storage range between its first and last element.
+        let data = self.data.as_slice();
+        let elements: Vec<T> = (0..len)
+            .map(|t| data[storage_row + (start_col + t) * self.ldab])
+            .collect();
 
-        // This is a workaround - we return the underlying slice section
-        // The actual diagonal elements are at indices start_idx, start_idx + ldab, ...
-        Some((&self.data.as_slice()[start_idx..end_idx], start_col))
+        Some((elements, start_col))
     }
 
     /// Returns the diagonal elements.
@@ -424,7 +445,13 @@ impl<T: Scalar> BandedMat<T> {
     ///
     /// For symmetric banded storage, we only store `k + 1` rows where `k` is
     /// the number of subdiagonals (or superdiagonals, they're equal).
-    pub fn to_symmetric_banded(&self) -> SymmetricBandedMat<T>
+    ///
+    /// `uplo` selects whether the resulting [`SymmetricBandedMat`] stores the
+    /// upper (`row <= col`) or lower (`row >= col`) triangle of `self`.
+    pub fn to_symmetric_banded(
+        &self,
+        uplo: super::packed::TriangularKind,
+    ) -> SymmetricBandedMat<T>
     where
         T: bytemuck::Zeroable,
     {
@@ -437,7 +464,7 @@ impl<T: Scalar> BandedMat<T> {
             "Matrix must be square for symmetric storage"
         );
 
-        SymmetricBandedMat::from_banded(self)
+        SymmetricBandedMat::from_banded(self, uplo)
     }
 }
 
@@ -522,7 +549,14 @@ impl<T: Scalar> SymmetricBandedMat<T> {
     }
 
     /// Creates a symmetric banded matrix from a general banded matrix.
-    pub fn from_banded(banded: &BandedMat<T>) -> Self
+    ///
+    /// `uplo` selects whether the elements are taken from (and the result
+    /// stores) the upper (`row <= col`) or lower (`row >= col`) triangle of
+    /// `banded`. This must match the caller's intent: for a matrix that is
+    /// only actually symmetric (or whose caller only cares about one
+    /// triangle), passing the wrong `uplo` silently reads the wrong half of
+    /// the source matrix.
+    pub fn from_banded(banded: &BandedMat<T>, uplo: super::packed::TriangularKind) -> Self
     where
         T: bytemuck::Zeroable,
     {
@@ -535,15 +569,28 @@ impl<T: Scalar> SymmetricBandedMat<T> {
 
         let n = banded.nrows();
         let k = banded.kl();
-        let uplo = super::packed::TriangularKind::Upper;
 
         let mut sb = Self::zeros(n, k, uplo);
 
-        for j in 0..n {
-            let start_i = j.saturating_sub(k);
-            for i in start_i..=j {
-                if let Some(&val) = banded.get(i, j) {
-                    sb.set(i, j, val);
+        match uplo {
+            super::packed::TriangularKind::Upper => {
+                for j in 0..n {
+                    let start_i = j.saturating_sub(k);
+                    for i in start_i..=j {
+                        if let Some(&val) = banded.get(i, j) {
+                            sb.set(i, j, val);
+                        }
+                    }
+                }
+            }
+            super::packed::TriangularKind::Lower => {
+                for j in 0..n {
+                    let end_i = (j + k + 1).min(n);
+                    for i in j..end_i {
+                        if let Some(&val) = banded.get(i, j) {
+                            sb.set(i, j, val);
+                        }
+                    }
                 }
             }
         }
@@ -1054,6 +1101,139 @@ mod tests {
         assert_eq!(bm.get(2, 0), Some(&-0.5));
         assert_eq!(bm.get(0, 2), Some(&-0.5));
         assert_eq!(bm.get(3, 0), None); // Beyond kl
+    }
+
+    #[test]
+    fn test_get_band_matches_hand_computed_diagonals() {
+        // 5x5 tridiagonal (kl=1, ku=1) using the exact BLAS storage example
+        // documented at the top of this module.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(5, 5, 1, 1);
+        let entries = [
+            (0, 0, 1.0),
+            (0, 1, 2.0),
+            (1, 0, 3.0),
+            (1, 1, 4.0),
+            (1, 2, 5.0),
+            (2, 1, 6.0),
+            (2, 2, 7.0),
+            (2, 3, 8.0),
+            (3, 2, 9.0),
+            (3, 3, 10.0),
+            (3, 4, 11.0),
+            (4, 3, 12.0),
+            (4, 4, 13.0),
+        ];
+        for &(i, j, v) in &entries {
+            bm.set(i, j, v);
+        }
+
+        // Main diagonal: a00, a11, a22, a33, a44.
+        let (main, start) = bm.get_band(0).expect("main diagonal must exist");
+        assert_eq!(main, vec![1.0, 4.0, 7.0, 10.0, 13.0]);
+        assert_eq!(start, 0);
+
+        // Superdiagonal (band_idx = 1): a01, a12, a23, a34.
+        let (super_diag, start) = bm.get_band(1).expect("superdiagonal must exist");
+        assert_eq!(super_diag, vec![2.0, 5.0, 8.0, 11.0]);
+        assert_eq!(start, 1);
+
+        // Subdiagonal (band_idx = -1): a10, a21, a32, a43. This is the
+        // sub-diagonal case that previously either underflowed or returned
+        // the raw interleaved storage range instead of the actual diagonal.
+        let (sub_diag, start) = bm.get_band(-1).expect("subdiagonal must exist");
+        assert_eq!(sub_diag, vec![3.0, 6.0, 9.0, 12.0]);
+        assert_eq!(start, 0);
+
+        // Outside the declared bandwidth.
+        assert!(bm.get_band(2).is_none());
+        assert!(bm.get_band(-2).is_none());
+    }
+
+    #[test]
+    fn test_get_band_degenerate_bandwidth_does_not_underflow() {
+        // kl (3) exceeds nrows-1 (1) for a 2x2 matrix. Requesting the
+        // farthest representable subdiagonal previously underflowed the
+        // `self.nrows - start_row` computation (panicking in debug builds,
+        // wrapping to a huge length and out-of-bounds slice index in
+        // release builds).
+        let bm: BandedMat<f64> = BandedMat::zeros(2, 2, 3, 0);
+
+        let (elements, start_col) = bm
+            .get_band(-3)
+            .expect("band_idx = -kl must be a representable band index");
+        assert!(elements.is_empty());
+        assert_eq!(start_col, 0);
+
+        // Sanity: the actually-populated diagonal still works correctly.
+        let (main, start) = bm.get_band(0).expect("main diagonal must exist");
+        assert_eq!(main.len(), 2);
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn test_from_banded_honors_lower_uplo() {
+        use crate::packed::TriangularKind;
+
+        // Intentionally non-symmetric tridiagonal matrix so the upper and
+        // lower triangles carry different values -- this lets the test
+        // detect whether `from_banded`/`to_symmetric_banded` actually reads
+        // the requested triangle instead of silently defaulting to Upper.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(4, 4, 1, 1);
+        for i in 0..4 {
+            bm.set(i, i, 10.0 * (i as f64 + 1.0)); // main diagonal: 10, 20, 30, 40
+        }
+        for i in 0..3 {
+            bm.set(i, i + 1, 100.0 * (i as f64 + 1.0)); // upper triangle: 100, 200, 300
+            bm.set(i + 1, i, i as f64 + 1.0); // lower triangle: 1, 2, 3
+        }
+
+        let sb = bm.to_symmetric_banded(TriangularKind::Lower);
+        assert_eq!(sb.uplo(), TriangularKind::Lower);
+
+        // Manually-constructed Lower symmetric banded matrix using the
+        // lower triangle's values (1, 2, 3), not the upper triangle's
+        // (100, 200, 300) that the pre-fix hardcoded-Upper path would have
+        // silently picked up instead.
+        let mut expected: SymmetricBandedMat<f64> =
+            SymmetricBandedMat::zeros(4, 1, TriangularKind::Lower);
+        for i in 0..4 {
+            expected.set(i, i, 10.0 * (i as f64 + 1.0));
+        }
+        for i in 0..3 {
+            expected.set(i + 1, i, i as f64 + 1.0);
+        }
+
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(sb.get(i, j), expected.get(i, j), "mismatch at ({i}, {j})");
+            }
+        }
+
+        // Directly confirm the lower-triangle values (not the upper ones)
+        // were picked up.
+        assert_eq!(sb.get(1, 0), Some(&1.0));
+        assert_eq!(sb.get(0, 1), Some(&1.0)); // symmetric storage
+        assert_eq!(sb.get(2, 1), Some(&2.0));
+        assert_eq!(sb.get(3, 2), Some(&3.0));
+    }
+
+    #[test]
+    fn test_to_symmetric_banded_upper_still_works() {
+        use crate::packed::TriangularKind;
+
+        // Regression guard: the Upper path (the previous, only behavior)
+        // must keep working once Lower support is added.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(3, 3, 1, 1);
+        bm.set(0, 0, 1.0);
+        bm.set(1, 1, 2.0);
+        bm.set(2, 2, 3.0);
+        bm.set(0, 1, -1.0);
+        bm.set(1, 2, -2.0);
+
+        let sb = bm.to_symmetric_banded(TriangularKind::Upper);
+        assert_eq!(sb.uplo(), TriangularKind::Upper);
+        assert_eq!(sb.get(0, 1), Some(&-1.0));
+        assert_eq!(sb.get(1, 2), Some(&-2.0));
     }
 
     #[test]

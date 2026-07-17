@@ -473,14 +473,24 @@ impl<T: Scalar> TriangularMat<T> {
     /// Sets an element.
     ///
     /// # Panics
-    /// Panics if setting diagonal on unit triangular matrix.
+    /// Panics if `(row, col)` is outside the stored triangle, or if
+    /// setting the diagonal on a unit triangular matrix.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
         assert!(
             !(self.diag == DiagonalKind::Unit && row == col),
             "Cannot set diagonal of unit triangular matrix"
         );
-        self.packed.set(row, col, value);
+        assert!(
+            self.in_triangle(row, col),
+            "Element outside stored triangle"
+        );
+        // Safety of the `expect`: `in_triangle` above is exactly the
+        // condition `PackedMat::set` uses to decide success, so having
+        // just checked it makes the error case unreachable here.
+        self.packed
+            .set(row, col, value)
+            .expect("in_triangle check above guarantees this index is valid");
     }
 
     /// Returns a pointer to the packed data.
@@ -576,7 +586,10 @@ impl<T: Scalar> TriangularMat<T> {
             for j in 0..n {
                 for i in 0..n {
                     if self.in_triangle(i, j) && i != j {
-                        self.packed.set(i, j, value);
+                        // Safety of the `expect`: guarded by `in_triangle` above.
+                        self.packed
+                            .set(i, j, value)
+                            .expect("in_triangle check above guarantees this index is valid");
                     }
                 }
             }
@@ -784,13 +797,25 @@ impl<'a, T: Scalar> TriangularMut<'a, T> {
     }
 
     /// Sets element at (row, col).
+    ///
+    /// # Panics
+    /// Panics if `(row, col)` is outside the stored triangle, or if
+    /// setting the diagonal on a unit triangular matrix.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
         assert!(
             !(self.diag == DiagonalKind::Unit && row == col),
             "Cannot set diagonal of unit triangular matrix"
         );
-        self.packed.set(row, col, value);
+        assert!(
+            self.packed.packed_index(row, col).is_some(),
+            "Element outside stored triangle"
+        );
+        // Safety of the `expect`: the `packed_index` check above is exactly
+        // the condition `PackedMut::set` uses to decide success.
+        self.packed
+            .set(row, col, value)
+            .expect("packed_index check above guarantees this index is valid");
     }
 
     /// Creates an immutable reborrow.

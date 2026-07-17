@@ -227,6 +227,197 @@ impl QuadFloat {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Double-double-aware integer rounding and helpers
+// -----------------------------------------------------------------------------
+//
+// A normalized `TwoFloat` stores a value as two non-overlapping `f64` words
+// `hi + lo`, where `hi` is the correctly rounded `f64` nearest the true value
+// and `lo` is the exact rounding error, so `|lo| <= 0.5 * ulp(hi)`. Rounding the
+// value to an integer therefore cannot be done on `hi` alone: when `hi` is
+// itself an integer the entire fractional part lives in `lo`, and when `hi` is a
+// half-integer the sign of `lo` decides how a tie falls. Each helper below
+// derives the case analysis from that invariant and renormalizes the resulting
+// pair with an error-free `two_sum` (`TwoFloat::new_add`).
+#[cfg(feature = "f128")]
+impl QuadFloat {
+    /// Largest integer `<= self`, at double-double precision (`f64::floor`).
+    ///
+    /// WHY the split: if `hi` is not an integer, the true value stays on the
+    /// same side of every integer as `hi` — the low word is at most half a ULP,
+    /// and had it been able to cross an integer boundary `hi` would already have
+    /// rounded to that integer — so `floor(hi+lo) == floor(hi)`. If `hi` is an
+    /// integer, `floor(hi+lo) = hi + floor(lo)`, which we renormalize.
+    #[inline]
+    fn dd_floor(self) -> Self {
+        let hi = self.0.hi();
+        let floored_hi = hi.floor();
+        if floored_hi != hi {
+            QuadFloat(TwoFloat::from_f64(floored_hi))
+        } else {
+            QuadFloat(TwoFloat::new_add(hi, self.0.lo().floor()))
+        }
+    }
+
+    /// Smallest integer `>= self`, at double-double precision (`f64::ceil`).
+    ///
+    /// Mirror image of [`dd_floor`](Self::dd_floor).
+    #[inline]
+    fn dd_ceil(self) -> Self {
+        let hi = self.0.hi();
+        let ceiled_hi = hi.ceil();
+        if ceiled_hi != hi {
+            QuadFloat(TwoFloat::from_f64(ceiled_hi))
+        } else {
+            QuadFloat(TwoFloat::new_add(hi, self.0.lo().ceil()))
+        }
+    }
+
+    /// Truncation toward zero, at double-double precision (`f64::trunc`).
+    ///
+    /// Truncation is floor for non-negative values and ceil for negative ones;
+    /// the sign of a normalized double-double equals the sign of its high word.
+    #[inline]
+    fn dd_trunc(self) -> Self {
+        if self.0.is_sign_negative() {
+            self.dd_ceil()
+        } else {
+            self.dd_floor()
+        }
+    }
+
+    /// Round half away from zero, at double-double precision (`f64::round`).
+    ///
+    /// WHY the tie handling: a genuine tie (value exactly `k + 0.5`) can arise
+    /// either from `hi` being a half-integer with `lo == 0`, or from `hi` being
+    /// an integer with `lo` a half-integer. Rounding `hi` (or `lo`) in isolation
+    /// with `f64::round` breaks the tie away from *that word's* zero, which is
+    /// the wrong direction whenever the word's sign differs from the whole
+    /// value's sign; those cases are corrected explicitly.
+    #[inline]
+    fn dd_round(self) -> Self {
+        let hi = self.0.hi();
+        let lo = self.0.lo();
+        let rounded_hi = hi.round();
+        if rounded_hi != hi {
+            // `hi` is not an integer, so `round(hi+lo) == round(hi)` unless `hi`
+            // is exactly a half-integer (its own tie), in which case the low
+            // word decides which side of the half-way point the value lies on.
+            if (hi - rounded_hi).abs() == 0.5 {
+                if hi > 0.0 && lo < 0.0 {
+                    QuadFloat(TwoFloat::from_f64(rounded_hi - 1.0))
+                } else if hi < 0.0 && lo > 0.0 {
+                    QuadFloat(TwoFloat::from_f64(rounded_hi + 1.0))
+                } else {
+                    QuadFloat(TwoFloat::from_f64(rounded_hi))
+                }
+            } else {
+                QuadFloat(TwoFloat::from_f64(rounded_hi))
+            }
+        } else {
+            // `hi` is an integer; the fractional part is entirely in `lo`.
+            let mut rounded_lo = lo.round();
+            // On a tie in `lo` whose away-from-zero direction disagrees with the
+            // whole value's away-from-zero direction (opposite signs), pick the
+            // neighbor lying on the whole value's side, i.e. `trunc(lo)`.
+            if (lo - lo.trunc()).abs() == 0.5 && (lo < 0.0) != (hi < 0.0) {
+                rounded_lo = lo.trunc();
+            }
+            QuadFloat(TwoFloat::new_add(hi, rounded_lo))
+        }
+    }
+
+    /// Fractional part `self - trunc(self)`, at double-double precision.
+    ///
+    /// Matches `f64::fract`: the result carries the sign of `self`. The integer
+    /// part is exact, so the subtraction is a well-conditioned double-double
+    /// operation.
+    #[inline]
+    fn dd_fract(self) -> Self {
+        self - self.dd_trunc()
+    }
+
+    /// Overflow-safe Euclidean length `sqrt(self^2 + other^2)`.
+    ///
+    /// WHY the two paths: the direct form `sqrt(a^2 + b^2)` is correctly rounded
+    /// at full double-double precision but overflows to infinity once the larger
+    /// operand exceeds `sqrt(MAX)` (and loses precision to subnormals when both
+    /// are tiny), even when the true result is finite. When the larger magnitude
+    /// is in the safe window we therefore use the direct form; outside it we fall
+    /// back to the scaled form `max * sqrt(1 + (min/max)^2)`, whose squared term
+    /// is bounded to `[0, 1]` so the only overflow that can occur is a genuine
+    /// one. (twofloat's `TwoFloat / TwoFloat` division is not full precision, so
+    /// the scaled path is slightly less accurate — hence it is used only when
+    /// unavoidable.)
+    #[inline]
+    fn dd_hypot(self, other: Self) -> Self {
+        // `sqrt(f64::MAX / 2)`, with headroom so `a*a + b*b` cannot overflow.
+        const HYPOT_MAX_SAFE: f64 = 2.9e153;
+        // Below this the squares would start degrading into the subnormal range.
+        const HYPOT_MIN_SAFE: f64 = 1e-150;
+        let a = QuadFloat(self.0.abs());
+        let b = QuadFloat(other.0.abs());
+        // IEEE-754 hypot special cases: an infinity dominates (even over a NaN),
+        // then a NaN propagates.
+        if a.0.is_infinite() || b.0.is_infinite() {
+            return QuadFloat(TwoFloat::INFINITY);
+        }
+        if a.0.is_nan() || b.0.is_nan() {
+            return QuadFloat(TwoFloat::NAN);
+        }
+        let (max, min) = if a >= b { (a, b) } else { (b, a) };
+        let max_hi = max.0.hi();
+        if max_hi == 0.0 {
+            return QuadFloat::from(0.0);
+        }
+        if (HYPOT_MIN_SAFE..HYPOT_MAX_SAFE).contains(&max_hi) {
+            let sum = self * self + other * other;
+            QuadFloat(sum.0.sqrt())
+        } else {
+            let ratio = min / max;
+            let radicand = QuadFloat::from(1.0) + ratio * ratio;
+            max * QuadFloat(radicand.0.sqrt())
+        }
+    }
+
+    /// Real cube root, at double-double precision (`f64::cbrt`).
+    ///
+    /// WHY not `powf(1/3)`: raising a negative base to a fractional power is
+    /// NaN, yet the real cube root of a negative number is a well-defined
+    /// negative real. We reduce to `|self|` and restore the sign via
+    /// `cbrt(-x) = -cbrt(x)`.
+    ///
+    /// WHY a division-free Newton: twofloat's `TwoFloat / TwoFloat` division and
+    /// its `powf`/`exp`/`ln` are not full double-double precision, so we refine
+    /// the *inverse* cube root `r = x^(-1/3)` with the iteration
+    /// `r <- r * (4 - x*r^3) / 3`, which uses only multiplications and an exact
+    /// `TwoFloat / f64` division by 3. Two quadratically convergent steps lift
+    /// the ~2^-53 `f64` seed to full ~2^-106 precision; then `cbrt(x) = x * r^2`.
+    #[inline]
+    fn dd_cbrt(self) -> Self {
+        if !self.0.is_finite() {
+            // cbrt(+-inf) = +-inf, cbrt(NaN) = NaN.
+            return self;
+        }
+        if self == QuadFloat::from(0.0) {
+            // Preserve the sign of zero (cbrt(-0.0) = -0.0).
+            return self;
+        }
+        let negative = self.0.is_sign_negative();
+        let x = self.0.abs();
+        let four = TwoFloat::from_f64(4.0);
+        let mut r = TwoFloat::from_f64((1.0 / x.hi()).cbrt());
+        r = r * ((four - x * (r * r * r)) / 3.0_f64);
+        r = r * ((four - x * (r * r * r)) / 3.0_f64);
+        let result = QuadFloat(x * r * r);
+        if negative {
+            -result
+        } else {
+            result
+        }
+    }
+}
+
 #[cfg(feature = "f128")]
 impl From<f64> for QuadFloat {
     #[inline]
@@ -326,9 +517,52 @@ impl Rem for QuadFloat {
     type Output = Self;
     #[inline]
     fn rem(self, rhs: Self) -> Self::Output {
-        // Implement remainder using floor division
-        let quotient = QuadFloat::from((self.0 / rhs.0).hi().floor());
-        self - quotient * rhs
+        // Truncated remainder, matching Rust's `%` for primitive floats: the
+        // result carries the sign of the dividend and `|result| < |rhs|`.
+        //   r = self - trunc(self / rhs) * rhs
+        // (NOT floored division, which would give the sign of the divisor.) The
+        // quotient is truncated at double-double precision, and a single
+        // boundary correction repairs the at-most-one-ULP error the division can
+        // introduce into the truncated quotient so the two defining properties
+        // above hold exactly. For `|self / rhs|` beyond the ~2^106 integer range
+        // of double-double the quotient can no longer be represented exactly and
+        // the result degrades gracefully, as it does for any single-step fmod.
+
+        // twofloat does not define operations on non-finite values, so match
+        // f64 `%` on the special cases explicitly:
+        //   x % 0 = NaN, inf % y = NaN, x % inf = x, NaN propagates.
+        if self.0.is_nan()
+            || rhs.0.is_nan()
+            || self.0.is_infinite()
+            || rhs == QuadFloat::from(0.0)
+        {
+            return QuadFloat(TwoFloat::NAN);
+        }
+        if rhs.0.is_infinite() {
+            return self;
+        }
+
+        let quotient = self / rhs;
+        let mut n = quotient.dd_trunc();
+        let mut remainder = self - n * rhs;
+
+        if remainder != QuadFloat::from(0.0) {
+            let step = if quotient > QuadFloat::from(0.0) {
+                QuadFloat::from(1.0)
+            } else {
+                QuadFloat::from(-1.0)
+            };
+            if remainder.0.is_sign_negative() != self.0.is_sign_negative() {
+                // Truncated quotient overshot: step it one unit toward zero.
+                n -= step;
+                remainder = self - n * rhs;
+            } else if QuadFloat(remainder.0.abs()) >= QuadFloat(rhs.0.abs()) {
+                // Truncated quotient fell short: step it one unit outward.
+                n += step;
+                remainder = self - n * rhs;
+            }
+        }
+        remainder
     }
 }
 
@@ -436,23 +670,23 @@ impl Float for QuadFloat {
     }
 
     fn floor(self) -> Self {
-        QuadFloat::from(self.0.hi().floor())
+        self.dd_floor()
     }
 
     fn ceil(self) -> Self {
-        QuadFloat::from(self.0.hi().ceil())
+        self.dd_ceil()
     }
 
     fn round(self) -> Self {
-        QuadFloat::from(self.0.hi().round())
+        self.dd_round()
     }
 
     fn trunc(self) -> Self {
-        QuadFloat::from(self.0.hi().trunc())
+        self.dd_trunc()
     }
 
     fn fract(self) -> Self {
-        QuadFloat::from(self.0.hi().fract())
+        self.dd_fract()
     }
 
     fn abs(self) -> Self {
@@ -540,11 +774,11 @@ impl Float for QuadFloat {
     }
 
     fn cbrt(self) -> Self {
-        QuadFloat(self.0.powf(TwoFloat::from_f64(1.0 / 3.0)))
+        self.dd_cbrt()
     }
 
     fn hypot(self, other: Self) -> Self {
-        Float::sqrt(self * self + other * other)
+        self.dd_hypot(other)
     }
 
     fn sin(self) -> Self {
@@ -800,27 +1034,27 @@ impl Real for QuadFloat {
 
     #[inline]
     fn floor(self) -> Self {
-        QuadFloat::from(self.0.hi().floor())
+        self.dd_floor()
     }
 
     #[inline]
     fn ceil(self) -> Self {
-        QuadFloat::from(self.0.hi().ceil())
+        self.dd_ceil()
     }
 
     #[inline]
     fn round(self) -> Self {
-        QuadFloat::from(self.0.hi().round())
+        self.dd_round()
     }
 
     #[inline]
     fn trunc(self) -> Self {
-        QuadFloat::from(self.0.hi().trunc())
+        self.dd_trunc()
     }
 
     #[inline]
     fn hypot(self, other: Self) -> Self {
-        Float::sqrt(self * self + other * other)
+        self.dd_hypot(other)
     }
 }
 

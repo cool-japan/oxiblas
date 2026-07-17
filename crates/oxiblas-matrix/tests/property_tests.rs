@@ -4,7 +4,7 @@
 
 use num_complex::Complex64;
 use oxiblas_matrix::{
-    Mat,
+    Expr, LazyExt, Mat,
     banded::BandedMat,
     ops,
     packed::{PackedMat, TriangularKind},
@@ -26,6 +26,129 @@ fn clamp_dim(n: usize) -> usize {
 /// Clamp bandwidth to valid range.
 fn clamp_band(k: usize, n: usize) -> usize {
     k.min(n.saturating_sub(1))
+}
+
+/// Clamp dimension for tests that perform O(n^3) work (matrix
+/// multiplication, matrix inversion), so property runs stay fast and the
+/// generated matrices stay numerically well conditioned.
+fn clamp_dim_cubic(n: usize) -> usize {
+    (n % 8) + 1
+}
+
+/// Fills a matrix with pseudo-random values in `[-1, 1]` using the same
+/// deterministic LCG pattern used throughout this file.
+fn random_mat(rows: usize, cols: usize, seed: u64) -> Mat<f64> {
+    let mut m: Mat<f64> = Mat::zeros(rows, cols);
+    let mut rng_state = seed;
+    for i in 0..rows {
+        for j in 0..cols {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            m[(i, j)] = (rng_state as f64 / u64::MAX as f64) * 2.0 - 1.0;
+        }
+    }
+    m
+}
+
+/// Builds a strictly diagonally dominant (hence invertible and
+/// well-conditioned) square matrix with pseudo-random off-diagonal
+/// entries, so `gauss_jordan_inverse` never encounters a singular pivot.
+fn random_diagonally_dominant_mat(n: usize, seed: u64) -> Mat<f64> {
+    let mut m: Mat<f64> = Mat::zeros(n, n);
+    let mut rng_state = seed;
+
+    for i in 0..n {
+        for j in 0..n {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let off = (rng_state as f64 / u64::MAX as f64) * 2.0 - 1.0; // [-1, 1]
+            m[(i, j)] = if i == j { 0.0 } else { off * 0.1 };
+        }
+    }
+
+    // The sum of off-diagonal magnitudes in any row is at most
+    // (n-1) * 0.1. Setting each diagonal entry strictly above `n`
+    // guarantees strict diagonal dominance (Levy-Desplanques theorem =>
+    // nonsingular, and well conditioned) for every size these tests use.
+    for i in 0..n {
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bump = (rng_state as f64 / u64::MAX as f64) + 1.0; // [1, 2]
+        m[(i, i)] = n as f64 + bump;
+    }
+
+    m
+}
+
+/// Inverts a square matrix via Gauss-Jordan elimination with partial
+/// pivoting. This is a hand-rolled oracle used only to build the
+/// `A * A^-1 == I` regression test below -- `oxiblas-matrix` itself does
+/// not provide matrix inversion (factorization/inversion lives in
+/// `oxiblas-lapack`, which depends on `oxiblas-matrix`, so it cannot be
+/// pulled in as a dev-dependency here without creating a cycle).
+fn gauss_jordan_inverse(a: &Mat<f64>) -> Mat<f64> {
+    let n = a.nrows();
+    assert_eq!(
+        n,
+        a.ncols(),
+        "gauss_jordan_inverse requires a square matrix"
+    );
+
+    // Augmented matrix [A | I], stored row-major for straightforward
+    // pivoting and elimination.
+    let mut aug: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row = vec![0.0; 2 * n];
+            for j in 0..n {
+                row[j] = a[(i, j)];
+            }
+            row[n + i] = 1.0;
+            row
+        })
+        .collect();
+
+    for col in 0..n {
+        let pivot_row = (col..n)
+            .max_by(|&r1, &r2| {
+                aug[r1][col]
+                    .abs()
+                    .partial_cmp(&aug[r2][col].abs())
+                    .expect("matrix entries are finite by construction")
+            })
+            .expect("column range col..n is non-empty since col < n");
+        aug.swap(col, pivot_row);
+
+        let pivot = aug[col][col];
+        assert!(
+            pivot.abs() > 1e-10,
+            "matrix is singular or ill-conditioned; callers must supply \
+             diagonally dominant matrices"
+        );
+
+        for val in &mut aug[col] {
+            *val /= pivot;
+        }
+
+        // Snapshot the normalized pivot row so it can be borrowed alongside
+        // each target row during elimination below (both live in `aug`).
+        let pivot_row_vals = aug[col].clone();
+        for (row, target_row) in aug.iter_mut().enumerate() {
+            if row == col {
+                continue;
+            }
+            let factor = target_row[col];
+            if factor != 0.0 {
+                for (target, &pivot_val) in target_row.iter_mut().zip(pivot_row_vals.iter()) {
+                    *target -= factor * pivot_val;
+                }
+            }
+        }
+    }
+
+    let mut inv: Mat<f64> = Mat::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            inv[(i, j)] = aug[i][n + j];
+        }
+    }
+    inv
 }
 
 // ============================================================================
@@ -100,29 +223,39 @@ fn prop_mat_transpose_involutory(rows: u8, cols: u8, seed: u64) -> bool {
     let rows = clamp_dim(rows as usize);
     let cols = clamp_dim(cols as usize);
 
-    // Create a matrix with deterministic values
-    let mut m: Mat<f64> = Mat::zeros(rows, cols);
-    let mut rng_state = seed;
-    for i in 0..rows {
-        for j in 0..cols {
-            // Simple LCG for deterministic values
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            m[(i, j)] = (rng_state as f64 / u64::MAX as f64) * 2.0 - 1.0;
-        }
-    }
+    let m = random_mat(rows, cols, seed);
 
-    // Transpose twice should give original
+    // Genuine involution check: transpose(transpose(A)) == A.
+    //
+    // `TransposeRef` (the type returned by `MatRef::transpose()`) does not
+    // itself expose `.transpose()`, so the second application is done by
+    // materializing the first transposed view into an owned matrix and
+    // transposing that -- this still exercises the real
+    // `MatRef::transpose()` code path twice, which is what this test's
+    // name promises (unlike the previous version, which only checked a
+    // single transpose against manual index math).
     let t1 = m.as_ref().transpose();
-
-    // Check dimensions
     if t1.nrows() != cols || t1.ncols() != rows {
         return false;
     }
 
-    // Check elements: t1[i,j] == m[j,i]
-    for i in 0..cols {
-        for j in 0..rows {
-            if (t1[(i, j)] - m[(j, i)]).abs() > 1e-14 {
+    let mut t1_owned: Mat<f64> = Mat::zeros(t1.nrows(), t1.ncols());
+    for i in 0..t1.nrows() {
+        for j in 0..t1.ncols() {
+            t1_owned[(i, j)] = t1[(i, j)];
+        }
+    }
+
+    let t2 = t1_owned.as_ref().transpose();
+    if t2.nrows() != rows || t2.ncols() != cols {
+        return false;
+    }
+
+    // Transposition only permutes element positions, so no rounding is
+    // introduced by either application: equality must be exact.
+    for i in 0..rows {
+        for j in 0..cols {
+            if t2[(i, j)] != m[(i, j)] {
                 return false;
             }
         }
@@ -172,6 +305,130 @@ fn prop_mat_clone_equals_original(rows: u8, cols: u8, seed: u64) -> bool {
     for i in 0..rows {
         for j in 0..cols {
             if (m[(i, j)] - m2[(i, j)]).abs() > 1e-14 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ============================================================================
+// Algebraic law property tests (exercise the real numerical kernels)
+// ============================================================================
+//
+// Unlike the structural/storage invariants above, these tests drive the
+// crate's actual arithmetic entry points (the lazy `Expr` add/matmul/gemm
+// evaluators) with genuinely random matrix content and check the algebraic
+// laws those kernels must satisfy.
+
+#[quickcheck]
+fn prop_mat_addition_is_associative(
+    rows: u8,
+    cols: u8,
+    seed_a: u64,
+    seed_b: u64,
+    seed_c: u64,
+) -> bool {
+    let rows = clamp_dim(rows as usize);
+    let cols = clamp_dim(cols as usize);
+
+    let a = random_mat(rows, cols, seed_a);
+    let b = random_mat(rows, cols, seed_b);
+    let c = random_mat(rows, cols, seed_c);
+
+    // (A + B) + C
+    let lhs = ((a.as_ref().lazy() + b.as_ref().lazy()) + c.as_ref().lazy()).eval();
+    // A + (B + C)
+    let rhs = (a.as_ref().lazy() + (b.as_ref().lazy() + c.as_ref().lazy())).eval();
+
+    for i in 0..rows {
+        for j in 0..cols {
+            if (lhs[(i, j)] - rhs[(i, j)]).abs() > 1e-9 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[quickcheck]
+fn prop_mat_addition_is_commutative(rows: u8, cols: u8, seed_a: u64, seed_b: u64) -> bool {
+    let rows = clamp_dim(rows as usize);
+    let cols = clamp_dim(cols as usize);
+
+    let a = random_mat(rows, cols, seed_a);
+    let b = random_mat(rows, cols, seed_b);
+
+    let ab = (a.as_ref().lazy() + b.as_ref().lazy()).eval();
+    let ba = (b.as_ref().lazy() + a.as_ref().lazy()).eval();
+
+    for i in 0..rows {
+        for j in 0..cols {
+            if (ab[(i, j)] - ba[(i, j)]).abs() > 1e-14 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[quickcheck]
+fn prop_mat_mul_is_associative(n: u8, seed_a: u64, seed_b: u64, seed_c: u64) -> bool {
+    let n = clamp_dim_cubic(n as usize);
+
+    let a = random_mat(n, n, seed_a);
+    let b = random_mat(n, n, seed_b);
+    let c = random_mat(n, n, seed_c);
+
+    // (A * B) * C
+    let lhs = a
+        .as_ref()
+        .lazy()
+        .matmul(b.as_ref().lazy())
+        .matmul(c.as_ref().lazy())
+        .eval();
+    // A * (B * C)
+    let rhs = a
+        .as_ref()
+        .lazy()
+        .matmul(b.as_ref().lazy().matmul(c.as_ref().lazy()))
+        .eval();
+
+    // Each chained multiplication accumulates O(n) rounding terms, and
+    // entry magnitudes grow like O(n) per multiplication, so allow
+    // rounding proportional to n^2 while still catching any real
+    // algorithmic bug (which produces O(1)-sized errors regardless of n).
+    let tolerance = 1e-9 * (n as f64).powi(2) + 1e-9;
+
+    for i in 0..n {
+        for j in 0..n {
+            if (lhs[(i, j)] - rhs[(i, j)]).abs() > tolerance {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[quickcheck]
+fn prop_mat_inverse_is_correct(n: u8, seed: u64) -> bool {
+    let n = clamp_dim_cubic(n as usize);
+
+    let a = random_diagonally_dominant_mat(n, seed);
+    let inv = gauss_jordan_inverse(&a);
+
+    // A * A^-1 == I
+    let product_right = a.as_ref().lazy().matmul(inv.as_ref().lazy()).eval();
+    // A^-1 * A == I
+    let product_left = inv.as_ref().lazy().matmul(a.as_ref().lazy()).eval();
+
+    for i in 0..n {
+        for j in 0..n {
+            let expected = if i == j { 1.0 } else { 0.0 };
+            if (product_right[(i, j)] - expected).abs() > 1e-6 {
+                return false;
+            }
+            if (product_left[(i, j)] - expected).abs() > 1e-6 {
                 return false;
             }
         }
@@ -260,7 +517,9 @@ fn prop_packed_set_get_roundtrip(n: u8, row: u8, col: u8, val: f64) -> bool {
     // Upper triangular: only set if row <= col
     let mut packed_upper: PackedMat<f64> = PackedMat::zeros(n, TriangularKind::Upper);
     if row <= col {
-        packed_upper.set(row, col, val);
+        if packed_upper.set(row, col, val).is_err() {
+            return false;
+        }
         if let Some(v) = packed_upper.get(row, col) {
             if (*v - val).abs() > 1e-14 {
                 return false;
@@ -273,7 +532,9 @@ fn prop_packed_set_get_roundtrip(n: u8, row: u8, col: u8, val: f64) -> bool {
     // Lower triangular: only set if row >= col
     let mut packed_lower: PackedMat<f64> = PackedMat::zeros(n, TriangularKind::Lower);
     if row >= col {
-        packed_lower.set(row, col, val);
+        if packed_lower.set(row, col, val).is_err() {
+            return false;
+        }
         if let Some(v) = packed_lower.get(row, col) {
             if (*v - val).abs() > 1e-14 {
                 return false;

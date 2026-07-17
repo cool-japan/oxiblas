@@ -123,18 +123,26 @@ pub fn hemm<T: Field>(
         return Ok(());
     }
 
-    // Helper to get Hermitian element: A[i,j] = conj(A[j,i]) for off-diagonal
+    // Helper to get a Hermitian element of A.
+    //
+    // Off-diagonal: A[i,j] = conj(A[j,i]). Diagonal: reference (Z/C)HEMM treat A's
+    // diagonal as purely REAL (the stored imaginary part is assumed zero), so we
+    // strip it here — a caller that leaves imaginary junk on the diagonal must still
+    // get the correct Hermitian product. No-op for real element types.
     let get_a = |i: usize, j: usize| -> T {
+        if i == j {
+            return T::from_real(a[(i, i)].real());
+        }
         match uplo {
             Uplo::Lower => {
-                if i >= j {
+                if i > j {
                     a[(i, j)]
                 } else {
                     a[(j, i)].conj()
                 }
             }
             Uplo::Upper => {
-                if i <= j {
+                if i < j {
                     a[(i, j)]
                 } else {
                     a[(j, i)].conj()
@@ -142,6 +150,11 @@ pub fn hemm<T: Field>(
             }
         }
     };
+
+    // β == 0 must NOT read C: an uninitialised C buffer may hold NaN/garbage, and
+    // `0·NaN == NaN` would poison the result. When β is zero the C term is dropped
+    // entirely rather than computed and discarded.
+    let beta_is_zero = beta == T::zero();
 
     match side {
         Side::Left => {
@@ -152,7 +165,11 @@ pub fn hemm<T: Field>(
                     for k in 0..ka {
                         sum += get_a(i, k) * b[(k, j)];
                     }
-                    let val = alpha * sum + beta * c[(i, j)];
+                    let val = if beta_is_zero {
+                        alpha * sum
+                    } else {
+                        alpha * sum + beta * c[(i, j)]
+                    };
                     c.set(i, j, val);
                 }
             }
@@ -165,7 +182,11 @@ pub fn hemm<T: Field>(
                     for k in 0..ka {
                         sum += b[(i, k)] * get_a(k, j);
                     }
-                    let val = alpha * sum + beta * c[(i, j)];
+                    let val = if beta_is_zero {
+                        alpha * sum
+                    } else {
+                        alpha * sum + beta * c[(i, j)]
+                    };
                     c.set(i, j, val);
                 }
             }
@@ -283,13 +304,15 @@ fn hemm_via_gemm_c64(
     c: MatMut<'_, Complex64>,
     ka: usize,
 ) -> Result<(), HemmError> {
-    // Expand Hermitian matrix to full matrix
-    // For Hermitian: A[i,j] = conj(A[j,i]) for off-diagonal elements
+    // Expand Hermitian matrix to full matrix.
+    // Off-diagonal: A[i,j] = conj(A[j,i]). Diagonal: reference ZHEMM treats A's
+    // diagonal as purely REAL (imaginary part assumed zero), so force it real here to
+    // match the naive path and keep the expanded matrix genuinely Hermitian.
     let mut a_full: Mat<Complex64> = Mat::zeros(ka, ka);
     match uplo {
         Uplo::Lower => {
             for i in 0..ka {
-                a_full[(i, i)] = a[(i, i)];
+                a_full[(i, i)] = Complex64::new(a[(i, i)].re, 0.0);
                 for j in 0..i {
                     let val = a[(i, j)];
                     a_full[(i, j)] = val;
@@ -299,7 +322,7 @@ fn hemm_via_gemm_c64(
         }
         Uplo::Upper => {
             for i in 0..ka {
-                a_full[(i, i)] = a[(i, i)];
+                a_full[(i, i)] = Complex64::new(a[(i, i)].re, 0.0);
                 for j in (i + 1)..ka {
                     let val = a[(i, j)];
                     a_full[(i, j)] = val;
@@ -380,12 +403,13 @@ fn hemm_via_gemm_c32(
     c: MatMut<'_, Complex32>,
     ka: usize,
 ) -> Result<(), HemmError> {
-    // Expand Hermitian matrix to full matrix
+    // Expand Hermitian matrix to full matrix. Diagonal forced real (imaginary part
+    // assumed zero) to match reference CHEMM and the naive path — see hemm_via_gemm_c64.
     let mut a_full: Mat<Complex32> = Mat::zeros(ka, ka);
     match uplo {
         Uplo::Lower => {
             for i in 0..ka {
-                a_full[(i, i)] = a[(i, i)];
+                a_full[(i, i)] = Complex32::new(a[(i, i)].re, 0.0);
                 for j in 0..i {
                     let val = a[(i, j)];
                     a_full[(i, j)] = val;
@@ -395,7 +419,7 @@ fn hemm_via_gemm_c32(
         }
         Uplo::Upper => {
             for i in 0..ka {
-                a_full[(i, i)] = a[(i, i)];
+                a_full[(i, i)] = Complex32::new(a[(i, i)].re, 0.0);
                 for j in (i + 1)..ka {
                     let val = a[(i, j)];
                     a_full[(i, j)] = val;
@@ -803,5 +827,163 @@ mod tests {
         assert!((c[(0, 0)].im - (-1.0)).abs() < 1e-5);
         assert!((c[(1, 0)].re - 4.0).abs() < 1e-5);
         assert!((c[(1, 0)].im - 1.0).abs() < 1e-5);
+    }
+
+    /// Regression: `beta == 0` must not read C, so NaN/garbage in the output buffer
+    /// cannot leak into the result via `0·NaN`. Exercises the naive `hemm` path.
+    #[test]
+    fn test_hemm_beta_zero_ignores_nan_c() {
+        let a = Mat::from_rows(&[
+            &[cplx(2.0, 0.0), cplx(0.0, 0.0)],
+            &[cplx(1.0, 1.0), cplx(3.0, 0.0)],
+        ]);
+        let b = Mat::from_rows(&[
+            &[cplx(1.0, 0.0), cplx(0.0, 1.0)],
+            &[cplx(1.0, 0.0), cplx(1.0, 0.0)],
+        ]);
+
+        let nan = cplx(f64::NAN, f64::NAN);
+        let mut c = Mat::from_rows(&[&[nan, nan], &[nan, nan]]);
+
+        hemm(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c.as_mut(),
+        )
+        .unwrap();
+
+        // Result must be NaN-free and equal to a clean α·A·B run.
+        let mut c_ref = Mat::zeros(2, 2);
+        hemm(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c_ref.as_mut(),
+        )
+        .unwrap();
+
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    c[(i, j)].re.is_finite() && c[(i, j)].im.is_finite(),
+                    "NaN leaked into C[{i},{j}] with beta==0"
+                );
+                assert!((c[(i, j)] - c_ref[(i, j)]).norm() < 1e-12);
+            }
+        }
+    }
+
+    /// Regression: A's diagonal is treated as real (imaginary part assumed zero).
+    /// A bogus imaginary part on the diagonal must produce the same result as the
+    /// matrix with an explicitly-real diagonal. Exercises the naive `hemm` path.
+    #[test]
+    fn test_hemm_ignores_diagonal_imaginary_part() {
+        let a_bogus = Mat::from_rows(&[
+            &[cplx(2.0, 5.0), cplx(0.0, 0.0)], // imaginary 5.0 on the diagonal is junk
+            &[cplx(1.0, 1.0), cplx(3.0, -7.0)], // imaginary -7.0 is junk
+        ]);
+        let a_real_diag = Mat::from_rows(&[
+            &[cplx(2.0, 0.0), cplx(0.0, 0.0)],
+            &[cplx(1.0, 1.0), cplx(3.0, 0.0)],
+        ]);
+        let b = Mat::from_rows(&[
+            &[cplx(1.0, 2.0), cplx(3.0, -1.0)],
+            &[cplx(-1.0, 1.0), cplx(2.0, 2.0)],
+        ]);
+
+        let mut c_bogus = Mat::zeros(2, 2);
+        hemm(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a_bogus.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c_bogus.as_mut(),
+        )
+        .unwrap();
+
+        let mut c_real = Mat::zeros(2, 2);
+        hemm(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a_real_diag.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c_real.as_mut(),
+        )
+        .unwrap();
+
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (c_bogus[(i, j)] - c_real[(i, j)]).norm() < 1e-12,
+                    "diagonal imaginary part not ignored at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Regression: the same diagonal-is-real invariant on the optimized 3M-GEMM path
+    /// (`hemm_via_gemm_c64`), which expands A into a full matrix.
+    #[test]
+    fn test_hemm_c64_ignores_diagonal_imaginary_part() {
+        let n = 64;
+        let mut a_bogus: Mat<Complex64> = Mat::zeros(n, n);
+        let mut a_real: Mat<Complex64> = Mat::zeros(n, n);
+        let mut b: Mat<Complex64> = Mat::zeros(n, n);
+        for i in 0..n {
+            a_bogus[(i, i)] = cplx((i + 1) as f64, 0.3 * (i + 1) as f64);
+            a_real[(i, i)] = cplx((i + 1) as f64, 0.0);
+            for j in 0..i {
+                let v = cplx(0.01 * (i + j) as f64, 0.001 * (i * j) as f64);
+                a_bogus[(i, j)] = v;
+                a_real[(i, j)] = v;
+            }
+            for j in 0..n {
+                b[(i, j)] = cplx(0.01 * (i + j + 1) as f64, 0.02 * (j as f64));
+            }
+        }
+
+        let mut c_bogus: Mat<Complex64> = Mat::zeros(n, n);
+        hemm_c64(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a_bogus.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c_bogus.as_mut(),
+        )
+        .unwrap();
+
+        let mut c_real: Mat<Complex64> = Mat::zeros(n, n);
+        hemm_c64(
+            Side::Left,
+            Uplo::Lower,
+            cplx(1.0, 0.0),
+            a_real.as_ref(),
+            b.as_ref(),
+            cplx(0.0, 0.0),
+            c_real.as_mut(),
+        )
+        .unwrap();
+
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    (c_bogus[(i, j)] - c_real[(i, j)]).norm() < 1e-8,
+                    "GEMM-path diagonal imaginary part not ignored at ({i},{j})"
+                );
+            }
+        }
     }
 }

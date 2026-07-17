@@ -234,6 +234,59 @@ impl Header {
         Ok(())
     }
 
+    /// Validates that a mapping of `mmap_len` bytes is actually large enough to
+    /// back the matrix these header dimensions describe, and that `row_stride`
+    /// can hold `nrows` elements per column.
+    ///
+    /// # Why this check is safety-critical (not just a nicety)
+    ///
+    /// [`Header::validate`] only checks magic / version / element-type — it never
+    /// cross-checks the *claimed dimensions* against the *real file length*. A
+    /// truncated or hand-crafted `.oxiblas` file would therefore map successfully,
+    /// after which every element accessor (`get`, `Index`, `as_ref`, and — on the
+    /// writable map — `set` / `get_mut` / `IndexMut`) computes byte offsets from
+    /// these header dimensions and reads or **writes** past the end of the mapping.
+    /// That is out-of-bounds memory access (UB / SIGBUS / memory corruption)
+    /// reachable from a 100%-safe API. This must run *before* any pointer
+    /// arithmetic that trusts the header dimensions.
+    ///
+    /// A `checked_mul` overflow is itself proof the dimensions are bogus — they
+    /// cannot describe any real allocation — so the `None` (overflow) case is
+    /// treated as an error, not silently clamped.
+    fn validate_layout<T: Scalar>(&self, mmap_len: usize) -> Result<(), MmapError> {
+        let nrows = self.nrows as usize;
+        let ncols = self.ncols as usize;
+        let row_stride = self.row_stride as usize;
+
+        // A stride shorter than the row count would make columns overlap and
+        // desynchronize offset math from the layout the writer produced.
+        if row_stride < nrows {
+            return Err(MmapError::InvalidDimensions(format!(
+                "row_stride ({row_stride}) is smaller than nrows ({nrows})"
+            )));
+        }
+
+        // required = HEADER_SIZE + row_stride * ncols * size_of::<T>()
+        let required = row_stride
+            .checked_mul(ncols)
+            .and_then(|elems| elems.checked_mul(core::mem::size_of::<T>()))
+            .and_then(|data_bytes| data_bytes.checked_add(HEADER_SIZE))
+            .ok_or_else(|| {
+                MmapError::InvalidDimensions(format!(
+                    "dimensions overflow usize: nrows={nrows}, ncols={ncols}, row_stride={row_stride}"
+                ))
+            })?;
+
+        if mmap_len < required {
+            return Err(MmapError::InvalidDimensions(format!(
+                "file too small: {mmap_len} bytes present, {required} required for \
+                 {nrows}x{ncols} matrix (row_stride={row_stride})"
+            )));
+        }
+
+        Ok(())
+    }
+
     fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut bytes = [0u8; HEADER_SIZE];
         bytes[0..8].copy_from_slice(&self.magic);
@@ -309,6 +362,9 @@ impl<T: Scalar> MmapMat<T> {
         // Read and validate header
         let header = Header::from_bytes(&mmap)?;
         header.validate::<T>()?;
+        // Reject truncated/corrupt files BEFORE any accessor can dereference off
+        // the header dimensions (out-of-bounds read hazard from a safe API).
+        header.validate_layout::<T>(mmap.len())?;
 
         Ok(MmapMat {
             mmap,
@@ -352,7 +408,10 @@ impl<T: Scalar> MmapMat<T> {
     /// Returns an immutable view of the matrix.
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, T> {
-        MatRef::new(self.as_ptr(), self.nrows, self.ncols, self.row_stride)
+        // SAFETY: the memory map backs `nrows * ncols` (padded to `row_stride`)
+        // initialized, aligned elements for the borrow's lifetime, and
+        // `row_stride >= nrows`, so every in-bounds `(i, j)` offset is valid.
+        unsafe { MatRef::new(self.as_ptr(), self.nrows, self.ncols, self.row_stride) }
     }
 
     /// Returns the element at (row, col).
@@ -464,6 +523,10 @@ impl<T: Scalar> MmapMatMut<T> {
         // Read and validate header
         let header = Header::from_bytes(&mmap)?;
         header.validate::<T>()?;
+        // Reject truncated/corrupt files BEFORE any accessor can dereference off
+        // the header dimensions. This map is WRITABLE (set / IndexMut), so an
+        // unchecked map here is an out-of-bounds *write* hazard.
+        header.validate_layout::<T>(mmap.len())?;
 
         Ok(MmapMatMut {
             mmap,
@@ -513,7 +576,10 @@ impl<T: Scalar> MmapMatMut<T> {
     /// Returns an immutable view of the matrix.
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, T> {
-        MatRef::new(self.as_ptr(), self.nrows, self.ncols, self.row_stride)
+        // SAFETY: the memory map backs `nrows * ncols` (padded to `row_stride`)
+        // initialized, aligned elements for the borrow's lifetime, and
+        // `row_stride >= nrows`, so every in-bounds `(i, j)` offset is valid.
+        unsafe { MatRef::new(self.as_ptr(), self.nrows, self.ncols, self.row_stride) }
     }
 
     /// Returns a mutable view of the matrix.
@@ -960,6 +1026,104 @@ mod tests {
         assert_eq!(mmat[(0, 1)], 2.0);
         assert_eq!(mmat[(1, 0)], 3.0);
         assert_eq!(mmat[(1, 1)], 4.0);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Writes a syntactically valid `.oxiblas` header (correct magic, version,
+    /// and `f64` element type) advertising `nrows x ncols` with `row_stride`,
+    /// followed by exactly `data_bytes` bytes of zero payload. Callers make the
+    /// payload shorter than those dimensions demand to exercise the truncation
+    /// guard in `open` without corrupting the header itself.
+    fn write_oxiblas_with_short_data(
+        path: &std::path::Path,
+        nrows: usize,
+        ncols: usize,
+        row_stride: usize,
+        data_bytes: usize,
+    ) {
+        use std::io::Write;
+        let header = Header::new::<f64>(nrows, ncols, row_stride)
+            .expect("f64 is a supported element type");
+        let mut file = std::fs::File::create(path).expect("create temp file");
+        file.write_all(&header.to_bytes()).expect("write header");
+        file.write_all(&vec![0u8; data_bytes])
+            .expect("write short data section");
+        file.flush().expect("flush temp file");
+    }
+
+    #[test]
+    fn test_mmap_open_truncated_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_mmap_open_truncated_ro.oxiblas");
+
+        // Header claims a 100x100 f64 matrix: with row_stride=104 that needs
+        // 104 * 100 * 8 = 83_200 data bytes, but we write only 64. Opening this
+        // read-only must fail rather than hand back a map whose accessors would
+        // read past the mapping.
+        write_oxiblas_with_short_data(&path, 100, 100, 104, 64);
+
+        match MmapMat::<f64>::open(&path) {
+            Err(MmapError::InvalidDimensions(_)) => {}
+            Err(other) => panic!("expected InvalidDimensions, got {other:?}"),
+            Ok(_) => panic!("truncated read-only file was accepted (out-of-bounds read hazard)"),
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_mmap_mut_open_truncated_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_mmap_open_truncated_rw.oxiblas");
+
+        // Same corrupt-but-parseable header, opened read-write. An unchecked map
+        // here would expose set()/IndexMut over an undersized region — an
+        // out-of-bounds *write* hazard — so this must be rejected too.
+        write_oxiblas_with_short_data(&path, 100, 100, 104, 64);
+
+        match MmapMatMut::<f64>::open(&path) {
+            Err(MmapError::InvalidDimensions(_)) => {}
+            Err(other) => panic!("expected InvalidDimensions, got {other:?}"),
+            Ok(_) => panic!("truncated writable file was accepted (out-of-bounds write hazard)"),
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_mmap_open_bad_row_stride_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_mmap_open_bad_stride.oxiblas");
+
+        // row_stride (4) < nrows (100): even with a generously long payload this
+        // is an inconsistent layout that must be rejected before any offset math.
+        write_oxiblas_with_short_data(&path, 100, 10, 4, 4 * 10 * 8);
+
+        match MmapMat::<f64>::open(&path) {
+            Err(MmapError::InvalidDimensions(_)) => {}
+            Err(other) => panic!("expected InvalidDimensions, got {other:?}"),
+            Ok(_) => panic!("file with row_stride < nrows was accepted"),
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_mmap_open_overflow_dims_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_mmap_open_overflow.oxiblas");
+
+        // row_stride * ncols * size_of::<f64>() overflows usize. The claimed
+        // dimensions cannot describe any real allocation, so opening must fail
+        // (the checked_mul None case) instead of wrapping to a small size.
+        write_oxiblas_with_short_data(&path, usize::MAX, 1024, usize::MAX, 64);
+
+        match MmapMat::<f64>::open(&path) {
+            Err(MmapError::InvalidDimensions(_)) => {}
+            Err(other) => panic!("expected InvalidDimensions, got {other:?}"),
+            Ok(_) => panic!("file with overflowing dimensions was accepted"),
+        }
 
         std::fs::remove_file(path).ok();
     }

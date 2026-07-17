@@ -1,21 +1,30 @@
 //! Runtime function multi-versioning infrastructure for OxiBLAS.
 //!
-//! This module builds on top of [`crate::simd::dispatch`] to provide:
+//! This module is a thin façade over [`crate::simd::dispatch`], which is the
+//! single source of truth for CPU SIMD capability detection and kernel
+//! selection.  It provides:
 //!
-//! - Extended [`SimdCapabilityInfo`] with the field names required by the task
-//!   specification (`has_avx512f`, `has_avx2`, `has_sse42`, `has_fma`,
-//!   `has_neon`, `cache_line_bytes`, `vector_width_bytes`) and a `detect()`
-//!   that returns `&'static Self` when `std` is enabled.
-//! - [`simd_dispatch_caps!`] macro for named-arm dispatch.
-//! - [`SimdDispatcher`] trait for multi-versioned computations.
-//! - [`KernelSelector`] / [`GemmKernelKind`] for startup kernel selection.
+//! - Extended [`SimdCapabilityInfo`] with the field names required by the
+//!   multi-versioning layer (`has_avx512f`, `has_avx2`, `has_sse42`, `has_fma`,
+//!   `has_neon`, `cache_line_bytes`, `vector_width_bytes`, `has_simd128`) and a
+//!   `detect()` that returns `&'static Self` when `std` is enabled.  Its values
+//!   are copied verbatim from [`dispatch::SimdCapabilities`] so the two can
+//!   never diverge.
+//! - The [`simd_dispatch_caps!`] macro for named-arm dispatch.
+//!
+//! [`SimdDispatcher`], [`KernelSelector`] and [`GemmKernelKind`] are **re-exported
+//! unchanged** from [`crate::simd::dispatch`].  An earlier revision of this
+//! module defined its own copies of those three types, but they had drifted out
+//! of sync — the copies here silently dropped the SSE4.2 kernel tier, so an
+//! SSE4.2-only x86-64 CPU was misclassified as scalar.  Re-exporting the
+//! dispatch definitions makes that class of divergence structurally impossible.
 //!
 //! # no_std
 //!
 //! Under `no_std`, `SimdCapabilityInfo::detect()` returns a freshly derived
-//! value on every call because `OnceLock` is unavailable.  All fields are set
-//! from compile-time `cfg!(target_feature = …)` constants, which the compiler
-//! constant-folds away.
+//! value on every call because `OnceLock` is unavailable.  The value is still
+//! copied from the dispatch layer, which itself derives from compile-time
+//! `cfg!(target_feature = …)` constants that the compiler constant-folds away.
 
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -62,6 +71,12 @@ pub struct SimdCapabilityInfo {
     pub has_sve: bool,
 
     // ------------------------------------------------------------------
+    // WebAssembly
+    // ------------------------------------------------------------------
+    /// WebAssembly `simd128` (128-bit) support (wasm32 target only).
+    pub has_simd128: bool,
+
+    // ------------------------------------------------------------------
     // Memory topology
     // ------------------------------------------------------------------
     /// Bytes in a single cache line (typically 64 on modern CPUs).
@@ -106,77 +121,44 @@ impl SimdCapabilityInfo {
         Self::from_legacy(legacy)
     }
 
-    /// Build from the legacy [`SimdCapabilities`] already present in
-    /// `dispatch.rs`.  This ensures the two structs never diverge in their
-    /// detection logic.
+    /// Build from the authoritative [`dispatch::SimdCapabilities`].
+    ///
+    /// Every field is copied verbatim.  The dispatch layer already performs
+    /// accurate runtime SSE4.2 detection *and* applies the `force-scalar` /
+    /// `max-simd-128` / `max-simd-256` cargo-feature gating, so re-deriving any
+    /// value here (as an earlier revision did — it wrongly claimed "the legacy
+    /// struct only tracks SSE3" and recomputed the width, defeating the
+    /// feature gating) would only reintroduce divergence.
     #[cfg(feature = "std")]
     fn from_legacy(legacy: &LegacyCaps) -> Self {
-        // SSE4.2 detection: the legacy struct only tracks SSE3.  We check for
-        // SSE4.2 directly when std is available so that runtime detection is
-        // accurate.
-        #[cfg(all(target_arch = "x86_64", feature = "std"))]
-        let has_sse42 = is_x86_feature_detected!("sse4.2");
-        #[cfg(not(target_arch = "x86_64"))]
-        let has_sse42 = false;
-
-        let has_avx512f = legacy.has_avx512f;
-        let has_avx2 = legacy.has_avx2;
-
-        let vector_width_bytes = if has_avx512f {
-            64
-        } else if has_avx2 {
-            32
-        } else if has_sse42 || legacy.has_neon {
-            16
-        } else {
-            8
-        };
-
-        Self {
-            has_sse42,
-            has_avx: legacy.has_avx,
-            has_avx2,
-            has_fma: legacy.has_fma,
-            has_avx512f,
-            has_avx512bw: legacy.has_avx512bw,
-            has_avx512vl: legacy.has_avx512vl,
-            has_neon: legacy.has_neon,
-            has_sve: legacy.has_sve,
-            cache_line_bytes: 64,
-            vector_width_bytes,
-        }
+        Self::mirror(legacy)
     }
 
-    /// Build from the legacy [`SimdCapabilities`] (no_std path, passed by
-    /// value).
+    /// Build from the authoritative [`dispatch::SimdCapabilities`] (no_std path,
+    /// passed by value).
     #[cfg(not(feature = "std"))]
     fn from_legacy(legacy: LegacyCaps) -> Self {
-        let has_sse42 = cfg!(target_feature = "sse4.2");
-        let has_avx512f = legacy.has_avx512f;
-        let has_avx2 = legacy.has_avx2;
+        Self::mirror(&legacy)
+    }
 
-        let vector_width_bytes: usize = if has_avx512f {
-            64
-        } else if has_avx2 {
-            32
-        } else if has_sse42 || legacy.has_neon {
-            16
-        } else {
-            8
-        };
-
+    /// Field-by-field copy from [`dispatch::SimdCapabilities`].  This is the
+    /// only construction path for [`SimdCapabilityInfo`], guaranteeing it stays
+    /// a faithful view of the single source of truth.
+    #[inline]
+    fn mirror(legacy: &LegacyCaps) -> Self {
         Self {
-            has_sse42,
+            has_sse42: legacy.has_sse42,
             has_avx: legacy.has_avx,
-            has_avx2,
+            has_avx2: legacy.has_avx2,
             has_fma: legacy.has_fma,
-            has_avx512f,
+            has_avx512f: legacy.has_avx512f,
             has_avx512bw: legacy.has_avx512bw,
             has_avx512vl: legacy.has_avx512vl,
             has_neon: legacy.has_neon,
             has_sve: legacy.has_sve,
-            cache_line_bytes: 64,
-            vector_width_bytes,
+            has_simd128: legacy.has_simd128,
+            cache_line_bytes: legacy.cache_line_bytes,
+            vector_width_bytes: legacy.vector_width_bytes,
         }
     }
 
@@ -213,6 +195,9 @@ impl SimdCapabilityInfo {
     }
 
     /// Returns the [`LegacyLevel`] that best summarises these capabilities.
+    ///
+    /// The tier ordering (SVE before NEON, plus the wasm `simd128` tier) mirrors
+    /// [`dispatch::SimdCapabilities::optimal_level`] exactly.
     #[inline]
     pub fn optimal_level(&self) -> LegacyLevel {
         if self.has_avx512_full() {
@@ -223,10 +208,12 @@ impl SimdCapabilityInfo {
             LegacyLevel::Avx
         } else if self.has_sse42 {
             LegacyLevel::Sse42
-        } else if self.has_neon {
-            LegacyLevel::Neon
         } else if self.has_sve {
             LegacyLevel::Sve
+        } else if self.has_neon {
+            LegacyLevel::Neon
+        } else if self.has_simd128 {
+            LegacyLevel::Simd128
         } else {
             LegacyLevel::Scalar
         }
@@ -295,172 +282,18 @@ macro_rules! simd_dispatch_caps {
 pub use simd_dispatch_caps;
 
 // ---------------------------------------------------------------------------
-// SimdDispatcher trait
+// Re-exports from dispatch.rs (the single source of truth)
 // ---------------------------------------------------------------------------
-
-/// Trait for types that provide architecture-specialised implementations of a
-/// single computation via function multi-versioning.
-///
-/// Implement the four required methods and call [`SimdDispatcher::dispatch`]
-/// to have the runtime select the fastest available path automatically.
-///
-/// # Design note
-///
-/// The trait uses `&self` receivers so that the dispatch object can carry all
-/// input data as fields, keeping call-sites clean.
-///
-/// # Example
-///
-/// ```rust
-/// use oxiblas_core::simd::multiver::SimdDispatcher;
-///
-/// struct ScalarSum<'a>(&'a [f64]);
-///
-/// impl SimdDispatcher for ScalarSum<'_> {
-///     type Output = f64;
-///     fn dispatch_avx512(&self) -> f64 { self.dispatch_scalar() }
-///     fn dispatch_avx2(&self)   -> f64 { self.dispatch_scalar() }
-///     fn dispatch_neon(&self)   -> f64 { self.dispatch_scalar() }
-///     fn dispatch_scalar(&self) -> f64 { self.0.iter().copied().sum() }
-/// }
-///
-/// assert_eq!(ScalarSum(&[1.0, 2.0, 3.0]).dispatch(), 6.0);
-/// ```
-pub trait SimdDispatcher {
-    /// The type returned by the computation.
-    type Output;
-
-    /// AVX-512F+BW+VL specialised implementation.
-    fn dispatch_avx512(&self) -> Self::Output;
-
-    /// AVX2 + FMA specialised implementation.
-    fn dispatch_avx2(&self) -> Self::Output;
-
-    /// NEON (AArch64) specialised implementation.
-    fn dispatch_neon(&self) -> Self::Output;
-
-    /// Portable scalar fallback.
-    fn dispatch_scalar(&self) -> Self::Output;
-
-    /// Select and call the best available implementation for the current CPU.
-    ///
-    /// The selection is based on [`SimdCapabilityInfo::detect`], which caches
-    /// the result in a process-wide static (std builds) or recomputes from
-    /// compile-time flags (no_std builds).
-    fn dispatch(&self) -> Self::Output {
-        #[cfg(feature = "std")]
-        let caps = SimdCapabilityInfo::detect();
-        #[cfg(not(feature = "std"))]
-        let caps = SimdCapabilityInfo::detect();
-
-        if caps.has_avx512_full() {
-            self.dispatch_avx512()
-        } else if caps.has_avx2_fma() {
-            self.dispatch_avx2()
-        } else if caps.has_neon {
-            self.dispatch_neon()
-        } else {
-            self.dispatch_scalar()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GemmKernelKind
-// ---------------------------------------------------------------------------
-
-/// Identifies which microkernel variant is used for GEMM operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GemmKernelKind {
-    /// AVX-512 microkernel (512-bit registers, x86-64).
-    Avx512,
-    /// AVX2 + FMA microkernel (256-bit registers, x86-64).
-    Avx2,
-    /// NEON microkernel (128-bit registers, AArch64).
-    Neon,
-    /// Portable scalar microkernel (fallback for all targets).
-    Scalar,
-}
-
-impl GemmKernelKind {
-    /// Human-readable name of this kernel kind.
-    #[inline]
-    pub const fn name(self) -> &'static str {
-        match self {
-            GemmKernelKind::Avx512 => "AVX-512",
-            GemmKernelKind::Avx2 => "AVX2+FMA",
-            GemmKernelKind::Neon => "NEON",
-            GemmKernelKind::Scalar => "scalar",
-        }
-    }
-
-    /// Returns `true` when this kind uses SIMD (i.e., is not `Scalar`).
-    #[inline]
-    pub const fn is_simd(self) -> bool {
-        !matches!(self, GemmKernelKind::Scalar)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// KernelSelector
-// ---------------------------------------------------------------------------
-
-/// Selects the optimal GEMM microkernel for `f64` and `f32` based on the CPU
-/// capabilities detected at runtime (or compile-time on no_std).
-///
-/// Call [`KernelSelector::select`] once at startup to obtain the globally
-/// cached selector; subsequent calls return the same reference (std) or a
-/// freshly computed identical value (no_std).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelSelector {
-    /// Best microkernel kind for double-precision (f64) GEMM.
-    pub gemm_f64_kernel: GemmKernelKind,
-    /// Best microkernel kind for single-precision (f32) GEMM.
-    pub gemm_f32_kernel: GemmKernelKind,
-}
-
-impl KernelSelector {
-    fn from_caps(caps: &SimdCapabilityInfo) -> Self {
-        let kind = if caps.has_avx512_full() {
-            GemmKernelKind::Avx512
-        } else if caps.has_avx2_fma() {
-            GemmKernelKind::Avx2
-        } else if caps.has_neon {
-            GemmKernelKind::Neon
-        } else {
-            GemmKernelKind::Scalar
-        };
-
-        Self {
-            gemm_f64_kernel: kind,
-            gemm_f32_kernel: kind,
-        }
-    }
-
-    /// Returns a reference to the globally cached [`KernelSelector`].
-    ///
-    /// The first call performs detection; all subsequent calls return the same
-    /// `&'static` reference.
-    #[cfg(feature = "std")]
-    pub fn select() -> &'static Self {
-        static KERNEL_SEL: OnceLock<KernelSelector> = OnceLock::new();
-        KERNEL_SEL.get_or_init(|| Self::from_caps(SimdCapabilityInfo::detect()))
-    }
-
-    /// Recomputes the [`KernelSelector`] from compile-time target features
-    /// (no_std path).
-    #[cfg(not(feature = "std"))]
-    pub fn select() -> Self {
-        Self::from_caps(&SimdCapabilityInfo::detect())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Convenience re-exports from dispatch.rs
-// ---------------------------------------------------------------------------
+//
+// `SimdDispatcher`, `KernelSelector` and `GemmKernelKind` are re-exported
+// verbatim from `dispatch` rather than redefined here.  The dispatch versions
+// carry the full x86-64 tier ladder — crucially including the SSE4.2 tier that
+// the former local copies silently dropped — so re-exporting them makes the two
+// modules physically the same types and eliminates any possibility of drift.
 
 pub use crate::simd::dispatch::{
-    SimdCapabilities, SimdLevel, has_avx2_fma, has_avx512, has_neon, optimal_simd_level, simd_caps,
+    GemmKernelKind, KernelSelector, SimdCapabilities, SimdDispatcher, SimdLevel, has_avx2_fma,
+    has_avx512, has_neon, optimal_simd_level, simd_caps,
 };
 
 // ---------------------------------------------------------------------------
@@ -595,18 +428,24 @@ mod tests {
                 assert!(!caps.has_avx);
                 assert!(caps.has_sse42);
             }
+            LegacyLevel::Sve => {
+                // SVE now wins the SVE/NEON tie, so has_neon may also be set.
+                assert!(caps.has_sve);
+            }
             LegacyLevel::Neon => {
                 assert!(caps.has_neon);
                 assert!(!caps.has_avx);
+                assert!(!caps.has_sve);
             }
-            LegacyLevel::Sve => {
-                assert!(caps.has_sve);
+            LegacyLevel::Simd128 => {
+                assert!(caps.has_simd128);
                 assert!(!caps.has_neon);
             }
             LegacyLevel::Scalar => {
                 assert!(!caps.has_avx);
                 assert!(!caps.has_neon);
                 assert!(!caps.has_sve);
+                assert!(!caps.has_simd128);
             }
         }
     }
@@ -625,6 +464,7 @@ mod tests {
             sel.gemm_f64_kernel,
             GemmKernelKind::Avx512
                 | GemmKernelKind::Avx2
+                | GemmKernelKind::Sse42
                 | GemmKernelKind::Neon
                 | GemmKernelKind::Scalar
         ));
@@ -632,6 +472,7 @@ mod tests {
             sel.gemm_f32_kernel,
             GemmKernelKind::Avx512
                 | GemmKernelKind::Avx2
+                | GemmKernelKind::Sse42
                 | GemmKernelKind::Neon
                 | GemmKernelKind::Scalar
         ));
@@ -655,6 +496,10 @@ mod tests {
         } else if caps.has_avx2_fma() {
             assert_eq!(sel.gemm_f64_kernel, GemmKernelKind::Avx2);
             assert_eq!(sel.gemm_f32_kernel, GemmKernelKind::Avx2);
+        } else if caps.has_sse42 {
+            // The SSE4.2 tier must be honored — it used to be dropped to scalar.
+            assert_eq!(sel.gemm_f64_kernel, GemmKernelKind::Sse42);
+            assert_eq!(sel.gemm_f32_kernel, GemmKernelKind::Sse42);
         } else if caps.has_neon {
             assert_eq!(sel.gemm_f64_kernel, GemmKernelKind::Neon);
             assert_eq!(sel.gemm_f32_kernel, GemmKernelKind::Neon);
@@ -743,6 +588,7 @@ mod tests {
         for kind in [
             GemmKernelKind::Avx512,
             GemmKernelKind::Avx2,
+            GemmKernelKind::Sse42,
             GemmKernelKind::Neon,
             GemmKernelKind::Scalar,
         ] {
@@ -757,6 +603,7 @@ mod tests {
     fn test_gemm_kernel_kind_is_simd() {
         assert!(GemmKernelKind::Avx512.is_simd());
         assert!(GemmKernelKind::Avx2.is_simd());
+        assert!(GemmKernelKind::Sse42.is_simd());
         assert!(GemmKernelKind::Neon.is_simd());
         assert!(!GemmKernelKind::Scalar.is_simd());
     }
@@ -789,5 +636,47 @@ mod tests {
         let y = [0.0_f64; 0];
         let result = DotProduct { x: &x, y: &y }.dispatch();
         assert_eq!(result, 0.0, "empty dot product must be zero");
+    }
+
+    // ------------------------------------------------------------------
+    // 17. Finding 5: multiver's shared types ARE dispatch's types.
+    //     Proving the type identity makes the "SSE4.2 tier silently dropped"
+    //     class of divergence structurally impossible: there is only one
+    //     GemmKernelKind / KernelSelector / SimdDispatcher in the crate now.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_multiver_delegates_to_dispatch_single_source() {
+        use core::any::TypeId;
+        assert_eq!(
+            TypeId::of::<KernelSelector>(),
+            TypeId::of::<crate::simd::dispatch::KernelSelector>(),
+            "multiver::KernelSelector must be dispatch::KernelSelector"
+        );
+        assert_eq!(
+            TypeId::of::<GemmKernelKind>(),
+            TypeId::of::<crate::simd::dispatch::GemmKernelKind>(),
+            "multiver::GemmKernelKind must be dispatch::GemmKernelKind"
+        );
+        // The SSE4.2 tier that the old local copies dropped now exists.
+        assert_eq!(GemmKernelKind::Sse42.name(), "SSE4.2");
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Finding 1 (multiver view): SimdCapabilityInfo mirrors the gated
+    //     dispatch capabilities field-for-field — never a wider/looser view.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_capability_info_mirrors_dispatch_exactly() {
+        let info = SimdCapabilityInfo::detect();
+        let legacy = simd_caps();
+        assert_eq!(info.has_sse42, legacy.has_sse42);
+        assert_eq!(info.has_avx2, legacy.has_avx2);
+        assert_eq!(info.has_avx512f, legacy.has_avx512f);
+        assert_eq!(info.has_neon, legacy.has_neon);
+        assert_eq!(info.has_sve, legacy.has_sve);
+        assert_eq!(info.has_simd128, legacy.has_simd128);
+        assert_eq!(info.vector_width_bytes, legacy.vector_width_bytes);
+        assert_eq!(info.cache_line_bytes, legacy.cache_line_bytes);
+        assert_eq!(info.optimal_level(), legacy.optimal_level());
     }
 }

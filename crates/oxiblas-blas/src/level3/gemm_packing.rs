@@ -22,7 +22,7 @@
 //!            [ ... ]
 //! ```
 
-use oxiblas_core::memory::{AlignedVec, CACHE_LINE_SIZE};
+use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::MatRef;
 
@@ -63,10 +63,6 @@ pub fn pack_a_optimized<T: Field>(
     let row_stride = a.row_stride();
     let base_ptr = a.as_ptr();
     let dst = pack.as_mut_ptr();
-    let elem_size = std::mem::size_of::<T>();
-
-    // Calculate cache line elements
-    let _elems_per_cache_line = CACHE_LINE_SIZE / elem_size;
 
     let mut idx = 0;
 
@@ -233,10 +229,21 @@ pub fn pack_b_optimized<T: Field>(
     }
 }
 
-/// Packs A panel with contiguous row storage (for row-major matrices).
+/// Packs an A panel, taking a flat-copy fast path when the source is a single
+/// fully-contiguous micro-panel.
 ///
-/// When the source matrix has contiguous rows, we can use more efficient
-/// copy operations.
+/// This crate stores matrices in column-major order: element `(i, j)` lives at
+/// `ptr + i + j * row_stride`, so consecutive rows within a column are always
+/// one element apart and `row_stride` is the leading dimension. A matrix is
+/// therefore *fully contiguous* (no padding between columns) exactly when
+/// `row_stride == nrows` — not `row_stride == ncols`, which the previous check
+/// used and which is wrong for any non-square matrix.
+///
+/// [`pack_a_optimized`] re-tiles the panel into `mr`-row sub-panels, so its
+/// packed order coincides with plain column-major order **only** when the whole
+/// panel is a single `mr`-row block (`nrows == mr`). For a taller panel a flat
+/// `memcpy` would emit the wrong layout, so the fast path additionally requires
+/// `nrows == mr`; every other shape delegates to the general path.
 #[inline]
 pub fn pack_a_contiguous<T: Field>(
     a: &MatRef<'_, T>,
@@ -247,29 +254,54 @@ pub fn pack_a_contiguous<T: Field>(
     pack: &mut AlignedVec<T>,
     mr: usize,
 ) {
-    // Check if rows are contiguous (row_stride == number of columns)
+    // Column-major contiguity: the leading dimension equals the row count only
+    // when columns sit back-to-back with no inter-column padding.
     let row_stride = a.row_stride();
-    let is_contiguous = row_stride == a.ncols();
+    let is_contiguous = row_stride == a.nrows();
 
-    if is_contiguous && row_start == 0 && col_start == 0 && nrows == a.nrows() && ncols == a.ncols()
+    if is_contiguous
+        && row_start == 0
+        && col_start == 0
+        && nrows == a.nrows()
+        && ncols == a.ncols()
+        && nrows == mr
     {
-        // Special case: entire matrix is contiguous
-        // Use block copy for maximum efficiency
+        // The whole matrix is contiguous AND a single micro-row-block, so the
+        // packed layout is exactly column-major and one bulk copy reproduces it.
         let src = a.as_ptr();
         let dst = pack.as_mut_ptr();
+        // SAFETY: `row_stride == nrows` means the `nrows * ncols` elements are
+        // stored contiguously with no gaps, `src` points at the first of them
+        // (row_start == col_start == 0), and `dst` is a distinct AlignedVec the
+        // caller sized for the panel; the ranges do not overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst, nrows * ncols);
         }
     } else {
-        // Fall back to optimized packing
+        // General path: correct for any stride, padding, or multi-block panel.
         pack_a_optimized(a, row_start, col_start, nrows, ncols, pack, mr);
     }
 }
 
-/// Packs B panel with streaming stores for write-through behavior.
+/// Packs a B panel using non-temporal (streaming) stores when the CPU supports
+/// them, falling back to ordinary cache-allocating stores otherwise.
 ///
-/// Uses non-temporal stores when available to avoid cache pollution
-/// when the packed buffer won't be immediately reused.
+/// The packed B buffer is written once here and then read exactly once by the
+/// micro-kernel, which makes it a textbook candidate for non-temporal stores:
+/// routing these writes through the cache would evict the packed-A panel and the
+/// live C tile that the kernel actually reuses. On AVX hardware we assemble each
+/// 32-byte lane and emit it with `_mm256_stream_si256` (`VMOVNTDQ`), bypassing
+/// the cache hierarchy; an `sfence` before returning makes those non-temporal
+/// writes visible to the subsequent (ordinary) reads.
+///
+/// The store is issued through the integer lane intrinsic so it is agnostic to
+/// `T`'s element type — only the raw bytes matter. The produced layout is
+/// byte-for-byte identical to [`pack_b_optimized`] on every path: streaming only
+/// changes *how* the bytes reach memory, never their values or their order.
+///
+/// (256-bit non-temporal stores, rather than 512-bit, are used deliberately: the
+/// AVX-512 `_mm512_stream_*` intrinsics only stabilized in Rust 1.89, above this
+/// workspace's MSRV, whereas `_mm256_stream_si256` has been stable since 1.27.)
 #[inline]
 pub fn pack_b_streaming<T: Field>(
     b: &MatRef<'_, T>,
@@ -280,9 +312,106 @@ pub fn pack_b_streaming<T: Field>(
     pack: &mut AlignedVec<T>,
     nr: usize,
 ) {
-    // For now, use optimized packing
-    // TODO: Add streaming stores for AVX-512 when stabilized
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `_mm256_stream_si256` needs a 32-byte-aligned destination and moves a
+        // full 32-byte lane at a time. `AlignedVec`'s base is aligned to
+        // `DEFAULT_ALIGN` (>= 64 on x86_64), but we still verify at runtime so the
+        // SAFETY contract holds for any buffer. Requiring `size_of::<T>()` to
+        // divide 32 guarantees every lane boundary lands on a 32-byte-aligned
+        // element offset.
+        let elem_size = core::mem::size_of::<T>();
+        if is_x86_feature_detected!("avx")
+            && elem_size != 0
+            && 32 % elem_size == 0
+            && (pack.as_ptr() as usize) % 32 == 0
+        {
+            // SAFETY: AVX is present, the destination base is 32-byte aligned, and
+            // the element size divides the 32-byte lane, so every streaming-store
+            // target is 32-byte aligned and in bounds.
+            unsafe {
+                pack_b_streaming_avx(b, row_start, col_start, nrows, ncols, pack, nr);
+            }
+            return;
+        }
+    }
+
+    // Portable fallback: ordinary temporal stores, identical output.
     pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+}
+
+/// AVX (256-bit) non-temporal streaming backend for [`pack_b_streaming`].
+///
+/// Traverses `B` in the exact linear order [`pack_b_optimized`] writes, buffers
+/// a full 32-byte lane, then emits it with `_mm256_stream_si256`. Any trailing
+/// partial lane uses ordinary stores; a final `sfence` orders all non-temporal
+/// writes before the buffer is read back.
+///
+/// # Safety
+///
+/// The caller must guarantee that AVX is available, that `pack`'s base pointer is
+/// 32-byte aligned, and that `size_of::<T>()` divides 32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn pack_b_streaming_avx<T: Field>(
+    b: &MatRef<'_, T>,
+    row_start: usize,
+    col_start: usize,
+    nrows: usize,
+    ncols: usize,
+    pack: &mut AlignedVec<T>,
+    nr: usize,
+) {
+    use std::arch::x86_64::*;
+
+    // Elements per 32-byte non-temporal lane. `size_of::<T>()` divides 32 (caller
+    // contract), so this is exact and `1 <= lane <= 32`.
+    let lane = 32 / core::mem::size_of::<T>();
+
+    let row_stride = b.row_stride();
+    let base_ptr = b.as_ptr();
+    let dst = pack.as_mut_ptr();
+
+    // Staging holds one full lane. Sized to the widest possible lane (32, for a
+    // hypothetical 1-byte element) so it is always large enough regardless of T;
+    // only the first `lane` elements are ever touched per flush.
+    let mut staging = [T::zero(); 32];
+    let mut buf_len = 0usize; // elements currently staged
+    let mut written = 0usize; // elements already streamed to `dst`
+
+    for j in (0..ncols).step_by(nr) {
+        let jb = nr.min(ncols - j);
+        let col_base = col_start + j;
+        for p in 0..nrows {
+            let row_base = base_ptr.add(row_start + p + col_base * row_stride);
+            for jj in 0..nr {
+                // Real element inside the block, zero padding beyond `jb`.
+                staging[buf_len] = if jj < jb {
+                    *row_base.add(jj * row_stride)
+                } else {
+                    T::zero()
+                };
+                buf_len += 1;
+
+                if buf_len == lane {
+                    // `written` is a multiple of `lane`, so `written * size_of`
+                    // is a multiple of 32 and the store target stays 32-aligned.
+                    let lane_vec = _mm256_loadu_si256(staging.as_ptr().cast::<__m256i>());
+                    _mm256_stream_si256(dst.add(written).cast::<__m256i>(), lane_vec);
+                    written += lane;
+                    buf_len = 0;
+                }
+            }
+        }
+    }
+
+    // Trailing partial lane (fewer than `lane` elements left): ordinary stores.
+    for k in 0..buf_len {
+        *dst.add(written + k) = staging[k];
+    }
+
+    // Order the non-temporal stores before the packed buffer is read back.
+    _mm_sfence();
 }
 
 /// Prefetch data for reading.
@@ -351,9 +480,15 @@ impl PackingConfig {
 // SIMD-Optimized Packing Functions
 // =============================================================================
 
-/// SIMD-optimized pack_a for f64 when data is column-major (row_stride == 1).
+/// SIMD-optimized `pack_a` for f64.
 ///
-/// Uses SIMD loads/stores when packing contiguous column data.
+/// This crate's column-major storage keeps every column contiguous — element
+/// `(i, j)` is at `ptr + i + j * row_stride`, so successive rows are one element
+/// apart. Packing an `mr`-row block therefore copies `mr` *contiguous* elements
+/// per column, which the AVX2 fast path vectorizes for **any** `row_stride`. No
+/// special "row_stride == 1" layout is required (and indeed `row_stride == 1`
+/// never holds for a genuine multi-row column-major matrix); we only need `mr`
+/// wide enough for a vector and AVX2 present at runtime.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn pack_a_simd_f64(
@@ -365,16 +500,14 @@ pub fn pack_a_simd_f64(
     pack: &mut AlignedVec<f64>,
     mr: usize,
 ) {
-    let row_stride = a.row_stride();
-
-    // If row_stride == 1, data is contiguous per column - use SIMD
-    if row_stride == 1 && mr >= 4 && is_x86_feature_detected!("avx2") {
-        // SAFETY: We just checked that AVX2 is available
+    // A full AVX2 register holds 4 f64; below that the scalar path is faster.
+    if mr >= 4 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 confirmed available at runtime.
         unsafe {
             pack_a_simd_contiguous_f64(a, row_start, col_start, nrows, ncols, pack, mr);
         }
     } else {
-        // Fall back to optimized scalar path
+        // Fall back to optimized scalar path.
         pack_a_optimized(a, row_start, col_start, nrows, ncols, pack, mr);
     }
 }
@@ -441,7 +574,11 @@ unsafe fn pack_a_simd_contiguous_f64(
     }
 }
 
-/// SIMD-optimized pack_a for f32 when data is column-major.
+/// SIMD-optimized `pack_a` for f32.
+///
+/// See [`pack_a_simd_f64`] for why any `row_stride` is supported: columns are
+/// always contiguous in this crate's column-major storage, so the AVX2 path
+/// copies `mr` contiguous elements per column. A full AVX2 register holds 8 f32.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn pack_a_simd_f32(
@@ -453,16 +590,12 @@ pub fn pack_a_simd_f32(
     pack: &mut AlignedVec<f32>,
     mr: usize,
 ) {
-    let row_stride = a.row_stride();
-
-    if row_stride == 1 && mr >= 8 {
-        // Safety: function is only called on x86_64 with AVX2
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                pack_a_simd_contiguous_f32(a, row_start, col_start, nrows, ncols, pack, mr);
-            }
-            return;
+    if mr >= 8 && is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 confirmed available at runtime.
+        unsafe {
+            pack_a_simd_contiguous_f32(a, row_start, col_start, nrows, ncols, pack, mr);
         }
+        return;
     }
     pack_a_optimized(a, row_start, col_start, nrows, ncols, pack, mr);
 }
@@ -710,7 +843,12 @@ pub fn pack_b_simd_f32(
 // NEON-Optimized Packing for ARM (aarch64)
 // =============================================================================
 
-/// SIMD-optimized pack_a for f64 on ARM NEON.
+/// SIMD-optimized `pack_a` for f64 on ARM NEON.
+///
+/// Columns are always contiguous in this crate's column-major storage (element
+/// `(i, j)` is at `ptr + i + j * row_stride`), so the NEON path copies `mr`
+/// contiguous elements per column for **any** `row_stride`. A NEON 128-bit
+/// register holds 2 f64.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn pack_a_simd_f64(
@@ -722,9 +860,8 @@ pub fn pack_a_simd_f64(
     pack: &mut AlignedVec<f64>,
     mr: usize,
 ) {
-    let row_stride = a.row_stride();
-
-    if row_stride == 1 && mr >= 2 {
+    if mr >= 2 {
+        // SAFETY: NEON is part of the aarch64 baseline, always available here.
         unsafe {
             pack_a_neon_contiguous_f64(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -792,7 +929,11 @@ unsafe fn pack_a_neon_contiguous_f64(
     }
 }
 
-/// SIMD-optimized pack_a for f32 on ARM NEON.
+/// SIMD-optimized `pack_a` for f32 on ARM NEON.
+///
+/// See [`pack_a_simd_f64`] (aarch64) for why any `row_stride` is supported:
+/// columns are always contiguous, so the NEON path copies `mr` contiguous
+/// elements per column. A NEON 128-bit register holds 4 f32.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn pack_a_simd_f32(
@@ -804,9 +945,8 @@ pub fn pack_a_simd_f32(
     pack: &mut AlignedVec<f32>,
     mr: usize,
 ) {
-    let row_stride = a.row_stride();
-
-    if row_stride == 1 && mr >= 4 {
+    if mr >= 4 {
+        // SAFETY: NEON is part of the aarch64 baseline, always available here.
         unsafe {
             pack_a_neon_contiguous_f32(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -1071,6 +1211,278 @@ mod tests {
                 pack_opt[i],
                 pack_simd[i]
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests for the packing correctness fixes.
+    // ------------------------------------------------------------------
+
+    /// Naive column-major reference for `pack_a`: re-tiles the panel into
+    /// `mr`-row blocks with zero padding for the trailing partial block, exactly
+    /// matching the layout contract of [`pack_a_optimized`].
+    fn pack_a_reference<T: Field>(
+        a: &MatRef<'_, T>,
+        row_start: usize,
+        col_start: usize,
+        nrows: usize,
+        ncols: usize,
+        mr: usize,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        for i in (0..nrows).step_by(mr) {
+            let ib = mr.min(nrows - i);
+            for p in 0..ncols {
+                for ii in 0..mr {
+                    if ii < ib {
+                        out.push(a[(row_start + i + ii, col_start + p)]);
+                    } else {
+                        out.push(T::zero());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Naive reference for `pack_b`: `nr`-column blocks, row-major within a
+    /// block, zero padding for the trailing partial block.
+    fn pack_b_reference<T: Field>(
+        b: &MatRef<'_, T>,
+        row_start: usize,
+        col_start: usize,
+        nrows: usize,
+        ncols: usize,
+        nr: usize,
+    ) -> Vec<T> {
+        let mut out = Vec::new();
+        for j in (0..ncols).step_by(nr) {
+            let jb = nr.min(ncols - j);
+            for p in 0..nrows {
+                for jj in 0..nr {
+                    if jj < jb {
+                        out.push(b[(row_start + p, col_start + j + jj)]);
+                    } else {
+                        out.push(T::zero());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Row-major sequential test matrix `[[1,2,..],[..]]` of the given shape.
+    fn seq_mat_f64(nrows: usize, ncols: usize) -> Mat<f64> {
+        let rows: Vec<Vec<f64>> = (0..nrows)
+            .map(|i| (0..ncols).map(|j| (i * ncols + j + 1) as f64).collect())
+            .collect();
+        Mat::from_rows(&rows.iter().map(|r| r.as_slice()).collect::<Vec<_>>())
+    }
+
+    fn seq_mat_f32(nrows: usize, ncols: usize) -> Mat<f32> {
+        let rows: Vec<Vec<f32>> = (0..nrows)
+            .map(|i| (0..ncols).map(|j| (i * ncols + j + 1) as f32).collect())
+            .collect();
+        Mat::from_rows(&rows.iter().map(|r| r.as_slice()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn test_pack_a_contiguous_matches_reference() {
+        // For every shape/`mr` the fast path and the fallback must both agree
+        // with the naive reference AND with the general `pack_a_optimized` path.
+        //
+        // The (8x8, mr=4) case is the direct regression for the original bug:
+        // the old flat-copy fast path fired for the whole contiguous matrix
+        // regardless of `mr`, emitting plain column-major order instead of the
+        // 4-row-tiled layout `pack_a_optimized` produces. The (8x4, mr=8) case
+        // covers the wrong `row_stride == ncols` contiguity test on a non-square
+        // matrix.
+        let cases = [
+            (8usize, 8usize, 8usize), // fast-path eligible on x86_64 (rs==nrows==mr)
+            (8, 8, 4),                // contiguous but multi-block -> must delegate
+            (8, 4, 8),                // non-square: old `== ncols` check was wrong
+            (5, 7, 3),                // padded (non-contiguous) -> fallback
+            (3, 3, 4),                // partial block with zero padding
+        ];
+
+        for (nrows, ncols, mr) in cases {
+            let a = seq_mat_f64(nrows, ncols);
+            let a_ref = a.as_ref();
+            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
+            let total = reference.len();
+
+            let mut pack_contig: AlignedVec<f64> = AlignedVec::zeros(total);
+            let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(total);
+            pack_a_contiguous(&a_ref, 0, 0, nrows, ncols, &mut pack_contig, mr);
+            pack_a_optimized(&a_ref, 0, 0, nrows, ncols, &mut pack_opt, mr);
+
+            for k in 0..total {
+                assert!(
+                    (pack_contig[k] - reference[k]).abs() < 1e-12,
+                    "pack_a_contiguous vs reference mismatch at {k} for {nrows}x{ncols} mr={mr}: {} vs {}",
+                    pack_contig[k],
+                    reference[k]
+                );
+                assert!(
+                    (pack_contig[k] - pack_opt[k]).abs() < 1e-12,
+                    "pack_a_contiguous vs pack_a_optimized mismatch at {k} for {nrows}x{ncols} mr={mr}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_a_contiguous_fast_path_layout() {
+        // A genuinely contiguous, single-micro-panel matrix (row_stride == nrows,
+        // nrows == mr) that takes the flat-copy fast path. 16 rows is a multiple
+        // of the f64 cache-line element count under both 64-byte (8) and 128-byte
+        // (16) padding, so the matrix is contiguous on every supported target. We
+        // assert the precondition so the fast path is actually exercised, then
+        // check it reproduces the reference layout.
+        let nrows = 16;
+        let ncols = 6;
+        let a = seq_mat_f64(nrows, ncols);
+        let a_ref = a.as_ref();
+        assert_eq!(
+            a_ref.row_stride(),
+            a_ref.nrows(),
+            "expected a contiguous {nrows}-row matrix on this target"
+        );
+        let mr = a_ref.nrows();
+        let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
+        let mut pack: AlignedVec<f64> = AlignedVec::zeros(reference.len());
+        pack_a_contiguous(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
+        for k in 0..reference.len() {
+            assert!(
+                (pack[k] - reference[k]).abs() < 1e-12,
+                "fast-path mismatch at {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pack_b_streaming_matches_optimized_f64() {
+        // Shapes cover full blocks, zero-padded partial blocks, and total element
+        // counts that are and are not multiples of the 4-element (32-byte) AVX
+        // lane, exercising both the streaming lanes and the ordinary tail on AVX
+        // hardware. Elsewhere this validates the identical fallback.
+        let cases = [
+            (8usize, 8usize, 4usize),
+            (3, 4, 4),  // total 12 -> three full lanes, no tail
+            (3, 6, 4),  // partial second block (jb=2, zero-padded), total 24
+            (5, 5, 6),  // nr > ncols -> single partial block, total 30 (tail 2)
+            (16, 12, 8),
+        ];
+        for (nrows, ncols, nr) in cases {
+            let b = seq_mat_f64(nrows, ncols);
+            let b_ref = b.as_ref();
+            let reference = pack_b_reference(&b_ref, 0, 0, nrows, ncols, nr);
+            let total = reference.len();
+
+            let mut pack_stream: AlignedVec<f64> = AlignedVec::zeros(total);
+            let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(total);
+            pack_b_streaming(&b_ref, 0, 0, nrows, ncols, &mut pack_stream, nr);
+            pack_b_optimized(&b_ref, 0, 0, nrows, ncols, &mut pack_opt, nr);
+
+            for k in 0..total {
+                assert!(
+                    (pack_stream[k] - reference[k]).abs() < 1e-12,
+                    "streaming vs reference mismatch at {k} for {nrows}x{ncols} nr={nr}: {} vs {}",
+                    pack_stream[k],
+                    reference[k]
+                );
+                assert!(
+                    (pack_stream[k] - pack_opt[k]).abs() < 1e-12,
+                    "streaming vs optimized mismatch at {k} for {nrows}x{ncols} nr={nr}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_b_streaming_matches_optimized_f32() {
+        // f32 uses an 8-element (32-byte) lane; (5,3,2) yields total 20 = two
+        // full lanes plus a 4-element tail.
+        let cases = [(4usize, 8usize, 4usize), (7, 5, 4), (5, 3, 2), (20, 16, 8)];
+        for (nrows, ncols, nr) in cases {
+            let b = seq_mat_f32(nrows, ncols);
+            let b_ref = b.as_ref();
+            let reference = pack_b_reference(&b_ref, 0, 0, nrows, ncols, nr);
+            let total = reference.len();
+
+            let mut pack_stream: AlignedVec<f32> = AlignedVec::zeros(total);
+            pack_b_streaming(&b_ref, 0, 0, nrows, ncols, &mut pack_stream, nr);
+
+            for k in 0..total {
+                assert!(
+                    (pack_stream[k] - reference[k]).abs() < 1e-5,
+                    "f32 streaming mismatch at {k} for {nrows}x{ncols} nr={nr}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_b_streaming_subregion() {
+        // Pack an interior region (row_start/col_start != 0) of a larger matrix,
+        // exercising the streaming gather with a non-zero origin and a padded
+        // leading dimension.
+        let b = seq_mat_f64(10, 10);
+        let b_ref = b.as_ref();
+        let (row_start, col_start, nrows, ncols, nr) = (2usize, 3usize, 6usize, 5usize, 4usize);
+        let reference = pack_b_reference(&b_ref, row_start, col_start, nrows, ncols, nr);
+        let total = reference.len();
+
+        let mut pack_stream: AlignedVec<f64> = AlignedVec::zeros(total);
+        pack_b_streaming(&b_ref, row_start, col_start, nrows, ncols, &mut pack_stream, nr);
+
+        for k in 0..total {
+            assert!(
+                (pack_stream[k] - reference[k]).abs() < 1e-12,
+                "subregion streaming mismatch at {k}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_pack_a_simd_f64_matches_reference() {
+        // With the corrected guard the AVX2 path fires for real column-major
+        // storage (any row_stride, including the padded strides these matrices
+        // have), so on AVX2 hardware this exercises `pack_a_simd_contiguous_f64`
+        // and checks it against the scalar reference.
+        let cases = [(8usize, 8usize, 4usize), (16, 5, 8), (10, 7, 4)];
+        for (nrows, ncols, mr) in cases {
+            let a = seq_mat_f64(nrows, ncols);
+            let a_ref = a.as_ref();
+            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
+            let mut pack: AlignedVec<f64> = AlignedVec::zeros(reference.len());
+            pack_a_simd_f64(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
+            for k in 0..reference.len() {
+                assert!(
+                    (pack[k] - reference[k]).abs() < 1e-12,
+                    "pack_a_simd_f64 mismatch at {k} for {nrows}x{ncols} mr={mr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_pack_a_simd_f32_matches_reference() {
+        let cases = [(16usize, 8usize, 8usize), (20, 5, 8)];
+        for (nrows, ncols, mr) in cases {
+            let a = seq_mat_f32(nrows, ncols);
+            let a_ref = a.as_ref();
+            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
+            let mut pack: AlignedVec<f32> = AlignedVec::zeros(reference.len());
+            pack_a_simd_f32(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
+            for k in 0..reference.len() {
+                assert!(
+                    (pack[k] - reference[k]).abs() < 1e-5,
+                    "pack_a_simd_f32 mismatch at {k} for {nrows}x{ncols} mr={mr}"
+                );
+            }
         }
     }
 }

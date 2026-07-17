@@ -823,7 +823,11 @@ fn trsm_naive_submatrix<T: Field>(
                 let diag_val = if diag == Diag::Unit {
                     T::one()
                 } else {
-                    let d = a[(i, i)];
+                    let d = if trans == Trans::ConjTrans {
+                        a[(i, i)].conj()
+                    } else {
+                        a[(i, i)]
+                    };
                     if d == T::zero() {
                         return Err(TrsmError::Singular);
                     }
@@ -853,7 +857,11 @@ fn trsm_naive_submatrix<T: Field>(
                 let diag_val = if diag == Diag::Unit {
                     T::one()
                 } else {
-                    let d = a[(i, i)];
+                    let d = if trans == Trans::ConjTrans {
+                        a[(i, i)].conj()
+                    } else {
+                        a[(i, i)]
+                    };
                     if d == T::zero() {
                         return Err(TrsmError::Singular);
                     }
@@ -906,7 +914,11 @@ fn trsm_naive_submatrix_right<T: Field>(
             let diag_val = if diag == Diag::Unit {
                 T::one()
             } else {
-                let d = a[(j, j)];
+                let d = if trans == Trans::ConjTrans {
+                    a[(j, j)].conj()
+                } else {
+                    a[(j, j)]
+                };
                 if d == T::zero() {
                     return Err(TrsmError::Singular);
                 }
@@ -938,7 +950,11 @@ fn trsm_naive_submatrix_right<T: Field>(
             let diag_val = if diag == Diag::Unit {
                 T::one()
             } else {
-                let d = a[(j, j)];
+                let d = if trans == Trans::ConjTrans {
+                    a[(j, j)].conj()
+                } else {
+                    a[(j, j)]
+                };
                 if d == T::zero() {
                     return Err(TrsmError::Singular);
                 }
@@ -999,7 +1015,11 @@ fn trsm_naive<T: Field>(
                         let diag_val = if diag == Diag::Unit {
                             T::one()
                         } else {
-                            let d = a[(i, i)];
+                            let d = if trans == Trans::ConjTrans {
+                                a[(i, i)].conj()
+                            } else {
+                                a[(i, i)]
+                            };
                             if d == T::zero() {
                                 return Err(TrsmError::Singular);
                             }
@@ -1011,7 +1031,12 @@ fn trsm_naive<T: Field>(
                             let a_val = if trans == Trans::NoTrans {
                                 a[(i, k)]
                             } else {
-                                a[(k, i)]
+                                let val = a[(k, i)];
+                                if trans == Trans::ConjTrans {
+                                    val.conj()
+                                } else {
+                                    val
+                                }
                             };
                             sum -= a_val * b[(k, j)];
                         }
@@ -1025,7 +1050,11 @@ fn trsm_naive<T: Field>(
                         let diag_val = if diag == Diag::Unit {
                             T::one()
                         } else {
-                            let d = a[(i, i)];
+                            let d = if trans == Trans::ConjTrans {
+                                a[(i, i)].conj()
+                            } else {
+                                a[(i, i)]
+                            };
                             if d == T::zero() {
                                 return Err(TrsmError::Singular);
                             }
@@ -1037,7 +1066,12 @@ fn trsm_naive<T: Field>(
                             let a_val = if trans == Trans::NoTrans {
                                 a[(i, k)]
                             } else {
-                                a[(k, i)]
+                                let val = a[(k, i)];
+                                if trans == Trans::ConjTrans {
+                                    val.conj()
+                                } else {
+                                    val
+                                }
                             };
                             sum -= a_val * b[(k, j)];
                         }
@@ -1054,7 +1088,11 @@ fn trsm_naive<T: Field>(
                     let diag_val = if diag == Diag::Unit {
                         T::one()
                     } else {
-                        let d = a[(j, j)];
+                        let d = if trans == Trans::ConjTrans {
+                            a[(j, j)].conj()
+                        } else {
+                            a[(j, j)]
+                        };
                         if d == T::zero() {
                             return Err(TrsmError::Singular);
                         }
@@ -1069,7 +1107,12 @@ fn trsm_naive<T: Field>(
                         let a_val = if trans == Trans::NoTrans {
                             a[(j, k)]
                         } else {
-                            a[(k, j)]
+                            let val = a[(k, j)];
+                            if trans == Trans::ConjTrans {
+                                val.conj()
+                            } else {
+                                val
+                            }
                         };
                         for i in 0..m {
                             b[(i, k)] = b[(i, k)] - b[(i, j)] * a_val;
@@ -1082,7 +1125,11 @@ fn trsm_naive<T: Field>(
                     let diag_val = if diag == Diag::Unit {
                         T::one()
                     } else {
-                        let d = a[(j, j)];
+                        let d = if trans == Trans::ConjTrans {
+                            a[(j, j)].conj()
+                        } else {
+                            a[(j, j)]
+                        };
                         if d == T::zero() {
                             return Err(TrsmError::Singular);
                         }
@@ -1097,7 +1144,12 @@ fn trsm_naive<T: Field>(
                         let a_val = if trans == Trans::NoTrans {
                             a[(j, k)]
                         } else {
-                            a[(k, j)]
+                            let val = a[(k, j)];
+                            if trans == Trans::ConjTrans {
+                                val.conj()
+                            } else {
+                                val
+                            }
                         };
                         for i in 0..m {
                             b[(i, k)] = b[(i, k)] - b[(i, j)] * a_val;
@@ -1114,3 +1166,307 @@ fn trsm_naive<T: Field>(
 // =============================================================================
 // Complex-optimized TRSM using 3M method
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_complex::Complex64;
+    use oxiblas_matrix::Mat;
+
+    /// Computes `A^H * X` explicitly (no shortcuts: literal conjugate-transpose
+    /// times X), used both to build right-hand sides and as an independent
+    /// residual check for Side::Left ConjTrans solves.
+    fn conj_transpose_mul(a: &Mat<Complex64>, x: &Mat<Complex64>) -> Mat<Complex64> {
+        let n = a.nrows();
+        let ncols = x.ncols();
+        let mut result: Mat<Complex64> = Mat::zeros(n, ncols);
+        for j in 0..ncols {
+            for i in 0..n {
+                let mut sum = Complex64::new(0.0, 0.0);
+                for k in 0..n {
+                    // (A^H)[i, k] = conj(A[k, i])
+                    sum += a[(k, i)].conj() * x[(k, j)];
+                }
+                result[(i, j)] = sum;
+            }
+        }
+        result
+    }
+
+    /// Computes `X * A^H` explicitly, used both to build right-hand sides
+    /// and as an independent residual check for Side::Right ConjTrans solves.
+    fn mul_conj_transpose(x: &Mat<Complex64>, a: &Mat<Complex64>) -> Mat<Complex64> {
+        let m = x.nrows();
+        let n = a.nrows();
+        let mut result: Mat<Complex64> = Mat::zeros(m, n);
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = Complex64::new(0.0, 0.0);
+                for k in 0..n {
+                    // (A^H)[k, j] = conj(A[j, k])
+                    sum += x[(i, k)] * a[(j, k)].conj();
+                }
+                result[(i, j)] = sum;
+            }
+        }
+        result
+    }
+
+    fn assert_mat_close(actual: &Mat<Complex64>, expected: &Mat<Complex64>, tol: f64, label: &str) {
+        assert_eq!(actual.nrows(), expected.nrows());
+        assert_eq!(actual.ncols(), expected.ncols());
+        for i in 0..actual.nrows() {
+            for j in 0..actual.ncols() {
+                let diff = actual[(i, j)] - expected[(i, j)];
+                assert!(
+                    diff.norm() < tol,
+                    "{label} mismatch at ({i}, {j}): got {:?}, expected {:?}",
+                    actual[(i, j)],
+                    expected[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// A lower-triangular matrix with genuinely complex entries both on and
+    /// off the diagonal (Im != 0 everywhere non-zero), used across the
+    /// ConjTrans regression tests below.
+    fn complex_lower_fixture() -> Mat<Complex64> {
+        Mat::from_rows(&[
+            &[
+                Complex64::new(2.0, 1.0),
+                Complex64::new(0.0, 0.0),
+                Complex64::new(0.0, 0.0),
+            ],
+            &[
+                Complex64::new(1.0, -2.0),
+                Complex64::new(3.0, 1.0),
+                Complex64::new(0.0, 0.0),
+            ],
+            &[
+                Complex64::new(0.0, 3.0),
+                Complex64::new(-1.0, 2.0),
+                Complex64::new(4.0, -1.0),
+            ],
+        ])
+    }
+
+    /// An upper-triangular counterpart with genuinely complex entries both
+    /// on and off the diagonal.
+    fn complex_upper_fixture() -> Mat<Complex64> {
+        Mat::from_rows(&[
+            &[
+                Complex64::new(2.0, 1.0),
+                Complex64::new(1.0, -2.0),
+                Complex64::new(0.0, 3.0),
+            ],
+            &[
+                Complex64::new(0.0, 0.0),
+                Complex64::new(3.0, 1.0),
+                Complex64::new(-1.0, 2.0),
+            ],
+            &[
+                Complex64::new(0.0, 0.0),
+                Complex64::new(0.0, 0.0),
+                Complex64::new(4.0, -1.0),
+            ],
+        ])
+    }
+
+    /// Arbitrary genuinely-complex 3x2 solution used for Side::Left tests.
+    fn x_left_fixture() -> Mat<Complex64> {
+        Mat::from_rows(&[
+            &[Complex64::new(1.0, 1.0), Complex64::new(0.5, -0.5)],
+            &[Complex64::new(2.0, -1.0), Complex64::new(-1.0, 0.0)],
+            &[Complex64::new(0.0, 2.0), Complex64::new(3.0, 1.0)],
+        ])
+    }
+
+    /// Arbitrary genuinely-complex 2x3 solution used for Side::Right tests.
+    fn x_right_fixture() -> Mat<Complex64> {
+        Mat::from_rows(&[
+            &[
+                Complex64::new(1.0, 1.0),
+                Complex64::new(2.0, -1.0),
+                Complex64::new(0.0, 2.0),
+            ],
+            &[
+                Complex64::new(0.5, -0.5),
+                Complex64::new(-1.0, 0.0),
+                Complex64::new(3.0, 1.0),
+            ],
+        ])
+    }
+
+    // ------------------------------------------------------------------
+    // trsm_naive: regression tests for Finding #2 (generic.rs:1011). Prior
+    // to the fix this function applied NO conjugation at all for
+    // Trans::ConjTrans (neither diagonal nor off-diagonal terms). All four
+    // Left/Right x Lower/Upper branches are covered so every occurrence of
+    // the bug pattern is exercised.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_trsm_naive_conjtrans_left_lower_complex() {
+        let a = complex_lower_fixture();
+        let x_expected = x_left_fixture();
+        // Solve A^H * X = B, so B = A^H * X_expected.
+        let b = conj_transpose_mul(&a, &x_expected);
+
+        let mut x = b.clone();
+        trsm_naive(
+            Side::Left,
+            Uplo::Lower,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            3,
+            2,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        // Independent residual check: reconstruct A^H * X_solved and
+        // compare it against the original right-hand side B.
+        let reconstructed = conj_transpose_mul(&a, &x);
+        assert_mat_close(&reconstructed, &b, 1e-9, "A^H * X_solved vs B");
+    }
+
+    #[test]
+    fn test_trsm_naive_conjtrans_left_upper_complex() {
+        let a = complex_upper_fixture();
+        let x_expected = x_left_fixture();
+        let b = conj_transpose_mul(&a, &x_expected);
+
+        let mut x = b.clone();
+        trsm_naive(
+            Side::Left,
+            Uplo::Upper,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            3,
+            2,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        let reconstructed = conj_transpose_mul(&a, &x);
+        assert_mat_close(&reconstructed, &b, 1e-9, "A^H * X_solved vs B");
+    }
+
+    #[test]
+    fn test_trsm_naive_conjtrans_right_lower_complex() {
+        let a = complex_lower_fixture();
+        let x_expected = x_right_fixture();
+        // Solve X * A^H = B, so B = X_expected * A^H.
+        let b = mul_conj_transpose(&x_expected, &a);
+        let (m, n) = (x_expected.nrows(), a.nrows());
+
+        let mut x = b.clone();
+        trsm_naive(
+            Side::Right,
+            Uplo::Lower,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            m,
+            n,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        let reconstructed = mul_conj_transpose(&x, &a);
+        assert_mat_close(&reconstructed, &b, 1e-9, "X_solved * A^H vs B");
+    }
+
+    #[test]
+    fn test_trsm_naive_conjtrans_right_upper_complex() {
+        let a = complex_upper_fixture();
+        let x_expected = x_right_fixture();
+        let b = mul_conj_transpose(&x_expected, &a);
+        let (m, n) = (x_expected.nrows(), a.nrows());
+
+        let mut x = b.clone();
+        trsm_naive(
+            Side::Right,
+            Uplo::Upper,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            m,
+            n,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        let reconstructed = mul_conj_transpose(&x, &a);
+        assert_mat_close(&reconstructed, &b, 1e-9, "X_solved * A^H vs B");
+    }
+
+    // ------------------------------------------------------------------
+    // trsm_naive_submatrix / trsm_naive_submatrix_right: these already
+    // conjugated off-diagonal terms correctly, but (like complex64.rs)
+    // divided by the UNCONJUGATED diagonal for Trans::ConjTrans. These
+    // cover the additional diagonal-conjugation fix applied to these
+    // siblings (discovered while verifying Finding #2's claim that they
+    // were already correct; they were correct for off-diagonal terms only).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_trsm_naive_submatrix_conjtrans_diagonal_complex() {
+        let a = complex_lower_fixture();
+        let x_expected = x_left_fixture();
+        let b = conj_transpose_mul(&a, &x_expected);
+
+        let mut x = b.clone();
+        trsm_naive_submatrix(
+            Uplo::Lower,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            3,
+            2,
+            0,
+            3,
+            0,
+            2,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        let reconstructed = conj_transpose_mul(&a, &x);
+        assert_mat_close(&reconstructed, &b, 1e-9, "A^H * X_solved vs B");
+    }
+
+    #[test]
+    fn test_trsm_naive_submatrix_right_conjtrans_diagonal_complex() {
+        let a = complex_lower_fixture();
+        let x_expected = x_right_fixture();
+        let b = mul_conj_transpose(&x_expected, &a);
+        let (m, n) = (x_expected.nrows(), a.nrows());
+
+        let mut x = b.clone();
+        trsm_naive_submatrix_right(
+            Uplo::Lower,
+            Trans::ConjTrans,
+            Diag::NonUnit,
+            a.as_ref(),
+            x.as_mut(),
+            m,
+            n,
+            0,
+            n,
+        )
+        .expect("diagonal entries are all non-zero");
+
+        assert_mat_close(&x, &x_expected, 1e-9, "solved X vs expected X");
+        let reconstructed = mul_conj_transpose(&x, &a);
+        assert_mat_close(&reconstructed, &b, 1e-9, "X_solved * A^H vs B");
+    }
+}

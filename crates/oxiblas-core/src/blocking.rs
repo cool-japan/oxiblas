@@ -87,9 +87,15 @@ pub fn trsm_block_size<T>(n: usize, nrhs: usize) -> usize {
     let max_block = ((2 * L1_CACHE_SIZE / elem_size) as f64).sqrt() as usize;
     let block = max_block.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE / 2);
 
-    // Align and adjust
+    // Align to SIMD-friendly boundaries. MIN_BLOCK_SIZE (16) is a multiple
+    // of 8, so this alignment step can never drop below MIN_BLOCK_SIZE.
     let block = (block / 8) * 8;
-    block.min(n).min(nrhs).max(MIN_BLOCK_SIZE)
+
+    // Never return a block size larger than either matrix dimension it
+    // will actually operate on: for small `n`/`nrhs` (including 0), the
+    // cache-driven heuristic above is meaningless and must be clamped
+    // down, not floored back up.
+    block.min(n).min(nrhs)
 }
 
 /// Calculates the optimal panel width for factorizations (LU, Cholesky, QR).
@@ -104,8 +110,14 @@ pub fn factorization_panel_width<T>(n: usize) -> usize {
     let max_panel = L2_CACHE_SIZE / (elem_size * n.max(1));
     let panel = max_panel.clamp(16, 128);
 
-    // Align to SIMD boundaries
-    ((panel / 4) * 4).min(n).max(16)
+    // Align to SIMD boundaries. The clamp lower bound (16) is a multiple
+    // of 4, so this alignment step can never drop below 16.
+    let panel = (panel / 4) * 4;
+
+    // Never return a panel width larger than the matrix dimension itself:
+    // for small `n` (including 0), the cache-driven heuristic above is
+    // meaningless and must be clamped down, not floored back up.
+    panel.min(n)
 }
 
 /// Recursive block range for cache-oblivious algorithms.
@@ -347,6 +359,65 @@ mod tests {
 
         // Should be divisible by 8
         assert_eq!(bm % 8, 0);
+    }
+
+    #[test]
+    fn test_trsm_block_size_clamped_to_matrix_extent() {
+        // For any n/nrhs at or below the cache-driven heuristic, the
+        // returned block size must never exceed either matrix dimension
+        // (this is the regression case: the old code re-floored the
+        // value with `.max(MIN_BLOCK_SIZE)` *after* clamping to n/nrhs,
+        // which could push the result back above a small n or nrhs).
+        for &n in &[0usize, 1, 4, 8, 15, 16] {
+            for &nrhs in &[0usize, 1, 4, 8] {
+                let block = trsm_block_size::<f64>(n, nrhs);
+                assert!(block <= n, "block {block} exceeds n={n} (nrhs={nrhs})");
+                assert!(
+                    block <= nrhs,
+                    "block {block} exceeds nrhs={nrhs} (n={n})"
+                );
+            }
+        }
+
+        // A zero-sized dimension must yield an exact zero block size, not
+        // MIN_BLOCK_SIZE.
+        assert_eq!(trsm_block_size::<f64>(0, 64), 0);
+        assert_eq!(trsm_block_size::<f64>(64, 0), 0);
+
+        // For f64 the unclamped heuristic value is 88 (derived from
+        // L1_CACHE_SIZE and MIN/MAX_BLOCK_SIZE): n = 87 is still limited
+        // by n itself, n = 88 lands exactly on the heuristic, and n = 89
+        // is no longer limited by n at all. This exercises the tier
+        // boundary where clamping stops being the binding constraint.
+        assert_eq!(trsm_block_size::<f64>(87, 4096), 87);
+        assert_eq!(trsm_block_size::<f64>(88, 4096), 88);
+        assert_eq!(trsm_block_size::<f64>(89, 4096), 88);
+
+        // Once both dimensions are large, the heuristic value (independent
+        // of n/nrhs) governs and stays within its documented bounds.
+        let unclamped = trsm_block_size::<f64>(4096, 4096);
+        assert!(unclamped >= MIN_BLOCK_SIZE);
+        assert!(unclamped <= MAX_BLOCK_SIZE / 2);
+    }
+
+    #[test]
+    fn test_factorization_panel_width_clamped_to_matrix_extent() {
+        // Same regression as trsm_block_size: the panel width must never
+        // exceed n itself, even though the heuristic's own floor is 16.
+        for &n in &[0usize, 1, 4, 8, 15, 16] {
+            let panel = factorization_panel_width::<f64>(n);
+            assert!(panel <= n, "panel {panel} exceeds n={n}");
+        }
+
+        assert_eq!(factorization_panel_width::<f64>(0), 0);
+        assert_eq!(factorization_panel_width::<f64>(1), 1);
+        assert_eq!(factorization_panel_width::<f64>(4), 4);
+
+        // Tier boundary: for f64, `L2_CACHE_SIZE / (elem_size * n)` sits
+        // at exactly 128 for n = 256, then drops (and gets aligned down to
+        // a multiple of 4) once n = 257 pushes it below 128.
+        assert_eq!(factorization_panel_width::<f64>(256), 128);
+        assert_eq!(factorization_panel_width::<f64>(257), 124);
     }
 
     #[test]

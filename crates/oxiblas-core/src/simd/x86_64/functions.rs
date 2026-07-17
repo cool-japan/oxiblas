@@ -2,10 +2,18 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
-use crate::simd::{SimdMask, SimdScalar};
-use core::arch::x86_64::*;
+use crate::simd::SimdScalar;
 
-use super::types::{Avx512Features, F32x16, F32x4Sse, F32x8, F64x2Sse, F64x4, F64x8, I16x32, I32x16, I8x64, U8x64};
+use super::types::{F32x16, F32x8, F64x4, F64x8};
+
+// Test-only switch that forces the scalar fallback path so the (otherwise dead
+// on a SIMD-capable CI host) `else` branches are actually executed by the
+// regression tests. `thread_local` keeps the override isolated to the setting
+// thread so the parallel test runner cannot cross-contaminate.
+#[cfg(test)]
+thread_local! {
+    static FORCE_SCALAR_FALLBACK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn set_force_scalar_fallback(value: bool) {
@@ -223,7 +231,15 @@ impl SimdScalar for f32 {
 
 #[cfg(test)]
 pub(super) mod tests {
+    // `super::*` provides the feature predicates, the scalar-fallback helpers and
+    // `set_force_scalar_fallback`. The register types, the intrinsic vector types
+    // (e.g. `__mmask8`) and the `SimdRegister`/`SimdMask` traits live elsewhere and
+    // are only needed by the tests, so import them here rather than widening the
+    // production imports of `functions`.
+    use super::super::types::*;
     use super::*;
+    use crate::simd::{SimdMask, SimdRegister};
+    use core::arch::x86_64::*;
 
     // SSE4.2 tests (always available on x86_64)
     #[test]

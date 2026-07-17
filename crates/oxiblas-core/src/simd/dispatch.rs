@@ -13,7 +13,25 @@
 //!   based on detected capabilities.
 //! - [`SimdDispatcher`]: Trait for types that provide multi-versioned
 //!   implementations of a computation.
-//! - [`KernelSelector`]: Chooses the optimal GEMM microkernel kind at startup.
+//! - [`KernelSelector`]: Computes a *recommended* GEMM microkernel kind from the
+//!   detected capabilities.
+//!
+//! # Consumption status (important)
+//!
+//! [`SimdCapabilities`], [`KernelSelector`] and [`SimdDispatcher`] form a
+//! capability-detection and dispatch *toolkit*.  As of this revision the actual
+//! GEMM microkernel selection in `oxiblas-blas`
+//! (`level3::gemm_kernel::GemmKernel`) still performs its own inline
+//! `is_x86_feature_detected!` probing and does **not** yet delegate to
+//! [`KernelSelector`].  This module therefore must not be described as the thing
+//! that *drives* kernel selection today — it only *recommends* one.  Wiring the
+//! BLAS GEMM path (and its `force-scalar` / `max-simd-*` gating) through
+//! [`KernelSelector`] is tracked as a follow-up; see the crate TODO.
+//!
+//! What this module *does* authoritatively provide is the single source of truth
+//! for CPU SIMD capability detection (respecting the `force-scalar`,
+//! `max-simd-128` and `max-simd-256` cargo features); [`crate::simd::multiver`]
+//! is a thin re-export layer on top of it.
 //!
 //! # no_std note
 //!
@@ -68,6 +86,13 @@ pub struct SimdCapabilities {
     pub has_sve: bool,
 
     // ------------------------------------------------------------------
+    // WebAssembly fields
+    // ------------------------------------------------------------------
+    /// WebAssembly `simd128` (128-bit) support.  Only ever `true` on the
+    /// `wasm32` target built with the `simd128` target feature enabled.
+    pub has_simd128: bool,
+
+    // ------------------------------------------------------------------
     // Memory topology
     // ------------------------------------------------------------------
     /// Size of a single cache line in bytes (typically 64).
@@ -104,11 +129,18 @@ impl SimdCapabilities {
     }
 
     // ------------------------------------------------------------------
-    // Internal constructor used by simd_caps_compute()
+    // Internal constructor used by simd_caps()
     // ------------------------------------------------------------------
 
+    /// Detect the CPU's **raw** capabilities, before the compile-time
+    /// SIMD-limiting cargo features are applied.
+    ///
+    /// This is split out from [`compute`](Self::compute) so the feature gating
+    /// (`force-scalar` / `max-simd-128` / `max-simd-256`) lives in exactly one
+    /// place — [`limited_to`](Self::limited_to) — instead of being duplicated
+    /// (and previously *forgotten*) in every architecture arm.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
-    fn compute() -> Self {
+    fn compute_raw() -> Self {
         let has_avx512f = is_x86_feature_detected!("avx512f");
         let has_avx512bw = is_x86_feature_detected!("avx512bw");
         let has_avx512vl = is_x86_feature_detected!("avx512vl");
@@ -137,13 +169,14 @@ impl SimdCapabilities {
             has_avx512vl,
             has_neon: false,
             has_sve: false,
+            has_simd128: false,
             cache_line_bytes: 64,
             vector_width_bytes,
         }
     }
 
     #[cfg(all(target_arch = "x86_64", not(feature = "std")))]
-    fn compute() -> Self {
+    fn compute_raw() -> Self {
         let has_avx512f = cfg!(target_feature = "avx512f");
         let has_avx512bw = cfg!(target_feature = "avx512bw");
         let has_avx512vl = cfg!(target_feature = "avx512vl");
@@ -172,15 +205,32 @@ impl SimdCapabilities {
             has_avx512vl,
             has_neon: false,
             has_sve: false,
+            has_simd128: false,
             cache_line_bytes: 64,
             vector_width_bytes,
         }
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn compute() -> Self {
+    fn compute_raw() -> Self {
+        use crate::simd::aarch64::SveSupport;
+
         // NEON is mandatory on AArch64 per the architecture specification.
-        let has_sve = cfg!(target_feature = "sve");
+        // SVE detection is delegated to the `aarch64` SIMD unit so the two
+        // never disagree; it currently lands on the compile-time `sve` target
+        // feature (there is no stable userspace runtime probe yet).
+        let has_sve = SveSupport::is_available();
+
+        // When SVE is present its register width is implementation-defined and
+        // only known at runtime via `svcntb()`; report that real width so the
+        // scalable tier is not misrepresented as a fixed 128-bit vector.  When
+        // SVE is absent, fall back to the fixed 128-bit NEON width.
+        let vector_width_bytes = if has_sve {
+            SveSupport::vector_length_bytes()
+        } else {
+            16
+        };
+
         Self {
             has_sse42: false,
             has_avx: false,
@@ -191,13 +241,20 @@ impl SimdCapabilities {
             has_avx512vl: false,
             has_neon: true,
             has_sve,
+            has_simd128: false,
             cache_line_bytes: 64,
-            vector_width_bytes: 16,
+            vector_width_bytes,
         }
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn compute() -> Self {
+    #[cfg(target_arch = "wasm32")]
+    fn compute_raw() -> Self {
+        // WebAssembly SIMD is a *compile-time* capability gated on the `simd128`
+        // target feature; wasm has no runtime feature-probe instruction, so this
+        // mirrors `crate::simd::detect_simd_level`'s wasm handling.
+        let has_simd128 = cfg!(target_feature = "simd128");
+        let vector_width_bytes = if has_simd128 { 16 } else { 8 };
+
         Self {
             has_sse42: false,
             has_avx: false,
@@ -208,9 +265,101 @@ impl SimdCapabilities {
             has_avx512vl: false,
             has_neon: false,
             has_sve: false,
+            has_simd128,
+            cache_line_bytes: 64,
+            vector_width_bytes,
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "wasm32"
+    )))]
+    fn compute_raw() -> Self {
+        Self {
+            has_sse42: false,
+            has_avx: false,
+            has_avx2: false,
+            has_fma: false,
+            has_avx512f: false,
+            has_avx512bw: false,
+            has_avx512vl: false,
+            has_neon: false,
+            has_sve: false,
+            has_simd128: false,
             cache_line_bytes: 64,
             vector_width_bytes: 8,
         }
+    }
+
+    /// Compute the **effective** [`SimdCapabilities`] for the current CPU:
+    /// raw hardware detection followed by the compile-time SIMD-limiting cargo
+    /// features.  This is the single entry point cached by [`simd_caps`].
+    fn compute() -> Self {
+        Self::compute_raw().limited_to(Self::simd_ceiling_bytes())
+    }
+
+    /// Maximum SIMD register width (in bytes) permitted by the compile-time
+    /// cargo features, or [`usize::MAX`] when unrestricted.
+    ///
+    /// Precedence matches [`crate::simd::detect_simd_level`]:
+    /// `force-scalar` (0) beats `max-simd-128` (16) beats `max-simd-256` (32).
+    ///
+    /// # Why `cfg!` instead of `#[cfg]`
+    ///
+    /// Using the `cfg!` macro keeps every branch syntactically present, so the
+    /// function is warning-clean under **any** feature combination — including
+    /// `cargo …​ --all-features`, where all three mutually-exclusive limiter
+    /// features are enabled simultaneously and `force-scalar` must win.
+    fn simd_ceiling_bytes() -> usize {
+        if cfg!(feature = "force-scalar") {
+            0
+        } else if cfg!(feature = "max-simd-128") {
+            16
+        } else if cfg!(feature = "max-simd-256") {
+            32
+        } else {
+            usize::MAX
+        }
+    }
+
+    /// Mask out every SIMD tier whose register width exceeds `ceiling_bytes`
+    /// and clamp the reported [`vector_width_bytes`](Self::vector_width_bytes).
+    ///
+    /// This is where the `force-scalar` / `max-simd-128` / `max-simd-256` cargo
+    /// features actually take effect — previously they were advertised in
+    /// `Cargo.toml` but silently ignored by the whole dispatch layer.  The
+    /// comparisons run against a plain `usize` parameter (not a `cfg!`) so the
+    /// body compiles and behaves identically for every feature combination and
+    /// the borrow checker sees `self` as genuinely mutated (no `unused_mut`).
+    fn limited_to(mut self, ceiling_bytes: usize) -> Self {
+        // 512-bit tier (64-byte registers).
+        if ceiling_bytes < 64 {
+            self.has_avx512f = false;
+            self.has_avx512bw = false;
+            self.has_avx512vl = false;
+        }
+        // 256-bit tier (32-byte registers).  SVE is a scalable, ≥128-bit tier;
+        // clamping below 256-bit forces the fixed-width NEON path instead.
+        if ceiling_bytes < 32 {
+            self.has_avx = false;
+            self.has_avx2 = false;
+            self.has_fma = false;
+            self.has_sve = false;
+        }
+        // 128-bit tier (16-byte registers).
+        if ceiling_bytes < 16 {
+            self.has_sse42 = false;
+            self.has_neon = false;
+            self.has_simd128 = false;
+        }
+        // Never report a width narrower than a single scalar register (8 bytes).
+        let effective = if ceiling_bytes < 8 { 8 } else { ceiling_bytes };
+        if self.vector_width_bytes > effective {
+            self.vector_width_bytes = effective;
+        }
+        self
     }
 
     // ------------------------------------------------------------------
@@ -253,6 +402,14 @@ impl SimdCapabilities {
     }
 
     /// Returns the [`SimdLevel`] that best summarises the capabilities.
+    ///
+    /// # Ordering note
+    ///
+    /// SVE is checked **before** NEON: on AArch64 `has_neon` is always `true`,
+    /// so if NEON were tested first the [`SimdLevel::Sve`] arm would be
+    /// structurally unreachable (which it was).  Because SVE registers are
+    /// ≥128-bit and scalable, SVE is genuinely the preferred tier whenever it is
+    /// present, so it must win the tie.
     #[inline]
     pub fn optimal_level(&self) -> SimdLevel {
         if self.has_avx512_full() {
@@ -263,10 +420,12 @@ impl SimdCapabilities {
             SimdLevel::Avx
         } else if self.has_sse42 {
             SimdLevel::Sse42
-        } else if self.has_neon {
-            SimdLevel::Neon
         } else if self.has_sve {
             SimdLevel::Sve
+        } else if self.has_neon {
+            SimdLevel::Neon
+        } else if self.has_simd128 {
+            SimdLevel::Simd128
         } else {
             SimdLevel::Scalar
         }
@@ -298,6 +457,8 @@ pub enum SimdLevel {
     Neon = 10,
     /// SVE (scalable, AArch64).
     Sve = 11,
+    /// WebAssembly `simd128` (128-bit, wasm32).
+    Simd128 = 20,
 }
 
 impl SimdLevel {
@@ -312,6 +473,7 @@ impl SimdLevel {
             SimdLevel::Avx512 => "AVX-512",
             SimdLevel::Neon => "NEON",
             SimdLevel::Sve => "SVE",
+            SimdLevel::Simd128 => "SIMD128",
         }
     }
 
@@ -325,6 +487,7 @@ impl SimdLevel {
             SimdLevel::Avx512 => 8,
             SimdLevel::Neon => 2,
             SimdLevel::Sve => 2, // conservative; actual width is dynamic
+            SimdLevel::Simd128 => 2,
         }
     }
 
@@ -338,6 +501,7 @@ impl SimdLevel {
             SimdLevel::Avx512 => 16,
             SimdLevel::Neon => 4,
             SimdLevel::Sve => 4, // conservative; actual width is dynamic
+            SimdLevel::Simd128 => 4,
         }
     }
 }
@@ -588,6 +752,14 @@ impl GemmKernelKind {
             GemmKernelKind::Scalar => "scalar",
         }
     }
+
+    /// Returns `true` when this kind uses SIMD (i.e., is not [`Scalar`]).
+    ///
+    /// [`Scalar`]: GemmKernelKind::Scalar
+    #[inline]
+    pub const fn is_simd(self) -> bool {
+        !matches!(self, GemmKernelKind::Scalar)
+    }
 }
 
 /// Selects the optimal GEMM microkernel for each floating-point type based on
@@ -678,6 +850,12 @@ pub fn print_capabilities() {
         println!("AArch64 Features:");
         println!("  NEON       : {}", caps.has_neon);
         println!("  SVE        : {}", caps.has_sve);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        println!("WebAssembly Features:");
+        println!("  SIMD128    : {}", caps.has_simd128);
     }
 
     let sel = KernelSelector::select();
@@ -838,12 +1016,18 @@ mod tests {
                 assert!(!caps.has_avx);
                 assert!(caps.has_sse42);
             }
+            SimdLevel::Sve => {
+                // SVE now wins the SVE/NEON tie, so has_neon may also be set.
+                assert!(caps.has_sve);
+            }
             SimdLevel::Neon => {
                 assert!(caps.has_neon);
                 assert!(!caps.has_avx);
+                // NEON is only chosen when SVE is absent (SVE is checked first).
+                assert!(!caps.has_sve);
             }
-            SimdLevel::Sve => {
-                assert!(caps.has_sve);
+            SimdLevel::Simd128 => {
+                assert!(caps.has_simd128);
                 assert!(!caps.has_neon);
             }
             SimdLevel::Scalar => {
@@ -851,6 +1035,7 @@ mod tests {
                 assert!(!caps.has_avx);
                 assert!(!caps.has_neon);
                 assert!(!caps.has_sve);
+                assert!(!caps.has_simd128);
             }
         }
     }
@@ -940,7 +1125,11 @@ mod tests {
             SimdLevel::Avx512 => 512,
             SimdLevel::Avx2 => 256,
             SimdLevel::Avx | SimdLevel::Sse42 => 128,
+            // On AArch64 `has_neon` is always set, so even an SVE-optimal CPU
+            // routes through the macro's `neon` arm.
             SimdLevel::Neon | SimdLevel::Sve => 1000,
+            // wasm `simd128` has no dedicated macro arm, so it falls to scalar.
+            SimdLevel::Simd128 => 1,
             SimdLevel::Scalar => 1,
         };
         assert_eq!(result, expected);
@@ -1021,5 +1210,138 @@ mod tests {
         assert_eq!(has_avx512(), caps.has_avx512_full());
         assert_eq!(has_avx2_fma(), caps.has_avx2_fma());
         assert_eq!(has_neon(), caps.has_neon);
+    }
+
+    // ------------------------------------------------------------------
+    // Test builder: a capability set with every flag equal to `value`.
+    // ------------------------------------------------------------------
+    fn caps_uniform(value: bool, width: usize) -> SimdCapabilities {
+        SimdCapabilities {
+            has_sse42: value,
+            has_avx: value,
+            has_avx2: value,
+            has_fma: value,
+            has_avx512f: value,
+            has_avx512bw: value,
+            has_avx512vl: value,
+            has_neon: value,
+            has_sve: value,
+            has_simd128: value,
+            cache_line_bytes: 64,
+            vector_width_bytes: width,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 17. Finding 1: force-scalar / max-simd-* gating via limited_to().
+    //     Tests the masking logic directly and deterministically, independent
+    //     of the host CPU or which cargo features happen to be enabled.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_limited_to_applies_simd_ceiling() {
+        // Unrestricted: nothing is masked.
+        let full = caps_uniform(true, 64).limited_to(usize::MAX);
+        assert!(full.has_avx512f && full.has_avx2 && full.has_sse42 && full.has_neon);
+        assert_eq!(full.vector_width_bytes, 64);
+
+        // max-simd-256 (32): AVX-512 masked, AVX2 kept, width clamped to 32.
+        let c256 = caps_uniform(true, 64).limited_to(32);
+        assert!(!c256.has_avx512f && !c256.has_avx512bw && !c256.has_avx512vl);
+        assert!(c256.has_avx2 && c256.has_fma && c256.has_avx);
+        assert_eq!(c256.vector_width_bytes, 32);
+
+        // max-simd-128 (16): AVX/AVX2/FMA/SVE masked, 128-bit tiers kept.
+        let c128 = caps_uniform(true, 64).limited_to(16);
+        assert!(!c128.has_avx512f && !c128.has_avx2 && !c128.has_avx && !c128.has_fma);
+        assert!(!c128.has_sve);
+        assert!(c128.has_sse42 && c128.has_neon && c128.has_simd128);
+        assert_eq!(c128.vector_width_bytes, 16);
+
+        // force-scalar (0): everything masked, width floored at one scalar reg.
+        let scalar = caps_uniform(true, 64).limited_to(0);
+        assert!(!scalar.has_sse42 && !scalar.has_avx && !scalar.has_avx2);
+        assert!(!scalar.has_avx512f && !scalar.has_neon && !scalar.has_sve);
+        assert!(!scalar.has_simd128);
+        assert_eq!(scalar.vector_width_bytes, 8);
+        assert_eq!(scalar.optimal_level(), SimdLevel::Scalar);
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Finding 1: compute() actually respects the compile-time ceiling.
+    //     Under `--all-features` force-scalar wins, so this asserts the
+    //     detected capabilities never exceed the enabled ceiling.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_compute_respects_feature_ceiling() {
+        let caps = SimdCapabilities::detect();
+        let ceiling = SimdCapabilities::simd_ceiling_bytes();
+        assert!(
+            caps.vector_width_bytes <= ceiling.max(8),
+            "detected width {} exceeds compile-time ceiling {ceiling}",
+            caps.vector_width_bytes
+        );
+        if ceiling < 64 {
+            assert!(!caps.has_avx512f, "AVX-512 must be masked below a 64-byte ceiling");
+        }
+        if ceiling < 32 {
+            assert!(!caps.has_avx2, "AVX2 must be masked below a 32-byte ceiling");
+        }
+        if ceiling == 0 {
+            assert_eq!(caps.optimal_level(), SimdLevel::Scalar);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 19. Finding 2: the SVE tier is reachable — SVE wins the SVE/NEON tie.
+    //     Previously optimal_level() checked NEON first, and because NEON is
+    //     always present on AArch64 the SVE arm was structurally dead code.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_sve_is_reachable_and_beats_neon() {
+        // SVE present alongside NEON (the real AArch64+SVE situation).
+        let mut caps = caps_uniform(false, 32);
+        caps.has_sve = true;
+        caps.has_neon = true;
+        assert_eq!(
+            caps.optimal_level(),
+            SimdLevel::Sve,
+            "SVE must be preferred over NEON when both are present"
+        );
+
+        // SVE without NEON also resolves to SVE.
+        let mut caps = caps_uniform(false, 32);
+        caps.has_sve = true;
+        assert_eq!(caps.optimal_level(), SimdLevel::Sve);
+    }
+
+    // ------------------------------------------------------------------
+    // 20. Finding 4: wasm32 simd128 is reported through the capability API.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_wasm_simd128_capability_is_visible() {
+        let mut caps = caps_uniform(false, 16);
+        caps.has_simd128 = true;
+        assert_eq!(caps.optimal_level(), SimdLevel::Simd128);
+        assert_eq!(caps.f64_simd_width(), 2);
+        assert_eq!(caps.f32_simd_width(), 4);
+
+        // The dedicated SimdLevel variant is consistent.
+        assert_eq!(SimdLevel::Simd128.f64_width(), 2);
+        assert_eq!(SimdLevel::Simd128.f32_width(), 4);
+        assert!(!SimdLevel::Simd128.name().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // 21. Finding 5: the SSE4.2 kernel tier is honored (not dropped to scalar).
+    //     multiver used to skip this tier; it now shares this exact selector.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_kernel_selector_honors_sse42_tier() {
+        let mut caps = caps_uniform(false, 16);
+        caps.has_sse42 = true;
+        let sel = KernelSelector::from_caps(&caps);
+        assert_eq!(sel.gemm_f64_kernel, GemmKernelKind::Sse42);
+        assert_eq!(sel.gemm_f32_kernel, GemmKernelKind::Sse42);
+        assert!(sel.gemm_f64_kernel.is_simd());
     }
 }

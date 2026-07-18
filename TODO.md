@@ -21,7 +21,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Implement a correct bidiagonal D&C merge (Gu-Eisenstat): after solving the secular equation, form the true singular vectors by multiplying the deflated/secular eigenvector matrix by the block-diagonal [[U1,0],[0,U2]] and [[V1,0],[0,V2]] respectively, with …
 - [x] `crates/oxiblas-ndarray/src/lapack.rs:78` — **lu_ndarray().solve() misinterprets the pivot swap-sequence as a direct permutation, returning wrong solutions whenever a row swap occurs** _(bug, medium)_
   - Fix: Do not treat the pivot array as a permutation. Either reuse the correct internal Lu::solve (partial_piv.rs) by keeping the decomposition object, or reproduce its logic: copy b into x, then for k in 0..n apply swap(x[k], x[pivot[k]]) in order before …
-- [ ] `crates/oxiblas-sparse/src/linalg/supernodal.rs:908` — **SupernodalLU::solve performs no substitution — returns the RHS unchanged** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/supernodal.rs:908` — **SupernodalLU::solve performs no substitution — returns the RHS unchanged** _(fabrication, hard)_
   - Fix: Implement real forward substitution with the L factor and backward substitution with the stored U (and real pivoting), or remove SupernodalLU from the public API until implemented instead of shipping a solve() that returns its input.
 
 ### P1 — HIGH (verified): wrong results/UB on realistic inputs, unsound safe APIs
@@ -91,27 +91,27 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **oxiblas-sparse**
 
-- [ ] `crates/oxiblas-sparse/src/convert.rs:158` — **coo_to_csr/csc misattribute values to the wrong row when a row's entries cancel to zero** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/convert.rs:158` — **coo_to_csr/csc misattribute values to the wrong row when a row's entries cancel to zero** _(bug, medium)_
   - Fix: Do not defer zero pruning across row/column boundaries. Finalize (and prune) each row's entries before pushing its row pointer — e.g. accumulate a row into a temporary buffer, drop zeros, append, then push row_ptrs.
-- [ ] `crates/oxiblas-sparse/src/dia.rs:476` — **DIA format is broken for wide (ncols > nrows) matrices: panics or silently drops super-diagonal entries** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/dia.rs:476` — **DIA format is broken for wide (ncols > nrows) matrices: panics or silently drops super-diagonal entries** _(bug, medium)_
   - Fix: Store diagonals with width `max(nrows, ncols)` (or the per-diagonal diag_length with an offset-consistent index scheme) and make data_index/get/matvec/to_dense/from_dense agree; add a bounds check `idx < data[k].len()` and a wide-matrix …
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/iram.rs:596` — **IRAM non-symmetric convergence/residual uses a diagonal entry of H, identical for every eigenvalue** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/iram.rs:596` — **IRAM non-symmetric convergence/residual uses a diagonal entry of H, identical for every eigenvalue** _(fabrication, medium)_
   - Fix: Use the true Arnoldi residual estimate |f_norm * y_last| (subdiagonal beyond H times the last component of each Ritz vector), or compute the actual residual against A; report per-eigenvalue residuals.
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/iram.rs:1458` — **IRAM non-symmetric eigenvectors are computed by power iteration on H, ignoring the requested eigenvalue** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/iram.rs:1458` — **IRAM non-symmetric eigenvectors are computed by power iteration on H, ignoring the requested eigenvalue** _(bug, hard)_
   - Fix: Compute the actual Schur/eigenvectors of the small Hessenberg matrix (e.g. inverse iteration on (H - lambda_idx I) or back-substitution from the real Schur form) for each selected Ritz value, then map x = V*y; validate with a residual against A.
-- [ ] `crates/oxiblas-sparse/src/linalg/out_of_core.rs:594` — **OutOfCoreLu partial pivoting is broken (permutation misapplied + left blocks not swapped)** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/out_of_core.rs:594` — **OutOfCoreLu partial pivoting is broken (permutation misapplied + left blocks not swapped)** _(bug, medium)_
   - Fix: Apply pivots as a permutation (b_new[i]=b[perm[i]] or track a proper LAPACK-style swap sequence in original order), and swap the entire block-row including left L blocks A[k,0..k] whenever the diagonal block pivots.
-- [ ] `crates/oxiblas-sparse/src/linalg/pivoting.rs:119` — **SparseLuThreshold: already-computed L rows not swapped on a pivot at step k>0 (PA ≠ LU)** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:119` — **SparseLuThreshold: already-computed L rows not swapped on a pivot at step k>0 (PA ≠ LU)** _(bug, medium)_
   - Fix: On perm.swap(k, max_row), also swap rows k and max_row of the already-computed columns of l_data (l_data[k][0..k] with l_data[max_row][0..k]); or physically permute the working rows instead of using perm indirection.
-- [ ] `crates/oxiblas-sparse/src/linalg/pivoting.rs:557` — **SparseLdlt (Bunch-Kaufman): L rows not swapped on symmetric pivot at step k>0** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:557` — **SparseLdlt (Bunch-Kaufman): L rows not swapped on symmetric pivot at step k>0** _(bug, medium)_
   - Fix: When swapping perm positions during pivoting, also swap the corresponding already-computed rows of l_data (columns 0..k), consistent with the position-indexed L used in solve().
-- [ ] `crates/oxiblas-sparse/src/linalg/precond/ainv.rs:143` — **AINV biconjugation uses a wrong A-inner-product (partial dot) and discards the correct coefficient** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/precond/ainv.rs:143` — **AINV biconjugation uses a wrong A-inner-product (partial dot) and discards the correct coefficient** _(bug, hard)_
   - Fix: Use the full dot product dot(z_j, az) (over all n rows) for the A-inner-product, and drive the z_j update with w_k^T A z_j (the already-computed `wkt_a_zj`) and the w_j update with z_k^T A w_j, dividing by d_k = 1/d_inv[k].
-- [ ] `crates/oxiblas-sparse/src/linalg/supernodal.rs:285` — **SupernodalCholesky symbolic analysis ignores fill-in — wrong factor for fill-generating matrices** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/supernodal.rs:285` — **SupernodalCholesky symbolic analysis ignores fill-in — wrong factor for fill-generating matrices** _(bug, hard)_
   - Fix: Compute the true column structure via the elimination tree (etree-path/reachability fill propagation, as multifrontal_cholesky does) before allocating supernode sub_rows, so fill rows are stored and updated.
-- [ ] `crates/oxiblas-sparse/src/linalg/svd/types.rs:805` — **IncrementalSVD.add_rows discards the new right-singular directions on rank growth (V^T padded with zeros)** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/svd/types.rs:805` — **IncrementalSVD.add_rows discards the new right-singular directions on rank growth (V^T padded with zeros)** _(bug, hard)_
   - Fix: Form V_new = [V | Q_r] and multiply by the right singular vectors of the K matrix (k_svd_result.v), storing the true updated V^T; add a reconstruction test with rows outside the current row space.
-- [ ] `crates/oxiblas-sparse/src/linalg/svd/types.rs:899` — **IncrementalSVD.add_columns never updates U on rank growth, leaving U/S/V^T dimensionally inconsistent** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/svd/types.rs:899` — **IncrementalSVD.add_columns never updates U on rank growth, leaving U/S/V^T dimensionally inconsistent** _(bug, hard)_
   - Fix: Form U_new = [U | Q_c] and multiply by the L-matrix left singular vectors (l_svd_result.u), truncated to k_new; assign to self.u so U/S/V^T stay consistent, and add a reconstruction test.
 
 ### P2 — MEDIUM (verified during adversarial review; originally reported higher)
@@ -147,7 +147,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 ### P2b — Verified LOW
 
-- [ ] `crates/oxiblas-sparse/src/convert.rs:198` — **coo_to_csr / coo_to_csc always emit row_ptrs/col_ptrs one element too long** _(bug, easy)_
+- [x] `crates/oxiblas-sparse/src/convert.rs:198` — **coo_to_csr / coo_to_csc always emit row_ptrs/col_ptrs one element too long** _(bug, easy)_
   - Fix: Delete the redundant `row_ptrs.push(values.len());` at line 198 and `col_ptrs.push(values.len());` at line 275; the preceding fill loop already terminates the pointer array. Add a test asserting `csr.row_ptrs().len() == nrows + 1`.
 
 ### P2c — MEDIUM (reported, not adversarially verified)
@@ -182,12 +182,12 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-matrix/src/mat.rs:245` — **Mat::col_stride() contradicts its own doc and duplicates row_stride(); stride naming is inverted crate-wide** _(bug, easy)_
 - [x] `crates/oxiblas-matrix/src/mat_ref.rs:140` — **submatrix bounds check `row_start + nrows <= self.nrows` can wrap in release, yielding views with huge dims -> OOB via safe Index** _(bug, easy)_
 - [x] `crates/oxiblas-ndarray/src/lapack.rs:1085` — **Tridiagonal solvers compute n-1 on usize before checking n==0, panicking (subtract overflow) on empty input in debug builds** _(bug, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1459` — **Non-symmetric generalized eigen (hessenberg_qr) silently drops all imaginary parts** _(bug, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/iterative/minres.rs:248` — **pminres returns a spurious 'Preconditioner not positive definite' error when the initial residual is zero** _(bug, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/iterative/qmr.rs:173` — **QMR computes a transpose sequence that is dead code, uses a constant shadow, and fabricates beta on breakdown** _(bug, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/iterative/qmr.rs:322` — **pqmr applies M^{-1} where the transpose M^{-T} is required, so it is wrong for nonsymmetric preconditioners** _(bug, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:92` — **SymbolicCholesky::column_counts ignores fill (dead tree-walk) → truncated/corrupt L pattern** _(bug, medium)_
-- [ ] `crates/oxiblas-sparse/src/ops/functions.rs:410` — **spmv_symmetric ignores its documented `lower_only` parameter (both branches identical)** _(bug, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1459` — **Non-symmetric generalized eigen (hessenberg_qr) silently drops all imaginary parts** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/iterative/minres.rs:248` — **pminres returns a spurious 'Preconditioner not positive definite' error when the initial residual is zero** _(bug, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/iterative/qmr.rs:173` — **QMR computes a transpose sequence that is dead code, uses a constant shadow, and fabricates beta on breakdown** _(bug, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/iterative/qmr.rs:322` — **pqmr applies M^{-1} where the transpose M^{-T} is required, so it is wrong for nonsymmetric preconditioners** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:92` — **SymbolicCholesky::column_counts ignores fill (dead tree-walk) → truncated/corrupt L pattern** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/ops/functions.rs:410` — **spmv_symmetric ignores its documented `lower_only` parameter (both branches identical)** _(bug, easy)_
 - [ ] `crates/oxiblas/src/lib.rs:434` — **features::NO_STD public constant computes an incorrect / misleading value** _(bug, easy)_
 
 **fabrication** (23)
@@ -205,16 +205,16 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/solve/expert_cholesky.rs:262` — **Expert Cholesky/symmetric rcond estimator only samples first 5 columns, silently misreports conditioning** _(fabrication, medium)_
 - [x] `crates/oxiblas-matrix/src/banded.rs:297` — **BandedMat::get_band returns raw interleaved storage, not the requested diagonal, and can underflow** _(fabrication, easy)_
 - [x] `crates/oxiblas-matrix/src/lazy.rs:44` — **Lazy-evaluation module advertises fusion and 'no intermediate allocations' but every node allocates a full temporary** _(fabrication, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/arnoldi.rs:173` — **Arnoldi reports converged=true whenever the Krylov space filled, with no residual and no eigenpair validation** _(fabrication, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:741` — **GeneralizedEigenResult.residual_norms are transformed-operator residuals, not the documented ||A x - lambda B x||** _(fabrication, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/lanczos.rs:549` — **WhichEigenvalues::NearTarget silently falls back to SmallestMagnitude with no target parameter** _(fabrication, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/special.rs:213` — **IntervalEigen counts/returns eigenvalues via Sturm sequence on the Lanczos tridiagonal, not on A** _(fabrication, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/special.rs:1208` — **PolynomialFilteredLanczos 'Chebyshev filter' does not amplify the target interval** _(fabrication, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/ordering/multilevel.rs:765` — **MultilevelND returns the identity ordering for any graph with n ≤ 2·max_coarse_size (default 200)** _(fabrication, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/pivoting.rs:85` — **SparseLuThreshold / SparseLuStaticPivot use full dense n×n work — no sparsity exploited** _(fabrication, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/precond/schwarz.rs:239` — **AdditiveSchwarz LocalSolverType::ExactLU is an alias for ILU0 (not an exact solve)** _(fabrication, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/precond/spai.rs:179` — **SPAI silently ignores its documented tuning parameters (tolerance, max_nnz_per_col, max_iterations)** _(fabrication, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/sparse_qr.rs:178` — **SparseQr densifies the whole matrix — not a sparse QR** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/arnoldi.rs:173` — **Arnoldi reports converged=true whenever the Krylov space filled, with no residual and no eigenpair validation** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:741` — **GeneralizedEigenResult.residual_norms are transformed-operator residuals, not the documented ||A x - lambda B x||** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/lanczos.rs:549` — **WhichEigenvalues::NearTarget silently falls back to SmallestMagnitude with no target parameter** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/special.rs:213` — **IntervalEigen counts/returns eigenvalues via Sturm sequence on the Lanczos tridiagonal, not on A** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/special.rs:1208` — **PolynomialFilteredLanczos 'Chebyshev filter' does not amplify the target interval** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/ordering/multilevel.rs:765` — **MultilevelND returns the identity ordering for any graph with n ≤ 2·max_coarse_size (default 200)** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:85` — **SparseLuThreshold / SparseLuStaticPivot use full dense n×n work — no sparsity exploited** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/precond/schwarz.rs:239` — **AdditiveSchwarz LocalSolverType::ExactLU is an alias for ILU0 (not an exact solve)** _(fabrication, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/precond/spai.rs:179` — **SPAI silently ignores its documented tuning parameters (tolerance, max_nnz_per_col, max_iterations)** _(fabrication, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/sparse_qr.rs:178` — **SparseQr densifies the whole matrix — not a sparse QR** _(fabrication, hard)_
 
 **missing-feature** (13)
 
@@ -230,7 +230,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/qr/lq.rs:81` — **No complex support for LQ/RQ/QL/pivoted QR/COD, and no orglq/ormlq-family helpers** _(missing-feature, hard)_
 - [x] `crates/oxiblas-matrix/src/mat.rs:446` — **Custom-allocator Mat<T, A> is advertised but unusable: no accessors, indexing, or views outside Global** _(missing-feature, medium)_
 - [x] `crates/oxiblas-matrix/src/mat_ref.rs:340` — **TransposeRef is a dead-end type and MatRef cannot represent strided/transposed data at all** _(missing-feature, hard)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1113` — **arnoldi_generalized performs a single Arnoldi pass with no implicit restart** _(missing-feature, hard)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized.rs:1113` — **arnoldi_generalized performs a single Arnoldi pass with no implicit restart** _(missing-feature, hard)_
 
 **stub** (7)
 
@@ -248,7 +248,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-blas/src/complex_interleaved.rs:432` — **Reachable assert!/assert_eq! panics across the public interleaved-complex API (no-panic policy)** _(policy, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/norms.rs:207` — **Public trace() panics on non-square input (reachable panic in production API)** _(policy, easy)_
 - [x] `crates/oxiblas-matrix/src/packed.rs:201` — **expect() calls in production API paths violate the zero-unwrap/expect policy** _(policy, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/precond/amg.rs:515` — **expect() in production constructor paths in AMG and SAMG (no-unwrap/expect policy)** _(policy, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/precond/amg.rs:515` — **expect() in production constructor paths in AMG and SAMG (no-unwrap/expect policy)** _(policy, easy)_
 - [ ] `crates/oxiblas/src/auto.rs:403` — **auto_svd_f64/f32 and auto_eigenvalues_f64 call .expect() on decomposition Results, panicking on inputs users will hit (NaN, non-convergence)** _(policy, medium)_
 
 **release** (3)
@@ -261,8 +261,8 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [x] `crates/oxiblas-blas/src/level3/strassen.rs:134` — **Strassen pads all dims to next power of two of the max dim — up to ~8x more FLOPs and huge allocations** _(performance, medium)_
 - [ ] `crates/oxiblas-lapack/src/utils/matfun/functions.rs:752` — **logm truncates log(I+X) at 8 Taylor terms with ||X|| up to 0.5, giving ~2e-4 error (sub-production accuracy)** _(performance, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/lobpcg.rs:415` — **LOBPCG search-direction block P grows unboundedly, defeating the fixed 3-block design** _(performance, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:825` — **permute_symmetric_csc scans all n columns per output column (≈O(n²)/O(n³)), defeating sparsity** _(performance, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/lobpcg.rs:415` — **LOBPCG search-direction block P grows unboundedly, defeating the fixed 3-block design** _(performance, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:825` — **permute_symmetric_csc scans all n columns per output column (≈O(n²)/O(n³)), defeating sparsity** _(performance, medium)_
 
 **test-gap** (4)
 
@@ -299,8 +299,8 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/qr/householder.rs:852` — **Householder vector norms computed as sqrt(sum of squares) without scaling: overflow/underflow for extreme magnitudes** _(bug, medium)_
 - [x] `crates/oxiblas-matrix/src/banded.rs:538` — **SymmetricBandedMat::from_banded hardcodes Upper storage, ignoring the documented upper/lower choice** _(bug, easy)_
 - [x] `crates/oxiblas-matrix/src/symmetric.rs:744` — **HermitianMat::scale accepts complex alpha despite doc requiring real, silently breaking the Hermitian invariant** _(bug, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/shift_invert.rs:276` — **build_shifted_matrix inserts a missing diagonal at the end of the row, breaking CSR column-sort order** _(bug, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/precond/gauss_seidel.rs:352` — **SSOR omits the omega*(2-omega) scaling factor of the standard SSOR operator** _(bug, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/shift_invert.rs:276` — **build_shifted_matrix inserts a missing diagonal at the end of the row, breaking CSR column-sort order** _(bug, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/precond/gauss_seidel.rs:352` — **SSOR omits the omega*(2-omega) scaling factor of the standard SSOR operator** _(bug, easy)_
 - [ ] `crates/oxiblas/src/builder.rs:236` — **MatBuilder::from_fn calls the user closure at (0,0) unconditionally, panicking for empty builders and double-invoking stateful closures** _(bug, easy)_
 
 **fabrication** (1)
@@ -320,7 +320,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:267` — **Dead, self-admitted-broken permutation block left in Lu::solve** _(stub, easy)_
 - [x] `crates/oxiblas-lapack/src/workspace.rs:173` — **workspace.rs is an orphaned advisory module — no routine in the crate consumes its lwork sizes** _(stub, medium)_
 - [x] `crates/oxiblas-matrix/src/prefetch.rs:168` — **prefetch module is orphaned, duplicates oxiblas-core, hardcodes CACHE_LINE_SIZE=64 contradicting core's arch-dependent value, and its strided path covers ~1/8 of lines** _(stub, medium)_
-- [ ] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_
+- [x] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_
 
 **policy** (10)
 
@@ -331,9 +331,9 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:1989` — **Production source files approaching the 2000-line refactor limit** _(policy, medium)_
 - [x] `crates/oxiblas-lapack/src/svd/qr_based.rs:379` — **expect() in production API path (condition_number) violates no-unwrap/expect policy** _(policy, easy)_
 - [x] `crates/oxiblas-matrix/Cargo.toml:26` — **Test/bench tooling deps are hard-pinned instead of workspace-inherited (Workspace Policy)** _(policy, easy)_
-- [ ] `crates/oxiblas-sparse/src/csr.rs:448` — **Index impl panics on structurally-zero elements via expect() (surprising API + no-unwrap policy)** _(policy, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/utils.rs:139` — **expect()/panic reachable in production matrix-construction and residual paths (zero-expect policy)** _(policy, easy)_
-- [ ] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:529` — **Public solve() methods panic (assert_eq!) on RHS length mismatch instead of returning an error** _(policy, easy)_
+- [x] `crates/oxiblas-sparse/src/csr.rs:448` — **Index impl panics on structurally-zero elements via expect() (surprising API + no-unwrap policy)** _(policy, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/eigenvalue/utils.rs:139` — **expect()/panic reachable in production matrix-construction and residual paths (zero-expect policy)** _(policy, easy)_
+- [x] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs:529` — **Public solve() methods panic (assert_eq!) on RHS length mismatch instead of returning an error** _(policy, easy)_
 
 **release** (2)
 
@@ -349,8 +349,8 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [x] `crates/oxiblas-matrix/tests/blas_compat_tests.rs:280` — **test_gemm_layout_requirements never calls gemm** _(test-gap, easy)_
 - [x] `crates/oxiblas-matrix/tests/property_tests.rs:99` — **prop_mat_transpose_involutory tests a single transpose, not the involution it names** _(test-gap, easy)_
-- [ ] `crates/oxiblas-sparse/tests/memory_usage_tests.rs:3` — **"Memory leak / memory usage" tests do not measure memory and cannot detect leaks** _(test-gap, medium)_
-- [ ] `crates/oxiblas-sparse/tests/suitesparse_matrices.rs:107` — **random_spd_matrix uses an entropy-seeded RNG with no fixed seed (non-reproducible test data)** _(test-gap, easy)_
+- [x] `crates/oxiblas-sparse/tests/memory_usage_tests.rs:3` — **"Memory leak / memory usage" tests do not measure memory and cannot detect leaks** _(test-gap, medium)_
+- [x] `crates/oxiblas-sparse/tests/suitesparse_matrices.rs:107` — **random_spd_matrix uses an entropy-seeded RNG with no fixed seed (non-reproducible test data)** _(test-gap, easy)_
 
 **docs** (22)
 
@@ -370,9 +370,9 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/utils/equilibrate.rs:147` — **geequ row_cond/col_cond use max/min, inverting LAPACK DGEEQU's ROWCND/COLCND (min/max in [0,1]) convention** _(docs, easy)_
 - [x] `crates/oxiblas-matrix/src/mat_ref.rs:215` — **col_as_slice / col_as_slice_mut advertise a contiguity check via Option but unconditionally return Some** _(docs, easy)_
 - [x] `crates/oxiblas-matrix/src/nalgebra_compat.rs:8` — **Module doc promises zero-copy nalgebra views; every conversion copies** _(docs, easy)_
-- [ ] `crates/oxiblas-sparse/src/graph/functions.rs:24` — **Public-API doctests marked ```ignore are never compiled or verified (64 total across the workspace)** _(docs, medium)_
-- [ ] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:696` — **Misleading algorithm docs: COLAMD forms A^T·A explicitly; 'AMD' is exact O(n²) minimum degree** _(docs, easy)_
-- [ ] `crates/oxiblas-sparse/src/test_matrices.rs:351` — **random_spd doc claims 'A = L*L^T + n*I' but constructs a different matrix** _(docs, easy)_
+- [x] `crates/oxiblas-sparse/src/graph/functions.rs:24` — **Public-API doctests marked ```ignore are never compiled or verified (64 total across the workspace)** _(docs, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:696` — **Misleading algorithm docs: COLAMD forms A^T·A explicitly; 'AMD' is exact O(n²) minimum degree** _(docs, easy)_
+- [x] `crates/oxiblas-sparse/src/test_matrices.rs:351` — **random_spd doc claims 'A = L*L^T + n*I' but constructs a different matrix** _(docs, easy)_
 - [ ] `crates/oxiblas/Cargo.toml:25` — **Published crates lack docs.rs all-features metadata, hiding feature-gated APIs from docs** _(docs, easy)_
 - [ ] `crates/oxiblas/README.md:132` — **Inconsistent oxiblas-ffi retirement version: crate README says v0.2.1, but CHANGELOG and workspace Cargo.toml say v0.2.0** _(docs, easy)_
 - [ ] `crates/oxiblas/src/lib.rs:434` — **features::NO_STD is derived from the facade's own `default` feature, not from oxiblas-core/std as its name and docs imply** _(docs, easy)_
@@ -385,22 +385,31 @@ Progress so far (all committed to branch `0.2.2`, working tree clean):
 - **Iteration 1 (oxiblas-core, 42 findings) — DONE.**
 - **Iteration 2a (oxiblas-matrix, 25 findings) — DONE.**
 - **Iteration 2b (oxiblas-blas, 57 findings) — DONE.**
-- **Iteration 3a (oxiblas-lapack + oxiblas-ndarray, 22 findings) — DONE** (commit `21a4701` completes the final 10; full workspace build+clippy+test green, 3175+ tests).
-- **Iteration 3b (oxiblas-sparse, ~40 findings) — IN PROGRESS** (Workflow `wf_c5ce248f-28b`, 29 units, dispatched 2026-07-18; not yet merged as of this TODO.md update).
+- **Iteration 3a (oxiblas-lapack + oxiblas-ndarray, 22 findings) — DONE** (commit `21a4701`).
+- **Iteration 3b (oxiblas-sparse, ~46 findings) — DONE** (commit `4c755a3`; full workspace build+clippy+test green).
+- **SVD/sparse follow-up fixes (2 findings from Iter3a verification) — IN PROGRESS** (Workflow `wf_3965d6d4-5f9`, dispatched 2026-07-18; not yet merged as of this update).
 - **Iteration 4 (oxiblas facade + workspace cleanup) — NOT STARTED.**
 - **Iteration 5 (final full-workspace verification + report) — NOT STARTED.**
 
 ### New findings surfaced during Iter3a-completion verification (2026-07-18)
-- [ ] `crates/oxiblas-lapack/src/svd/bidiag_dc.rs` (`deflate()`, ~line 660-676) — **coincident-eigenvalue deflation in the new Gu-Eisenstat SVD D&C merge omits the required Givens rotation** (LAPACK dlaed2-style): when two nearly-equal diagonal entries are merged, the code combines coupling magnitudes and drops one to `trivial` without rotating the accumulated eigenvectors, so that pair loses orthogonality. Adversarially verified as a real (not superficial) mathematical gap, but **effectively unreachable in practice**: requires two *different* perturbed Cuppen sub-blocks to share an eigenvalue to within `eps*n*scale`, which is measure-zero for generic input — confirmed 0 branch hits across the full D&C test suite plus a deliberately-constructed repeated-singular-value matrix (block-diagonal `A = M⊕M`, n=32), which still passed via the secular/Gu-Eisenstat path, not this merge branch. _(bug, low-in-practice, hard)_
+- [ ] `crates/oxiblas-lapack/src/svd/bidiag_dc.rs` (`deflate()`, ~line 660-676) — **coincident-eigenvalue deflation in the new Gu-Eisenstat SVD D&C merge omits the required Givens rotation** (LAPACK dlaed2-style): when two nearly-equal diagonal entries are merged, the code combines coupling magnitudes and drops one to `trivial` without rotating the accumulated eigenvectors, so that pair loses orthogonality. Adversarially verified as a real (not superficial) mathematical gap, but **effectively unreachable in practice**: requires two *different* perturbed Cuppen sub-blocks to share an eigenvalue to within `eps*n*scale`, which is measure-zero for generic input — confirmed 0 branch hits across the full D&C test suite plus a deliberately-constructed repeated-singular-value matrix (block-diagonal `A = M⊕M`, n=32), which still passed via the secular/Gu-Eisenstat path, not this merge branch. _(bug, low-in-practice, hard)_ — **fix dispatched, see Workflow `wf_3965d6d4-5f9` unit `bidiag_dc_deflation`**
   - Fix: add the Givens rotation `G(i,j)` with `c=u_i/r, s=u_j/r` to the accumulated eigenvectors at the merge point, matching the exact Gu-Eisenstat/dlaed2 algorithm, so genuinely structurally-symmetric/repeated inputs (e.g. Kronecker/tensor-product constructions common in scientific computing) don't silently lose orthogonality.
-- [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs` — **QrSvd (Golub-Kahan-Reinsch bidiagonal QR) fails to converge on realistic-sized dense matrices**: observed `NotConverged { num_unconverged: 33 }` on a deterministic 50×50 pseudo-random matrix (`divide_conquer.rs` test `test_svd_dc_vs_reference_across_sizes`, LCG seed `0x2545_f491_4f6c_dd1d ^ n`) — over half the singular values failed to converge within budget. This is a pre-existing robustness limitation (not introduced this session) that was previously masked because the pre-Iter3a `QrSvd` silently returned inaccurate results instead of reporting `NotConverged`; now that it reports honestly, the gap is visible. The `divide_conquer.rs` test was adjusted to skip (not fail) its QrSvd cross-check when this happens, since the primary Jacobi-SVD-based reference check already validates D&C correctness at that size. _(bug, medium, hard)_
+- [ ] `crates/oxiblas-lapack/src/svd/qr_based.rs` — **QrSvd (Golub-Kahan-Reinsch bidiagonal QR) fails to converge on realistic-sized dense matrices**: observed `NotConverged { num_unconverged: 33 }` on a deterministic 50×50 pseudo-random matrix (`divide_conquer.rs` test `test_svd_dc_vs_reference_across_sizes`, LCG seed `0x2545_f491_4f6c_dd1d ^ n`) — over half the singular values failed to converge within budget. This is a pre-existing robustness limitation (not introduced this session) that was previously masked because the pre-Iter3a `QrSvd` silently returned inaccurate results instead of reporting `NotConverged`; now that it reports honestly, the gap is visible. The `divide_conquer.rs` test was adjusted to skip (not fail) its QrSvd cross-check when this happens, since the primary Jacobi-SVD-based reference check already validates D&C correctness at that size. _(bug, medium, hard)_ — **fix dispatched, see Workflow `wf_3965d6d4-5f9` unit `qr_svd_convergence`**
   - Fix: investigate why the implicit-shift bidiagonal QR needs so many more iterations than expected for n=50 (check shift strategy / deflation criteria against LAPACK dbdsqr's `MAXITR = 6` sweeps-per-unconverged-element budget — oxiblas may be using too few iterations, or missing a deflation case), and raise the iteration budget or fix the shift/deflation logic so QrSvd is reliable at realistic sizes, not just the small sizes it's currently tested at.
 
+### New findings surfaced during Iter3b (oxiblas-sparse) verification (2026-07-18)
+- [ ] `crates/oxiblas-sparse/src/linalg/svd/types.rs` — **IncrementalSVD rank-growth fix (`add_rows`/`add_columns`) is a real improvement but still wrong on non-trivial inputs**: adversarially verified failures include (a) `dense_svd_full` (the internal dense-SVD helper the fix relies on) cannot resolve repeated/clustered singular values — e.g. `dense_svd_full(diag(4,3,1,1))` returns `[4, 3, 1, 2.2e-5]`, missing the second unit direction entirely; (b) sequential single-row adds that create a repeated-singular-value K matrix give reconstruction error ~1.0 instead of near-zero; (c) multi-row adds with linearly-dependent residuals give reconstruction error ~2.7 due to `p_prime` over-counting rank from a rank-deficient QR. The two reconstruction tests added by the fix only exercise the one subcase (rank-grows-by-1, distinct singular values) where these bugs don't trigger. _(bug, medium, hard)_
+  - Fix: replace/harden `dense_svd_full` to handle repeated/clustered singular values correctly (e.g. route through the crate's Jacobi SVD or a proper deflation-aware small-dense SVD instead of whatever naive method it currently uses), and fix the rank-deficient-residual over-counting in `p_prime` (should reflect the numerical rank of the QR residual, e.g. via a rank-revealing tolerance on the R diagonal, not `q_r[0].len()`).
+- [ ] `crates/oxiblas-sparse/src/linalg/eigenvalue/generalized/{mod.rs,kernel.rs}` — **`arnoldi_generalized`'s new IRAM-style implicit restart is a real improvement over the old single-pass code but is not robust**: directly exercising the restart path (n=24, ncv=10, non-symmetric upper-bidiagonal with distinct real eigenvalues, `Standard` mode) returned `converged=false` after 5 iterations. Root cause: `apply_implicit_qr_shifts_b` takes `_shifts_imag` but never uses it — every unwanted Ritz value is applied as a single real exact shift (`Re(mu)`) even for genuinely complex-conjugate pairs, instead of a proper Francis double-shift. The regression test claiming convergence exercises a case too easy to catch this. _(bug, medium, hard)_
+  - Fix: implement a proper real Francis double-shift (or complex-conjugate-pair exact-shift) QR step in `apply_implicit_qr_shifts_b` so complex-conjugate unwanted Ritz pairs are compressed correctly, using `_shifts_imag` instead of discarding it.
+- [ ] `crates/oxiblas-sparse/src/linalg/multifrontal_cholesky.rs` — **MultifrontalCholesky's symbolic factorization produces an INCORRECT solve for general 2D fill-generating matrices** (discovered as a side-effect of fixing the sibling `supernodal.rs` fill-in bug and cross-checking against it): a 3x3 2D-grid Laplacian gives residual ~10.5 with `multifrontal_cholesky.rs` vs ~4e-15 with the now-corrected `supernodal.rs`. Its `symbolic_factorization` walks up the elimination tree from A's direct neighbors instead of doing the proper child-structure recursion (`struct(L[:,j]) = A-rows>j ∪ ⋃_children (struct(L[:,c]) \ {c})`), only partially compensated at assembly time via update-matrix indices — insufficient for general fill patterns. Not touched by the Iter3b `multifrontal_extra` unit (which only fixed the separate `permute_symmetric_csc` perf issue and the RHS-mismatch panic). _(bug, high, hard)_ — **not yet dispatched**
+  - Fix: apply the same fill-aware elimination-tree symbolic analysis now implemented correctly in `linalg/supernodal.rs` (commit `4c755a3`) to `multifrontal_cholesky.rs`'s symbolic factorization.
+
 ### Next orchestrator: how to resume
-1. Iter3b (oxiblas-sparse) may already be running/complete — check for Workflow `wf_c5ce248f-28b` results before re-dispatching. If it needs a fresh run, the full finding list is in the main audit section below (search `oxiblas-sparse`), grouped into ~29 non-overlapping file-cluster units per the established pattern.
-2. Then the two new findings above (bidiag_dc deflation Givens rotation, QrSvd convergence robustness) — both well-scoped, suitable for a single Opus unit each.
+1. The SVD/sparse follow-up workflow (`wf_3965d6d4-5f9`) may already be complete — check before re-dispatching.
+2. Then the 3 new findings above from Iter3b verification (svd_types remaining gaps, arnoldi_generalized Francis double-shift, multifrontal_cholesky fill-in correctness) — each well-scoped for a single Opus unit.
 3. Then Iter4 (facade + workspace cleanup) and Iter5 (final verify) as originally planned.
-4. **Lesson learned, keep applying**: `isolation: 'worktree'` agents' worktrees branch from a STALE base commit (observed repeatedly: `00dcf64`) — do NOT `git merge` their branches directly. Extract each agent's changed files via `git show <commit>:<path> > <path>`, then rebuild/reconcile by hand. Watch specifically for: (a) files that moved from single-file to a split directory (e.g. `qr/householder.rs` → `qr/householder/mod.rs`) since the stale worktree won't know about the split — port the diff manually to the new location; (b) `MatRef::new`/`MatMut::new` unsafe-call-site ripples in any file the stale base predates the unsafe-API change for; (c) cross-unit file overlaps (two units touching the same file) — diff each unit's change against its own parent commit to extract just that unit's delta, don't blindly overwrite. Always `git add -A && git commit` promptly after each iteration's merge-and-verify, and clean up worktrees/branches immediately after.
+4. **Lesson learned, keep applying**: `isolation: 'worktree'` agents' worktrees branch from a STALE base commit (observed repeatedly: `00dcf64`, `b2e271e`, `06b2225`) — do NOT `git merge` their branches directly. Extract each agent's changed files via `git show <commit>:<path> > <path>`, then rebuild/reconcile by hand. Watch specifically for: (a) files that moved from single-file to a split directory (e.g. `qr/householder.rs` → `qr/householder/mod.rs`, `generalized.rs` → `generalized/{mod,kernel}.rs`) since the stale worktree won't know about the split — port the diff manually to the new location; (b) `MatRef::new`/`MatMut::new` unsafe-call-site ripples in any file the stale base predates the unsafe-API change for; (c) cross-unit file overlaps (two+ units touching the same file, including test files where 4 units appended tests to the same file) — diff each unit's change against its own parent commit to extract just that unit's delta; if all units share the same parent and their diffs are pure insertions, sequential `git apply` works cleanly, otherwise reconcile by hand; (d) when checking off TODO.md findings, verify the effort actually resolved them — adversarial verification in this session caught several "fixed" findings that still have real bugs (SVD D&C deflation, QrSvd convergence, IncrementalSVD, arnoldi_generalized restart) and one finding that surfaced a NEW bug in an untouched neighboring file (multifrontal_cholesky) purely from comparative testing. Always `git add -A && git commit` promptly after each iteration's merge-and-verify, and clean up worktrees/branches immediately after.
 
 ## Iteration 1 gap-sweep — new findings (added 2026-07-17, orchestrated re-audit)
 
@@ -438,8 +447,8 @@ Progress so far (all committed to branch `0.2.2`, working tree clean):
 - [x] `crates/oxiblas-ndarray/src/conversions.rs:297` — array_view_to_mat_ref and friends cast a possibly-negative column stride to usize unchecked — safe API path to UB _(bug, low, hard)_
 
 **oxiblas-sparse (2, queued for Iter3):**
-- [ ] `crates/oxiblas-sparse/src/ops/functions.rs:441` — spmv_hermitian delegates to spmv_symmetric verbatim (no conjugation) — wrong for complex Hermitian matrices despite its own doc claim _(bug, high, hard)_
-- [ ] `crates/oxiblas-sparse/src/bsr.rs:225` — DenseBlock::frobenius_norm_sq sums val*val instead of |val|^2 (val*conj(val)) — wrong (complex-valued) result for complex T _(bug, low, hard)_
+- [x] `crates/oxiblas-sparse/src/ops/functions.rs:441` — spmv_hermitian delegates to spmv_symmetric verbatim (no conjugation) — wrong for complex Hermitian matrices despite its own doc claim _(bug, high, hard)_
+- [x] `crates/oxiblas-sparse/src/bsr.rs:225` — DenseBlock::frobenius_norm_sq sums val*val instead of |val|^2 (val*conj(val)) — wrong (complex-valued) result for complex T _(bug, low, hard)_
 
 **oxiblas (facade) (6, queued for Iter4):**
 - [ ] `crates/oxiblas/src/auto.rs:476` — auto_svd_f32/f64(DivideConquer branch:412)/auto_eigenvalues_f64 panic via .expect() on non-convergence/NaN/empty input; prior audit only caught :403 _(bug, high)_

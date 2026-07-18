@@ -9,6 +9,10 @@ repository.workspace = true
 authors.workspace = true
 keywords = ["ffi", "blas", "lapack", "linear-algebra", "c-bindings"]
 categories = ["external-ffi-bindings", "mathematics", "science"]
+# Retired crate (see workspace Cargo.toml comment): broken/unmaintained, must
+# never be published to crates.io. This is a second layer of protection in
+# addition to excluding it from release.yml's publish-crates job.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

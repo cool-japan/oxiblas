@@ -175,6 +175,78 @@ impl std::fmt::Display for SolveError {
 
 impl std::error::Error for SolveError {}
 
+/// Result type for eigen/singular-value decomposition operations.
+pub type DecompositionResult<T> = Result<T, DecompositionError>;
+
+/// Error type for automatic decomposition operations (SVD, eigenvalue decomposition).
+#[derive(Debug, Clone)]
+pub enum DecompositionError {
+    /// Input matrix is empty (zero rows or columns).
+    EmptyMatrix,
+    /// Matrix is not square (required for eigenvalue decomposition).
+    NotSquare,
+    /// The underlying iterative algorithm did not converge.
+    NotConverged,
+    /// Generic/underlying error.
+    Other(String),
+}
+
+impl std::fmt::Display for DecompositionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecompositionError::EmptyMatrix => write!(f, "Matrix is empty"),
+            DecompositionError::NotSquare => write!(f, "Matrix must be square"),
+            DecompositionError::NotConverged => {
+                write!(f, "Decomposition algorithm did not converge")
+            }
+            DecompositionError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DecompositionError {}
+
+impl From<oxiblas_lapack::svd::SvdError> for DecompositionError {
+    fn from(e: oxiblas_lapack::svd::SvdError) -> Self {
+        match e {
+            oxiblas_lapack::svd::SvdError::EmptyMatrix => Self::EmptyMatrix,
+            oxiblas_lapack::svd::SvdError::NotConverged => Self::NotConverged,
+        }
+    }
+}
+
+impl From<oxiblas_lapack::svd::SvdDcError> for DecompositionError {
+    fn from(e: oxiblas_lapack::svd::SvdDcError) -> Self {
+        match e {
+            oxiblas_lapack::svd::SvdDcError::EmptyMatrix => Self::EmptyMatrix,
+            oxiblas_lapack::svd::SvdDcError::NotConverged => Self::NotConverged,
+            oxiblas_lapack::svd::SvdDcError::SecularEquationFailed => {
+                Self::Other("Secular equation solver failed".to_string())
+            }
+        }
+    }
+}
+
+impl From<oxiblas_lapack::evd::SymmetricEvdError> for DecompositionError {
+    fn from(e: oxiblas_lapack::evd::SymmetricEvdError) -> Self {
+        match e {
+            oxiblas_lapack::evd::SymmetricEvdError::EmptyMatrix => Self::EmptyMatrix,
+            oxiblas_lapack::evd::SymmetricEvdError::NotSquare => Self::NotSquare,
+            oxiblas_lapack::evd::SymmetricEvdError::NotConverged => Self::NotConverged,
+        }
+    }
+}
+
+impl From<oxiblas_lapack::evd::GeneralEvdError> for DecompositionError {
+    fn from(e: oxiblas_lapack::evd::GeneralEvdError) -> Self {
+        match e {
+            oxiblas_lapack::evd::GeneralEvdError::EmptyMatrix => Self::EmptyMatrix,
+            oxiblas_lapack::evd::GeneralEvdError::NotSquare => Self::NotSquare,
+            oxiblas_lapack::evd::GeneralEvdError::NotConverged => Self::NotConverged,
+        }
+    }
+}
+
 /// Automatic linear system solve for f64.
 ///
 /// Solves A × x = b using the most appropriate algorithm:
@@ -280,6 +352,119 @@ pub fn auto_solve_f32(a: MatRef<'_, f32>, b: MatRef<'_, f32>) -> SolveResult<f32
     }
 }
 
+/// Maximum number of index pairs to sample when checking symmetry of a large
+/// matrix. Keeps the heuristic O(1) in memory and roughly O(samples) in time
+/// while still spreading coverage across the whole matrix instead of a single
+/// corner.
+const SPD_SYMMETRY_MAX_SAMPLES: usize = 4096;
+
+/// Below this size, check symmetry exhaustively (cheap for small matrices and
+/// avoids sampling gaps entirely).
+const SPD_SYMMETRY_FULL_CHECK_THRESHOLD: usize = 64;
+
+/// Generates a sequence of pseudo-random but deterministic index pairs
+/// `(i, j)` with `i < j < n`, spread across the full `n x n` index space
+/// rather than clustered in one corner.
+///
+/// Uses a simple multiplicative-congruential stream (splitmix64-style) so the
+/// heuristic stays dependency-free and fully deterministic (no reliance on
+/// external RNG state), while still decorrelating consecutive samples enough
+/// to cover the whole matrix.
+struct SymmetryIndexSampler {
+    state: u64,
+}
+
+impl SymmetryIndexSampler {
+    fn new(seed: u64) -> Self {
+        // Avoid a zero state, which would make the stream degenerate.
+        Self {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // splitmix64
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Returns a value in `0..bound` (bound must be > 0).
+    fn next_below(&mut self, bound: usize) -> usize {
+        (self.next_u64() % bound as u64) as usize
+    }
+}
+
+/// Checks whether `a` is approximately symmetric using a representative
+/// sample of index pairs.
+///
+/// For small matrices (`n <= SPD_SYMMETRY_FULL_CHECK_THRESHOLD`) every
+/// off-diagonal pair is checked. For larger matrices, a bounded number of
+/// pairs are sampled pseudo-randomly across the *entire* index range (not
+/// just a small corner), so structurally non-symmetric matrices are
+/// statistically very unlikely to slip through undetected regardless of
+/// where the asymmetry lives.
+fn is_approximately_symmetric<T, F>(n: usize, get: F, rel_tol: T, epsilon: T) -> bool
+where
+    T: num_traits::Float,
+    F: Fn(usize, usize) -> T,
+{
+    let check_pair = |i: usize, j: usize, tol: T| -> bool {
+        let a_ij = get(i, j);
+        let a_ji = get(j, i);
+        let diff = (a_ij - a_ji).abs();
+        let scale = a_ij.abs() + a_ji.abs() + epsilon;
+        diff <= scale * tol
+    };
+
+    if n <= SPD_SYMMETRY_FULL_CHECK_THRESHOLD {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if !check_pair(i, j, rel_tol) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Total number of off-diagonal pairs (upper triangle), used to scale the
+    // sample count with matrix size while staying bounded.
+    let total_pairs = n.saturating_mul(n.saturating_sub(1)) / 2;
+    let sample_count = total_pairs.min(SPD_SYMMETRY_MAX_SAMPLES).max(n);
+
+    // Deterministic seed derived from the matrix size keeps the heuristic
+    // reproducible across calls while still spreading samples across the
+    // whole index range (not just the top-left corner).
+    let mut sampler = SymmetryIndexSampler::new(n as u64);
+
+    for _ in 0..sample_count {
+        let i = sampler.next_below(n);
+        let mut j = sampler.next_below(n);
+        if i == j {
+            j = (j + 1) % n;
+        }
+        let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+        if !check_pair(lo, hi, rel_tol) {
+            return false;
+        }
+    }
+
+    // Additionally sweep the diagonal-adjacent band to catch narrow-band
+    // asymmetries that pure random sampling could statistically miss.
+    for i in 0..n {
+        for j in (i + 1)..n.min(i + 8) {
+            if !check_pair(i, j, rel_tol) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Heuristic to check if a matrix is likely symmetric positive definite (f64).
 fn is_likely_spd_f64(a: &MatRef<'_, f64>) -> bool {
     let n = a.nrows();
@@ -295,19 +480,9 @@ fn is_likely_spd_f64(a: &MatRef<'_, f64>) -> bool {
         }
     }
 
-    // Check if approximately symmetric (sample a few off-diagonal elements)
-    let samples = n.min(5);
-    for i in 0..samples {
-        for j in (i + 1)..n.min(i + samples) {
-            let diff = (a[(i, j)] - a[(j, i)]).abs();
-            let scale = a[(i, j)].abs() + a[(j, i)].abs() + f64::EPSILON;
-            if diff / scale > 1e-6 {
-                return false;
-            }
-        }
-    }
-
-    true
+    // Check approximate symmetry across a representative sample of the
+    // matrix (full check for small n, spread sampling for large n).
+    is_approximately_symmetric(n, |i, j| a[(i, j)], 1e-6, f64::EPSILON)
 }
 
 /// Heuristic to check if a matrix is likely symmetric positive definite (f32).
@@ -324,18 +499,7 @@ fn is_likely_spd_f32(a: &MatRef<'_, f32>) -> bool {
         }
     }
 
-    let samples = n.min(5);
-    for i in 0..samples {
-        for j in (i + 1)..n.min(i + samples) {
-            let diff = (a[(i, j)] - a[(j, i)]).abs();
-            let scale = a[(i, j)].abs() + a[(j, i)].abs() + f32::EPSILON;
-            if diff / scale > 1e-4 {
-                return false;
-            }
-        }
-    }
-
-    true
+    is_approximately_symmetric(n, |i, j| a[(i, j)], 1e-4, f32::EPSILON)
 }
 
 /// Algorithm selection hint for SVD.
@@ -362,7 +526,9 @@ pub enum SvdAlgorithm {
 ///
 /// # Returns
 ///
-/// Tuple of (U, S, Vt) where A ≈ U × diag(S) × Vt.
+/// Tuple of (U, S, Vt) where A ≈ U × diag(S) × Vt, or an error if the
+/// underlying decomposition fails (e.g. non-convergence or an empty input
+/// matrix).
 ///
 /// # Examples
 ///
@@ -371,17 +537,20 @@ pub enum SvdAlgorithm {
 /// use oxiblas::auto::auto_svd_f64;
 ///
 /// let a = MatBuilder::<f64>::random(50, 30, 42);
-/// let (u, s, vt) = auto_svd_f64(a.as_ref());
+/// let (u, s, vt) = auto_svd_f64(a.as_ref()).expect("SVD failed");
 /// ```
-pub fn auto_svd_f64(a: MatRef<'_, f64>) -> (Mat<f64>, Vec<f64>, Mat<f64>) {
+pub fn auto_svd_f64(a: MatRef<'_, f64>) -> DecompositionResult<(Mat<f64>, Vec<f64>, Mat<f64>)> {
     auto_svd_f64_with_algorithm(a, SvdAlgorithm::Auto)
 }
 
 /// Compute SVD with specified algorithm (f64).
+///
+/// Returns an error if the underlying decomposition fails (e.g.
+/// non-convergence or an empty input matrix) instead of panicking.
 pub fn auto_svd_f64_with_algorithm(
     a: MatRef<'_, f64>,
     algorithm: SvdAlgorithm,
-) -> (Mat<f64>, Vec<f64>, Mat<f64>) {
+) -> DecompositionResult<(Mat<f64>, Vec<f64>, Mat<f64>)> {
     let m = a.nrows();
     let n = a.ncols();
     let min_dim = m.min(n);
@@ -400,47 +569,50 @@ pub fn auto_svd_f64_with_algorithm(
     match algo {
         SvdAlgorithm::Standard | SvdAlgorithm::Auto => {
             use oxiblas_lapack::svd::Svd;
-            let svd = Svd::compute(a.to_owned()).expect("SVD failed");
-            (
+            let svd = Svd::compute(a.to_owned())?;
+            Ok((
                 matref_to_mat(svd.u()),
                 svd.singular_values().to_vec(),
                 matref_to_mat(svd.vt()),
-            )
+            ))
         }
         SvdAlgorithm::DivideConquer => {
             use oxiblas_lapack::svd::SvdDc;
-            let svd = SvdDc::compute(a.to_owned()).expect("SVD DC failed");
-            (
+            let svd = SvdDc::compute(a.to_owned())?;
+            Ok((
                 matref_to_mat(svd.u()),
                 svd.singular_values().to_vec(),
                 matref_to_mat(svd.vt()),
-            )
+            ))
         }
     }
 }
 
 /// Compute SVD with automatic algorithm selection (f32).
-pub fn auto_svd_f32(a: MatRef<'_, f32>) -> (Mat<f32>, Vec<f32>, Mat<f32>) {
+///
+/// Returns an error if the underlying decomposition fails (e.g.
+/// non-convergence or an empty input matrix) instead of panicking.
+pub fn auto_svd_f32(a: MatRef<'_, f32>) -> DecompositionResult<(Mat<f32>, Vec<f32>, Mat<f32>)> {
     let m = a.nrows();
     let n = a.ncols();
     let min_dim = m.min(n);
 
     if min_dim < 100 {
         use oxiblas_lapack::svd::Svd;
-        let svd = Svd::compute(a.to_owned()).expect("SVD failed");
-        (
+        let svd = Svd::compute(a.to_owned())?;
+        Ok((
             matref_to_mat(svd.u()),
             svd.singular_values().to_vec(),
             matref_to_mat(svd.vt()),
-        )
+        ))
     } else {
         use oxiblas_lapack::svd::SvdDc;
-        let svd = SvdDc::compute(a.to_owned()).expect("SVD DC failed");
-        (
+        let svd = SvdDc::compute(a.to_owned())?;
+        Ok((
             matref_to_mat(svd.u()),
             svd.singular_values().to_vec(),
             matref_to_mat(svd.vt()),
-        )
+        ))
     }
 }
 
@@ -456,7 +628,9 @@ pub fn auto_svd_f32(a: MatRef<'_, f32>) -> (Mat<f32>, Vec<f32>, Mat<f32>) {
 ///
 /// # Returns
 ///
-/// Vector of eigenvalues (real parts for general matrices).
+/// Vector of eigenvalues (real parts for general matrices), or an error if
+/// the matrix is not square or the underlying decomposition fails (e.g.
+/// non-convergence or an empty input matrix).
 ///
 /// # Examples
 ///
@@ -465,21 +639,23 @@ pub fn auto_svd_f32(a: MatRef<'_, f32>) -> (Mat<f32>, Vec<f32>, Mat<f32>) {
 /// use oxiblas::auto::auto_eigenvalues_f64;
 ///
 /// let a = MatBuilder::<f64>::random_spd(20, 42);
-/// let eigvals = auto_eigenvalues_f64(a.as_ref(), true);
+/// let eigvals = auto_eigenvalues_f64(a.as_ref(), true).expect("EVD failed");
 /// ```
-pub fn auto_eigenvalues_f64(a: MatRef<'_, f64>, symmetric: bool) -> Vec<f64> {
+pub fn auto_eigenvalues_f64(a: MatRef<'_, f64>, symmetric: bool) -> DecompositionResult<Vec<f64>> {
     let n = a.nrows();
-    assert_eq!(n, a.ncols(), "Matrix must be square");
+    if n != a.ncols() {
+        return Err(DecompositionError::NotSquare);
+    }
 
     if symmetric {
         use oxiblas_lapack::evd::SymmetricEvd;
-        let evd = SymmetricEvd::compute(a).expect("EVD failed");
-        evd.eigenvalues().to_vec()
+        let evd = SymmetricEvd::compute(a)?;
+        Ok(evd.eigenvalues().to_vec())
     } else {
         use oxiblas_lapack::evd::GeneralEvd;
-        let evd = GeneralEvd::compute(a).expect("EVD failed");
+        let evd = GeneralEvd::compute(a)?;
         // For general matrices, eigenvalues may be complex. Return real parts.
-        evd.eigenvalues().iter().map(|e| e.real).collect()
+        Ok(evd.eigenvalues().iter().map(|e| e.real).collect())
     }
 }
 
@@ -522,7 +698,7 @@ mod tests {
     #[test]
     fn test_auto_svd() {
         let a = MatBuilder::<f64>::random(20, 10, 42);
-        let (u, s, vt) = auto_svd_f64(a.as_ref());
+        let (u, s, vt) = auto_svd_f64(a.as_ref()).expect("SVD failed");
 
         // Full SVD: U is m×m, Vt is n×n
         assert_eq!(u.nrows(), 20);
@@ -541,7 +717,7 @@ mod tests {
     #[test]
     fn test_auto_eigenvalues_symmetric() {
         let a = MatBuilder::<f64>::random_spd(10, 42);
-        let eigvals = auto_eigenvalues_f64(a.as_ref(), true);
+        let eigvals = auto_eigenvalues_f64(a.as_ref(), true).expect("EVD failed");
 
         assert_eq!(eigvals.len(), 10);
 
@@ -555,5 +731,92 @@ mod tests {
     fn test_is_likely_spd() {
         let spd = MatBuilder::<f64>::random_spd(10, 42);
         assert!(is_likely_spd_f64(&spd.as_ref()));
+    }
+
+    #[test]
+    fn test_is_likely_spd_large_random_matrix() {
+        // Sanity check that a genuinely large SPD matrix is still recognized
+        // as such by the spread-sampling heuristic (no false negatives from
+        // the new sampling strategy).
+        let spd = MatBuilder::<f64>::random_spd(150, 7);
+        assert!(is_likely_spd_f64(&spd.as_ref()));
+    }
+
+    #[test]
+    fn test_is_likely_spd_rejects_asymmetry_outside_top_left_corner() {
+        // Regression test: the old heuristic only sampled the 5x5 top-left
+        // corner, so an asymmetric matrix perturbed far away from (0,0)
+        // (e.g. near row/col 150 of a 200x200 matrix) would be incorrectly
+        // flagged as symmetric. The fixed heuristic must catch this.
+        let n = 200;
+        let mut a = MatBuilder::<f64>::from_fn(n, n, |i, j| {
+            if i == j {
+                (i + 10) as f64
+            } else {
+                1.0 / ((i as f64 - j as f64).abs() + 1.0)
+            }
+        });
+
+        // `a` is exactly symmetric at this point. Introduce a single
+        // deliberate asymmetry near the diagonal, far outside the old 5x5
+        // corner sample window, which the near-diagonal band sweep must
+        // still catch regardless of random sampling.
+        a[(150, 152)] = 999.0;
+
+        assert!(!is_likely_spd_f64(&a.as_ref()));
+    }
+
+    #[test]
+    fn test_is_likely_spd_f32_rejects_asymmetry_outside_top_left_corner() {
+        let n = 200;
+        let mut a = MatBuilder::<f32>::from_fn(n, n, |i, j| {
+            if i == j {
+                (i + 10) as f32
+            } else {
+                1.0 / ((i as f32 - j as f32).abs() + 1.0)
+            }
+        });
+
+        a[(150, 152)] = 999.0;
+
+        assert!(!is_likely_spd_f32(&a.as_ref()));
+    }
+
+    #[test]
+    fn test_auto_svd_empty_matrix_returns_error_not_panic() {
+        let a = MatBuilder::<f64>::zeros(0, 0);
+        let result = auto_svd_f64(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_svd_dc_empty_matrix_returns_error_not_panic() {
+        let a = MatBuilder::<f64>::zeros(0, 0);
+        let result = auto_svd_f64_with_algorithm(a.as_ref(), SvdAlgorithm::DivideConquer);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_svd_f32_empty_matrix_returns_error_not_panic() {
+        let a = MatBuilder::<f32>::zeros(0, 0);
+        let result = auto_svd_f32(a.as_ref());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auto_eigenvalues_non_square_returns_error_not_panic() {
+        let a = MatBuilder::<f64>::zeros(3, 4);
+        let result = auto_eigenvalues_f64(a.as_ref(), true);
+        assert!(matches!(result, Err(DecompositionError::NotSquare)));
+    }
+
+    #[test]
+    fn test_auto_eigenvalues_empty_matrix_returns_error_not_panic() {
+        let a = MatBuilder::<f64>::zeros(0, 0);
+        let result = auto_eigenvalues_f64(a.as_ref(), true);
+        assert!(result.is_err());
+
+        let result = auto_eigenvalues_f64(a.as_ref(), false);
+        assert!(result.is_err());
     }
 }

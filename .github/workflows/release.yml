@@ -81,12 +81,10 @@ jobs:
       - name: Wait for oxiblas-sparse
         run: sleep 30
 
-      - name: Publish oxiblas-ffi
-        run: cargo publish --package oxiblas-ffi
-        continue-on-error: true
-
-      - name: Wait for oxiblas-ffi
-        run: sleep 30
+      # NOTE: oxiblas-ffi is intentionally NOT published. It is a retired,
+      # broken crate excluded from the workspace (see crates/oxiblas-ffi's
+      # `publish = false` and the workspace [workspace] exclude) and must
+      # never be published to crates.io.
 
       - name: Publish oxiblas-ndarray
         run: cargo publish --package oxiblas-ndarray

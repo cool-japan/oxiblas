@@ -31,3 +31,6 @@ max-simd-256 = ["oxiblas-core/max-simd-256"]  # Limit to 256-bit SIMD
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

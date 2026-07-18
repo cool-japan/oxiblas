@@ -35,3 +35,6 @@ nalgebra = ["dep:nalgebra"]  # nalgebra type conversions
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

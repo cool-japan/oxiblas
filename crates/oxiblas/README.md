@@ -17,7 +17,7 @@
 - **Sparse matrices** - 9 formats with iterative solvers
 - **Tensor operations** - Einstein summation, batched operations
 - **Extended precision** - f16, f128 support
-- **High performance** - 80-172% of OpenBLAS depending on operation
+- **High performance** - Competitive with OpenBLAS for typical workloads; see [oxiblas-benchmarks](../oxiblas-benchmarks/) for reproducible numbers on your own hardware
 - **Pure Rust** - No C dependencies, easy cross-compilation
 
 ## Quick Start
@@ -80,9 +80,9 @@ let r = qr.r();
 let svd = Svd::compute(a.as_ref())?;
 let singular_values = svd.singular_values();
 
-// Solve Ax = b
-let b = vec![4.0, 10.0, 24.0];
-let x = lu.solve(&b)?;
+// Solve Ax = b (b is an n x 1 matrix, i.e. a column vector)
+let b = Mat::from_rows(&[&[4.0], &[10.0], &[24.0]]);
+let x = lu.solve(b.as_ref())?;
 ```
 
 ### Sparse Matrices
@@ -91,27 +91,36 @@ let x = lu.solve(&b)?;
 use oxiblas::prelude::*;
 
 // Create sparse matrix
-let mut coo = CooMatrix::<f64>::new(1000, 1000);
+let mut coo = CooMatrix::<f64>::new_empty(1000, 1000);
 coo.push(0, 0, 4.0);
 coo.push(0, 1, -1.0);
 // ... add more elements
 
-let csr = CsrMatrix::from_coo(&coo);
+let csr = coo.to_csr();
 
 // Solve sparse system with GMRES
 let b = vec![/*...*/];
-let result = gmres(&csr, &b, 1e-10, 100, 30, None)?;
+let x0 = vec![0.0; 1000]; // initial guess
+let result = gmres(&csr, &b, &x0, 30, 1e-10, 100)?;
+let x = result.x;
 ```
 
 ### Tensor Operations
 
 ```rust
-use oxiblas::prelude::*;
+// Tensor operations live in `oxiblas-blas`'s `tensor` module and are not
+// part of `oxiblas::prelude` - import them from `oxiblas::blas::tensor`.
+use oxiblas::blas::tensor::{Tensor3, batched_matmul, einsum};
 
-// Einstein summation
-let c = einsum("ij,jk->ik", &a, &[m, n], Some((&b, &[n, k])))?;
+// Einstein summation: matrix multiplication (A: 2x3, B: 3x2)
+let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+let c = einsum("ij,jk->ik", &a, &[2, 3], Some((&b, &[3, 2])))?;
 
 // Batched matrix multiplication
+let (batch, m, k, n) = (4, 2, 3, 2);
+let data_a = vec![1.0; batch * m * k];
+let data_b = vec![1.0; batch * k * n];
 let a_batch = Tensor3::from_data(data_a, batch, m, k);
 let b_batch = Tensor3::from_data(data_b, batch, k, n);
 let c_batch = batched_matmul(&a_batch, &b_batch)?;
@@ -129,7 +138,7 @@ The `oxiblas` crate re-exports from these sub-crates:
 | `oxiblas::lapack` | `oxiblas-lapack` | LAPACK decompositions |
 | `oxiblas::sparse` | `oxiblas-sparse` | Sparse matrices and solvers |
 | `oxiblas::ndarray` | `oxiblas-ndarray` | ndarray integration (optional) |
-| | `oxiblas-ffi` | **RETIRED** (v0.2.1) - C FFI bindings |
+| | `oxiblas-ffi` | **RETIRED** (v0.2.0) - C FFI bindings |
 
 ## Prelude
 
@@ -156,9 +165,16 @@ use oxiblas::prelude::*;
 | `f128` | Quad-precision (~31 digits) | |
 | `sparse` | Sparse matrix operations | ✓ |
 | `ndarray` | ndarray integration | |
-| `ffi` | C FFI bindings | |
+| `serde` | Serialization support for matrix types | |
+| `mmap` | Memory-mapped matrices for large datasets | |
+| `nalgebra` | nalgebra type conversions | |
 | `full` | All features enabled | |
-| `nightly` | Nightly-only optimizations | |
+| `force-scalar` | Disable all SIMD optimizations (scalar only) | |
+| `max-simd-128` | Limit SIMD to 128-bit registers (SSE/NEON) | |
+| `max-simd-256` | Limit SIMD to 256-bit registers (AVX2) | |
+
+> Note: `oxiblas-ffi` (C FFI bindings) was **retired** in v0.2.0 and is no longer
+> a feature of this crate - see the [Module Structure](#module-structure) table above.
 
 ### Examples
 
@@ -202,25 +218,23 @@ cargo run --example sparse_matrices --features parallel
 
 ## Performance
 
-OxiBLAS provides competitive performance with industry-standard libraries:
+OxiBLAS is competitive with OpenBLAS for typical workloads (dense GEMM, BLAS Level 1-3,
+LAPACK decompositions), thanks to BLIS-style blocked algorithms and hand-tuned SIMD
+micro-kernels. Actual performance depends heavily on operation, matrix size, and
+hardware (SIMD width, cache hierarchy, core count), so no single ratio is representative.
 
-### macOS M3 (Apple Silicon)
+Run the benchmark suite yourself for numbers reproducible on your own hardware:
 
-| Operation | OxiBLAS | OpenBLAS | Ratio |
-|-----------|---------|----------|-------|
-| DGEMM 1024×1024 | 40.25 ms | 40.54 ms | **101%** |
-| SGEMM 1024×1024 | 19.18 ms | 32.94 ms | **172%** |
-| DOT 1M elements | 167 µs | 279 µs | **165%** |
+```bash
+# OxiBLAS-only benchmarks
+cargo bench --package oxiblas-benchmarks
 
-### Linux x86_64 (Intel Xeon)
+# Direct comparison against OpenBLAS (requires OpenBLAS installed)
+cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas
+```
 
-| Operation | OxiBLAS | OpenBLAS | Ratio |
-|-----------|---------|----------|-------|
-| DGEMM 1024×1024 | 80.68 ms | 82.51 ms | **102%** |
-| SGEMM 64×64 | 16.60 µs | 18.64 µs | **112%** |
-| DGEMM 256×256 | 1.220 ms | 1.159 ms | 95% |
-
-**Summary**: OxiBLAS achieves **80-172% of OpenBLAS performance** across different platforms and operations.
+See the [oxiblas-benchmarks README](../oxiblas-benchmarks/README.md) for details on
+the available benchmark suites.
 
 ## Documentation
 

@@ -10,9 +10,13 @@ members = [
     "crates/oxiblas-sparse",
     "crates/oxiblas-benchmarks",
 ]
+# oxiblas-ffi is retired (v0.2.0 Pure Rust pivot): unbuilt, untested by CI,
+# not part of the shipped product. Structurally excluded so it can never be
+# accidentally pulled in by --workspace / --all or a future members-list edit.
+exclude = ["crates/oxiblas-ffi"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -21,13 +25,13 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.1", default-features = false }
-oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.1", default-features = false }
-oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.1" }
-oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.1" }
-oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.1" }
-oxiblas = { path = "crates/oxiblas", version = "0.2.1" }
-oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.1" }
+oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.2", default-features = false }
+oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.2", default-features = false }
+oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.2" }
+oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.2" }
+oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.2" }
+oxiblas = { path = "crates/oxiblas", version = "0.2.2" }
+oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.2" }
 # oxiblas-ffi has been retired as of v0.2.0 (Pure Rust ecosystem)
 
 # Essential dependencies

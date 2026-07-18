@@ -170,6 +170,30 @@ pub fn norm_2<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<
     Ok(svd.norm2())
 }
 
+/// Error type for trace computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceError {
+    /// Matrix is not square.
+    NotSquare {
+        /// Number of rows.
+        nrows: usize,
+        /// Number of columns.
+        ncols: usize,
+    },
+}
+
+impl core::fmt::Display for TraceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotSquare { nrows, ncols } => {
+                write!(f, "Matrix is not square: {nrows}×{ncols}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TraceError {}
+
 /// Computes the trace of a square matrix.
 ///
 /// tr(A) = Σ_i a_ii
@@ -182,9 +206,9 @@ pub fn norm_2<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<
 ///
 /// The trace. Returns zero if the matrix is empty.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the matrix is not square.
+/// Returns `TraceError::NotSquare` if the matrix is not square.
 ///
 /// # Example
 ///
@@ -197,18 +221,21 @@ pub fn norm_2<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<
 ///     &[3.0, 4.0],
 /// ]);
 ///
-/// let t = trace(a.as_ref());
+/// let t = trace(a.as_ref()).unwrap();
 /// assert!((t - 5.0).abs() < 1e-10); // 1 + 4 = 5
 /// ```
-pub fn trace<T: Field>(a: MatRef<'_, T>) -> T {
+pub fn trace<T: Field>(a: MatRef<'_, T>) -> Result<T, TraceError> {
     let n = a.nrows();
 
     if n != a.ncols() {
-        panic!("trace requires a square matrix, got {}×{}", n, a.ncols());
+        return Err(TraceError::NotSquare {
+            nrows: n,
+            ncols: a.ncols(),
+        });
     }
 
     if n == 0 {
-        return T::zero();
+        return Ok(T::zero());
     }
 
     let mut tr = T::zero();
@@ -216,7 +243,7 @@ pub fn trace<T: Field>(a: MatRef<'_, T>) -> T {
         tr = tr + a[(i, i)];
     }
 
-    tr
+    Ok(tr)
 }
 
 /// Computes the nuclear norm (trace norm / sum of singular values).
@@ -356,7 +383,7 @@ mod tests {
     fn test_trace() {
         let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 9.0]]);
 
-        let t = trace(a.as_ref());
+        let t = trace(a.as_ref()).unwrap();
         assert!(approx_eq(t, 15.0, 1e-10)); // 1 + 5 + 9
     }
 
@@ -364,8 +391,30 @@ mod tests {
     fn test_trace_identity() {
         let eye = Mat::from_rows(&[&[1.0f64, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]]);
 
-        let t = trace(eye.as_ref());
+        let t = trace(eye.as_ref()).unwrap();
         assert!(approx_eq(t, 3.0, 1e-10));
+    }
+
+    #[test]
+    fn test_trace_not_square() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
+
+        let result = trace(a.as_ref());
+        assert!(matches!(
+            result,
+            Err(TraceError::NotSquare {
+                nrows: 2,
+                ncols: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn test_trace_empty() {
+        let a: Mat<f64> = Mat::zeros(0, 0);
+
+        let t = trace(a.as_ref()).unwrap();
+        assert!(approx_eq(t, 0.0, 1e-10));
     }
 
     #[test]

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-18
+
+A production-readiness hardening release. A systematic multi-agent audit swept the
+entire workspace (`oxiblas-core`, `oxiblas-matrix`, `oxiblas-blas`, `oxiblas-lapack`,
+`oxiblas-ndarray`, `oxiblas-sparse`), followed by adversarial re-verification of every
+proposed fix, resulting in a large batch of correctness, honesty, and documentation
+fixes. No public API breaking changes.
+
+### Fixed
+- Numerous numerical correctness bugs across BLAS, LAPACK, and sparse routines,
+  including Hermitian/symmetric diagonal handling, SVD and eigensolver convergence
+  and deflation, sparse factorization fill-in, incremental SVD, and IRAM restart
+  logic
+- Several fabricated or stub code paths replaced with real, verified algorithms
+  (e.g. a dead-code MRRR eigensolver path, an untested symmetric divide-and-conquer
+  EVD merge, and fake complex-routine aliases)
+- Panics on edge-case inputs (empty, singular, or near-singular matrices) converted
+  to proper `Result`-based error handling instead of `unwrap()`/`expect()`/`panic!()`
+- Assorted silent-fallback and misleading-documentation issues that could mask
+  incorrect results
+
+### Changed
+- Dependencies updated to latest compatible versions
+- Documentation corrected in numerous places to accurately describe actual behavior
+
+### Added
+- `[package.metadata.docs.rs]` with `all-features = true` on every publishable
+  crate so feature-gated APIs are visible on docs.rs
+
 ## [0.2.1] - 2026-03-16
 
 ### Fixed
@@ -259,7 +288,11 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 
 ---
 
-## Release Checklist
+## Release Checklist (v0.1.0 — historical)
+
+This checklist tracked readiness for the original v0.1.0 release (2025-12-27) and is
+complete; it is retained here for historical reference only and requires no further
+action. See the dated entries above for what shipped in each subsequent release.
 
 - [x] All tests pass
 - [x] Zero clippy warnings
@@ -268,14 +301,15 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 - [x] LICENSE file (Apache-2.0)
 - [x] README up to date
 - [x] CHANGELOG created
-- [ ] Version 0.1.0 in all Cargo.toml
-- [ ] Examples functional
-- [ ] cargo publish --dry-run succeeds
-- [ ] Git tags created
+- [x] Version 0.1.0 in all Cargo.toml
+- [x] Examples functional
+- [x] cargo publish --dry-run succeeds
+- [x] Git tags created
 
 ---
 
-[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/cool-japan/oxiblas/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxiblas/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxiblas/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxiblas/compare/v0.1.1...v0.1.2

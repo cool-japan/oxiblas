@@ -355,7 +355,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **docs** (22)
 
 - [ ] `.github/README-internal.md:8` — **README-internal.md documents CI as active on main/develop while workflows are disabled and the branch is master** _(docs, easy)_
-- [ ] `CHANGELOG.md:270` — **Stale 'Release Checklist' in CHANGELOG references version 0.1.0 and leaves publish-readiness items unchecked** _(docs, easy)_
+- [x] `CHANGELOG.md:270` — **Stale 'Release Checklist' in CHANGELOG references version 0.1.0 and leaves publish-readiness items unchecked** _(docs, easy)_ — resolved as part of the 0.2.2 release-mechanics pass: retitled as historical/v0.1.0-scoped, all items marked complete
 - [ ] `README.md:696` — **README Project Status metrics are stale (Version 0.2.1, ~223,935 lines / 371 files) versus actual codebase** _(docs, easy)_
 - [x] `crates/oxiblas-blas/src/accuracy.rs:26` — **Accuracy-bound doc table contradicts the implemented error-bound functions** _(docs, easy)_
 - [x] `crates/oxiblas-blas/src/complex_interleaved.rs:357` — **'in-place' conversions allocate full auxiliary buffers, contradicting their doc claim** _(docs, medium)_
@@ -373,7 +373,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-sparse/src/graph/functions.rs:24` — **Public-API doctests marked ```ignore are never compiled or verified (64 total across the workspace)** _(docs, medium)_
 - [x] `crates/oxiblas-sparse/src/linalg/ordering/functions.rs:696` — **Misleading algorithm docs: COLAMD forms A^T·A explicitly; 'AMD' is exact O(n²) minimum degree** _(docs, easy)_
 - [x] `crates/oxiblas-sparse/src/test_matrices.rs:351` — **random_spd doc claims 'A = L*L^T + n*I' but constructs a different matrix** _(docs, easy)_
-- [ ] `crates/oxiblas/Cargo.toml:25` — **Published crates lack docs.rs all-features metadata, hiding feature-gated APIs from docs** _(docs, easy)_
+- [x] `crates/oxiblas/Cargo.toml:25` — **Published crates lack docs.rs all-features metadata, hiding feature-gated APIs from docs** _(docs, easy)_ — resolved: `[package.metadata.docs.rs]` with `all-features = true` added to all 7 publishable crates
 - [ ] `crates/oxiblas/README.md:132` — **Inconsistent oxiblas-ffi retirement version: crate README says v0.2.1, but CHANGELOG and workspace Cargo.toml say v0.2.0** _(docs, easy)_
 - [ ] `crates/oxiblas/src/lib.rs:434` — **features::NO_STD is derived from the facade's own `default` feature, not from oxiblas-core/std as its name and docs imply** _(docs, easy)_
 - [ ] `crates/oxiblas-core/src/simd/complex.rs:660` — **Complex SIMD exists only for aarch64; x86_64 silently gets scalar despite 256-bit claims in module docs** _(missing-feature, medium)_ — not covered by Iter1 core batch, carry to a core follow-up
@@ -484,12 +484,12 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 ### Standard pre-release steps for 0.2.2 (not defects; flagged during audit)
 
-- [ ] Bump workspace version 0.2.1 → 0.2.2 (workspace `Cargo.toml` line 15 + 7 internal path-dep pins, README.md version/status, TODO.md header) — do this at release time
-- [ ] Add `[0.2.2]` section to CHANGELOG.md (currently empty `[Unreleased]`; refresh stale 0.1.0 release checklist at line ~270; fix compare links)
+- [x] Bump workspace version 0.2.1 → 0.2.2 (workspace `Cargo.toml` line 15 + 7 internal path-dep pins, README.md version/status, TODO.md header) — do this at release time
+- [x] Add `[0.2.2]` section to CHANGELOG.md (currently empty `[Unreleased]`; refresh stale 0.1.0 release checklist at line ~270; fix compare links)
 - [ ] Re-enable CI: `.github/workflows.disabled/` → `.github/workflows/` after fixing release.yml (still publishes retired oxiblas-ffi) and README-internal.md branch names
 - [ ] Decide fate of orphaned `crates/oxiblas-ffi` (37k LOC, excluded from workspace): delete, or add to `workspace.exclude` and mark clearly retired
-- [ ] Delete zero-byte junk file `crates/oxiblas-blas/src/level3/XX2vDM7e`
-- [ ] Add `[package.metadata.docs.rs] all-features = true` to every publishable crate
+- [x] Delete zero-byte junk file `crates/oxiblas-blas/src/level3/XX2vDM7e` — already gone (verified absent on disk; presumably cleaned up alongside its Iter1 fix)
+- [x] Add `[package.metadata.docs.rs] all-features = true` to every publishable crate
 
 ### Refuted during adversarial verification (do NOT re-flag)
 
@@ -500,7 +500,7 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 Production-grade pure Rust BLAS/LAPACK implementation.
 
-## Project Status (v0.2.1 Release - Updated 2026-03-16)
+## Project Status (v0.2.2 Release - Updated 2026-07-18)
 
 - **Tests:** 2,922 tests passing (100% success rate) + 287 doctests
 - **Code:** ~223,935 lines of Rust across 371 files

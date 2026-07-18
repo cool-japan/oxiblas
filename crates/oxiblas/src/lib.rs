@@ -428,10 +428,17 @@ pub mod features {
     pub const HAS_F128: bool = cfg!(feature = "f128");
     /// `true` when the `ndarray` feature (ndarray interop) is compiled in.
     pub const HAS_NDARRAY: bool = cfg!(feature = "ndarray");
-    /// `true` when the `oxiblas-core` std feature is absent (no-std mode for the core layer).
+    /// `true` when this crate is actually built without the standard library
+    /// support that it forwards to the `oxiblas-core`/`oxiblas-matrix` layers
+    /// (no-std mode for the core layer).
     ///
-    /// Note: check `oxiblas_core` feature flags directly for precise no-std detection.
-    pub const NO_STD: bool = !cfg!(feature = "default");
+    /// This mirrors the `#![cfg_attr(not(feature = "std"), no_std)]` gating
+    /// that `oxiblas-core` and `oxiblas-matrix` use internally: this crate's
+    /// own `std` feature (enabled by default) forwards to `oxiblas-core/std`
+    /// and `oxiblas-matrix/std`, so `NO_STD` reflects the real build
+    /// configuration rather than merely whether the unrelated `default`
+    /// feature happens to be active.
+    pub const NO_STD: bool = !cfg!(feature = "std");
 }
 
 /// Prelude module - import everything commonly needed.

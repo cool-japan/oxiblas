@@ -76,17 +76,36 @@ impl SimdRegister for F64x2 {
         unsafe { F64x2(f64x2_div(self.0, other.0)) }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, so emulate it
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -195,17 +214,36 @@ impl SimdRegister for F32x4 {
         unsafe { F32x4(f32x4_div(self.0, other.0)) }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, so emulate it
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -368,17 +406,36 @@ impl SimdRegister for F64x4 {
         }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, emulate
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -547,17 +604,36 @@ impl SimdRegister for F32x8 {
         }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, emulate
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))

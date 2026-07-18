@@ -692,36 +692,49 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
     }
 }
 
-/// Builds the elimination tree from a symmetric matrix (lower triangle).
+/// Builds the elimination tree of a symmetric matrix from its (full symmetric)
+/// pattern.
+///
+/// This is the classic path-compressing `cs_etree` algorithm for Cholesky.
+/// `ancestor[v]` tracks the highest ancestor of `v` discovered so far (`None`
+/// marks a root). For each column `k`, every earlier neighbour `i < k` walks
+/// toward its current root, path-compressing the traversed pointers directly to
+/// `k`; the root of that walk gets `k` as its parent.
+///
+/// Every traversed node — including the eventual root — has its `ancestor`
+/// updated to `k`, so a later column that touches the same node routes through
+/// `k` instead of re-rooting it. Omitting that update (as a naive variant does)
+/// lets a node with several parent-candidate edges have its parent overwritten,
+/// yielding a wrong tree for fill-generating matrices such as 2D grids.
 fn build_elimination_tree<T: Scalar>(a: &CscMatrix<T>) -> Vec<Option<usize>> {
     let n = a.nrows();
     let mut parent: Vec<Option<usize>> = vec![None; n];
-    let mut ancestor = vec![0usize; n];
+    let mut ancestor: Vec<Option<usize>> = vec![None; n];
 
     for k in 0..n {
-        ancestor[k] = k;
         let col_start = a.col_ptrs()[k];
         let col_end = a.col_ptrs()[k + 1];
 
         for idx in col_start..col_end {
             let i = a.row_indices()[idx];
             if i < k {
-                // Walk up the tree, path-compressing
-                let mut r = i;
-                while ancestor[r] != r && ancestor[r] != k {
-                    let next = ancestor[r];
-                    ancestor[r] = k;
-                    r = next;
-                }
-                if ancestor[r] == r {
-                    parent[r] = Some(k);
-                }
-                // Path compression for i
-                let mut j = i;
-                while ancestor[j] != k {
-                    let next = ancestor[j];
-                    ancestor[j] = k;
-                    j = next;
+                // Walk from `i` toward the current root, compressing to `k`.
+                let mut node = i;
+                loop {
+                    let next = ancestor[node];
+                    ancestor[node] = Some(k);
+                    match next {
+                        None => {
+                            parent[node] = Some(k);
+                            break;
+                        }
+                        Some(nx) => {
+                            if nx >= k {
+                                break;
+                            }
+                            node = nx;
+                        }
+                    }
                 }
             }
         }
@@ -761,57 +774,79 @@ fn compute_postorder(_parent: &[Option<usize>], children: &[Vec<usize>], n: usiz
     order
 }
 
-/// Symbolic factorization: determine the sparsity structure of each column of L.
+/// Symbolic factorization: determine the fill-aware sparsity structure of each
+/// column of `L`.
 ///
-/// For each column j, l_struct[j] contains the sorted row indices of L below the diagonal.
+/// For each column `j`, `l_struct[j]` contains the sorted row indices of `L`
+/// strictly below the diagonal. The structure is computed with the exact
+/// symbolic-Cholesky recursion over the elimination tree:
+///
+/// ```text
+/// struct(L[:,j]) = { i > j : A[i,j] != 0 }
+///                  ∪ ( ∪_{child c of j in etree} struct(L[:,c]) \ {c} )
+/// ```
+///
+/// The child union is what captures *fill-in* — nonzeros created during
+/// factorization that are absent from the pattern of `A`. A bare walk over the
+/// direct neighbours of `A` (or up the tree from those neighbours) misses fill
+/// for anything beyond the immediate sparsity pattern, which is exactly what a
+/// 2D-grid Laplacian produces.
+///
+/// Because every child index is strictly smaller than its parent, processing
+/// columns in increasing order guarantees each child's structure is already
+/// available when its parent is reached. `a` here is the fill-reducing-permuted
+/// matrix stored with its full symmetric pattern, so column `j` already exposes
+/// every neighbour of `j`; keeping rows `> j` selects the strictly-below-diagonal
+/// entries. Since each child `c` has parent `j`, the value `j` is the minimum of
+/// `struct(L[:,c])`, so restricting the propagated rows to `> j` drops exactly
+/// the shared parent entry (the `\ {c}` in the recursion is realised because `c`
+/// itself never appears in its own below-diagonal structure).
 fn symbolic_factorization<T: Scalar>(
     a: &CscMatrix<T>,
     parent: &[Option<usize>],
 ) -> Vec<Vec<usize>> {
     let n = a.nrows();
-    let mut l_struct: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-    // For each column j, the structure of L[:,j] below diagonal is the
-    // union of:
-    // 1. Row indices from A[:,j] that are > j
-    // 2. For each child c of j in etree, the row indices of L[:,c] that are > j
+    // Build the elimination-tree child lists from the parent pointers.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (c, p) in parent.iter().enumerate() {
+        if let Some(pp) = p {
+            children[*pp].push(c);
+        }
+    }
 
-    // Process in natural order (0..n)
+    let mut structs: Vec<std::collections::BTreeSet<usize>> =
+        vec![std::collections::BTreeSet::new(); n];
+
     for j in 0..n {
-        let mut row_set = std::collections::BTreeSet::new();
+        let mut set = std::collections::BTreeSet::new();
 
-        // Add entries from A
+        // Direct contributions from the (symmetric) pattern of A.
         let col_start = a.col_ptrs()[j];
         let col_end = a.col_ptrs()[j + 1];
         for idx in col_start..col_end {
             let row = a.row_indices()[idx];
             if row > j {
-                row_set.insert(row);
+                set.insert(row);
             }
         }
 
-        // Propagate structure from children via elimination tree
-        // For each row r in l_struct[j], if parent[r] exists and > j, add it
-        // This is a simplified column count / reachability
-        let rows: Vec<usize> = row_set.iter().copied().collect();
-        for &r in &rows {
-            // Walk up the elimination tree from r
-            let mut current = r;
-            while let Some(p) = parent[current] {
-                if p <= j {
-                    break;
+        // Fill contributions propagated from children in the elimination tree.
+        for &c in &children[j] {
+            for &row in &structs[c] {
+                if row > j {
+                    set.insert(row);
                 }
-                if !row_set.contains(&p) {
-                    row_set.insert(p);
-                }
-                current = p;
             }
         }
 
-        l_struct[j] = row_set.into_iter().collect();
+        structs[j] = set;
     }
 
-    l_struct
+    structs
+        .into_iter()
+        .map(|s| s.into_iter().collect())
+        .collect()
 }
 
 /// Permutes a symmetric matrix: returns P * A * P^T.
@@ -1399,6 +1434,143 @@ mod tests {
                     a_full[perm[i]][perm[j]]
                 );
             }
+        }
+    }
+
+    /// Builds a `k x k` 2D grid 5-point Laplacian as a full symmetric SPD matrix.
+    ///
+    /// Diagonal `4`, nearest-neighbour coupling `-1`. Under any elimination
+    /// ordering these matrices generate genuine fill-in (nonzeros in `L` absent
+    /// from `A`), which is precisely what exercises the fill-aware symbolic
+    /// factorization.
+    fn make_grid_laplacian(k: usize) -> CscMatrix<f64> {
+        let n = k * k;
+        let idx = |r: usize, c: usize| r * k + c;
+
+        let mut col_ptrs = vec![0usize];
+        let mut row_indices = Vec::new();
+        let mut values = Vec::new();
+
+        for lin in 0..n {
+            let r = lin / k;
+            let c = lin % k;
+            let mut entries: Vec<(usize, f64)> = Vec::new();
+
+            if r > 0 {
+                entries.push((idx(r - 1, c), -1.0));
+            }
+            if c > 0 {
+                entries.push((idx(r, c - 1), -1.0));
+            }
+            entries.push((lin, 4.0));
+            if c + 1 < k {
+                entries.push((idx(r, c + 1), -1.0));
+            }
+            if r + 1 < k {
+                entries.push((idx(r + 1, c), -1.0));
+            }
+
+            entries.sort_by_key(|(row, _)| *row);
+            for (row, val) in entries {
+                row_indices.push(row);
+                values.push(val);
+            }
+            col_ptrs.push(values.len());
+        }
+
+        CscMatrix::new(n, n, col_ptrs, row_indices, values)
+            .expect("valid grid Laplacian construction")
+    }
+
+    /// Relative residual `||A x - b|| / ||b||` for a solved system.
+    fn relative_residual(a: &CscMatrix<f64>, x: &[f64], b: &[f64]) -> f64 {
+        let ax = csc_matvec(a, x);
+        let residual: f64 = (0..b.len())
+            .map(|i| (ax[i] - b[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if b_norm > 0.0 {
+            residual / b_norm
+        } else {
+            residual
+        }
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_3x3() {
+        // The exact reproduction from the bug report: a 3x3 2D-grid Laplacian
+        // (5-point stencil, n = 9). Before the fill-aware symbolic factorization
+        // this produced residual ~10.5; it must now be near machine epsilon.
+        let a = make_grid_laplacian(3);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("3x3 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64)).collect();
+        let x = chol.solve(&b).expect("3x3 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-12,
+            "3x3 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_5x5() {
+        // Larger fill-generating case (5x5 grid, n = 25).
+        let a = make_grid_laplacian(5);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("5x5 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.5) - 3.0).collect();
+        let x = chol.solve(&b).expect("5x5 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-11,
+            "5x5 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_10x10() {
+        // Substantial fill-generating case (10x10 grid, n = 100).
+        let a = make_grid_laplacian(10);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("10x10 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| (((i * 7 + 3) % 11) as f64) - 5.0).collect();
+        let x = chol.solve(&b).expect("10x10 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-10,
+            "10x10 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_matches_direct() {
+        // Cross-check the fill-generating factor against the reference direct
+        // sparse Cholesky on the same grid Laplacian.
+        let a = make_grid_laplacian(4);
+        let n = a.nrows();
+        let mf = MultifrontalCholesky::new(&a).expect("multifrontal factorization should succeed");
+        let direct = super::super::SparseCholesky::new(&a).expect("direct cholesky should succeed");
+
+        let b: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
+        let x_mf = mf.solve(&b).expect("multifrontal solve should succeed");
+        let x_direct = direct.solve(&b);
+
+        for i in 0..n {
+            assert!(
+                (x_mf[i] - x_direct[i]).abs() < 1e-9,
+                "multifrontal vs direct differ at {}: {} vs {}",
+                i,
+                x_mf[i],
+                x_direct[i]
+            );
         }
     }
 }

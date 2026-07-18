@@ -1,150 +1,19 @@
-//! Implicitly Restarted Arnoldi Method (IRAM) for sparse eigenvalue problems.
+//! # `IRAM` - new_group Methods
 //!
-//! IRAM is a memory-efficient eigenvalue algorithm that computes a few eigenvalues
-//! of large sparse matrices. It maintains a Krylov subspace of bounded size through
-//! implicit restarts using shifted QR iterations.
+//! This module contains method implementations for `IRAM`.
 //!
-//! # Algorithm Overview
-//!
-//! 1. Build initial Arnoldi factorization: A*V_m = V_m*H_m + f_m*e_m^T
-//! 2. Compute Ritz values (eigenvalues of H_m)
-//! 3. Select p = m - k unwanted Ritz values as shifts
-//! 4. Apply p implicit QR shifts to compress factorization to dimension k
-//! 5. Continue Arnoldi from dimension k back to m
-//! 6. Repeat until convergence
-//!
-//! For symmetric matrices, IRAM reduces to Implicitly Restarted Lanczos (IRL),
-//! where H is tridiagonal and the algorithm is more efficient.
+//! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
 use crate::csr::CsrMatrix;
 use crate::ops::spmv;
 use num_traits::FromPrimitive;
 use oxiblas_core::scalar::{Field, Real, Scalar};
+use super::super::error::{EigenvalueError, WhichEigenvalues};
+use super::super::utils::{dot, givens_rotation, norm};
 
-use super::error::{EigenvalueError, WhichEigenvalues};
-use super::utils::{dot, givens_rotation, norm};
+use super::types::{IRAMConfig, IRAMResult};
 
-// =============================================================================
-// IRAMConfig
-// =============================================================================
-
-/// Configuration for IRAM (Implicitly Restarted Arnoldi Method).
-#[derive(Debug, Clone)]
-pub struct IRAMConfig<T> {
-    /// Number of eigenvalues to compute.
-    pub num_eigenvalues: usize,
-    /// Which eigenvalues to compute.
-    pub which: WhichEigenvalues,
-    /// Maximum number of outer restart iterations.
-    pub max_iterations: usize,
-    /// Convergence tolerance for residual norm.
-    pub tolerance: T,
-    /// Whether to compute eigenvectors.
-    pub compute_eigenvectors: bool,
-    /// Size of Krylov subspace (ncv - number of Arnoldi vectors).
-    /// Must be > num_eigenvalues. Typically 2*num_eigenvalues or num_eigenvalues + 10.
-    pub krylov_dimension: usize,
-    /// Whether the matrix is symmetric (uses Lanczos instead of Arnoldi).
-    pub symmetric: bool,
-}
-
-impl Default for IRAMConfig<f64> {
-    fn default() -> Self {
-        Self {
-            num_eigenvalues: 6,
-            which: WhichEigenvalues::LargestMagnitude,
-            max_iterations: 300,
-            tolerance: 1e-8,
-            compute_eigenvectors: true,
-            krylov_dimension: 20,
-            symmetric: false,
-        }
-    }
-}
-
-impl Default for IRAMConfig<f32> {
-    fn default() -> Self {
-        Self {
-            num_eigenvalues: 6,
-            which: WhichEigenvalues::LargestMagnitude,
-            max_iterations: 300,
-            tolerance: 1e-6,
-            compute_eigenvectors: true,
-            krylov_dimension: 20,
-            symmetric: false,
-        }
-    }
-}
-
-// =============================================================================
-// IRAMResult
-// =============================================================================
-
-/// Result of IRAM eigenvalue computation.
-#[derive(Debug, Clone)]
-pub struct IRAMResult<T> {
-    /// Real parts of computed eigenvalues.
-    pub eigenvalues_real: Vec<T>,
-    /// Imaginary parts of computed eigenvalues.
-    pub eigenvalues_imag: Vec<T>,
-    /// Eigenvectors (if requested), stored as column vectors.
-    pub eigenvectors: Option<Vec<Vec<T>>>,
-    /// Number of outer iterations (restarts) performed.
-    pub iterations: usize,
-    /// Residual norms for each converged eigenpair.
-    pub residual_norms: Vec<T>,
-    /// Whether all requested eigenvalues converged.
-    pub converged: bool,
-    /// Number of converged eigenvalues.
-    pub num_converged: usize,
-}
-
-// =============================================================================
-// IRAM Solver
-// =============================================================================
-
-/// Implicitly Restarted Arnoldi Method (IRAM).
-///
-/// IRAM is a memory-efficient eigenvalue algorithm that computes a few eigenvalues
-/// of large sparse matrices. It maintains a Krylov subspace of bounded size through
-/// implicit restarts using shifted QR iterations.
-///
-/// # Algorithm Overview
-///
-/// 1. Build initial Arnoldi factorization: A*V_m = V_m*H_m + f_m*e_m^T
-/// 2. Compute Ritz values (eigenvalues of H_m)
-/// 3. Select p = m - k unwanted Ritz values as shifts
-/// 4. Apply p implicit QR shifts to compress factorization to dimension k
-/// 5. Continue Arnoldi from dimension k back to m
-/// 6. Repeat until convergence
-///
-/// For symmetric matrices, IRAM reduces to Implicitly Restarted Lanczos (IRL),
-/// where H is tridiagonal and the algorithm is more efficient.
-///
-/// # Example
-///
-/// ```ignore
-/// use oxiblas_sparse::csr::CsrMatrix;
-/// use oxiblas_sparse::linalg::eigenvalue::{IRAM, IRAMConfig, WhichEigenvalues};
-///
-/// // Create a large sparse matrix
-/// let a = CsrMatrix::<f64>::eye(1000);
-///
-/// let config = IRAMConfig {
-///     num_eigenvalues: 10,
-///     which: WhichEigenvalues::LargestMagnitude,
-///     krylov_dimension: 30,  // ncv = 30 > nev = 10
-///     symmetric: true,  // More efficient for symmetric matrices
-///     ..Default::default()
-/// };
-///
-/// let iram = IRAM::new(config);
-/// let result = iram.compute(&a, None).unwrap();
-/// println!("Converged: {}, eigenvalues: {:?}", result.converged, result.eigenvalues_real);
-/// ```
-pub struct IRAM<T> {
-    config: IRAMConfig<T>,
-}
+use super::iram_type::IRAM;
 
 impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
     /// Create a new IRAM solver with the given configuration.
@@ -588,44 +457,45 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
 
             // Check convergence.
             //
-            // The Arnoldi relation A*V_m = V_m*H_m + f*e_m^T yields, for a Ritz
-            // pair (lambda_i, x_i = V_m*y_i) with H_m*y_i = lambda_i*y_i, the
-            // exact residual
-            //     ||A*x_i - lambda_i*x_i|| = ||f * e_m^T y_i||
-            //                              = |h_{m+1,m}| * |e_m^T y_i|,
-            // where h_{m+1,m} = ||f|| is the subdiagonal element beyond the
-            // current m x m Hessenberg block and e_m^T y_i is the last
-            // component of the Ritz eigenvector y_i. This produces a *distinct*
-            // residual per eigenvalue, unlike a bare diagonal/subdiagonal entry
-            // of H which is identical for every Ritz value.
+            // For an Arnoldi factorization A*V_m = V_m*H_m + f*e_m^T, the residual of
+            // the Ritz pair (theta, x = V_m*y) is exactly ||A*x - theta*x|| = ||f|| * |y_m|
+            // where y is the eigenvector of H_m for theta and y_m its last component.
+            // We therefore estimate the residual as beta_m * |y_m| with beta_m = ||f||.
+            //
+            // `solve_hessenberg_eigenvalues` only pins down each Ritz value to a limited
+            // accuracy; we refine every wanted Ritz value together with its eigenvector by
+            // Rayleigh-quotient iteration so both the reported eigenpair and the residual
+            // estimate `beta_m * |y_m|` are accurate.
+            let beta_m = norm(&f);
             converged_count = 0;
-            let beta = norm(&f);
             for (idx, &wi) in wanted_indices.iter().enumerate() {
                 if idx >= nev || wi >= current_dim {
                     continue;
                 }
 
-                // Ritz eigenvector of the small Hessenberg matrix for this
-                // eigenvalue, obtained by inverse iteration on (H - lambda*I).
-                let y = self.hessenberg_ritz_vector(&h, current_dim, ritz_real[wi].clone());
-                let y_last = y
-                    .get(current_dim - 1)
-                    .cloned()
-                    .unwrap_or_else(T::zero);
-                let residual = beta.clone() * Scalar::abs(y_last);
+                let (y_re, y_im, ref_re, ref_im) = self.ritz_eigenvector(
+                    &h,
+                    current_dim,
+                    ritz_real[wi].clone(),
+                    ritz_imag[wi].clone(),
+                );
+                let last_comp = Real::sqrt(
+                    y_re[current_dim - 1].clone() * y_re[current_dim - 1].clone()
+                        + y_im[current_dim - 1].clone() * y_im[current_dim - 1].clone(),
+                );
+                let residual = beta_m.clone() * last_comp;
                 residual_norms[idx] = residual.clone();
 
                 let ritz_mag = Real::sqrt(
-                    ritz_real[wi].clone() * ritz_real[wi].clone()
-                        + ritz_imag[wi].clone() * ritz_imag[wi].clone(),
+                    ref_re.clone() * ref_re.clone() + ref_im.clone() * ref_im.clone(),
                 );
 
                 if residual <= self.config.tolerance * ritz_mag.max(T::one()) {
                     converged_count += 1;
                 }
 
-                final_eigenvalues_real[idx] = ritz_real[wi].clone();
-                final_eigenvalues_imag[idx] = ritz_imag[wi].clone();
+                final_eigenvalues_real[idx] = ref_re;
+                final_eigenvalues_imag[idx] = ref_im;
             }
 
             // Check if all wanted eigenvalues converged
@@ -684,20 +554,31 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
             arnoldi_vectors.push(v_next);
             h[nev][nev - 1] = f_norm.clone();
 
-            // Continue Arnoldi to refill
-            while arnoldi_vectors.len() < ncv {
-                let j = arnoldi_vectors.len() - 1;
-
+            // Continue Arnoldi from column nev back up to ncv. This mirrors the initial
+            // build loop: columns nev..ncv-2 append a new Arnoldi vector, while the final
+            // column j = ncv-1 stores the new residual vector f (it is the m-step residual
+            // of the refilled factorization, not an appended basis vector).
+            let mut refill_break = false;
+            for j in nev..ncv {
                 // w = A * v_j
                 spmv(T::one(), a, &arnoldi_vectors[j], T::zero(), &mut w);
 
-                // Modified Gram-Schmidt
+                // The column j of H holds stale values from the shift transform; clear the
+                // entries we are about to (re)compute.
                 for i in 0..=j {
-                    if i < arnoldi_vectors.len() {
-                        h[i][j] = dot(&arnoldi_vectors[i], &w);
+                    h[i][j] = T::zero();
+                }
+
+                // Arnoldi orthogonalization with one reorthogonalization pass (DGKS).
+                // A single Modified Gram-Schmidt pass loses orthogonality catastrophically
+                // for these restarted, non-symmetric factorizations, so we repeat it and
+                // fold the correction back into H.
+                for _pass in 0..2 {
+                    for i in 0..=j {
+                        let proj = dot(&arnoldi_vectors[i], &w);
+                        h[i][j] = h[i][j].clone() + proj.clone();
                         for idx in 0..n {
-                            w[idx] =
-                                w[idx].clone() - h[i][j].clone() * arnoldi_vectors[i][idx].clone();
+                            w[idx] = w[idx].clone() - proj.clone() * arnoldi_vectors[i][idx].clone();
                         }
                     }
                 }
@@ -705,6 +586,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
                 f_norm = norm(&w);
 
                 if f_norm <= tol_breakdown {
+                    refill_break = true;
                     break;
                 }
 
@@ -718,6 +600,9 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
                 } else {
                     f.clone_from_slice(&w);
                 }
+            }
+            if refill_break {
+                break;
             }
         }
 
@@ -1139,565 +1024,4 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
         (wanted_indices, unwanted_values)
     }
 
-    /// Select wanted eigenvalues and unwanted shifts for general case.
-    fn select_shifts_general(
-        &self,
-        real: &[T],
-        imag: &[T],
-        nev: usize,
-        p: usize,
-    ) -> (Vec<usize>, Vec<T>, Vec<T>) {
-        let n = real.len();
-        if n == 0 {
-            return (vec![], vec![], vec![]);
-        }
-
-        let nev = nev.min(n);
-        let p = p.min(n.saturating_sub(nev));
-
-        // Compute magnitudes
-        let mut indexed: Vec<(usize, T)> = real
-            .iter()
-            .zip(imag.iter())
-            .enumerate()
-            .map(|(i, (r, im))| {
-                let mag = Real::sqrt(r.clone() * r.clone() + im.clone() * im.clone());
-                (i, mag)
-            })
-            .collect();
-
-        // Sort by magnitude based on selection criterion
-        match self.config.which {
-            WhichEigenvalues::LargestMagnitude => {
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            WhichEigenvalues::SmallestMagnitude => {
-                indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            _ => {
-                // For algebraic, sort by real part
-                let mut real_indexed: Vec<(usize, T)> = real
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (i, r.clone()))
-                    .collect();
-                match self.config.which {
-                    WhichEigenvalues::LargestAlgebraic => {
-                        real_indexed.sort_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    }
-                    _ => {
-                        real_indexed.sort_by(|a, b| {
-                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    }
-                }
-                indexed = real_indexed;
-            }
-        }
-
-        let wanted_indices: Vec<usize> = indexed.iter().take(nev).map(|(i, _)| *i).collect();
-        let unwanted_real: Vec<T> = indexed
-            .iter()
-            .skip(nev)
-            .take(p)
-            .map(|(i, _)| real[*i].clone())
-            .collect();
-        let unwanted_imag: Vec<T> = indexed
-            .iter()
-            .skip(nev)
-            .take(p)
-            .map(|(i, _)| imag[*i].clone())
-            .collect();
-
-        (wanted_indices, unwanted_real, unwanted_imag)
-    }
-
-    /// Apply implicit QR shifts for symmetric tridiagonal case.
-    fn apply_implicit_qr_shifts_symmetric(
-        &self,
-        alpha: &mut Vec<T>,
-        beta: &mut Vec<T>,
-        v: &mut Vec<Vec<T>>,
-        f: &mut [T],
-        shifts: &[T],
-        nev: usize,
-    ) {
-        let n = v[0].len();
-        let two = T::from_f64(2.0).unwrap_or_else(T::one);
-
-        for shift in shifts {
-            let m = alpha.len();
-            if m < 2 {
-                break;
-            }
-
-            // Apply bulge-chasing QR step with shift
-            // For tridiagonal, this is more efficient than full Hessenberg QR
-
-            // First, compute the initial Givens rotation
-            let mut g = alpha[0].clone() - shift.clone();
-            let mut s = T::one();
-            let mut c = T::one();
-
-            for i in 0..m - 1 {
-                let i_beta = if i < beta.len() {
-                    beta[i].clone()
-                } else {
-                    T::zero()
-                };
-                let f_val = s.clone() * i_beta.clone();
-                let b = c.clone() * i_beta;
-
-                // Givens rotation to chase bulge
-                if Scalar::abs(f_val.clone()) >= Scalar::abs(g.clone()) {
-                    c = g.clone() / f_val.clone();
-                    let r = Real::sqrt(c.clone() * c.clone() + T::one());
-                    if i > 0 && i - 1 < beta.len() {
-                        beta[i - 1] = f_val.clone() * r.clone();
-                    }
-                    s = T::one() / r.clone();
-                    c = c.clone() * s.clone();
-                } else {
-                    s = f_val.clone() / g.clone();
-                    let r = Real::sqrt(s.clone() * s.clone() + T::one());
-                    if i > 0 && i - 1 < beta.len() {
-                        beta[i - 1] = g.clone() * r.clone();
-                    }
-                    c = T::one() / r.clone();
-                    s = s.clone() * c.clone();
-                }
-
-                // Update tridiagonal elements
-                let p_val = s.clone() * alpha[i].clone() - c.clone() * b.clone();
-                let next_alpha = if i + 1 < alpha.len() {
-                    alpha[i + 1].clone()
-                } else {
-                    T::zero()
-                };
-                let r = (next_alpha.clone() - alpha[i].clone()) * s.clone()
-                    + two.clone() * c.clone() * b.clone();
-
-                alpha[i] = alpha[i].clone() + p_val.clone();
-                g = c.clone() * r.clone() - b.clone();
-
-                if i + 1 < alpha.len() {
-                    alpha[i + 1] = next_alpha - s.clone() * r.clone();
-                }
-
-                // Apply Givens rotation to Lanczos vectors
-                for k in 0..n {
-                    if i + 1 < v.len() {
-                        let tmp = c.clone() * v[i][k].clone() + s.clone() * v[i + 1][k].clone();
-                        v[i + 1][k] = T::zero() - s.clone() * v[i][k].clone()
-                            + c.clone() * v[i + 1][k].clone();
-                        v[i][k] = tmp;
-                    }
-                }
-            }
-
-            // Update beta[m-2] if it exists
-            if m >= 2 && m - 2 < beta.len() {
-                beta[m - 2] = g;
-            }
-        }
-
-        // Apply rotation to residual vector
-        if !shifts.is_empty() {
-            let m = alpha.len();
-            if m > 0 && m <= v.len() {
-                // The residual is updated implicitly through the Lanczos vectors
-                let beta_last = if !beta.is_empty() {
-                    beta.last().cloned().unwrap_or_else(T::zero)
-                } else {
-                    T::zero()
-                };
-                let last_v = v.last().cloned().unwrap_or_else(|| vec![T::zero(); n]);
-                for i in 0..n {
-                    f[i] = beta_last.clone() * last_v[i].clone();
-                }
-            }
-        }
-
-        // Truncate to nev
-        alpha.truncate(nev);
-        if !beta.is_empty() {
-            beta.truncate(nev.saturating_sub(1));
-        }
-    }
-
-    /// Apply implicit QR shifts for general Hessenberg case.
-    fn apply_implicit_qr_shifts_general(
-        &self,
-        h: &mut Vec<Vec<T>>,
-        v: &mut Vec<Vec<T>>,
-        f: &mut [T],
-        shifts_real: &[T],
-        _shifts_imag: &[T],
-        nev: usize,
-        ncv: usize,
-    ) {
-        let n = v[0].len();
-
-        // Apply real shifts using bulge-chasing
-        for shift in shifts_real {
-            let m = v.len().min(ncv);
-            if m < 2 {
-                break;
-            }
-
-            // Apply shifted QR step
-            // First, apply shift
-            for i in 0..m {
-                if i < h.len() && i < h[i].len() {
-                    h[i][i] = h[i][i].clone() - shift.clone();
-                }
-            }
-
-            // QR factorization with Givens rotations
-            for i in 0..m - 1 {
-                if i + 1 >= h.len() || i >= h[i + 1].len() {
-                    continue;
-                }
-
-                if Scalar::abs(h[i + 1][i].clone()) <= <T as Scalar>::epsilon() {
-                    continue;
-                }
-
-                let (c, s, r) = givens_rotation(h[i][i].clone(), h[i + 1][i].clone());
-
-                h[i][i] = r;
-                h[i + 1][i] = T::zero();
-
-                // Apply to remaining columns
-                for j in i + 1..m {
-                    if j < h[i].len() && j < h[i + 1].len() {
-                        let temp = c.clone() * h[i][j].clone() + s.clone() * h[i + 1][j].clone();
-                        h[i + 1][j] = T::zero() - s.clone() * h[i][j].clone()
-                            + c.clone() * h[i + 1][j].clone();
-                        h[i][j] = temp;
-                    }
-                }
-
-                // Apply to columns (RQ product)
-                let col_end = (i + 3).min(m);
-                for j in 0..col_end {
-                    if j < h.len() && i < h[j].len() && i + 1 < h[j].len() {
-                        let temp = c.clone() * h[j][i].clone() + s.clone() * h[j][i + 1].clone();
-                        h[j][i + 1] = T::zero() - s.clone() * h[j][i].clone()
-                            + c.clone() * h[j][i + 1].clone();
-                        h[j][i] = temp;
-                    }
-                }
-
-                // Apply to Arnoldi vectors
-                for k in 0..n {
-                    if i < v.len() && i + 1 < v.len() {
-                        let temp = c.clone() * v[i][k].clone() + s.clone() * v[i + 1][k].clone();
-                        v[i + 1][k] = T::zero() - s.clone() * v[i][k].clone()
-                            + c.clone() * v[i + 1][k].clone();
-                        v[i][k] = temp;
-                    }
-                }
-            }
-
-            // Remove shift
-            for i in 0..m {
-                if i < h.len() && i < h[i].len() {
-                    h[i][i] = h[i][i].clone() + shift.clone();
-                }
-            }
-        }
-
-        // Update residual
-        if nev < v.len() {
-            let h_sub = if nev < h.len() && nev > 0 && nev - 1 < h[nev].len() {
-                h[nev][nev - 1].clone()
-            } else {
-                T::zero()
-            };
-            let v_nev = if nev < v.len() {
-                v[nev].clone()
-            } else {
-                vec![T::zero(); n]
-            };
-            for i in 0..n {
-                f[i] = h_sub.clone() * v_nev[i].clone();
-            }
-        }
-    }
-
-    /// Compute eigenvectors for symmetric case.
-    fn compute_eigenvectors_symmetric(
-        &self,
-        lanczos_vectors: &[Vec<T>],
-        ritz_vectors: &[Vec<T>],
-        wanted_indices: &[usize],
-        n: usize,
-    ) -> Vec<Vec<T>> {
-        let mut eigenvectors = Vec::with_capacity(wanted_indices.len());
-
-        for &idx in wanted_indices {
-            if idx >= ritz_vectors.len() {
-                continue;
-            }
-
-            let y = &ritz_vectors[idx];
-            let mut x = vec![T::zero(); n];
-
-            // Transform from Lanczos basis to original basis: x = V * y
-            for (j, vj) in lanczos_vectors.iter().enumerate() {
-                if j < y.len() {
-                    for i in 0..n {
-                        x[i] = x[i].clone() + y[j].clone() * vj[i].clone();
-                    }
-                }
-            }
-
-            // Normalize
-            let x_norm = norm(&x);
-            if x_norm > <T as Scalar>::epsilon() {
-                for xi in &mut x {
-                    *xi = xi.clone() / x_norm.clone();
-                }
-            }
-
-            eigenvectors.push(x);
-        }
-
-        eigenvectors
-    }
-
-    /// Compute a Ritz eigenvector of the leading `m x m` block of the upper
-    /// Hessenberg matrix `h` associated with the eigenvalue whose real part is
-    /// `lambda`, using inverse iteration on `(H - lambda*I)`.
-    ///
-    /// Because `lambda` is (nearly) an eigenvalue, `H - lambda*I` is close to
-    /// singular; solving `(H - lambda*I) y_{k+1} = y_k` therefore amplifies the
-    /// component of `y_k` along the requested eigenvector, and a couple of
-    /// iterations converge to it. A single LU factorization (partial pivoting,
-    /// with the pivots regularized to a small multiple of `||H||` so an exactly
-    /// singular shift does not overflow) is reused across the iterations.
-    ///
-    /// The returned vector has length `m` and unit Euclidean norm.
-    pub(crate) fn hessenberg_ritz_vector(&self, h: &[Vec<T>], m: usize, lambda: T) -> Vec<T> {
-        if m == 0 {
-            return Vec::new();
-        }
-
-        // Dense B = H - lambda*I.
-        let mut b: Vec<Vec<T>> = (0..m)
-            .map(|i| {
-                let mut row = vec![T::zero(); m];
-                if i < h.len() {
-                    for (j, slot) in row.iter_mut().enumerate() {
-                        if j < h[i].len() {
-                            *slot = h[i][j].clone();
-                        }
-                    }
-                }
-                row[i] = row[i].clone() - lambda.clone();
-                row
-            })
-            .collect();
-
-        // Scale for pivot regularization: largest magnitude entry of B (>= 1).
-        let mut scale = T::one();
-        for row in &b {
-            for entry in row {
-                let a = Scalar::abs(entry.clone());
-                if a > scale {
-                    scale = a;
-                }
-            }
-        }
-        let eps = <T as Scalar>::epsilon();
-        let pivot_floor = eps.clone() * scale;
-
-        // LU factorization with partial pivoting, stored in place. `perm[i]` is
-        // the original row now occupying factored row `i`.
-        let mut perm: Vec<usize> = (0..m).collect();
-        for k in 0..m {
-            let mut pivot_row = k;
-            let mut pivot_mag = Scalar::abs(b[k][k].clone());
-            for i in (k + 1)..m {
-                let cand = Scalar::abs(b[i][k].clone());
-                if cand > pivot_mag {
-                    pivot_mag = cand;
-                    pivot_row = i;
-                }
-            }
-            if pivot_row != k {
-                b.swap(k, pivot_row);
-                perm.swap(k, pivot_row);
-            }
-
-            // Regularize a (near-)zero pivot: the near-singular direction is the
-            // eigenvector we are after, so we keep the factorization solvable
-            // without destroying that direction.
-            if Scalar::abs(b[k][k].clone()) <= pivot_floor {
-                let signed = if b[k][k].clone() >= T::zero() {
-                    pivot_floor.clone()
-                } else {
-                    T::zero() - pivot_floor.clone()
-                };
-                b[k][k] = signed;
-            }
-
-            let pivot = b[k][k].clone();
-            for i in (k + 1)..m {
-                let factor = b[i][k].clone() / pivot.clone();
-                b[i][k] = factor.clone();
-                for j in (k + 1)..m {
-                    b[i][j] = b[i][j].clone() - factor.clone() * b[k][j].clone();
-                }
-            }
-        }
-
-        // Inverse iteration starting from a flat, generically non-orthogonal
-        // seed so it has a component along the target eigenvector.
-        let mut y = vec![T::one(); m];
-        let seed_norm = norm(&y);
-        if seed_norm > eps.clone() {
-            for yi in &mut y {
-                *yi = yi.clone() / seed_norm.clone();
-            }
-        }
-
-        for _ in 0..3 {
-            // Solve B*z = y using the stored LU factors: P applied to rhs, then
-            // forward (unit lower L) and back (upper U) substitution.
-            let mut z: Vec<T> = (0..m).map(|i| y[perm[i]].clone()).collect();
-            for i in 0..m {
-                let mut sum = z[i].clone();
-                for j in 0..i {
-                    sum = sum - b[i][j].clone() * z[j].clone();
-                }
-                z[i] = sum;
-            }
-            for i in (0..m).rev() {
-                let mut sum = z[i].clone();
-                for j in (i + 1)..m {
-                    sum = sum - b[i][j].clone() * z[j].clone();
-                }
-                // Every U diagonal was regularized to magnitude >= pivot_floor > 0
-                // above, so the division is always well defined. Dividing by the
-                // (tiny, floored) pivot is exactly what amplifies the eigenvector
-                // direction when the shift equals an eigenvalue.
-                z[i] = sum / b[i][i].clone();
-            }
-
-            let z_norm = norm(&z);
-            if z_norm <= eps.clone() {
-                break;
-            }
-            for zi in &mut z {
-                *zi = zi.clone() / z_norm.clone();
-            }
-            y = z;
-        }
-
-        y
-    }
-
-    /// Compute eigenvectors for the general (non-symmetric) case.
-    ///
-    /// For each selected Ritz value `lambda_idx` the eigenvector of the small
-    /// upper Hessenberg matrix `H` is computed by inverse iteration on
-    /// `(H - lambda_idx*I)` (see [`Self::hessenberg_ritz_vector`]) and then
-    /// mapped back to the original space as `x = V*y`. The result is validated
-    /// against the original operator `A` via the residual `||A*x - rho*x||`,
-    /// where `rho = x^T A x` is the Rayleigh quotient; for real eigenvalues the
-    /// shift is refined with `rho` (Rayleigh-quotient iteration) and the vector
-    /// achieving the smallest residual is kept. This targets the *specific*
-    /// requested eigenvalue instead of always converging to the dominant one.
-    fn compute_eigenvectors_general(
-        &self,
-        a: &CsrMatrix<T>,
-        arnoldi_vectors: &[Vec<T>],
-        h: &[Vec<T>],
-        ritz_real: &[T],
-        ritz_imag: &[T],
-        wanted_indices: &[usize],
-        n: usize,
-        m: usize,
-    ) -> Vec<Vec<T>> {
-        let mut eigenvectors = Vec::with_capacity(wanted_indices.len());
-        let eps = <T as Scalar>::epsilon();
-        let res_tol = eps.clone() * T::from_f64(100.0).unwrap_or_else(T::one);
-        let mut ax = vec![T::zero(); n];
-
-        for &idx in wanted_indices {
-            if idx >= m {
-                continue;
-            }
-
-            let lambda_re = ritz_real.get(idx).cloned().unwrap_or_else(T::zero);
-            let lambda_im = ritz_imag.get(idx).cloned().unwrap_or_else(T::zero);
-            // A genuinely complex eigenvalue has no real eigenvector, so a
-            // real-part shift cannot be refined to drive the residual to zero;
-            // use a single inverse-iteration solve in that case.
-            let is_complex = Scalar::abs(lambda_im) > eps.clone();
-            let refine_steps = if is_complex { 1 } else { 4 };
-
-            let mut shift = lambda_re;
-            let mut best_x: Option<Vec<T>> = None;
-            let mut best_res = T::zero();
-
-            for step in 0..refine_steps {
-                // Eigenvector of the small Hessenberg matrix for this Ritz value.
-                let y = self.hessenberg_ritz_vector(h, m, shift.clone());
-
-                // Map back to the original space: x = V * y.
-                let mut x = vec![T::zero(); n];
-                for (j, vj) in arnoldi_vectors.iter().enumerate() {
-                    if j < y.len() {
-                        for (i, xi) in x.iter_mut().enumerate() {
-                            *xi = xi.clone() + y[j].clone() * vj[i].clone();
-                        }
-                    }
-                }
-                let x_norm = norm(&x);
-                if x_norm <= eps.clone() {
-                    break;
-                }
-                for xi in &mut x {
-                    *xi = xi.clone() / x_norm.clone();
-                }
-
-                // Validate against the original operator A. With x normalized,
-                // rho = x^T A x is the Rayleigh quotient and res = ||A x - rho x||.
-                spmv(T::one(), a, &x, T::zero(), &mut ax);
-                let rho = dot(&x, &ax);
-                let mut res_sq = T::zero();
-                for (i, axi) in ax.iter().enumerate() {
-                    let ri = axi.clone() - rho.clone() * x[i].clone();
-                    res_sq = res_sq + ri.clone() * ri.clone();
-                }
-                let res = Real::sqrt(res_sq);
-
-                let improved = match best_x {
-                    None => true,
-                    Some(_) => res < best_res,
-                };
-                if improved {
-                    best_res = res.clone();
-                    best_x = Some(x);
-                }
-
-                // Rayleigh-quotient refinement of the shift for the next step.
-                if !is_complex {
-                    shift = rho;
-                }
-                if res <= res_tol || step + 1 == refine_steps {
-                    break;
-                }
-            }
-
-            eigenvectors.push(best_x.unwrap_or_else(|| vec![T::zero(); n]));
-        }
-
-        eigenvectors
-    }
 }

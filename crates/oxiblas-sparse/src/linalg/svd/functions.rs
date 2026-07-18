@@ -66,160 +66,239 @@ fn orthonormalize_dense<T: Scalar<Real = T> + Clone + Field + Real + FromPrimiti
     }
     result
 }
-/// QR decomposition of dense matrix using Householder reflections.
+/// Orthonormalize a set of column vectors (each of length `dim`) using modified
+/// Gram-Schmidt with reorthogonalization and a rank-revealing tolerance.
 ///
-/// Returns (Q, R) where A = Q*R, Q is orthonormal, R is upper triangular.
-/// Q is returned as column vectors (m×k), R is k×n.
-pub(super) fn qr_decompose_dense<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive>(
-    a: &[Vec<T>],
+/// Returns `(basis, coeffs)` where `basis` holds the `p'` accepted orthonormal
+/// vectors (the *numerical* rank of the input set) and `coeffs` is a `p' × ncols`
+/// matrix such that `column_j = Σ_i coeffs[i][j] · basis[i]`.
+///
+/// Linearly dependent columns produce a residual whose norm falls below the
+/// relative tolerance, so they contribute **no** new basis vector: the numerical
+/// rank `p'` can therefore be strictly smaller than `ncols`. This is precisely
+/// what prevents rank-deficient residual blocks from being counted as though they
+/// added `ncols` new orthogonal directions.
+pub(super) fn orthonormal_basis_with_coeffs<
+    T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive,
+>(
+    columns: &[Vec<T>],
+    dim: usize,
 ) -> (Vec<Vec<T>>, Vec<Vec<T>>) {
-    if a.is_empty() || a[0].is_empty() {
+    let ncols = columns.len();
+    if ncols == 0 || dim == 0 {
         return (Vec::new(), Vec::new());
     }
-    let m = a.len();
-    let n = a[0].len();
-    let k = m.min(n);
-    let a_cols: Vec<Vec<T>> = transpose_dense(a);
-    let mut q = vec![vec![T::zero(); k]; m];
-    let mut r = vec![vec![T::zero(); n]; k];
-    for j in 0..k {
-        let mut v = a_cols[j].clone();
-        for i in 0..j {
-            let mut proj = T::zero();
-            for l in 0..m {
-                proj = proj + q[l][i].clone() * v[l].clone();
-            }
-            r[i][j] = proj.clone();
-            for l in 0..m {
-                v[l] = v[l].clone() - proj.clone() * q[l][i].clone();
-            }
+    // The largest input column norm sets the scale for the relative rank test.
+    let mut max_norm = T::zero();
+    for column in columns.iter() {
+        let mut sum_sq = T::zero();
+        for value in column.iter().take(dim) {
+            sum_sq = sum_sq + value.clone() * value.clone();
         }
-        let norm = Real::sqrt(
-            v.iter()
-                .map(|x| x.clone() * x.clone())
-                .fold(T::zero(), |acc, x| acc + x),
-        );
-        r[j][j] = norm.clone();
-        if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
-            for l in 0..m {
-                q[l][j] = v[l].clone() / norm.clone();
-            }
-        }
-        for jj in (j + 1)..n {
-            let mut dot = T::zero();
-            for l in 0..m {
-                dot = dot + q[l][j].clone() * a_cols[jj][l].clone();
-            }
-            r[j][jj] = dot;
+        let norm = Real::sqrt(sum_sq);
+        if norm > max_norm {
+            max_norm = norm;
         }
     }
-    (q, r)
+    let rel_tol = T::from_f64(1e-9).unwrap_or_else(T::zero);
+    let threshold = rel_tol * max_norm;
+    let mut basis: Vec<Vec<T>> = Vec::new();
+    let mut coeff_columns: Vec<Vec<T>> = Vec::with_capacity(ncols);
+    for column in columns.iter() {
+        let mut residual = column.clone();
+        let mut coeff = vec![T::zero(); basis.len()];
+        // Two Gram-Schmidt passes (reorthogonalization) for numerical stability.
+        for _pass in 0..2 {
+            for (bi, basis_vec) in basis.iter().enumerate() {
+                let mut dot = T::zero();
+                for i in 0..dim {
+                    dot = dot + basis_vec[i].clone() * residual[i].clone();
+                }
+                for i in 0..dim {
+                    residual[i] = residual[i].clone() - dot.clone() * basis_vec[i].clone();
+                }
+                coeff[bi] = coeff[bi].clone() + dot;
+            }
+        }
+        let mut sum_sq = T::zero();
+        for value in residual.iter().take(dim) {
+            sum_sq = sum_sq + value.clone() * value.clone();
+        }
+        let norm = Real::sqrt(sum_sq);
+        if norm > threshold {
+            let inv = T::one() / norm.clone();
+            for value in residual.iter_mut().take(dim) {
+                *value = value.clone() * inv.clone();
+            }
+            basis.push(residual);
+            coeff.push(norm);
+        }
+        coeff_columns.push(coeff);
+    }
+    let rank = basis.len();
+    let mut coeffs = vec![vec![T::zero(); ncols]; rank];
+    for (j, coeff) in coeff_columns.iter().enumerate() {
+        for (i, value) in coeff.iter().enumerate() {
+            if i < rank {
+                coeffs[i][j] = value.clone();
+            }
+        }
+    }
+    (basis, coeffs)
 }
-/// Full SVD of a dense matrix using LAPACK-style dense decomposition.
+/// Full singular value decomposition of a small dense matrix via **one-sided
+/// Jacobi rotations**.
+///
+/// One-sided Jacobi orthogonalizes the columns of the matrix through a sequence
+/// of plane rotations. Unlike power iteration with deflation — which reuses a
+/// single deterministic start vector and therefore loses the second copy of a
+/// repeated singular value once the first has been deflated out of that
+/// subspace — Jacobi resolves repeated and tightly clustered singular values
+/// *exactly*: when two singular values are equal the relevant columns are
+/// already mutually orthogonal (`A Aᵀ` is a scalar on that subspace), so the
+/// rotation that would separate them is the identity and both magnitudes are
+/// retained.
+///
+/// Returns a [`RandomizedSparseSvdResult`] whose `u` is `rows × r`, `v` is
+/// `cols × r` and `singular_values` has length `r = min(rows, cols)`, sorted in
+/// descending order. Both `u` and `v` store singular vectors as **columns**,
+/// i.e. `u[i][j]` is the `i`-th component of the `j`-th left singular vector and
+/// `v[i][j]` the `i`-th component of the `j`-th right singular vector.
 pub(super) fn dense_svd_full<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive>(
     matrix: &[Vec<T>],
 ) -> Result<RandomizedSparseSvdResult<T>, SVDError> {
     if matrix.is_empty() || matrix[0].is_empty() {
         return Err(SVDError::InvalidConfig("Empty matrix".to_string()));
     }
-    let m = matrix.len();
-    let n = matrix[0].len();
-    let min_dim = m.min(n);
-    let mut a_flat = Vec::with_capacity(m * n);
-    for j in 0..n {
-        for i in 0..m {
-            a_flat.push(matrix[i][j].clone());
-        }
+    let rows = matrix.len();
+    let cols = matrix[0].len();
+    if rows >= cols {
+        let (u, s, v) = one_sided_jacobi_svd(matrix, rows, cols);
+        Ok(RandomizedSparseSvdResult {
+            singular_values: s,
+            u: Some(u),
+            v: Some(v),
+        })
+    } else {
+        // One-sided Jacobi needs at least as many rows as columns; run it on the
+        // transpose and swap the roles of the left and right singular vectors.
+        let transposed = transpose_dense(matrix);
+        let (u_t, s, v_t) = one_sided_jacobi_svd(&transposed, cols, rows);
+        Ok(RandomizedSparseSvdResult {
+            singular_values: s,
+            u: Some(v_t),
+            v: Some(u_t),
+        })
     }
-    let mut ata = vec![vec![T::zero(); n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            let mut sum = T::zero();
-            for k in 0..m {
-                sum = sum + matrix[k][i].clone() * matrix[k][j].clone();
-            }
-            ata[i][j] = sum;
-        }
+}
+
+/// One-sided Jacobi SVD kernel for a matrix with `m >= n` (`m` rows, `n` cols).
+///
+/// Returns `(u, s, v)` with `u` of shape `m × n`, `s` of length `n` and `v` of
+/// shape `n × n`, with singular values (and their matching singular vectors)
+/// sorted in descending order. The columns of `u` are the normalized, mutually
+/// orthogonal columns of the rotated matrix; `v` accumulates the applied Jacobi
+/// rotations so that `input = u · diag(s) · vᵀ`.
+fn one_sided_jacobi_svd<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive>(
+    input: &[Vec<T>],
+    m: usize,
+    n: usize,
+) -> (Vec<Vec<T>>, Vec<T>, Vec<Vec<T>>) {
+    // Working copy whose columns are progressively orthogonalized.
+    let mut a: Vec<Vec<T>> = input.to_vec();
+    // Accumulated right rotations, initialized to the identity.
+    let mut v = vec![vec![T::zero(); n]; n];
+    for (i, v_row) in v.iter_mut().enumerate() {
+        v_row[i] = T::one();
     }
-    let mut singular_values: Vec<T> = Vec::new();
-    let mut v_vectors: Vec<Vec<T>> = Vec::new();
-    for _ in 0..min_dim {
-        let mut v = vec![T::from_f64(1.0).unwrap_or_else(T::zero); n];
-        for i in 1..n {
-            v[i] = T::from_f64((i as f64).sin()).unwrap_or_else(T::zero);
-        }
-        for prev_v in &v_vectors {
-            let dot: T = v
-                .iter()
-                .zip(prev_v.iter())
-                .map(|(a, b)| a.clone() * b.clone())
-                .fold(T::zero(), |acc, x| acc + x);
-            for i in 0..n {
-                v[i] = v[i].clone() - dot.clone() * prev_v[i].clone();
-            }
-        }
-        for _ in 0..20 {
-            let mut new_v = vec![T::zero(); n];
-            for i in 0..n {
-                for j in 0..n {
-                    new_v[i] = new_v[i].clone() + ata[i][j].clone() * v[j].clone();
+    let eps = T::from_f64(1e-15).unwrap_or_else(T::zero);
+    let two = T::one() + T::one();
+    let max_sweeps = 60;
+    for _sweep in 0..max_sweeps {
+        let mut converged = true;
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let mut alpha = T::zero();
+                let mut beta = T::zero();
+                let mut gamma = T::zero();
+                for row in a.iter() {
+                    alpha = alpha + row[p].clone() * row[p].clone();
+                    beta = beta + row[q].clone() * row[q].clone();
+                    gamma = gamma + row[p].clone() * row[q].clone();
+                }
+                let denom = Real::sqrt(alpha.clone() * beta.clone());
+                if denom <= eps {
+                    continue;
+                }
+                // Columns already (numerically) orthogonal: nothing to do.
+                if Scalar::abs(gamma.clone()) <= eps.clone() * denom {
+                    continue;
+                }
+                converged = false;
+                // Jacobi rotation that diagonalizes the 2×2 Gram submatrix
+                // [[alpha, gamma], [gamma, beta]].
+                let zeta = (beta.clone() - alpha.clone()) / (two.clone() * gamma.clone());
+                let abs_zeta = Scalar::abs(zeta.clone());
+                let root = Real::sqrt(T::one() + zeta.clone() * zeta.clone());
+                let magnitude = T::one() / (abs_zeta + root);
+                let t = if zeta < T::zero() {
+                    T::zero() - magnitude
+                } else {
+                    magnitude
+                };
+                let c = T::one() / Real::sqrt(T::one() + t.clone() * t.clone());
+                let s = c.clone() * t;
+                for row in a.iter_mut() {
+                    let aip = row[p].clone();
+                    let aiq = row[q].clone();
+                    row[p] = c.clone() * aip.clone() - s.clone() * aiq.clone();
+                    row[q] = s.clone() * aip + c.clone() * aiq;
+                }
+                for v_row in v.iter_mut() {
+                    let vip = v_row[p].clone();
+                    let viq = v_row[q].clone();
+                    v_row[p] = c.clone() * vip.clone() - s.clone() * viq.clone();
+                    v_row[q] = s.clone() * vip + c.clone() * viq;
                 }
             }
-            let norm = Real::sqrt(
-                new_v
-                    .iter()
-                    .map(|x| x.clone() * x.clone())
-                    .fold(T::zero(), |acc, x| acc + x),
-            );
-            if norm > T::from_f64(1e-14).unwrap_or_else(T::zero) {
-                v = new_v.iter().map(|x| x.clone() / norm.clone()).collect();
-            } else {
-                break;
-            }
         }
-        let mut av = vec![T::zero(); m];
-        for i in 0..m {
-            for j in 0..n {
-                av[i] = av[i].clone() + matrix[i][j].clone() * v[j].clone();
-            }
-        }
-        let sigma = Real::sqrt(
-            av.iter()
-                .map(|x| x.clone() * x.clone())
-                .fold(T::zero(), |acc, x| acc + x),
-        );
-        if sigma < T::from_f64(1e-10).unwrap_or_else(T::zero) {
+        if converged {
             break;
         }
-        singular_values.push(sigma);
-        v_vectors.push(v);
+    }
+    // Column norms are the singular values; normalized columns form U.
+    let mut norms = vec![T::zero(); n];
+    for (j, norm_slot) in norms.iter_mut().enumerate() {
+        let mut sum_sq = T::zero();
+        for row in a.iter() {
+            sum_sq = sum_sq + row[j].clone() * row[j].clone();
+        }
+        *norm_slot = Real::sqrt(sum_sq);
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&x, &y| {
+        norms[y]
+            .partial_cmp(&norms[x])
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
+    let tol = T::from_f64(1e-14).unwrap_or_else(T::zero);
+    let mut singular_values = Vec::with_capacity(n);
+    let mut u = vec![vec![T::zero(); n]; m];
+    let mut v_sorted = vec![vec![T::zero(); n]; n];
+    for (new_j, &old_j) in order.iter().enumerate() {
+        let sigma = norms[old_j].clone();
+        singular_values.push(sigma.clone());
+        if sigma > tol {
+            let inv = T::one() / sigma;
+            for i in 0..m {
+                u[i][new_j] = a[i][old_j].clone() * inv.clone();
+            }
+        }
         for i in 0..n {
-            for j in 0..n {
-                let deflate = sigma.clone()
-                    * sigma.clone()
-                    * v_vectors.last().expect("collection should be non-empty")[i].clone()
-                    * v_vectors.last().expect("collection should be non-empty")[j].clone();
-                ata[i][j] = ata[i][j].clone() - deflate;
-            }
+            v_sorted[i][new_j] = v[i][old_j].clone();
         }
     }
-    let mut u_vectors = vec![vec![T::zero(); singular_values.len()]; m];
-    for (k, (sigma, v)) in singular_values.iter().zip(v_vectors.iter()).enumerate() {
-        for i in 0..m {
-            let mut sum = T::zero();
-            for j in 0..n {
-                sum = sum + matrix[i][j].clone() * v[j].clone();
-            }
-            if Scalar::abs(sigma.clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
-                u_vectors[i][k] = sum / sigma.clone();
-            }
-        }
-    }
-    Ok(RandomizedSparseSvdResult {
-        singular_values,
-        u: Some(u_vectors),
-        v: Some(v_vectors),
-    })
+    (u, singular_values, v_sorted)
 }
 #[cfg(test)]
 mod tests {
@@ -667,5 +746,176 @@ mod tests {
         for &sigma in s {
             assert!(sigma >= 0.0);
         }
+    }
+
+    /// Reconstruct a dense matrix from the `dense_svd_full` factors (columns are
+    /// singular vectors): `A[i][j] = Σ_l u[i][l] · s[l] · v[j][l]`.
+    fn reconstruct_from_columns(u: &[Vec<f64>], s: &[f64], v: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let m = u.len();
+        let n = v.len();
+        let r = s.len();
+        let mut out = vec![vec![0.0; n]; m];
+        for (i, out_row) in out.iter_mut().enumerate() {
+            for (j, out_val) in out_row.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for l in 0..r {
+                    sum += u[i][l] * s[l] * v[j][l];
+                }
+                *out_val = sum;
+            }
+        }
+        out
+    }
+
+    /// Reconstruct from the incremental-SVD factors `(U, Σ, Vᵀ)`.
+    fn reconstruct_from_incremental(u: &[Vec<f64>], s: &[f64], vt: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let m = u.len();
+        let n = if vt.is_empty() { 0 } else { vt[0].len() };
+        let r = s.len();
+        let mut out = vec![vec![0.0; n]; m];
+        for (i, out_row) in out.iter_mut().enumerate() {
+            for (j, out_val) in out_row.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for l in 0..r {
+                    sum += u[i][l] * s[l] * vt[l][j];
+                }
+                *out_val = sum;
+            }
+        }
+        out
+    }
+
+    fn frobenius_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+        let mut sum = 0.0;
+        for (row_a, row_b) in a.iter().zip(b.iter()) {
+            for (va, vb) in row_a.iter().zip(row_b.iter()) {
+                let d = va - vb;
+                sum += d * d;
+            }
+        }
+        sum.sqrt()
+    }
+
+    #[test]
+    fn test_dense_svd_repeated_singular_values() {
+        // diag(4, 3, 1, 1): the repeated unit singular value must be resolved.
+        // The old power-iteration-with-deflation helper returned [4, 3, 1, ~0].
+        let matrix = vec![
+            vec![4.0, 0.0, 0.0, 0.0],
+            vec![0.0, 3.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let result = dense_svd_full(&matrix).unwrap();
+        assert_eq!(result.singular_values.len(), 4);
+        let mut sorted = result.singular_values.clone();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert!((sorted[0] - 4.0).abs() < 1e-10, "s0 = {}", sorted[0]);
+        assert!((sorted[1] - 3.0).abs() < 1e-10, "s1 = {}", sorted[1]);
+        assert!((sorted[2] - 1.0).abs() < 1e-10, "s2 = {}", sorted[2]);
+        assert!(
+            (sorted[3] - 1.0).abs() < 1e-10,
+            "repeated singular value not resolved: s3 = {}",
+            sorted[3]
+        );
+        let u = result.u.clone().unwrap();
+        let v = result.v.clone().unwrap();
+        let recon = reconstruct_from_columns(&u, &result.singular_values, &v);
+        let err = frobenius_diff(&matrix, &recon);
+        assert!(err < 1e-10, "reconstruction error {}", err);
+    }
+
+    #[test]
+    fn test_dense_svd_general_reconstruction() {
+        // Square, tall, wide and rank-deficient cases all reconstruct exactly.
+        let matrices: Vec<Vec<Vec<f64>>> = vec![
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]],
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+            vec![
+                vec![2.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 5.0],
+            ],
+        ];
+        for matrix in &matrices {
+            let result = dense_svd_full(matrix).unwrap();
+            let u = result.u.clone().unwrap();
+            let v = result.v.clone().unwrap();
+            let recon = reconstruct_from_columns(&u, &result.singular_values, &v);
+            let err = frobenius_diff(matrix, &recon);
+            assert!(err < 1e-9, "reconstruction error {} for {:?}", err, matrix);
+            for w in result.singular_values.windows(2) {
+                assert!(w[0] >= w[1] - 1e-12, "singular values not descending");
+            }
+            for &sv in &result.singular_values {
+                assert!(sv >= -1e-12, "negative singular value {}", sv);
+            }
+        }
+    }
+
+    #[test]
+    fn test_incremental_svd_sequential_single_row_adds() {
+        // Start from a 2×4 matrix with singular values 4 and 3, then append the
+        // unit rows e2 and e3. The second update's coupling matrix is
+        // diag(4, 3, 1, 1) with a repeated singular value 1. With the old dense
+        // SVD helper the reconstruction error came out ~1.0.
+        let a = CsrMatrix::new(2, 4, vec![0, 1, 2], vec![0, 1], vec![4.0, 3.0]).unwrap();
+        let config = IncrementalSVDConfig {
+            max_rank: 8,
+            tolerance: 1e-12,
+            reorthogonalize: true,
+        };
+        let mut isvd = IncrementalSVD::new(config);
+        isvd.initialize(&a, 2).unwrap();
+        isvd.add_rows(&[vec![0.0, 0.0, 1.0, 0.0]]).unwrap();
+        isvd.add_rows(&[vec![0.0, 0.0, 0.0, 1.0]]).unwrap();
+        assert_eq!(isvd.dimensions(), (4, 4));
+        let expected = vec![
+            vec![4.0, 0.0, 0.0, 0.0],
+            vec![0.0, 3.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let recon = reconstruct_from_incremental(u, s, vt);
+        let err = frobenius_diff(&expected, &recon);
+        assert!(err < 1e-6, "reconstruction error {} (expected near zero)", err);
+        let mut sorted = s.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(sorted.len(), 4);
+        assert!((sorted[0] - 4.0).abs() < 1e-4, "s0 = {}", sorted[0]);
+        assert!((sorted[1] - 3.0).abs() < 1e-4, "s1 = {}", sorted[1]);
+        assert!((sorted[2] - 1.0).abs() < 1e-4, "s2 = {}", sorted[2]);
+        assert!(
+            (sorted[3] - 1.0).abs() < 1e-4,
+            "repeated singular value not resolved: s3 = {}",
+            sorted[3]
+        );
+    }
+
+    #[test]
+    fn test_incremental_svd_add_columns_reconstruction() {
+        // Adding a column that introduces a new left-singular direction must
+        // update U as well as V so the factorization still reconstructs A'.
+        let a = CsrMatrix::new(3, 2, vec![0, 1, 2, 2], vec![0, 1], vec![3.0, 2.0]).unwrap();
+        let config = IncrementalSVDConfig {
+            max_rank: 8,
+            tolerance: 1e-12,
+            reorthogonalize: true,
+        };
+        let mut isvd = IncrementalSVD::new(config);
+        isvd.initialize(&a, 2).unwrap();
+        isvd.add_columns(&[vec![0.0, 0.0, 1.0]]).unwrap();
+        assert_eq!(isvd.dimensions(), (3, 3));
+        let expected = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let recon = reconstruct_from_incremental(u, s, vt);
+        let err = frobenius_diff(&expected, &recon);
+        assert!(err < 1e-6, "reconstruction error {} (expected near zero)", err);
     }
 }

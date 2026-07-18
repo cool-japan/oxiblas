@@ -561,10 +561,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
     }
 
     /// Sparse matrix-matrix multiplication: C = A * B
-    fn spmm_csr(
-        a: &CsrMatrix<T>,
-        b: &CsrMatrix<T>,
-    ) -> Result<CsrMatrix<T>, PreconditionerError> {
+    fn spmm_csr(a: &CsrMatrix<T>, b: &CsrMatrix<T>) -> Result<CsrMatrix<T>, PreconditionerError> {
         let m = a.nrows();
         let n = b.ncols();
 

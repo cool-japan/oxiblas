@@ -63,10 +63,7 @@ impl core::fmt::Display for MultifrontalError {
                 write!(f, "Assembly error: {message}")
             }
             Self::DimensionMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "RHS length mismatch: expected {expected}, got {actual}"
-                )
+                write!(f, "RHS length mismatch: expected {expected}, got {actual}")
             }
         }
     }
@@ -1323,7 +1320,9 @@ mod tests {
 
         let b = vec![2.0, -1.0, 3.0, -2.0, 1.0];
 
-        let x_mf = mf_chol.solve(&b).expect("multifrontal solve should succeed");
+        let x_mf = mf_chol
+            .solve(&b)
+            .expect("multifrontal solve should succeed");
         let x_direct = direct_chol.solve(&b);
 
         for i in 0..5 {
@@ -1507,7 +1506,9 @@ mod tests {
         let chol = MultifrontalCholesky::new(&a).expect("3x3 grid Laplacian is SPD");
 
         let b: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64)).collect();
-        let x = chol.solve(&b).expect("3x3 grid Laplacian solve should succeed");
+        let x = chol
+            .solve(&b)
+            .expect("3x3 grid Laplacian solve should succeed");
 
         let rel = relative_residual(&a, &x, &b);
         assert!(
@@ -1524,7 +1525,9 @@ mod tests {
         let chol = MultifrontalCholesky::new(&a).expect("5x5 grid Laplacian is SPD");
 
         let b: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.5) - 3.0).collect();
-        let x = chol.solve(&b).expect("5x5 grid Laplacian solve should succeed");
+        let x = chol
+            .solve(&b)
+            .expect("5x5 grid Laplacian solve should succeed");
 
         let rel = relative_residual(&a, &x, &b);
         assert!(
@@ -1541,7 +1544,9 @@ mod tests {
         let chol = MultifrontalCholesky::new(&a).expect("10x10 grid Laplacian is SPD");
 
         let b: Vec<f64> = (0..n).map(|i| (((i * 7 + 3) % 11) as f64) - 5.0).collect();
-        let x = chol.solve(&b).expect("10x10 grid Laplacian solve should succeed");
+        let x = chol
+            .solve(&b)
+            .expect("10x10 grid Laplacian solve should succeed");
 
         let rel = relative_residual(&a, &x, &b);
         assert!(

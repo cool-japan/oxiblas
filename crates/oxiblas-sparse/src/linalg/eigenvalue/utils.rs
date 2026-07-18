@@ -321,7 +321,9 @@ pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> Result<CscMatrix<T>,
     }
 
     CscMatrix::new(nrows, ncols, col_ptrs, row_indices, values).map_err(|e| {
-        EigenvalueError::ComputationError(format!("failed to construct CSC matrix in csr_to_csc: {e}"))
+        EigenvalueError::ComputationError(format!(
+            "failed to construct CSC matrix in csr_to_csc: {e}"
+        ))
     })
 }
 

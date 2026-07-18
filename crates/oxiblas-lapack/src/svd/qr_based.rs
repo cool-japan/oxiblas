@@ -254,8 +254,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
             // If the top diagonal of the block is (numerically) zero, the shifted
             // step cannot introduce the bulge cleanly; a zero-shift left-side
             // Givens sweep chases the zero out along the row and decouples it.
-            if Scalar::abs(d_work[lo])
-                <= tol * (Scalar::abs(d_work[hi]) + Scalar::abs(e_work[lo]))
+            if Scalar::abs(d_work[lo]) <= tol * (Scalar::abs(d_work[hi]) + Scalar::abs(e_work[lo]))
             {
                 Self::deflate_zero_diagonal(&mut d_work, &mut e_work, &mut u, lo, hi + 1);
                 continue;
@@ -507,13 +506,7 @@ impl<T: Field + Real + bytemuck::Zeroable> QrSvd<T> {
     /// a zero singular value and decoupling the block so the ordinary shifted
     /// iteration can proceed. Only `U` (left vectors) is updated because these are
     /// left rotations; `Vᵀ` is untouched.
-    fn deflate_zero_diagonal(
-        d: &mut [T],
-        e: &mut [T],
-        u: &mut Mat<T>,
-        start: usize,
-        end: usize,
-    ) {
+    fn deflate_zero_diagonal(d: &mut [T], e: &mut [T], u: &mut Mat<T>, start: usize, end: usize) {
         let n = u.nrows();
         let last = end - 1;
 
@@ -1042,7 +1035,11 @@ mod tests {
 
             // Singular values are sorted descending and non-negative.
             for k in 0..n {
-                assert!(s_qr[k] >= -1e-12, "n={n}: sigma[{k}]={} is negative", s_qr[k]);
+                assert!(
+                    s_qr[k] >= -1e-12,
+                    "n={n}: sigma[{k}]={} is negative",
+                    s_qr[k]
+                );
             }
             for k in 1..n {
                 assert!(
@@ -1217,9 +1214,8 @@ mod tests {
                 if zero_pos + 1 < n {
                     a[(zero_pos, zero_pos + 1)] = 0.0;
                 }
-                let qr = QrSvd::compute(a.as_ref()).unwrap_or_else(|e| {
-                    panic!("n={n} zero_pos={zero_pos}: failed: {e}")
-                });
+                let qr = QrSvd::compute(a.as_ref())
+                    .unwrap_or_else(|e| panic!("n={n} zero_pos={zero_pos}: failed: {e}"));
                 let reference = Svd::compute(a.as_ref()).unwrap();
                 let s_qr = qr.singular_values();
                 let s_ref = reference.singular_values();

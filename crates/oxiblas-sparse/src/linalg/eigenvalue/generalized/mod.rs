@@ -1420,7 +1420,10 @@ mod tests {
         {
             assert!((re - 2.0).abs() < 1e-4, "real part should be ~2, got {re}");
             let mag = (re * re + im * im).sqrt();
-            assert!((mag - 5.0_f64.sqrt()).abs() < 1e-3, "magnitude should be ~sqrt(5)");
+            assert!(
+                (mag - 5.0_f64.sqrt()).abs() < 1e-3,
+                "magnitude should be ~sqrt(5)"
+            );
         }
     }
 

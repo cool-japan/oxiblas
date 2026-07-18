@@ -1194,7 +1194,10 @@ mod tests {
             .data()
             .iter()
             .fold(Complex64::new(0.0, 0.0), |acc, val| acc + val * val);
-        assert!(naive_sum.im.abs() > 1e-12, "test fixture should exercise the complex case");
+        assert!(
+            naive_sum.im.abs() > 1e-12,
+            "test fixture should exercise the complex case"
+        );
     }
 
     #[test]

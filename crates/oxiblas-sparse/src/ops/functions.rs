@@ -1853,7 +1853,14 @@ mod tests {
         let a = CsrMatrix::new(2, 2, row_ptrs, col_indices, values).unwrap();
         let x = vec![Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)];
         let mut y = vec![Complex64::new(0.0, 0.0); 2];
-        spmv_hermitian(Complex64::new(1.0, 0.0), &a, &x, Complex64::new(0.0, 0.0), &mut y, true);
+        spmv_hermitian(
+            Complex64::new(1.0, 0.0),
+            &a,
+            &x,
+            Complex64::new(0.0, 0.0),
+            &mut y,
+            true,
+        );
         // Verified by hand / via full dense Hermitian multiply: y = [6+5i, 9-4i].
         let expected = [Complex64::new(6.0, 5.0), Complex64::new(9.0, -4.0)];
         for i in 0..2 {
@@ -1870,7 +1877,11 @@ mod tests {
         // make sure we do NOT match that wrong value.
         let wrong_y0 = Complex64::new(2.0, -3.0);
         let diff_from_wrong = y[0] - wrong_y0;
-        assert!((diff_from_wrong.re * diff_from_wrong.re + diff_from_wrong.im * diff_from_wrong.im).sqrt() > 1e-6);
+        assert!(
+            (diff_from_wrong.re * diff_from_wrong.re + diff_from_wrong.im * diff_from_wrong.im)
+                .sqrt()
+                > 1e-6
+        );
     }
     #[test]
     fn test_spmv_hermitian_complex_full_stored() {

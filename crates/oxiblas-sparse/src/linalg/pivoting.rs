@@ -1699,7 +1699,10 @@ mod tests {
                 );
             }
         }
-        assert!(factored > 50, "too few successful factorizations: {factored}");
+        assert!(
+            factored > 50,
+            "too few successful factorizations: {factored}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1788,7 +1791,13 @@ mod tests {
                 }
             }
         }
-        assert!(factored > 50, "too few successful factorizations: {factored}");
-        assert!(with_2x2 > 0, "expected some 2x2 pivot blocks to be exercised");
+        assert!(
+            factored > 50,
+            "too few successful factorizations: {factored}"
+        );
+        assert!(
+            with_2x2 > 0,
+            "expected some 2x2 pivot blocks to be exercised"
+        );
     }
 }

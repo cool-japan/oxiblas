@@ -1743,10 +1743,7 @@ mod tests {
     fn test_logm_diagonal_exact() {
         // exp(0.5) and exp(-0.5) give a matrix with ||A - I|| near the old
         // boundary; log must recover 0.5 and -0.5 to near machine precision.
-        let a = Mat::from_rows(&[
-            &[0.5f64.exp(), 0.0],
-            &[0.0, (-0.5f64).exp()],
-        ]);
+        let a = Mat::from_rows(&[&[0.5f64.exp(), 0.0], &[0.0, (-0.5f64).exp()]]);
         let log_a = logm(a.as_ref()).unwrap();
         assert!(
             (log_a[(0, 0)] - 0.5).abs() < 1e-13,

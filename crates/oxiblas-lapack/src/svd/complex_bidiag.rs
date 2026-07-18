@@ -508,12 +508,7 @@ where
     }
 
     /// Applies `Q` (or `Q^H`) to `c`.
-    fn apply_q(
-        &self,
-        side: Side,
-        trans: Trans,
-        c: MatRef<'_, T>,
-    ) -> Result<Mat<T>, BidiagError> {
+    fn apply_q(&self, side: Side, trans: Trans, c: MatRef<'_, T>) -> Result<Mat<T>, BidiagError> {
         match side {
             Side::Left if c.nrows() != self.m => return Err(BidiagError::DimensionMismatch),
             Side::Right if c.ncols() != self.m => return Err(BidiagError::DimensionMismatch),
@@ -530,12 +525,7 @@ where
     }
 
     /// Applies `P` (or `P^H`) to `c`.
-    fn apply_p(
-        &self,
-        side: Side,
-        trans: Trans,
-        c: MatRef<'_, T>,
-    ) -> Result<Mat<T>, BidiagError> {
+    fn apply_p(&self, side: Side, trans: Trans, c: MatRef<'_, T>) -> Result<Mat<T>, BidiagError> {
         match side {
             Side::Left if c.nrows() != self.n => return Err(BidiagError::DimensionMismatch),
             Side::Right if c.ncols() != self.n => return Err(BidiagError::DimensionMismatch),
@@ -1720,8 +1710,14 @@ mod tests {
 
         // --- Cross-check apply (UNMBR) against generation ---
         // Full Q (m x m) obtained by applying Q to the identity from the left.
-        let qf = unmbr(&f, BidiagVect::Q, Side::Left, Trans::NoTrans, eye_c64(m).as_ref())
-            .expect("unmbr Q L N");
+        let qf = unmbr(
+            &f,
+            BidiagVect::Q,
+            Side::Left,
+            Trans::NoTrans,
+            eye_c64(m).as_ref(),
+        )
+        .expect("unmbr Q L N");
         assert_unitary_c64(&qf, &format!("{label}/Qfull"), tol);
         // The first `q.ncols()` columns of the full Q equal the thin generated Q.
         let mut qf_thin: Mat<Complex64> = Mat::zeros(m, q.ncols());
@@ -1733,43 +1729,97 @@ mod tests {
         assert_close_c64(&qf_thin, &q, tol, &format!("{label}/Qthin-vs-apply"));
 
         // Q^H via apply (Left, Trans) matches the conjugate transpose of full Q.
-        let qf_h = unmbr(&f, BidiagVect::Q, Side::Left, Trans::Trans, eye_c64(m).as_ref())
-            .expect("unmbr Q L C");
+        let qf_h = unmbr(
+            &f,
+            BidiagVect::Q,
+            Side::Left,
+            Trans::Trans,
+            eye_c64(m).as_ref(),
+        )
+        .expect("unmbr Q L C");
         assert_close_c64(&qf_h, &conj_t_c64(&qf), tol, &format!("{label}/QH"));
 
         // Right-side applications: I * Q = Q, I * Q^H = Q^H.
-        let qf_r = unmbr(&f, BidiagVect::Q, Side::Right, Trans::NoTrans, eye_c64(m).as_ref())
-            .expect("unmbr Q R N");
+        let qf_r = unmbr(
+            &f,
+            BidiagVect::Q,
+            Side::Right,
+            Trans::NoTrans,
+            eye_c64(m).as_ref(),
+        )
+        .expect("unmbr Q R N");
         assert_close_c64(&qf_r, &qf, tol, &format!("{label}/Q-right"));
-        let qf_rh = unmbr(&f, BidiagVect::Q, Side::Right, Trans::Trans, eye_c64(m).as_ref())
-            .expect("unmbr Q R C");
+        let qf_rh = unmbr(
+            &f,
+            BidiagVect::Q,
+            Side::Right,
+            Trans::Trans,
+            eye_c64(m).as_ref(),
+        )
+        .expect("unmbr Q R C");
         assert_close_c64(&qf_rh, &qf_h, tol, &format!("{label}/QH-right"));
 
         // Same battery for P (n x n).
-        let pf = unmbr(&f, BidiagVect::P, Side::Left, Trans::NoTrans, eye_c64(n).as_ref())
-            .expect("unmbr P L N");
+        let pf = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Left,
+            Trans::NoTrans,
+            eye_c64(n).as_ref(),
+        )
+        .expect("unmbr P L N");
         assert_close_c64(&pf, &p, tol, &format!("{label}/P-vs-apply"));
-        let pf_h = unmbr(&f, BidiagVect::P, Side::Left, Trans::Trans, eye_c64(n).as_ref())
-            .expect("unmbr P L C");
+        let pf_h = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Left,
+            Trans::Trans,
+            eye_c64(n).as_ref(),
+        )
+        .expect("unmbr P L C");
         assert_close_c64(&pf_h, &conj_t_c64(&pf), tol, &format!("{label}/PH"));
-        let pf_r = unmbr(&f, BidiagVect::P, Side::Right, Trans::NoTrans, eye_c64(n).as_ref())
-            .expect("unmbr P R N");
+        let pf_r = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Right,
+            Trans::NoTrans,
+            eye_c64(n).as_ref(),
+        )
+        .expect("unmbr P R N");
         assert_close_c64(&pf_r, &pf, tol, &format!("{label}/P-right"));
-        let pf_rh = unmbr(&f, BidiagVect::P, Side::Right, Trans::Trans, eye_c64(n).as_ref())
-            .expect("unmbr P R C");
+        let pf_rh = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Right,
+            Trans::Trans,
+            eye_c64(n).as_ref(),
+        )
+        .expect("unmbr P R C");
         assert_close_c64(&pf_rh, &pf_h, tol, &format!("{label}/PH-right"));
 
         // --- Reconstruction Q^H A P = B via apply, and the round trip back ---
-        let qh_a = unmbr(&f, BidiagVect::Q, Side::Left, Trans::Trans, a.as_ref())
-            .expect("unmbr Q^H A");
-        let b_full = unmbr(&f, BidiagVect::P, Side::Right, Trans::NoTrans, qh_a.as_ref())
-            .expect("unmbr (Q^H A) P");
+        let qh_a =
+            unmbr(&f, BidiagVect::Q, Side::Left, Trans::Trans, a.as_ref()).expect("unmbr Q^H A");
+        let b_full = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Right,
+            Trans::NoTrans,
+            qh_a.as_ref(),
+        )
+        .expect("unmbr (Q^H A) P");
         let b_full_ref = build_bidiag_c64(&f.d, &f.e, m, n, upper);
         assert_close_c64(&b_full, &b_full_ref, tol, &format!("{label}/QHAP-apply"));
 
         // A = Q * B * P^H, applied matrix-free.
-        let qb = unmbr(&f, BidiagVect::Q, Side::Left, Trans::NoTrans, b_full.as_ref())
-            .expect("unmbr Q B");
+        let qb = unmbr(
+            &f,
+            BidiagVect::Q,
+            Side::Left,
+            Trans::NoTrans,
+            b_full.as_ref(),
+        )
+        .expect("unmbr Q B");
         let a_rec = unmbr(&f, BidiagVect::P, Side::Right, Trans::Trans, qb.as_ref())
             .expect("unmbr (Q B) P^H");
         assert_close_c64(&a_rec, a, tol, &format!("{label}/roundtrip"));
@@ -1881,7 +1931,13 @@ mod tests {
         assert_eq!(res.err(), Some(BidiagError::DimensionMismatch));
         // P acts on n = 3 columns; a 2-column matrix is invalid for Side::Right.
         let bad2: Mat<Complex64> = Mat::zeros(4, 2);
-        let res2 = unmbr(&f, BidiagVect::P, Side::Right, Trans::NoTrans, bad2.as_ref());
+        let res2 = unmbr(
+            &f,
+            BidiagVect::P,
+            Side::Right,
+            Trans::NoTrans,
+            bad2.as_ref(),
+        );
         assert_eq!(res2.err(), Some(BidiagError::DimensionMismatch));
     }
 

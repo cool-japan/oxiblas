@@ -71,11 +71,7 @@ const MAX_JACOBI_SWEEPS: usize = 100;
 
 #[inline]
 fn fabs<R: Real>(x: R) -> R {
-    if x < R::zero() {
-        -x
-    } else {
-        x
-    }
+    if x < R::zero() { -x } else { x }
 }
 
 #[inline]
@@ -406,7 +402,11 @@ fn wilkinson_shift<R: Real>(t11: R, t12: R, t22: R) -> R {
     }
     let two = from_f64::<R>(2.0);
     let delta = (t11 - t22) / two;
-    let sign = if delta < R::zero() { -R::one() } else { R::one() };
+    let sign = if delta < R::zero() {
+        -R::one()
+    } else {
+        R::one()
+    };
     // λ = t22 − t12² / (δ + sign(δ)·√(δ² + t12²))
     let denom = delta + sign * rsqrt(delta * delta + t12 * t12);
     if denom == R::zero() {
@@ -630,11 +630,7 @@ fn tridiag_scale<R: Real>(diag: &[R], off: &[R]) -> R {
     for &x in off {
         s = s.max(fabs(x));
     }
-    if s > R::zero() {
-        s
-    } else {
-        R::one()
-    }
+    if s > R::zero() { s } else { R::one() }
 }
 
 // ---------------------------------------------------------------------------
@@ -660,11 +656,7 @@ fn tridiag_scale<R: Real>(diag: &[R], off: &[R]) -> R {
 /// eigenvalue attached to its own eigenvector even when negligible-coupling and
 /// coincident-eigenvalue deflations interleave.
 #[allow(clippy::type_complexity)]
-fn deflate<R>(
-    d: &[R],
-    u: &[R],
-    tol: R,
-) -> (Vec<R>, Vec<R>, Vec<usize>, Vec<(R, usize)>, Mat<R>)
+fn deflate<R>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Vec<(R, usize)>, Mat<R>)
 where
     R: Field + Real + bytemuck::Zeroable,
 {
@@ -758,11 +750,7 @@ where
 /// `ŵᵢ² = ∏ₖ(λₖ − dᵢ) / ∏_{k≠i}(dₖ − dᵢ)`, so that `vₖ[i] = ŵᵢ/(dᵢ − λₖ)`
 /// (normalised) is numerically orthogonal even for clustered eigenvalues.
 #[allow(clippy::type_complexity)]
-fn secular_eigenpairs<R>(
-    d: &[R],
-    u: &[R],
-    beta: R,
-) -> Result<(Vec<R>, Vec<Vec<R>>), BidiagDcError>
+fn secular_eigenpairs<R>(d: &[R], u: &[R], beta: R) -> Result<(Vec<R>, Vec<Vec<R>>), BidiagDcError>
 where
     R: Field + Real,
 {
@@ -773,7 +761,10 @@ where
 
     // Sort d ascending, permuting u alongside; remember the inverse map.
     let mut idx: Vec<usize> = (0..m).collect();
-    idx.sort_by(|&a, &b| d[a].partial_cmp(&d[b]).unwrap_or(core::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        d[a].partial_cmp(&d[b])
+            .unwrap_or(core::cmp::Ordering::Equal)
+    });
     let d_s: Vec<R> = idx.iter().map(|&i| d[i]).collect();
     let u_s: Vec<R> = idx.iter().map(|&i| u[i]).collect();
 
@@ -1237,7 +1228,11 @@ mod tests {
         assert_eq!(d_defl.len(), 3, "one active component should have deflated");
         assert_eq!(u_defl.len(), 3);
         assert_eq!(active_idx.len(), 3);
-        assert_eq!(trivial.len(), 1, "exactly one coincident pair should deflate");
+        assert_eq!(
+            trivial.len(),
+            1,
+            "exactly one coincident pair should deflate"
+        );
 
         // The survivor (original position 1) carries the combined coupling
         // r = √(0.8² + 0.6²) = 1.0; the deflated column is position 2, λ = 5.0.
@@ -1274,7 +1269,11 @@ mod tests {
             .map(|k| (0..n).map(|p| rot[(p, k)] * u[p]).sum::<f64>())
             .collect();
         assert!(u_hat[2].abs() < 1e-14, "coupling not zeroed: {}", u_hat[2]);
-        assert!((u_hat[1] - 1.0).abs() < 1e-14, "survivor coupling: {}", u_hat[1]);
+        assert!(
+            (u_hat[1] - 1.0).abs() < 1e-14,
+            "survivor coupling: {}",
+            u_hat[1]
+        );
 
         // (c) The deflated column q = rot[:,2] is an exact eigenvector of
         // M = D + β·u·uᵀ with eigenvalue λ = 5.0 (⟨u, q⟩ = 0 ⇒ M·q = D·q).
@@ -1285,7 +1284,10 @@ mod tests {
             let mq = d[p] * q[p] + beta * u[p] * u_dot_q;
             resid = resid.max((mq - defl_lambda * q[p]).abs());
         }
-        assert!(resid < 1e-13, "deflated column not an eigenvector: residual {resid}");
+        assert!(
+            resid < 1e-13,
+            "deflated column not an eigenvector: residual {resid}"
+        );
     }
 
     /// Full-SVD regression for genuinely repeated singular values: a
@@ -1298,7 +1300,9 @@ mod tests {
         let d0: Vec<f64> = (0..k)
             .map(|i| 2.5 + (i as f64 * 0.53).sin() + 0.4 * (i as f64 * 1.3).cos())
             .collect();
-        let e0: Vec<f64> = (0..k - 1).map(|i| 0.7 + 0.3 * (i as f64 * 0.8).cos()).collect();
+        let e0: Vec<f64> = (0..k - 1)
+            .map(|i| 0.7 + 0.3 * (i as f64 * 0.8).cos())
+            .collect();
 
         let mut d = Vec::with_capacity(2 * k);
         d.extend_from_slice(&d0);

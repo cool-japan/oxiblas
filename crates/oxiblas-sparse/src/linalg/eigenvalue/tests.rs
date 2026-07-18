@@ -917,7 +917,10 @@ fn test_hessenberg_eigensolver_and_ritz_vector() {
         );
     }
     for imi in &im {
-        assert!(imi.abs() < 1e-12, "eigenvalues must be real, got imag {imi}");
+        assert!(
+            imi.abs() < 1e-12,
+            "eigenvalues must be real, got imag {imi}"
+        );
     }
 
     // Each Ritz eigenvector must satisfy H y = lambda y to machine precision,
@@ -933,7 +936,10 @@ fn test_hessenberg_eigensolver_and_ritz_vector() {
                 *hyi += h[i][j] * yj;
             }
         }
-        let res: f64 = (0..3).map(|i| (hy[i] - lam * y[i]).powi(2)).sum::<f64>().sqrt();
+        let res: f64 = (0..3)
+            .map(|i| (hy[i] - lam * y[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!(
             res < 1e-9,
             "Ritz vector for lambda={lam} has residual ||Hy - lambda y||={res}"
@@ -1042,7 +1048,10 @@ fn test_iram_general_eigenvectors_residual() {
     for (k, x) in evecs.iter().enumerate() {
         assert_eq!(x.len(), n, "eigenvector {k} has wrong dimension");
         let xnorm: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(xnorm > 0.5, "eigenvector {k} must be nonzero (norm {xnorm})");
+        assert!(
+            xnorm > 0.5,
+            "eigenvector {k} must be nonzero (norm {xnorm})"
+        );
 
         let lambda = result.eigenvalues_real[k];
         let mut ax = vec![0.0; n];
@@ -2168,12 +2177,23 @@ fn test_interval_eigen_non_tridiagonal_general_path() {
 
     let mut evs = result.eigenvalues.clone();
     evs.sort_by(|x, y| x.partial_cmp(y).unwrap());
-    assert!((evs[0] - 3.0).abs() < 1e-4, "First eigenvalue ~3, got {}", evs[0]);
-    assert!((evs[1] - 5.0).abs() < 1e-4, "Second eigenvalue ~5, got {}", evs[1]);
+    assert!(
+        (evs[0] - 3.0).abs() < 1e-4,
+        "First eigenvalue ~3, got {}",
+        evs[0]
+    );
+    assert!(
+        (evs[1] - 5.0).abs() < 1e-4,
+        "Second eigenvalue ~5, got {}",
+        evs[1]
+    );
 
     // The verified residual bound must actually hold for each reported pair.
     for &res in &result.residual_norms {
-        assert!(res < 1e-8, "Reported eigenpair must satisfy the residual bound, got {res}");
+        assert!(
+            res < 1e-8,
+            "Reported eigenpair must satisfy the residual bound, got {res}"
+        );
     }
 
     // A disjoint sub-interval should find only eigenvalue 1.
@@ -2605,8 +2625,16 @@ fn test_iram_restart_complex_conjugate_spectrum() {
 
     // The recovered eigenvalues form two complex-conjugate pairs (two +imag, two -imag),
     // and the two magnitudes are distinct dominant blocks.
-    let n_pos = result.eigenvalues_imag.iter().filter(|im| **im > 0.5).count();
-    let n_neg = result.eigenvalues_imag.iter().filter(|im| **im < -0.5).count();
+    let n_pos = result
+        .eigenvalues_imag
+        .iter()
+        .filter(|im| **im > 0.5)
+        .count();
+    let n_neg = result
+        .eigenvalues_imag
+        .iter()
+        .filter(|im| **im < -0.5)
+        .count();
     assert_eq!(n_pos, 2, "expected two eigenvalues with +imag");
     assert_eq!(n_neg, 2, "expected two eigenvalues with -imag");
     assert!(

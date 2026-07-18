@@ -4,7 +4,6 @@
 
 use super::types::IRAMConfig;
 
-
 /// Implicitly Restarted Arnoldi Method (IRAM).
 ///
 /// IRAM is a memory-efficient eigenvalue algorithm that computes a few eigenvalues

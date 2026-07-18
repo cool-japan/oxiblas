@@ -567,7 +567,11 @@ fn merge_rank_one<T: Field + Real + bytemuck::Zeroable>(
             nrm_sq = nrm_sq + val * val;
         }
         let nrm = Real::sqrt(nrm_sq);
-        let inv = if nrm > T::zero() { T::one() / nrm } else { T::one() };
+        let inv = if nrm > T::zero() {
+            T::one() / nrm
+        } else {
+            T::one()
+        };
 
         for r in 0..n {
             let mut acc = T::zero();
@@ -1250,9 +1254,7 @@ mod tests {
             let qr_eigs = qr.eigenvalues();
 
             // Scale tolerance by the spectral radius.
-            let scale = qr_eigs
-                .iter()
-                .fold(1.0f64, |acc, &e| acc.max(e.abs()));
+            let scale = qr_eigs.iter().fold(1.0f64, |acc, &e| acc.max(e.abs()));
             let eig_tol = 1e-7 * scale * (n as f64).sqrt();
 
             for i in 0..n {
@@ -1409,6 +1411,10 @@ mod tests {
                 ortho = ortho.max((dot - expected).abs());
             }
         }
-        assert!(ortho <= 1e-3 * n as f32, "f32 orthogonality {} too large", ortho);
+        assert!(
+            ortho <= 1e-3 * n as f32,
+            "f32 orthogonality {} too large",
+            ortho
+        );
     }
 }

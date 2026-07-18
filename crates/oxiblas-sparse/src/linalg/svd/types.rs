@@ -1062,10 +1062,7 @@ mod incremental_exact_tests {
         let mut isvd = seed(
             vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             vec![4.0, 3.0],
-            vec![
-                vec![1.0, 0.0, 0.0, 0.0],
-                vec![0.0, 1.0, 0.0, 0.0],
-            ],
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
             8,
         );
         // Append e2 then e3. The second update's coupling matrix is
@@ -1082,7 +1079,11 @@ mod incremental_exact_tests {
         ];
         let (u, s, vt) = isvd.get_svd();
         let err = frobenius_diff(&expected, &reconstruct(u, s, vt));
-        assert!(err < 1e-10, "reconstruction error {} (was ~1.0 before fix)", err);
+        assert!(
+            err < 1e-10,
+            "reconstruction error {} (was ~1.0 before fix)",
+            err
+        );
         let mut sorted = s.to_vec();
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
         assert!((sorted[2] - 1.0).abs() < 1e-10, "s2 = {}", sorted[2]);
@@ -1105,8 +1106,7 @@ mod incremental_exact_tests {
         // Both appended rows have residuals along e2 only, so the residual block
         // is rank 1: the update must add exactly one new direction (rank 3), not
         // two (rank 4).
-        isvd
-            .add_rows(&[vec![1.0, 1.0, 1.0], vec![2.0, 0.0, 5.0]])
+        isvd.add_rows(&[vec![1.0, 1.0, 1.0], vec![2.0, 0.0, 5.0]])
             .unwrap();
         assert_eq!(isvd.dimensions(), (4, 3));
         assert_eq!(
@@ -1123,7 +1123,11 @@ mod incremental_exact_tests {
         ];
         let (u, s, vt) = isvd.get_svd();
         let err = frobenius_diff(&expected, &reconstruct(u, s, vt));
-        assert!(err < 1e-10, "reconstruction error {} (was ~2.74 before fix)", err);
+        assert!(
+            err < 1e-10,
+            "reconstruction error {} (was ~2.74 before fix)",
+            err
+        );
     }
 
     #[test]
@@ -1136,8 +1140,7 @@ mod incremental_exact_tests {
             vec![vec![1.0, 0.0], vec![0.0, 1.0]],
             8,
         );
-        isvd
-            .add_columns(&[vec![1.0, 1.0, 1.0], vec![0.0, 2.0, 5.0]])
+        isvd.add_columns(&[vec![1.0, 1.0, 1.0], vec![0.0, 2.0, 5.0]])
             .unwrap();
         assert_eq!(isvd.dimensions(), (3, 4));
         assert_eq!(
@@ -1217,10 +1220,7 @@ mod incremental_reconstruction_tests {
         ];
         let (u, s, vt) = isvd.get_svd();
         let err = frobenius_reconstruction_error(u, s, vt, &expected);
-        assert!(
-            err < 1e-6,
-            "add_rows reconstruction error too large: {err}"
-        );
+        assert!(err < 1e-6, "add_rows reconstruction error too large: {err}");
     }
 
     #[test]

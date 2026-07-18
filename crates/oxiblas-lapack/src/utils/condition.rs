@@ -593,7 +593,10 @@ mod tests {
         let rc_exact = rcond(a.as_ref()).unwrap();
 
         assert!(rc_est > 0.0);
-        assert!(rc_est < 1e-6, "near-singular matrix should have tiny rcond, got {rc_est}");
+        assert!(
+            rc_est < 1e-6,
+            "near-singular matrix should have tiny rcond, got {rc_est}"
+        );
         assert!(rc_est >= rc_exact * (1.0 - 1e-9));
         assert!(rc_est <= rc_exact * 5.0 + 1e-12);
     }

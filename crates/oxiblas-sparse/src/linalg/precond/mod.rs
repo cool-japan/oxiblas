@@ -1091,10 +1091,10 @@ mod tests {
         let mut prev_nnz = 0usize;
         for max_nnz in [1usize, 2, 3] {
             let config = SPAIConfig {
-                tolerance: 1e-6,       // tight enough that the cap, not tol, binds
+                tolerance: 1e-6, // tight enough that the cap, not tol, binds
                 max_nnz_per_col: max_nnz,
-                use_a_pattern: false,  // diagonal start so the cap is the only limit
-                max_iterations: 100,   // large enough to not bind
+                use_a_pattern: false, // diagonal start so the cap is the only limit
+                max_iterations: 100,  // large enough to not bind
             };
             let spai = SPAI::new(&a, config).unwrap();
 
@@ -1156,8 +1156,18 @@ mod tests {
         assert_eq!(nnz0, n, "max_iterations=0 must give a diagonal M");
         // Each additional round adds (at most) one index per column, so the fill
         // strictly increases while candidates remain.
-        assert!(nnz1 > nnz0, "one round did not grow fill: {} !> {}", nnz1, nnz0);
-        assert!(nnz2 > nnz1, "two rounds did not grow fill: {} !> {}", nnz2, nnz1);
+        assert!(
+            nnz1 > nnz0,
+            "one round did not grow fill: {} !> {}",
+            nnz1,
+            nnz0
+        );
+        assert!(
+            nnz2 > nnz1,
+            "two rounds did not grow fill: {} !> {}",
+            nnz2,
+            nnz1
+        );
     }
 
     #[test]

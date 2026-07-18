@@ -1001,12 +1001,8 @@ pub fn complex64_scale_real(a: &[Complex64], scalar: f64, out: &mut [Complex64])
     {
         unsafe {
             match _level {
-                SimdLevel::Simd512 => {
-                    map1::<C64x4>(a, out, |x| x.scale_real(scalar), sop)
-                }
-                SimdLevel::Simd256 => {
-                    map1::<C64x2>(a, out, |x| x.scale_real(scalar), sop)
-                }
+                SimdLevel::Simd512 => map1::<C64x4>(a, out, |x| x.scale_real(scalar), sop),
+                SimdLevel::Simd256 => map1::<C64x2>(a, out, |x| x.scale_real(scalar), sop),
                 _ => map1_scalar(a, out, sop),
             }
         }
@@ -1034,12 +1030,8 @@ pub fn complex32_scale_real(a: &[Complex32], scalar: f32, out: &mut [Complex32])
     {
         unsafe {
             match _level {
-                SimdLevel::Simd512 => {
-                    map1::<C32x8>(a, out, |x| x.scale_real(scalar), sop)
-                }
-                SimdLevel::Simd256 => {
-                    map1::<C32x4>(a, out, |x| x.scale_real(scalar), sop)
-                }
+                SimdLevel::Simd512 => map1::<C32x8>(a, out, |x| x.scale_real(scalar), sop),
+                SimdLevel::Simd256 => map1::<C32x4>(a, out, |x| x.scale_real(scalar), sop),
                 _ => map1_scalar(a, out, sop),
             }
         }

@@ -49,7 +49,6 @@ pub struct SvdDc<T: Scalar> {
 }
 
 impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
-
     /// Computes the full SVD of matrix A using divide-and-conquer algorithm.
     ///
     /// # Example
@@ -862,7 +861,10 @@ mod tests {
                     rec_err = rec_err.max((rec[(i, j)] - a[(i, j)]).abs());
                 }
             }
-            assert!(rec_err < 1e-8 * smax, "n={n}: reconstruction error {rec_err}");
+            assert!(
+                rec_err < 1e-8 * smax,
+                "n={n}: reconstruction error {rec_err}"
+            );
         }
     }
 }

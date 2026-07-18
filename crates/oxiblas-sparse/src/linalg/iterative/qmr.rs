@@ -580,7 +580,10 @@ mod tests {
         let mut ax = vec![0.0; 3];
         spmv(1.0, &a, &result.x, 0.0, &mut ax);
         for i in 0..3 {
-            assert!((ax[i] - b[i]).abs() < 1e-7, "PQMR solution incorrect at {i}");
+            assert!(
+                (ax[i] - b[i]).abs() < 1e-7,
+                "PQMR solution incorrect at {i}"
+            );
         }
     }
 

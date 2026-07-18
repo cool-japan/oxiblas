@@ -4,12 +4,12 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use super::super::error::{EigenvalueError, WhichEigenvalues};
+use super::super::utils::{dot, givens_rotation, norm};
 use crate::csr::CsrMatrix;
 use crate::ops::spmv;
 use num_traits::FromPrimitive;
 use oxiblas_core::scalar::{Field, Real, Scalar};
-use super::super::error::{EigenvalueError, WhichEigenvalues};
-use super::super::utils::{dot, givens_rotation, norm};
 
 use super::types::{IRAMConfig, IRAMResult};
 
@@ -486,9 +486,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
                 let residual = beta_m.clone() * last_comp;
                 residual_norms[idx] = residual.clone();
 
-                let ritz_mag = Real::sqrt(
-                    ref_re.clone() * ref_re.clone() + ref_im.clone() * ref_im.clone(),
-                );
+                let ritz_mag =
+                    Real::sqrt(ref_re.clone() * ref_re.clone() + ref_im.clone() * ref_im.clone());
 
                 if residual <= self.config.tolerance * ritz_mag.max(T::one()) {
                     converged_count += 1;
@@ -578,7 +577,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
                         let proj = dot(&arnoldi_vectors[i], &w);
                         h[i][j] = h[i][j].clone() + proj.clone();
                         for idx in 0..n {
-                            w[idx] = w[idx].clone() - proj.clone() * arnoldi_vectors[i][idx].clone();
+                            w[idx] =
+                                w[idx].clone() - proj.clone() * arnoldi_vectors[i][idx].clone();
                         }
                     }
                 }
@@ -1023,5 +1023,4 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
 
         (wanted_indices, unwanted_values)
     }
-
 }

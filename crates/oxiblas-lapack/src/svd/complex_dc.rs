@@ -57,7 +57,6 @@ impl<T: Field + ComplexScalar + bytemuck::Zeroable> ComplexSvdDc<T>
 where
     T::Real: Field + Real + bytemuck::Zeroable,
 {
-
     /// Computes the full SVD of a complex matrix A using divide-and-conquer algorithm.
     ///
     /// # Example
@@ -216,9 +215,7 @@ where
         e: &[T::Real],
     ) -> Result<(Mat<T::Real>, Vec<T::Real>, Mat<T::Real>), ComplexSvdDcError> {
         crate::svd::bidiag_dc::bidiagonal_svd_dc(d, e).map_err(|err| match err {
-            crate::svd::bidiag_dc::BidiagDcError::NotConverged => {
-                ComplexSvdDcError::NotConverged
-            }
+            crate::svd::bidiag_dc::BidiagDcError::NotConverged => ComplexSvdDcError::NotConverged,
             crate::svd::bidiag_dc::BidiagDcError::SecularEquationFailed => {
                 ComplexSvdDcError::SecularEquationFailed
             }
@@ -1349,7 +1346,10 @@ mod tests {
                     rec_err = rec_err.max((rec[(i, j)] - a[(i, j)]).norm());
                 }
             }
-            assert!(rec_err < 1e-8 * smax, "n={n}: reconstruction error {rec_err}");
+            assert!(
+                rec_err < 1e-8 * smax,
+                "n={n}: reconstruction error {rec_err}"
+            );
 
             for k in 1..n {
                 assert!(

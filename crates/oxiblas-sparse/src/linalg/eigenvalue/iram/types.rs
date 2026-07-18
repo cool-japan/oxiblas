@@ -4,7 +4,6 @@
 
 use super::super::error::WhichEigenvalues;
 
-
 /// Configuration for IRAM (Implicitly Restarted Arnoldi Method).
 #[derive(Debug, Clone)]
 pub struct IRAMConfig<T> {

@@ -4,12 +4,12 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use super::super::error::WhichEigenvalues;
+use super::super::utils::{dot, norm};
 use crate::csr::CsrMatrix;
 use crate::ops::spmv;
 use num_traits::FromPrimitive;
 use oxiblas_core::scalar::{Field, Real, Scalar};
-use super::super::error::WhichEigenvalues;
-use super::super::utils::{dot, norm};
 
 use super::iram_type::IRAM;
 
@@ -351,7 +351,14 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
     /// the first column of `H^2 - s*H + t*I` (nonzero only in its first three entries),
     /// and the width-2 bulge it creates is chased down with length-3 Householder
     /// reflectors (length-2 at the very bottom). Everything stays in real arithmetic.
-    pub(super) fn francis_double_shift(&self, h: &mut [Vec<T>], q: &mut [Vec<T>], s: T, t: T, m: usize) {
+    pub(super) fn francis_double_shift(
+        &self,
+        h: &mut [Vec<T>],
+        q: &mut [Vec<T>],
+        s: T,
+        t: T,
+        m: usize,
+    ) {
         if m < 2 {
             return;
         }
@@ -757,7 +764,13 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
     /// refined eigenvalue are reliable even though the input Ritz value is not.
     ///
     /// Returns `(y_re, y_im, refined_re, refined_im)` with `y` normalised to unit 2-norm.
-    pub(super) fn ritz_eigenvector(&self, h: &[Vec<T>], m: usize, re: T, im: T) -> (Vec<T>, Vec<T>, T, T) {
+    pub(super) fn ritz_eigenvector(
+        &self,
+        h: &[Vec<T>],
+        m: usize,
+        re: T,
+        im: T,
+    ) -> (Vec<T>, Vec<T>, T, T) {
         if m == 0 {
             return (vec![], vec![], re, im);
         }
@@ -785,9 +798,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
             );
             let mut nrm_sq = T::zero();
             for i in 0..m {
-                nrm_sq = nrm_sq
-                    + z_re[i].clone() * z_re[i].clone()
-                    + z_im[i].clone() * z_im[i].clone();
+                nrm_sq =
+                    nrm_sq + z_re[i].clone() * z_re[i].clone() + z_im[i].clone() * z_im[i].clone();
             }
             let nrm = Real::sqrt(nrm_sq);
             if nrm <= <T as Scalar>::epsilon() {
@@ -817,8 +829,11 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
             let mut num_im = T::zero();
             for i in 0..m {
                 // conj(y_i) * (H y)_i
-                num_re = num_re + y_re[i].clone() * hy_re[i].clone() + y_im[i].clone() * hy_im[i].clone();
-                num_im = num_im + y_re[i].clone() * hy_im[i].clone() - y_im[i].clone() * hy_re[i].clone();
+                num_re = num_re
+                    + y_re[i].clone() * hy_re[i].clone()
+                    + y_im[i].clone() * hy_im[i].clone();
+                num_im = num_im + y_re[i].clone() * hy_im[i].clone()
+                    - y_im[i].clone() * hy_re[i].clone();
             }
 
             let delta = Scalar::abs(num_re.clone() - theta_re.clone())
@@ -968,5 +983,4 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IRAM<T> {
     pub(super) fn cmag(ar: T, ai: T) -> T {
         Real::sqrt(ar.clone() * ar.clone() + ai.clone() * ai.clone())
     }
-
 }

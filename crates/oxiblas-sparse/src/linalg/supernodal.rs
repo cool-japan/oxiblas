@@ -1407,7 +1407,12 @@ mod tests {
         let x = lu.solve(&b);
 
         for i in 0..4 {
-            assert!((x[i] - b[i]).abs() < 1e-12, "identity solve at {}: {}", i, x[i]);
+            assert!(
+                (x[i] - b[i]).abs() < 1e-12,
+                "identity solve at {}: {}",
+                i,
+                x[i]
+            );
         }
     }
 

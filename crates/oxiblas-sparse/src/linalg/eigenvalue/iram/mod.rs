@@ -16,10 +16,10 @@
 //! For symmetric matrices, IRAM reduces to Implicitly Restarted Lanczos (IRL),
 //! where H is tridiagonal and the algorithm is more efficient.
 
-pub mod iramconfig_traits;
 pub mod iram_impl;
 pub mod iram_impl_2;
 pub mod iram_type;
+pub mod iramconfig_traits;
 pub mod types;
 
 // Re-export all types

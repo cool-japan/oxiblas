@@ -1131,7 +1131,10 @@ mod tests {
         });
         assert_eq!(m.nrows(), 5);
         assert_eq!(m.ncols(), 0);
-        assert_eq!(calls, 0, "closure must not be called for a 0-column builder");
+        assert_eq!(
+            calls, 0,
+            "closure must not be called for a 0-column builder"
+        );
     }
 
     #[test]

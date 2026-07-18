@@ -777,7 +777,9 @@ fn refine_relative<T: Field + Real>(
     for _ in 0..MAX_BISECTION_ITER {
         let mid = (lo + hi) / two;
         let width = hi - lo;
-        if width <= two * params.eps * (Scalar::abs(mid) + params.spdiam) + <T as Scalar>::min_positive() {
+        if width
+            <= two * params.eps * (Scalar::abs(mid) + params.spdiam) + <T as Scalar>::min_positive()
+        {
             break;
         }
         if rrr.neg_count(mid, params.pivmin) <= i {
@@ -1016,8 +1018,8 @@ fn gershgorin_bounds<T: Field + Real>(diagonal: &[T], off_diagonal: &[T]) -> (T,
         max = last_high;
     }
 
-    let margin = (max - min) * T::from_f64(0.01).unwrap_or_else(T::zero)
-        + <T as Scalar>::min_positive();
+    let margin =
+        (max - min) * T::from_f64(0.01).unwrap_or_else(T::zero) + <T as Scalar>::min_positive();
     (min - margin, max + margin)
 }
 
@@ -1419,7 +1421,9 @@ mod tests {
         // Simple LCG for reproducible entries in [-1, 1].
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f64 / (1u64 << 31) as f64) - 1.0
         };
         let diag: Vec<f64> = (0..n).map(|_| 3.0 * next()).collect();

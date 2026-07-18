@@ -880,7 +880,11 @@ mod tests {
         let (u, s, vt) = isvd.get_svd();
         let recon = reconstruct_from_incremental(u, s, vt);
         let err = frobenius_diff(&expected, &recon);
-        assert!(err < 1e-6, "reconstruction error {} (expected near zero)", err);
+        assert!(
+            err < 1e-6,
+            "reconstruction error {} (expected near zero)",
+            err
+        );
         let mut sorted = s.to_vec();
         sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
         assert_eq!(sorted.len(), 4);
@@ -916,6 +920,10 @@ mod tests {
         let (u, s, vt) = isvd.get_svd();
         let recon = reconstruct_from_incremental(u, s, vt);
         let err = frobenius_diff(&expected, &recon);
-        assert!(err < 1e-6, "reconstruction error {} (expected near zero)", err);
+        assert!(
+            err < 1e-6,
+            "reconstruction error {} (expected near zero)",
+            err
+        );
     }
 }

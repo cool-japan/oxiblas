@@ -78,8 +78,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
             let mut l: isize = nn;
             while l >= 1 {
                 let li = l as usize;
-                let mut s =
-                    Scalar::abs(a[li - 1][li - 1].clone()) + Scalar::abs(a[li][li].clone());
+                let mut s = Scalar::abs(a[li - 1][li - 1].clone()) + Scalar::abs(a[li][li].clone());
                 if s <= eps.clone() * anorm.clone() {
                     s = anorm.clone();
                 }
@@ -171,8 +170,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
                     for i in 0..=nu {
                         a[i][i] = a[i][i].clone() - xx.clone();
                     }
-                    let s = Scalar::abs(a[nu][nu - 1].clone())
-                        + Scalar::abs(a[nu - 1][nu - 2].clone());
+                    let s =
+                        Scalar::abs(a[nu][nu - 1].clone()) + Scalar::abs(a[nu - 1][nu - 2].clone());
                     xx = c075.clone() * s.clone();
                     yy = xx.clone();
                     ww = T::zero() - c04375.clone() * s.clone() * s.clone();
@@ -335,8 +334,11 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
             }
             _ => {
                 // Algebraic orderings compare the real part.
-                let mut real_indexed: Vec<(usize, T)> =
-                    real.iter().enumerate().map(|(i, r)| (i, r.clone())).collect();
+                let mut real_indexed: Vec<(usize, T)> = real
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i, r.clone()))
+                    .collect();
                 match self.config.which {
                     WhichEigenvalues::LargestAlgebraic => {
                         real_indexed.sort_by(|x, y| {
@@ -583,7 +585,13 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
 
     /// Solve `(H - shift I) y = rhs` for an upper Hessenberg matrix H via a Givens QR
     /// factorization followed by back-substitution.
-    pub(super) fn solve_hessenberg_shifted(&self, h: &[Vec<T>], m: usize, shift: &T, rhs: &[T]) -> Vec<T> {
+    pub(super) fn solve_hessenberg_shifted(
+        &self,
+        h: &[Vec<T>],
+        m: usize,
+        shift: &T,
+        rhs: &[T],
+    ) -> Vec<T> {
         let mut a: Vec<Vec<T>> = (0..m)
             .map(|i| {
                 let mut row = vec![T::zero(); m];
@@ -644,7 +652,12 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
     /// eigenvalues to working precision. The pairs are returned sorted by ascending
     /// eigenvalue, with `eigenvectors[k]` the eigenvector (in the tridiagonal basis) for
     /// `eigenvalues[k]`.
-    pub(super) fn symmetric_tridiag_qr(&self, alpha: &[T], beta: &[T], m: usize) -> (Vec<T>, Vec<Vec<T>>) {
+    pub(super) fn symmetric_tridiag_qr(
+        &self,
+        alpha: &[T],
+        beta: &[T],
+        m: usize,
+    ) -> (Vec<T>, Vec<Vec<T>>) {
         if m == 0 {
             return (vec![], vec![]);
         }
@@ -788,7 +801,11 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> GeneralizedEige
     /// which is orthogonally similar to `T` and preserves the (symmetric) tridiagonal
     /// structure. `Q` is exactly the orthogonal factor, so `V_new = V Q` keeps the
     /// (B-orthonormal) Krylov basis consistent during an implicit restart.
-    pub(super) fn tridiag_qr_step(alpha: &[T], beta: &[T], shift: T) -> (Vec<Vec<T>>, Vec<T>, Vec<T>) {
+    pub(super) fn tridiag_qr_step(
+        alpha: &[T],
+        beta: &[T],
+        shift: T,
+    ) -> (Vec<Vec<T>>, Vec<T>, Vec<T>) {
         let m = alpha.len();
         if m == 0 {
             return (vec![], vec![], vec![]);

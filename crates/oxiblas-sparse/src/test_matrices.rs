@@ -871,7 +871,14 @@ mod tests {
         // (with real, positive diagonal L) when A is SPD.
         use crate::linalg::cholesky::SparseCholesky;
 
-        for &(n, density) in &[(1usize, 0.0f64), (5, 0.0), (10, 0.3), (20, 0.2), (15, 0.4), (40, 0.6)] {
+        for &(n, density) in &[
+            (1usize, 0.0f64),
+            (5, 0.0),
+            (10, 0.3),
+            (20, 0.2),
+            (15, 0.4),
+            (40, 0.6),
+        ] {
             let mat = random_spd(n, density).expect("Failed to create random SPD");
             let csc = mat.to_csc();
             let chol = SparseCholesky::new(&csc);

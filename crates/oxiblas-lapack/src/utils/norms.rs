@@ -402,10 +402,7 @@ mod tests {
         let result = trace(a.as_ref());
         assert!(matches!(
             result,
-            Err(TraceError::NotSquare {
-                nrows: 2,
-                ncols: 3
-            })
+            Err(TraceError::NotSquare { nrows: 2, ncols: 3 })
         ));
     }
 

@@ -1355,7 +1355,11 @@ mod tests {
         // Cross-check by residual: A x must reproduce b.
         for i in 0..3 {
             let axi = a[[i, 0]] * x[0] + a[[i, 1]] * x[1] + a[[i, 2]] * x[2];
-            assert!((axi - b[i]).abs() < 1e-10, "residual row {i}: {axi} != {}", b[i]);
+            assert!(
+                (axi - b[i]).abs() < 1e-10,
+                "residual row {i}: {axi} != {}",
+                b[i]
+            );
         }
     }
 
@@ -1372,8 +1376,7 @@ mod tests {
         assert_eq!(x_spd.len(), 0);
 
         let b_empty: Array2<f64> = Array2::zeros((0, 3));
-        let x_multi =
-            tridiag_solve_multiple_ndarray(&empty1, &empty1, &empty1, &b_empty).unwrap();
+        let x_multi = tridiag_solve_multiple_ndarray(&empty1, &empty1, &empty1, &b_empty).unwrap();
         assert_eq!(x_multi.dim(), (0, 3));
     }
 

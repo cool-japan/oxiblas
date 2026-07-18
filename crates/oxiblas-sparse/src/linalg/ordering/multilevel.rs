@@ -975,11 +975,7 @@ fn minimum_degree_local(n: usize, xadj: &[usize], adjncy: &[usize]) -> Vec<usize
         order.push(v);
 
         // Fill: the surviving neighbors of the eliminated vertex become a clique.
-        let neighbors: Vec<usize> = adj[v]
-            .iter()
-            .copied()
-            .filter(|&u| !eliminated[u])
-            .collect();
+        let neighbors: Vec<usize> = adj[v].iter().copied().filter(|&u| !eliminated[u]).collect();
         for &u in &neighbors {
             adj[u].remove(&v);
         }

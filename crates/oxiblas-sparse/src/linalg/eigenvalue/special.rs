@@ -264,9 +264,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
         let mut eigenvalues = Vec::with_capacity(candidates.len());
         let mut eigenvectors = Vec::with_capacity(candidates.len());
         let mut residual_norms = Vec::with_capacity(candidates.len());
-        for ((lambda, ritz_vec), residual) in
-            candidates.iter().zip(ritz_vectors).zip(residuals)
-        {
+        for ((lambda, ritz_vec), residual) in candidates.iter().zip(ritz_vectors).zip(residuals) {
             let in_interval = *lambda >= self.config.low && *lambda <= self.config.high;
             if in_interval && residual < verify_tol {
                 eigenvalues.push(lambda.clone());
@@ -366,43 +364,43 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
 
         let eigenvalues = self.find_eigenvalues_in_interval(diag_a, off_a, count)?;
 
-        let (eigenvectors, residual_norms) =
-            if self.config.compute_eigenvectors && !eigenvalues.is_empty() {
-                let eps = T::from_f64(1e-15).unwrap_or_else(T::zero);
-                let mut evecs = Vec::with_capacity(eigenvalues.len());
-                let mut resids = Vec::with_capacity(eigenvalues.len());
-                for lambda in &eigenvalues {
-                    // Eigenvector of `A` via inverse iteration on its bands.
-                    let mut x =
-                        self.inverse_iteration_tridiagonal(diag_a, off_a, lambda.clone())?;
+        let (eigenvectors, residual_norms) = if self.config.compute_eigenvectors
+            && !eigenvalues.is_empty()
+        {
+            let eps = T::from_f64(1e-15).unwrap_or_else(T::zero);
+            let mut evecs = Vec::with_capacity(eigenvalues.len());
+            let mut resids = Vec::with_capacity(eigenvalues.len());
+            for lambda in &eigenvalues {
+                // Eigenvector of `A` via inverse iteration on its bands.
+                let mut x = self.inverse_iteration_tridiagonal(diag_a, off_a, lambda.clone())?;
 
-                    // Normalize.
-                    let mut norm_sq = T::zero();
-                    for xi in &x {
-                        norm_sq = norm_sq + xi.clone() * xi.clone();
-                    }
-                    let norm = Real::sqrt(norm_sq);
-                    if norm > eps {
-                        for xi in &mut x {
-                            *xi = xi.clone() / norm.clone();
-                        }
-                    }
-
-                    // Residual ||A x - lambda x||.
-                    let mut ax = vec![T::zero(); n];
-                    spmv(T::one(), a, &x, T::zero(), &mut ax);
-                    let mut res_sq = T::zero();
-                    for i in 0..n {
-                        let diff = ax[i].clone() - lambda.clone() * x[i].clone();
-                        res_sq = res_sq + diff.clone() * diff;
-                    }
-                    resids.push(Real::sqrt(res_sq));
-                    evecs.push(x);
+                // Normalize.
+                let mut norm_sq = T::zero();
+                for xi in &x {
+                    norm_sq = norm_sq + xi.clone() * xi.clone();
                 }
-                (Some(evecs), resids)
-            } else {
-                (None, vec![T::zero(); eigenvalues.len()])
-            };
+                let norm = Real::sqrt(norm_sq);
+                if norm > eps {
+                    for xi in &mut x {
+                        *xi = xi.clone() / norm.clone();
+                    }
+                }
+
+                // Residual ||A x - lambda x||.
+                let mut ax = vec![T::zero(); n];
+                spmv(T::one(), a, &x, T::zero(), &mut ax);
+                let mut res_sq = T::zero();
+                for i in 0..n {
+                    let diff = ax[i].clone() - lambda.clone() * x[i].clone();
+                    res_sq = res_sq + diff.clone() * diff;
+                }
+                resids.push(Real::sqrt(res_sq));
+                evecs.push(x);
+            }
+            (Some(evecs), resids)
+        } else {
+            (None, vec![T::zero(); eigenvalues.len()])
+        };
 
         Ok(IntervalEigenResult {
             count: eigenvalues.len(),
@@ -1102,13 +1100,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         let dedup_tol = {
             let width = Scalar::abs(lambda_max.clone() - lambda_min.clone());
             let rel = width * Real::sqrt(<T as Scalar>::epsilon());
-            let abs = self.config.tolerance.clone()
-                * T::from_f64(8.0).unwrap_or_else(T::zero);
-            if rel > abs {
-                rel
-            } else {
-                abs
-            }
+            let abs = self.config.tolerance.clone() * T::from_f64(8.0).unwrap_or_else(T::zero);
+            if rel > abs { rel } else { abs }
         };
 
         for iter in 0..self.config.max_iterations {
@@ -1176,8 +1169,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             let (ritz_vals, ritz_vecs) = dense_symmetric_jacobi_evd(&h);
 
             // Examine Ritz values in order of proximity to the target interval.
-            let target_center = (self.config.target_low.clone()
-                + self.config.target_high.clone())
+            let target_center = (self.config.target_low.clone() + self.config.target_high.clone())
                 / T::from_f64(2.0).unwrap_or_else(T::zero);
             let mut order: Vec<usize> = (0..ritz_vals.len()).collect();
             order.sort_by(|&i, &j| {

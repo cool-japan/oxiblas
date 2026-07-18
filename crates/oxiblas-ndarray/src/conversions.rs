@@ -724,8 +724,7 @@ mod tests {
 
         // Column-major 3x4 array: strides = [1, 3]. Reversing the column
         // axis flips strides[1] negative while strides[0] stays 1.
-        let col_major: Array2<f64> =
-            Array2::from_shape_fn((3, 4).f(), |(i, j)| (i * 4 + j) as f64);
+        let col_major: Array2<f64> = Array2::from_shape_fn((3, 4).f(), |(i, j)| (i * 4 + j) as f64);
         let reversed = col_major.slice(s![.., ..;-1]);
         assert_eq!(reversed.strides()[0], 1);
         assert!(reversed.strides()[1] < 0);
@@ -754,8 +753,7 @@ mod tests {
         // Build the negative-stride view on a statically 2D array first
         // (so the `s![]` macro produces a fixed Ix2 output dimension), then
         // erase the dimension to IxDyn while preserving the strides/layout.
-        let col_major: Array2<f64> =
-            Array2::from_shape_fn((3, 4).f(), |(i, j)| (i * 4 + j) as f64);
+        let col_major: Array2<f64> = Array2::from_shape_fn((3, 4).f(), |(i, j)| (i * 4 + j) as f64);
         let reversed = col_major.slice(s![.., ..;-1]).into_dyn();
         assert_eq!(reversed.strides()[0], 1);
         assert!(reversed.strides()[1] < 0);

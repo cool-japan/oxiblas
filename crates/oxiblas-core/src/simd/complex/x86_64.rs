@@ -281,10 +281,7 @@ impl ComplexSimdRegister for C32x4 {
     fn conj(self) -> Self {
         #[target_feature(enable = "avx")]
         unsafe fn imp(x: __m256) -> __m256 {
-            _mm256_mul_ps(
-                x,
-                _mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0),
-            )
+            _mm256_mul_ps(x, _mm256_set_ps(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0))
         }
         unsafe { C32x4(imp(self.0)) }
     }
@@ -421,10 +418,7 @@ impl ComplexSimdRegister for C64x4 {
     fn conj(self) -> Self {
         #[target_feature(enable = "avx512f")]
         unsafe fn imp(x: __m512d) -> __m512d {
-            _mm512_mul_pd(
-                x,
-                _mm512_set_pd(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0),
-            )
+            _mm512_mul_pd(x, _mm512_set_pd(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0))
         }
         unsafe { C64x4(imp(self.0)) }
     }

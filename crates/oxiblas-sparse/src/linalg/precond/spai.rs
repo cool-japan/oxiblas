@@ -260,8 +260,14 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
             }
 
             // Pattern augmentation: pick the single most profitable new index.
-            let candidate =
-                Self::best_candidate(a, &j_set, &solved.i_set, &solved.residual, col_norm_sq, &drop_tol);
+            let candidate = Self::best_candidate(
+                a,
+                &j_set,
+                &solved.i_set,
+                &solved.residual,
+                col_norm_sq,
+                &drop_tol,
+            );
 
             match candidate {
                 Some(new_idx) => match j_set.binary_search(&new_idx) {

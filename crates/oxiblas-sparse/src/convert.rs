@@ -193,7 +193,12 @@ pub fn coo_to_csr<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
         if row != current_row {
             // Row boundary: flush the completed row, then fill any fully
             // empty rows between it and the new row.
-            flush_coo_group(&mut row_col_buf, &mut row_val_buf, &mut col_indices, &mut values);
+            flush_coo_group(
+                &mut row_col_buf,
+                &mut row_val_buf,
+                &mut col_indices,
+                &mut values,
+            );
             row_ptrs.push(values.len());
             current_row += 1;
 
@@ -215,7 +220,12 @@ pub fn coo_to_csr<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
     }
 
     // Flush the final row's buffer.
-    flush_coo_group(&mut row_col_buf, &mut row_val_buf, &mut col_indices, &mut values);
+    flush_coo_group(
+        &mut row_col_buf,
+        &mut row_val_buf,
+        &mut col_indices,
+        &mut values,
+    );
     row_ptrs.push(values.len());
     current_row += 1;
 
@@ -268,7 +278,12 @@ pub fn coo_to_csc<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
         if col != current_col {
             // Column boundary: flush the completed column, then fill any
             // fully empty columns between it and the new column.
-            flush_coo_group(&mut col_row_buf, &mut col_val_buf, &mut row_indices, &mut values);
+            flush_coo_group(
+                &mut col_row_buf,
+                &mut col_val_buf,
+                &mut row_indices,
+                &mut values,
+            );
             col_ptrs.push(values.len());
             current_col += 1;
 
@@ -290,7 +305,12 @@ pub fn coo_to_csc<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
     }
 
     // Flush the final column's buffer.
-    flush_coo_group(&mut col_row_buf, &mut col_val_buf, &mut row_indices, &mut values);
+    flush_coo_group(
+        &mut col_row_buf,
+        &mut col_val_buf,
+        &mut row_indices,
+        &mut values,
+    );
     col_ptrs.push(values.len());
     current_col += 1;
 

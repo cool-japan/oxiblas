@@ -1392,7 +1392,12 @@ fn householder_3<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
         v_norm_sq = v_norm_sq + v[i] * v[i];
     }
 
-    if v_norm_sq > T::zero() {
+    // `!= zero` (not `> zero`): `v_norm_sq` is NaN whenever `x` contains a
+    // NaN (the un-gated sum-of-squares above propagates it correctly), and
+    // `>` is always false for NaN — silently downgrading a poisoned norm to
+    // the identity-reflector fallback (`tau = 0`) instead of honestly
+    // returning a NaN `tau`.
+    if v_norm_sq != T::zero() {
         let tau = T::from_f64(2.0).unwrap_or_else(T::zero) / v_norm_sq;
         (v, tau)
     } else {

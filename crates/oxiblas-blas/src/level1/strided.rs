@@ -499,13 +499,21 @@ pub fn nrm2_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
     let mut ssq = T::one();
     for i in 0..n {
         let abs_xi = Scalar::abs(x.get(i));
-        if abs_xi > T::zero() {
+        // `!= zero` (not `> zero`): a NaN `abs_xi` must still enter this
+        // branch and poison the accumulator, matching `nrm2_fold` in
+        // `level1/nrm2.rs` (`>` is always false for NaN, which would
+        // otherwise silently drop a NaN element from the norm).
+        if abs_xi != T::zero() {
             if scale < abs_xi {
                 let t = scale / abs_xi;
                 ssq = T::one() + ssq * t * t;
                 scale = abs_xi;
             } else {
-                let t = abs_xi / scale;
+                let t = if scale == abs_xi {
+                    T::one()
+                } else {
+                    abs_xi / scale
+                };
                 ssq += t * t;
             }
         }

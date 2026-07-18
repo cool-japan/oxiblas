@@ -771,14 +771,19 @@ where
         let diag = l_matrix[(i, i)];
         let diag_abs = Scalar::abs(diag);
 
-        if diag <= T::zero() {
+        // `<=`/`>` are always false for NaN, so a NaN diagonal would
+        // otherwise silently skip both the failure flag and the min/max
+        // tracking below instead of correctly signaling a broken
+        // factorization (`diag.is_nan()` catches what `diag <= T::zero()`
+        // misses).
+        if diag.is_nan() || diag <= T::zero() {
             failure_index = Some(i);
         }
 
-        if diag_abs > max_diag {
+        if diag_abs.is_nan() || diag_abs > max_diag {
             max_diag = diag_abs;
         }
-        if diag_abs < min_diag && diag_abs > T::zero() {
+        if diag_abs.is_nan() || (diag_abs > T::zero() && diag_abs < min_diag) {
             min_diag = diag_abs;
         }
         if diag > T::zero() {

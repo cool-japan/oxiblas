@@ -214,13 +214,16 @@ pub unsafe extern "C" fn cblas_dnrm2(n: i32, x: *const f64, incx: i32) -> f64 {
     let mut ix = 0isize;
     for _ in 0..n {
         let abs_xi = (*x.offset(ix)).abs();
-        if abs_xi > 0.0 {
+        // `!= 0.0` (not `> 0.0`): a NaN element must still enter this branch
+        // and poison the accumulator, matching `nrm2_fold` in
+        // `level1/nrm2.rs` (`>` is always false for NaN).
+        if abs_xi != 0.0 {
             if scale < abs_xi {
                 let t = scale / abs_xi;
                 ssq = (ssq * t).mul_add(t, 1.0);
                 scale = abs_xi;
             } else {
-                let t = abs_xi / scale;
+                let t = if scale == abs_xi { 1.0 } else { abs_xi / scale };
                 ssq += t * t;
             }
         }
@@ -256,13 +259,16 @@ pub unsafe extern "C" fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32 {
     let mut ix = 0isize;
     for _ in 0..n {
         let abs_xi = (*x.offset(ix)).abs();
-        if abs_xi > 0.0 {
+        // `!= 0.0` (not `> 0.0`): a NaN element must still enter this branch
+        // and poison the accumulator, matching `nrm2_fold` in
+        // `level1/nrm2.rs` (`>` is always false for NaN).
+        if abs_xi != 0.0 {
             if scale < abs_xi {
                 let t = scale / abs_xi;
                 ssq = (ssq * t).mul_add(t, 1.0);
                 scale = abs_xi;
             } else {
-                let t = abs_xi / scale;
+                let t = if scale == abs_xi { 1.0 } else { abs_xi / scale };
                 ssq += t * t;
             }
         }

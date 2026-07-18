@@ -907,13 +907,23 @@ fn householder_vector<T: Field + Real>(qr: &mut Mat<T>, j: usize, m: usize, _n: 
     let mut running_ssq = T::one();
     for i in j..m {
         let abs_val = Scalar::abs(qr[(i, j)]);
-        if abs_val > T::zero() {
+        // `!= zero` (not `> zero`) is required so a NaN `abs_val` still enters
+        // this branch and poisons the accumulator, matching the equivalent
+        // scaled-accumulation guard in `nrm2_fold`
+        // (crates/oxiblas-blas/src/level1/nrm2.rs) — `>` is always false for
+        // NaN operands, which previously let a NaN column entry silently
+        // vanish from the norm instead of propagating.
+        if abs_val != T::zero() {
             if running_scale < abs_val {
                 let t = running_scale / abs_val;
                 running_ssq = T::one() + running_ssq * t * t;
                 running_scale = abs_val;
             } else {
-                let t = abs_val / running_scale;
+                let t = if running_scale == abs_val {
+                    T::one()
+                } else {
+                    abs_val / running_scale
+                };
                 running_ssq = running_ssq + t * t;
             }
         }

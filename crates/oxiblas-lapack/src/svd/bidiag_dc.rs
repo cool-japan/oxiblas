@@ -21,8 +21,13 @@
 //!    diagonal `D` (their eigenvalues) and block-diagonal eigenvector matrix
 //!    `Q = diag(Q₁, Q₂)`.
 //! 3. **Deflate** – eigenpairs whose rank-one coupling component `uᵢ` is
-//!    negligible, and numerically-coincident eigenvalues, are deflated: they
-//!    pass through unchanged, contributing their (trivial) eigenvector directly.
+//!    negligible pass through unchanged (their eigenvector is the corresponding
+//!    unit vector). Numerically-coincident eigenvalues are deflated by the exact
+//!    `dlaed2` Givens rotation `G(i,j)` (`c = uᵢ/r, s = uⱼ/r, r = √(uᵢ²+uⱼ²)`):
+//!    it merges the coupling pair `(uᵢ, uⱼ) → (r, 0)` and rotates the two
+//!    accumulated eigenvector columns together, so column `j` becomes an exact
+//!    eigenvector that deflates out while column `i` keeps the combined coupling
+//!    `r` and stays in the active secular problem.
 //! 4. **Secular equation** – the remaining eigenvalues solve
 //!    `f(λ) = 1 + |β|·Σᵢ uᵢ²/(dᵢ − λ) = 0`, found by safeguarded
 //!    Newton–Raphson with bisection fall-back.  The associated eigenvectors are
@@ -508,7 +513,7 @@ where
     }
 
     let deflation_tol = eps * from_f64::<R>(n as f64) * scale.max(R::one());
-    let (d_defl, u_defl, active_idx, trivial_evals) = deflate(&d, &u, deflation_tol);
+    let (d_defl, u_defl, active_idx, trivial, rot) = deflate(&d, &u, deflation_tol);
 
     // Solve the secular equation for the active part and build its eigenvectors
     // with the Gu–Eisenstat stable (Löwner) formula, which stays orthogonal even
@@ -519,27 +524,36 @@ where
         secular_eigenpairs(&d_defl, &u_defl, abs_beta)?
     };
 
-    let total = trivial_evals.len() + secular_evals.len();
+    let total = trivial.len() + secular_evals.len();
     if total != n {
         // Deflation bookkeeping disagreed with the split; fall back to a direct
         // (always-correct) Jacobi solve of the original block.
         return jacobi_tridiag(diag, off);
     }
 
-    // Assemble (eigenvalue, D-space eigenvector) pairs.
+    // Assemble (eigenvalue, D-space eigenvector) pairs. Both deflated and active
+    // eigenvectors are expressed through the columns of `rot`, so any
+    // coincident-eigenvalue Givens rotation applied during deflation is
+    // reflected in the D-space vectors (identity columns leave this unchanged).
     let mut pairs: Vec<(R, Vec<R>)> = Vec::with_capacity(n);
 
-    let trivial_positions: Vec<usize> = (0..n).filter(|i| !active_idx.contains(i)).collect();
-    for (&eval, &pos) in trivial_evals.iter().zip(trivial_positions.iter()) {
+    for &(eval, col) in trivial.iter() {
         let mut ev = vec![R::zero(); n];
-        ev[pos] = R::one();
+        for (p, ev_p) in ev.iter_mut().enumerate() {
+            *ev_p = rot[(p, col)];
+        }
         pairs.push((eval, ev));
     }
 
     for (lam, evec_active) in secular_evals.into_iter().zip(secular_evecs) {
         let mut ev = vec![R::zero(); n];
         for (k, &ai) in active_idx.iter().enumerate() {
-            ev[ai] = evec_active[k];
+            let x = evec_active[k];
+            if x != R::zero() {
+                for (p, ev_p) in ev.iter_mut().enumerate() {
+                    *ev_p = *ev_p + x * rot[(p, ai)];
+                }
+            }
         }
         pairs.push((lam, ev));
     }
@@ -627,12 +641,33 @@ fn tridiag_scale<R: Real>(diag: &[R], off: &[R]) -> R {
 // Deflation and secular equation
 // ---------------------------------------------------------------------------
 
-/// Deflates the rank-one modification: drops eigenpairs with negligible
-/// coupling `|uᵢ|` and merges numerically-coincident `dᵢ`.
+/// Deflates the rank-one modification `D + β·u·uᵀ`: drops eigenpairs with
+/// negligible coupling `|uᵢ|` and merges numerically-coincident `dᵢ` with the
+/// exact Gu–Eisenstat/LAPACK `dlaed2` Givens rotation.
 ///
-/// Returns `(deflated_d, deflated_u, active_indices, trivial_evals)`.
+/// Returns `(deflated_d, deflated_u, active_indices, trivial_pairs, rotation)`:
+/// - `deflated_d`, `deflated_u` – the reduced active secular problem.
+/// - `active_indices[k]` – the column of `rotation` carrying active component
+///   `k` (its D-space basis direction).
+/// - `trivial_pairs[t] = (λ, col)` – a deflated eigenpair whose D-space
+///   eigenvector is column `col` of `rotation` and whose eigenvalue is `λ`.
+/// - `rotation` – the accumulated orthogonal transform of the D-eigenbasis
+///   (identity except for the columns touched by a coincident-eigenvalue
+///   Givens rotation). Its columns are orthonormal by construction.
+///
+/// Carrying `(λ, col)` together (rather than pairing a separate ascending
+/// position list against a merge-ordered eigenvalue list) keeps every deflated
+/// eigenvalue attached to its own eigenvector even when negligible-coupling and
+/// coincident-eigenvalue deflations interleave.
 #[allow(clippy::type_complexity)]
-fn deflate<R: Real>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Vec<R>) {
+fn deflate<R>(
+    d: &[R],
+    u: &[R],
+    tol: R,
+) -> (Vec<R>, Vec<R>, Vec<usize>, Vec<(R, usize)>, Mat<R>)
+where
+    R: Field + Real + bytemuck::Zeroable,
+{
     let n = d.len();
     let mut u_norm_sq = R::zero();
     for &x in u {
@@ -640,14 +675,23 @@ fn deflate<R: Real>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Ve
     }
     let u_norm = rsqrt(u_norm_sq).max(R::min_positive());
 
+    // Accumulated orthogonal transform G of the D-eigenbasis: its columns are
+    // the (possibly rotated) basis directions, initialised to the identity.
+    let mut rot = Mat::zeros(n, n);
+    for i in 0..n {
+        rot[(i, i)] = R::one();
+    }
+
     let mut defl_d = Vec::new();
     let mut defl_u = Vec::new();
     let mut active_idx = Vec::new();
-    let mut trivial = Vec::new();
+    let mut trivial: Vec<(R, usize)> = Vec::new();
 
     for i in 0..n {
         if fabs(u[i]) < tol * u_norm {
-            trivial.push(d[i]);
+            // Negligible coupling: eᵢ is already an eigenvector (eigenvalue dᵢ);
+            // column i of `rot` is still eᵢ.
+            trivial.push((d[i], i));
         } else {
             defl_d.push(d[i]);
             defl_u.push(u[i]);
@@ -655,16 +699,43 @@ fn deflate<R: Real>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Ve
         }
     }
 
-    // Merge nearly-equal d among the active components (Givens rotation in the
-    // exact algorithm; here the coincident eigenvalue deflates out directly).
+    // Merge numerically-coincident diagonal entries. In the exact
+    // Gu–Eisenstat/LAPACK `dlaed2` algorithm this is a Givens rotation
+    // G(i,j) = [[c, s], [-s, c]] with c = uᵢ/r, s = uⱼ/r, r = √(uᵢ²+uⱼ²): it maps
+    // the coupling pair (uᵢ, uⱼ) → (r, 0) and rotates the two accumulated
+    // eigenvector columns together, so column j becomes an exact eigenvector
+    // (zero coupling ⇒ eigenvalue dⱼ) that deflates out while column i keeps the
+    // combined coupling r and stays active. Omitting the rotation would rotate
+    // both members of the pair away from their true eigenvectors by atan2(uⱼ,uᵢ),
+    // silently losing orthogonality for genuinely repeated spectra.
     let mut i = 0;
     while i < defl_d.len() {
         let mut j = i + 1;
         while j < defl_d.len() {
             if fabs(defl_d[j] - defl_d[i]) < tol * (fabs(defl_d[i]) + R::one()) {
-                let merged = rsqrt(defl_u[i] * defl_u[i] + defl_u[j] * defl_u[j]);
-                defl_u[i] = merged;
-                trivial.push(defl_d[j]);
+                let ui = defl_u[i];
+                let uj = defl_u[j];
+                let r = rsqrt(ui * ui + uj * uj);
+                let pos_i = active_idx[i];
+                let pos_j = active_idx[j];
+                if r > R::min_positive() {
+                    let c = ui / r;
+                    let s = uj / r;
+                    // Rotate columns pos_i, pos_j of the accumulated transform:
+                    //   new col pos_i =  c·col_i + s·col_j   (∥ u ⇒ coupling r)
+                    //   new col pos_j = -s·col_i + c·col_j   (⟂ u ⇒ coupling 0)
+                    for p in 0..n {
+                        let a = rot[(p, pos_i)];
+                        let b = rot[(p, pos_j)];
+                        rot[(p, pos_i)] = c * a + s * b;
+                        rot[(p, pos_j)] = c * b - s * a;
+                    }
+                }
+                // Position i now carries the combined coupling r and stays
+                // active; position j deflates as an exact eigenvector (its
+                // rotated column) with eigenvalue dⱼ (≈ dᵢ within `tol`).
+                defl_u[i] = r;
+                trivial.push((defl_d[j], pos_j));
                 defl_d.remove(j);
                 defl_u.remove(j);
                 active_idx.remove(j);
@@ -675,7 +746,7 @@ fn deflate<R: Real>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Ve
         i += 1;
     }
 
-    (defl_d, defl_u, active_idx, trivial)
+    (defl_d, defl_u, active_idx, trivial, rot)
 }
 
 /// Solves `1 + β·Σᵢ uᵢ²/(dᵢ − λ) = 0` (`β = |β| > 0`) for all `m` eigenvalues of
@@ -1144,5 +1215,112 @@ mod tests {
         e[15] = 0.0;
         let (uu, vv, rec, _) = svd_errors(&d, &e);
         assert!(uu < 1e-6 && vv < 1e-9 && rec < 1e-8, "{uu} {vv} {rec}");
+    }
+
+    /// Directly exercises the coincident-eigenvalue deflation branch of
+    /// [`deflate`] — unreachable from generic public input (measure-zero) — and
+    /// verifies the `dlaed2` Givens rotation keeps the eigenvector basis exactly
+    /// orthonormal and turns the deflated column into a true eigenvector.
+    #[test]
+    fn deflate_coincident_merge_applies_givens() {
+        // Positions 1 and 2 share a diagonal entry (5.0) with non-negligible
+        // coupling; positions 0 and 3 are distinct. M = D + β·u·uᵀ.
+        let d = vec![1.0_f64, 5.0, 5.0, 9.0];
+        let u = vec![0.5_f64, 0.8, 0.6, 0.4];
+        let beta = 0.7_f64; // |β| > 0
+        let tol = 1e-12_f64;
+        let n = d.len();
+
+        let (d_defl, u_defl, active_idx, trivial, rot) = deflate(&d, &u, tol);
+
+        // (a) The coincident-merge branch fired: exactly one pair deflated out.
+        assert_eq!(d_defl.len(), 3, "one active component should have deflated");
+        assert_eq!(u_defl.len(), 3);
+        assert_eq!(active_idx.len(), 3);
+        assert_eq!(trivial.len(), 1, "exactly one coincident pair should deflate");
+
+        // The survivor (original position 1) carries the combined coupling
+        // r = √(0.8² + 0.6²) = 1.0; the deflated column is position 2, λ = 5.0.
+        let survivor = active_idx
+            .iter()
+            .position(|&p| p == 1)
+            .expect("position 1 must remain active");
+        assert!(
+            (u_defl[survivor] - 1.0).abs() < 1e-14,
+            "combined coupling r, got {}",
+            u_defl[survivor]
+        );
+        let (defl_lambda, defl_col) = trivial[0];
+        assert_eq!(defl_col, 2, "deflated column");
+        assert!((defl_lambda - 5.0).abs() < 1e-14, "deflated eigenvalue");
+
+        // (b) `rot` is orthonormal to tight tolerance.
+        let mut max_orth = 0.0_f64;
+        for a in 0..n {
+            for b in 0..n {
+                let mut dot = 0.0;
+                for p in 0..n {
+                    dot += rot[(p, a)] * rot[(p, b)];
+                }
+                let expect = if a == b { 1.0 } else { 0.0 };
+                max_orth = max_orth.max((dot - expect).abs());
+            }
+        }
+        assert!(max_orth < 1e-14, "rot not orthonormal: {max_orth}");
+
+        // The rotated coupling û = rotᵀ·u is zeroed at the deflated column and
+        // equals the combined magnitude r at the survivor column.
+        let u_hat: Vec<f64> = (0..n)
+            .map(|k| (0..n).map(|p| rot[(p, k)] * u[p]).sum::<f64>())
+            .collect();
+        assert!(u_hat[2].abs() < 1e-14, "coupling not zeroed: {}", u_hat[2]);
+        assert!((u_hat[1] - 1.0).abs() < 1e-14, "survivor coupling: {}", u_hat[1]);
+
+        // (c) The deflated column q = rot[:,2] is an exact eigenvector of
+        // M = D + β·u·uᵀ with eigenvalue λ = 5.0 (⟨u, q⟩ = 0 ⇒ M·q = D·q).
+        let q: Vec<f64> = (0..n).map(|p| rot[(p, 2)]).collect();
+        let u_dot_q: f64 = (0..n).map(|p| u[p] * q[p]).sum();
+        let mut resid = 0.0_f64;
+        for p in 0..n {
+            let mq = d[p] * q[p] + beta * u[p] * u_dot_q;
+            resid = resid.max((mq - defl_lambda * q[p]).abs());
+        }
+        assert!(resid < 1e-13, "deflated column not an eigenvector: residual {resid}");
+    }
+
+    /// Full-SVD regression for genuinely repeated singular values: a
+    /// block-diagonal bidiagonal `B = B₀ ⊕ B₀` (n = 32 > `DIRECT_THRESHOLD`)
+    /// routes through divide-and-conquer with every singular value doubled, and
+    /// must still reconstruct `B` with orthonormal `U`/`V`.
+    #[test]
+    fn svd_repeated_singular_values_reconstructs() {
+        let k = 16usize;
+        let d0: Vec<f64> = (0..k)
+            .map(|i| 2.5 + (i as f64 * 0.53).sin() + 0.4 * (i as f64 * 1.3).cos())
+            .collect();
+        let e0: Vec<f64> = (0..k - 1).map(|i| 0.7 + 0.3 * (i as f64 * 0.8).cos()).collect();
+
+        let mut d = Vec::with_capacity(2 * k);
+        d.extend_from_slice(&d0);
+        d.extend_from_slice(&d0);
+        let mut e = Vec::with_capacity(2 * k - 1);
+        e.extend_from_slice(&e0);
+        e.push(0.0); // decouple the two identical blocks
+        e.extend_from_slice(&e0);
+
+        let (uu, vv, rec, sigma) = svd_errors(&d, &e);
+
+        // Every singular value has a coincident partner (one from each block).
+        for (a, &sa) in sigma.iter().enumerate() {
+            let has_partner = sigma
+                .iter()
+                .enumerate()
+                .any(|(b, &sb)| b != a && (sa - sb).abs() < 1e-8);
+            assert!(has_partner, "no coincident partner for sigma[{a}] = {sa}");
+        }
+
+        assert!(uu < 1e-6, "UtU orthonormality: {uu}");
+        assert!(vv < 1e-9, "VtV orthonormality: {vv}");
+        assert!(rec < 1e-8, "reconstruction: {rec}");
     }
 }

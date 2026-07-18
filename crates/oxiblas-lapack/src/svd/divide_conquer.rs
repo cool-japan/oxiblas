@@ -821,27 +821,19 @@ mod tests {
             }
 
             // Independent cross-check against the QR-based reference SVD
-            // (Golub–Kahan–Reinsch), when it converges. Its bidiagonal QR can
-            // fail to converge within its iteration budget on some dense
-            // pseudo-random matrices at these sizes (a separate, pre-existing
-            // robustness limitation of QrSvd, not of the D&C code under test
-            // here) and now honestly reports that via `NotConverged` instead
-            // of silently returning an inaccurate result. The tight Jacobi
-            // comparison above already validates dc's correctness for every
-            // size in this loop, so this cross-check is best-effort extra
-            // corroboration only, skipped when the reference itself can't
-            // produce one.
+            // (Golub–Kahan–Reinsch). QrSvd's convergence/deflation logic was
+            // fixed to be reliable at these sizes (direction-aware shifted
+            // sweeps, O(n^2) sweep budget), so this is a hard assertion.
             if n <= 50 {
-                if let Ok(qr_reference) = QrSvd::compute(a.as_ref()) {
-                    let s_qr = qr_reference.singular_values();
-                    for k in 0..n {
-                        assert!(
-                            (s_dc[k] - s_qr[k]).abs() < 5e-3 * smax,
-                            "n={n}: sigma[{k}] dc={} qr={}",
-                            s_dc[k],
-                            s_qr[k]
-                        );
-                    }
+                let qr_reference = QrSvd::compute(a.as_ref()).unwrap();
+                let s_qr = qr_reference.singular_values();
+                for k in 0..n {
+                    assert!(
+                        (s_dc[k] - s_qr[k]).abs() < 5e-3 * smax,
+                        "n={n}: sigma[{k}] dc={} qr={}",
+                        s_dc[k],
+                        s_qr[k]
+                    );
                 }
             }
 

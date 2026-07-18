@@ -1,7 +1,7 @@
 //! Condition number estimation.
 
 use oxiblas_core::scalar::{Field, Real, Scalar};
-use oxiblas_matrix::MatRef;
+use oxiblas_matrix::{Mat, MatRef};
 
 use super::norms::{norm_1, norm_inf};
 use crate::lu::{Lu, LuError};
@@ -240,10 +240,22 @@ pub fn rcond<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<T
     }
 }
 
-/// Estimates the reciprocal condition number using LAPACK-style algorithm.
+/// Estimates the reciprocal of the 1-norm condition number using the
+/// Hager-Higham estimator (equivalent to LAPACK's `DGECON` / `xLACN2`).
 ///
-/// This is a fast O(n²) estimation that doesn't require computing the
-/// full inverse. It uses a 1-norm estimation technique.
+/// This is a fast estimator (a handful of triangular solves, `O(n²)` work per
+/// solve) that avoids forming the full inverse. It obtains a lower bound on
+/// `||A^{-1}||_1` by iteratively applying the operator `A^{-1}` and its
+/// transpose `(A^{-1})^T = (A^T)^{-1}` to a sequence of sign vectors, following
+/// Hager (1984) and Higham (1988).
+///
+/// Alternating between solves with `A` and `A^T` is an intrinsic part of the
+/// algorithm: without the transpose solves the iteration can only ever probe a
+/// single direction, systematically *under*-estimating `||A^{-1}||_1` and hence
+/// *over*-estimating `rcond`. Over-estimating `rcond` (under-estimating the true
+/// condition number) is exactly the failure mode that would make an
+/// ill-conditioning warning miss dangerous matrices, so the transpose solves
+/// are mandatory.
 ///
 /// # Arguments
 ///
@@ -251,7 +263,7 @@ pub fn rcond<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<T
 ///
 /// # Returns
 ///
-/// An estimate of 1/κ_1(A).
+/// An estimate of `1/κ_1(A)` in `[0, 1]`. Returns `0` for a singular matrix.
 pub fn rcond_estimate<T: Field + Real + bytemuck::Zeroable>(
     a: MatRef<'_, T>,
 ) -> Result<T, CondError> {
@@ -266,54 +278,20 @@ pub fn rcond_estimate<T: Field + Real + bytemuck::Zeroable>(
 
     let norm_a = norm_1(a);
 
-    // LU factorize
+    // Factorize once; both the `A x = y` and `A^T x = y` solves reuse the
+    // same LU factors.
     let lu = match Lu::compute(a) {
         Ok(lu) => lu,
-        Err(_) => return Ok(T::zero()), // Singular
+        Err(_) => return Ok(T::zero()), // Singular => rcond = 0.
     };
 
-    // Use 1-norm estimation algorithm (simplified version)
-    // This is a Hager-Higham type estimator
-    // Start with x = (1/n, 1/n, ..., 1/n)
-    use oxiblas_matrix::Mat;
+    // Estimate ||A^{-1}||_1 with the Hager-Higham iteration.
+    let norm_a_inv_est = match hager_higham_inv_norm(&lu, n) {
+        Some(v) => v,
+        None => return Ok(T::zero()), // A solve failed => treat as singular.
+    };
 
-    let mut x = Mat::zeros(n, 1);
-    let scale = T::one() / T::from_f64(n as f64).unwrap_or(T::one());
-    for i in 0..n {
-        x[(i, 0)] = scale;
-    }
-
-    // Iterate a few times to estimate ||A^(-1)||_1
-    let mut norm_a_inv_est = T::zero();
-
-    for _iter in 0..5 {
-        // Solve A*y = x to get y = A^(-1)*x
-        let y = match lu.solve(x.as_ref()) {
-            Ok(y) => y,
-            Err(_) => return Ok(T::zero()),
-        };
-
-        // Compute ||y||_1
-        let mut y_norm = T::zero();
-        for i in 0..n {
-            y_norm = y_norm + Scalar::abs(y[(i, 0)]);
-        }
-
-        if y_norm > norm_a_inv_est {
-            norm_a_inv_est = y_norm;
-        }
-
-        // Update x to be sign(y)
-        for i in 0..n {
-            x[(i, 0)] = if y[(i, 0)] >= T::zero() {
-                T::one()
-            } else {
-                -T::one()
-            };
-        }
-    }
-
-    // rcond = 1 / (||A||_1 * ||A^(-1)||_1)
+    // rcond = 1 / (||A||_1 * ||A^{-1}||_1).
     let kappa_est = norm_a * norm_a_inv_est;
 
     if kappa_est <= T::zero()
@@ -323,6 +301,156 @@ pub fn rcond_estimate<T: Field + Real + bytemuck::Zeroable>(
     } else {
         Ok(T::one() / kappa_est)
     }
+}
+
+/// One-norm (sum of absolute values) of the first column of `x` (length `n`).
+fn column_one_norm<T: Real>(x: &Mat<T>, n: usize) -> T {
+    let mut sum = T::zero();
+    for i in 0..n {
+        sum = sum + Scalar::abs(x[(i, 0)]);
+    }
+    sum
+}
+
+/// Index of the first entry attaining the maximum absolute value in the first
+/// column of `x` (length `n`); mirrors LAPACK's `IDAMAX`.
+fn column_argmax_abs<T: Real>(x: &Mat<T>, n: usize) -> usize {
+    let mut best = 0usize;
+    let mut best_val = Scalar::abs(x[(0, 0)]);
+    for i in 1..n {
+        let val = Scalar::abs(x[(i, 0)]);
+        if val > best_val {
+            best_val = val;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Hager-Higham 1-norm estimator of `||A^{-1}||_1`, faithfully following
+/// LAPACK's reverse-communication routine `DLACN2`.
+///
+/// The algorithm alternates between the two operators
+/// * `y = A^{-1} x`         (via [`Lu::solve`]) and
+/// * `y = (A^{-1})^T x = (A^T)^{-1} x`  (via [`Lu::solve_transpose`]),
+///
+/// refining a `±1` sign vector until the estimate stops increasing, the sign
+/// vector repeats, or the maximiser stabilises (with a hard cap of `ITMAX`
+/// iterations). A final estimate using the alternating vector
+/// `x_i = (-1)^i (1 + i/(n-1))` is always taken as an additional lower bound.
+///
+/// Returns `None` if any triangular solve fails.
+fn hager_higham_inv_norm<T: Field + Real + bytemuck::Zeroable>(lu: &Lu<T>, n: usize) -> Option<T> {
+    const ITMAX: usize = 5;
+
+    // Fortran SIGN(1, val): +1 for val >= 0 (including +0), -1 otherwise.
+    let sign_of = |val: T| -> T {
+        if val >= T::zero() {
+            T::one()
+        } else {
+            -T::one()
+        }
+    };
+
+    // Initial probe vector x = (1/n, ..., 1/n)^T.
+    let mut x = Mat::<T>::zeros(n, 1);
+    let inv_n = T::one() / T::from_f64(n as f64)?;
+    for i in 0..n {
+        x[(i, 0)] = inv_n;
+    }
+
+    // First operator application: x <- A^{-1} x.
+    let mut v = lu.solve(x.as_ref()).ok()?;
+
+    if n == 1 {
+        // The estimate is exact for a 1×1 matrix.
+        return Some(Scalar::abs(v[(0, 0)]));
+    }
+
+    let mut est = column_one_norm(&v, n);
+
+    // Sign vector of the first solve; also becomes the next probe.
+    let mut isgn = vec![T::one(); n];
+    for i in 0..n {
+        let s = sign_of(v[(i, 0)]);
+        isgn[i] = s;
+        x[(i, 0)] = s;
+    }
+
+    // x <- (A^{-1})^T x, then locate the dominant component.
+    let mut xt = lu.solve_transpose(x.as_ref()).ok()?;
+    let mut j = column_argmax_abs(&xt, n);
+    let mut iter = 2usize;
+
+    loop {
+        // Probe with the j-th unit vector.
+        for i in 0..n {
+            x[(i, 0)] = T::zero();
+        }
+        x[(j, 0)] = T::one();
+
+        // x <- A^{-1} x.
+        v = lu.solve(x.as_ref()).ok()?;
+
+        let est_old = est;
+        est = column_one_norm(&v, n);
+
+        // Convergence test 1: the sign vector repeated exactly.
+        let mut sign_changed = false;
+        for i in 0..n {
+            if sign_of(v[(i, 0)]) != isgn[i] {
+                sign_changed = true;
+                break;
+            }
+        }
+        if !sign_changed {
+            break;
+        }
+
+        // Convergence test 2 (anti-cycling): the estimate stopped increasing.
+        if est <= est_old {
+            break;
+        }
+
+        // Adopt the new sign vector as the next transpose probe.
+        for i in 0..n {
+            let s = sign_of(v[(i, 0)]);
+            isgn[i] = s;
+            x[(i, 0)] = s;
+        }
+
+        // x <- (A^{-1})^T x.
+        xt = lu.solve_transpose(x.as_ref()).ok()?;
+        let j_last = j;
+        j = column_argmax_abs(&xt, n);
+
+        // Convergence test 3: the maximiser did not move (or the cap is hit).
+        // `j` maximises |xt|, so |xt[j_last]| <= |xt[j]| always; equality means
+        // the previous index still attains the maximum.
+        if Scalar::abs(xt[(j_last, 0)]) >= Scalar::abs(xt[(j, 0)]) || iter >= ITMAX {
+            break;
+        }
+        iter += 1;
+    }
+
+    // Final refinement with the alternating vector
+    //   x_i = (-1)^i * (1 + i/(n-1)),  i = 0..n-1,
+    // which frequently exposes a larger lower bound than the sign iterations.
+    let mut alt = T::one();
+    let denom = T::from_f64((n - 1) as f64)?;
+    for i in 0..n {
+        let frac = T::from_f64(i as f64)? / denom;
+        x[(i, 0)] = alt * (T::one() + frac);
+        alt = -alt;
+    }
+    let vf = lu.solve(x.as_ref()).ok()?;
+    let three_n = T::from_f64((3 * n) as f64)?;
+    let temp = (T::from_f64(2.0)? * column_one_norm(&vf, n)) / three_n;
+    if temp > est {
+        est = temp;
+    }
+
+    Some(est)
 }
 
 #[cfg(test)]
@@ -429,6 +557,45 @@ mod tests {
         assert!(rc_est > 0.0);
         assert!(rc_est / rc_exact < 10.0);
         assert!(rc_exact / rc_est < 10.0);
+    }
+
+    #[test]
+    fn test_rcond_estimate_nonsymmetric() {
+        // Non-symmetric, moderately ill-conditioned matrix. Capturing
+        // ||A^{-1}||_1 here requires alternating A and A^T solves; a single
+        // direction (no transpose) would under-estimate it and thereby report
+        // an rcond that is too large (too optimistic).
+        let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[0.0, 1e-2, 5.0], &[4.0, 0.0, 1.0]]);
+
+        let rc_est = rcond_estimate(a.as_ref()).unwrap();
+        let rc_exact = rcond(a.as_ref()).unwrap();
+
+        assert!(rc_est > 0.0);
+        // The estimator lower-bounds ||A^{-1}||_1, so rc_est >= rc_exact (up to
+        // rounding) and must not be far above it.
+        assert!(
+            rc_est >= rc_exact * (1.0 - 1e-9),
+            "rc_est = {rc_est} should not be below rc_exact = {rc_exact}"
+        );
+        assert!(
+            rc_est <= rc_exact * 3.0 + 1e-12,
+            "rc_est = {rc_est} over-estimates rcond vs exact = {rc_exact}"
+        );
+    }
+
+    #[test]
+    fn test_rcond_estimate_ill_conditioned_nonsymmetric() {
+        // A strongly non-symmetric, badly conditioned matrix: the estimate of
+        // rcond must be small (the matrix is near-singular), not close to 1.
+        let a = Mat::from_rows(&[&[1.0f64, 1.0, 1.0], &[0.0, 1e-8, 1.0], &[0.0, 0.0, 1e-8]]);
+
+        let rc_est = rcond_estimate(a.as_ref()).unwrap();
+        let rc_exact = rcond(a.as_ref()).unwrap();
+
+        assert!(rc_est > 0.0);
+        assert!(rc_est < 1e-6, "near-singular matrix should have tiny rcond, got {rc_est}");
+        assert!(rc_est >= rc_exact * (1.0 - 1e-9));
+        assert!(rc_est <= rc_exact * 5.0 + 1e-12);
     }
 
     #[test]

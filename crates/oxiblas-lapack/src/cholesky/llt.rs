@@ -307,8 +307,8 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     /// Returns `CholeskyError::NotPositiveDefinite` if the matrix is not positive definite.
     #[inline]
     pub fn compute_blocked(a: MatRef<'_, T>) -> Result<Self, CholeskyError> {
-        const BLOCK_SIZE: usize = 64;
-        Self::compute_with_block_size(a, BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_cholesky(a.nrows());
+        Self::compute_with_block_size(a, nb)
     }
 
     /// Computes Cholesky decomposition with a specified block size.
@@ -731,8 +731,8 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T
     /// Returns `CholeskyError::NotPositiveDefinite` if the matrix is not positive definite.
     #[inline]
     pub fn compute_blocked_par(a: MatRef<'_, T>) -> Result<Self, CholeskyError> {
-        const BLOCK_SIZE: usize = 64;
-        Self::compute_blocked_par_with_block_size(a, BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_cholesky(a.nrows());
+        Self::compute_blocked_par_with_block_size(a, nb)
     }
 
     /// Computes parallel blocked Cholesky decomposition with a specified block size.

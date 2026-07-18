@@ -162,23 +162,34 @@ pub fn dotu_c32_ndarray(x: &Array1<Complex32>, y: &Array1<Complex32>) -> Complex
 /// ||x||_2 = sqrt(Σ |x\[i\]|²) = sqrt(Σ (x\[i\].re² + x\[i\].im²))
 ///
 /// This is equivalent to sqrt(x^H · x).
+///
+/// The real and imaginary components are treated as a flat real vector and
+/// passed to the numerically stable, scaled (LASSQ-style) [`nrm2`] used by
+/// the BLAS Level-1 norm routines, so this never overflows to infinity for
+/// vectors whose true norm is representable but whose naive sum of squares
+/// would overflow (e.g. entries with magnitude around `1e200`).
 pub fn nrm2_c64_ndarray(x: &Array1<Complex64>) -> f64 {
-    let mut sum = 0.0f64;
+    let mut components = Vec::with_capacity(x.len() * 2);
     for xi in x.iter() {
-        sum += xi.norm_sqr();
+        components.push(xi.re);
+        components.push(xi.im);
     }
-    sum.sqrt()
+    nrm2(&components)
 }
 
 /// Computes the Euclidean norm of a Complex32 vector.
 ///
 /// ||x||_2 = sqrt(Σ |x\[i\]|²)
+///
+/// See [`nrm2_c64_ndarray`]: uses the same scaled (LASSQ-style) algorithm
+/// via [`nrm2`] to avoid overflow/underflow for extreme-magnitude entries.
 pub fn nrm2_c32_ndarray(x: &Array1<Complex32>) -> f32 {
-    let mut sum = 0.0f32;
+    let mut components = Vec::with_capacity(x.len() * 2);
     for xi in x.iter() {
-        sum += xi.norm_sqr();
+        components.push(xi.re);
+        components.push(xi.im);
     }
-    sum.sqrt()
+    nrm2(&components)
 }
 
 /// Computes the L1 norm of a Complex64 vector (sum of absolute values).
@@ -477,12 +488,21 @@ where
 /// Computes the Frobenius norm of a matrix.
 ///
 /// ||A||_F = sqrt(sum(a_ij^2))
+///
+/// Delegates to the numerically stable, scaled (LASSQ-style) [`nrm2`] used
+/// by the BLAS Level-1 norm routines (tracks a running scale factor and a
+/// sum-of-squares relative to that scale, combining them at the end as
+/// `scale * sqrt(sumsq)`), so this never overflows to infinity for matrices
+/// whose true Frobenius norm is representable but whose naive sum of
+/// squares would overflow.
 pub fn frobenius_norm<T: Field + oxiblas_core::scalar::Real>(a: &Array2<T>) -> T {
-    let mut sum = T::zero();
-    for val in a.iter() {
-        sum += (*val) * (*val);
+    if let Some(slice) = a.as_slice() {
+        nrm2(slice)
+    } else {
+        // Non-contiguous (e.g. transposed/strided) layout: flatten first.
+        let vec: Vec<T> = a.iter().copied().collect();
+        nrm2(&vec)
     }
-    oxiblas_core::scalar::Real::sqrt(sum)
 }
 
 /// Computes the 1-norm (maximum column sum) of a matrix.
@@ -628,23 +648,31 @@ pub fn conj_transpose_c32(a: &Array2<Complex32>) -> Array2<Complex32> {
 /// ||A||_F = sqrt(Σ |a\[i,j\]|²) = sqrt(Σ (a\[i,j\].re² + a\[i,j\].im²))
 ///
 /// This is equivalent to sqrt(trace(A^H * A)).
+///
+/// Same scaled (LASSQ-style) [`nrm2`] delegation as [`nrm2_c64_ndarray`], to
+/// avoid overflow for matrices with extreme-magnitude entries.
 pub fn frobenius_norm_c64(a: &Array2<Complex64>) -> f64 {
-    let mut sum = 0.0f64;
+    let mut components = Vec::with_capacity(a.len() * 2);
     for val in a.iter() {
-        sum += val.norm_sqr();
+        components.push(val.re);
+        components.push(val.im);
     }
-    sum.sqrt()
+    nrm2(&components)
 }
 
 /// Computes the Frobenius norm of a Complex32 matrix.
 ///
 /// ||A||_F = sqrt(Σ |a\[i,j\]|²)
+///
+/// Same scaled (LASSQ-style) [`nrm2`] delegation as [`nrm2_c32_ndarray`], to
+/// avoid overflow for matrices with extreme-magnitude entries.
 pub fn frobenius_norm_c32(a: &Array2<Complex32>) -> f32 {
-    let mut sum = 0.0f32;
+    let mut components = Vec::with_capacity(a.len() * 2);
     for val in a.iter() {
-        sum += val.norm_sqr();
+        components.push(val.re);
+        components.push(val.im);
     }
-    sum.sqrt()
+    nrm2(&components)
 }
 
 /// Computes the 1-norm (maximum column sum of absolute values) of a Complex64 matrix.
@@ -950,6 +978,24 @@ mod tests {
     }
 
     #[test]
+    fn test_frobenius_norm_overflow_prevention() {
+        // Squaring 1e200 gives 1e400, which overflows f64::MAX (1.8e308),
+        // but the true Frobenius norm (2e200) is well within range. The
+        // naive sum-of-squares implementation would return `inf` here.
+        let large = 1e200f64;
+        let a = array![[large, large], [large, large]];
+        let norm = frobenius_norm(&a);
+        let expected = 2.0 * large; // sqrt(4) * large
+        assert!(norm.is_finite(), "norm should be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
+            norm
+        );
+    }
+
+    #[test]
     fn test_norm_1() {
         let a = array![[1.0f64, 2.0], [3.0, 4.0]];
         let norm = norm_1(&a);
@@ -1086,6 +1132,39 @@ mod tests {
     }
 
     #[test]
+    fn test_nrm2_c64_ndarray_overflow_prevention() {
+        // |x_i|^2 for a component around 1e200 would overflow when squared
+        // naively (1e400 > f64::MAX), even though the true norm (2e200) is
+        // representable.
+        let large = 1e200f64;
+        let x = array![Complex64::new(large, 0.0), Complex64::new(0.0, large)];
+        let norm = nrm2_c64_ndarray(&x);
+        let expected = 2.0f64.sqrt() * large;
+        assert!(norm.is_finite(), "norm should be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
+            norm
+        );
+    }
+
+    #[test]
+    fn test_nrm2_c32_ndarray_overflow_prevention() {
+        let large = 1e30f32; // near f32::MAX (3.4e38) once squared and summed
+        let x = array![Complex32::new(large, 0.0), Complex32::new(0.0, large)];
+        let norm = nrm2_c32_ndarray(&x);
+        let expected = 2.0f32.sqrt() * large;
+        assert!(norm.is_finite(), "norm should be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-5,
+            "expected {}, got {}",
+            expected,
+            norm
+        );
+    }
+
+    #[test]
     fn test_asum_c64_ndarray() {
         // sum of |x_i|
         let x = array![Complex64::new(3.0, 4.0), Complex64::new(5.0, 12.0)];
@@ -1169,6 +1248,36 @@ mod tests {
         ];
         let norm = frobenius_norm_c32(&a);
         assert!((norm - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_frobenius_norm_c64_overflow_prevention() {
+        let large = 1e200f64;
+        let a = array![[Complex64::new(large, 0.0), Complex64::new(0.0, large)]];
+        let norm = frobenius_norm_c64(&a);
+        let expected = 2.0f64.sqrt() * large;
+        assert!(norm.is_finite(), "norm should be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
+            norm
+        );
+    }
+
+    #[test]
+    fn test_frobenius_norm_c32_overflow_prevention() {
+        let large = 1e30f32;
+        let a = array![[Complex32::new(large, 0.0), Complex32::new(0.0, large)]];
+        let norm = frobenius_norm_c32(&a);
+        let expected = 2.0f32.sqrt() * large;
+        assert!(norm.is_finite(), "norm should be finite, got {}", norm);
+        assert!(
+            (norm - expected).abs() / expected < 1e-5,
+            "expected {}, got {}",
+            expected,
+            norm
+        );
     }
 
     #[test]

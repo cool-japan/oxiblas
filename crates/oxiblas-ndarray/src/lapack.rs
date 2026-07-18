@@ -72,10 +72,21 @@ where
         let n = self.l.dim().0;
         assert_eq!(b.len(), n, "b length must match matrix dimension");
 
-        // Apply permutation to b
-        let mut pb: Vec<T> = vec![T::zero(); n];
-        for i in 0..n {
-            pb[i] = b[self.perm[i]];
+        // Apply the row permutation P to b, forming Pb.
+        //
+        // `perm` is LAPACK's pivot *sequence*, not a destination-index
+        // permutation array: at factorization step k, row k was interchanged
+        // with row `perm[k]`. The interchanges must therefore be *replayed in
+        // ascending k* (exactly as LAPACK's DLASWP does) so that a chain of
+        // pivots — e.g. 0->2 followed by 1->2 — is composed correctly. The old
+        // `pb[i] = b[perm[i]]` treated the sequence as a final permutation and
+        // returned wrong solutions whenever any row interchange occurred.
+        let mut pb: Vec<T> = b.iter().cloned().collect();
+        for k in 0..n {
+            let pk = self.perm[k];
+            if k != pk {
+                pb.swap(k, pk);
+            }
         }
 
         // Forward substitution: L * y = pb
@@ -111,26 +122,23 @@ where
             det *= self.u[[i, i]];
         }
 
-        // Account for permutation sign
-        let mut sign_changes = 0;
-        let mut visited = vec![false; n];
-        for i in 0..n {
-            if visited[i] {
-                continue;
-            }
-            let mut j = i;
-            let mut cycle_len = 0;
-            while !visited[j] {
-                visited[j] = true;
-                j = self.perm[j];
-                cycle_len += 1;
-            }
-            if cycle_len > 1 {
-                sign_changes += cycle_len - 1;
-            }
-        }
+        // Account for the permutation sign.
+        //
+        // `perm` is LAPACK's pivot *sequence* (a sequence of transpositions),
+        // not a destination-index permutation array. The number of actual row
+        // interchanges performed during factorization is exactly the count of
+        // positions k with `perm[k] != k` — each such step swapped one pair of
+        // rows once — so the determinant sign is (-1)^num_swaps. Cycle-
+        // decomposing `perm` as if it were a permutation array (the previous
+        // approach) yields the wrong sign as soon as two or more swaps occur.
+        let num_swaps = self
+            .perm
+            .iter()
+            .enumerate()
+            .filter(|&(k, &pk)| k != pk)
+            .count();
 
-        if sign_changes % 2 == 1 {
+        if num_swaps % 2 == 1 {
             det = T::zero() - det;
         }
 
@@ -1082,6 +1090,19 @@ where
 {
     let n = d.len();
 
+    // Empty system: guard the `n - 1` arithmetic below, which would otherwise
+    // underflow (usize) and panic on debug builds. The only consistent inputs
+    // are empty off-diagonals and an empty right-hand side; the solution is the
+    // empty vector.
+    if n == 0 {
+        if !dl.is_empty() || !du.is_empty() || !b.is_empty() {
+            return Err(LapackError::DimensionMismatch(
+                "Tridiagonal dimensions must be consistent".to_string(),
+            ));
+        }
+        return Ok(Array1::from_vec(Vec::new()));
+    }
+
     if dl.len() != n - 1 || du.len() != n - 1 || b.len() != n {
         return Err(LapackError::DimensionMismatch(
             "Tridiagonal dimensions must be consistent".to_string(),
@@ -1121,6 +1142,19 @@ where
 {
     let n = d.len();
 
+    // Empty system: guard the `n - 1` arithmetic below, which would otherwise
+    // underflow (usize) and panic on debug builds. An empty SPD tridiagonal
+    // system has an empty off-diagonal and right-hand side; its solution is the
+    // empty vector.
+    if n == 0 {
+        if !e.is_empty() || !b.is_empty() {
+            return Err(LapackError::DimensionMismatch(
+                "Tridiagonal dimensions must be consistent".to_string(),
+            ));
+        }
+        return Ok(Array1::from_vec(Vec::new()));
+    }
+
     if e.len() != n - 1 || b.len() != n {
         return Err(LapackError::DimensionMismatch(
             "Tridiagonal dimensions must be consistent".to_string(),
@@ -1157,7 +1191,19 @@ where
     T: Field + Clone + bytemuck::Zeroable + oxiblas_core::scalar::Real,
 {
     let n = d.len();
-    let (b_rows, _b_cols) = b.dim();
+    let (b_rows, b_cols) = b.dim();
+
+    // Empty system: guard the `n - 1` arithmetic below, which would otherwise
+    // underflow (usize) and panic on debug builds. With zero equations the
+    // solution is an empty (0 × nrhs) matrix.
+    if n == 0 {
+        if !dl.is_empty() || !du.is_empty() || b_rows != 0 {
+            return Err(LapackError::DimensionMismatch(
+                "Tridiagonal dimensions must be consistent".to_string(),
+            ));
+        }
+        return Ok(Array2::zeros((0, b_cols)));
+    }
 
     if dl.len() != n - 1 || du.len() != n - 1 || b_rows != n {
         return Err(LapackError::DimensionMismatch(
@@ -1247,6 +1293,88 @@ mod tests {
         let ax1 = a[[1, 0]] * x[0] + a[[1, 1]] * x[1];
         assert!((ax0 - b[0]).abs() < 1e-10);
         assert!((ax1 - b[1]).abs() < 1e-10);
+    }
+
+    /// Regression for the pivot-sequence bug in `LuResult::solve` / `det`.
+    ///
+    /// The matrix `[[2,1,1],[4,3,3],[8,7,9]]` forces partial pivoting to perform
+    /// **two** row interchanges: the pivot sequence is `perm = [2, 2, 2]` (swap
+    /// rows 0<->2 at step 0, then rows 1<->2 at step 1). This is exactly the
+    /// case the old code mishandled:
+    ///
+    /// * `solve` computed `pb[i] = b[perm[i]]`, i.e. `[b[2], b[2], b[2]]`, so
+    ///   every entry of the permuted RHS collapsed to `b[2]` — a wildly wrong
+    ///   solution.
+    /// * `det` cycle-decomposed `perm = [2,2,2]` into a single 2-cycle and
+    ///   reported an *odd* number of sign changes, negating the determinant: it
+    ///   returned `-4` for a matrix whose true determinant is `+4`.
+    ///
+    /// Independently verified references (by hand):
+    ///   det(A) = 2(27-21) - 1(36-24) + 1(28-24) = 12 - 12 + 4 = +4,
+    ///   and A * [1,2,3]^T = [7, 19, 49]^T.
+    #[test]
+    fn test_lu_solve_and_det_with_two_pivot_swaps() {
+        let a = array![[2.0f64, 1.0, 1.0], [4.0, 3.0, 3.0], [8.0, 7.0, 9.0]];
+
+        let lu = lu_ndarray(&a).unwrap();
+
+        // The factorization must genuinely require >= 2 interchanges, otherwise
+        // this test would not exercise the composed-permutation path at all.
+        let num_swaps = lu
+            .perm
+            .iter()
+            .enumerate()
+            .filter(|&(k, &pk)| k != pk)
+            .count();
+        assert!(
+            num_swaps >= 2,
+            "test matrix must force at least two row swaps, got perm = {:?}",
+            lu.perm
+        );
+
+        // Determinant: true value is +4. The buggy sign logic returned -4.
+        let det = lu.det();
+        assert!(
+            (det - 4.0).abs() < 1e-10,
+            "det = {det}, expected +4 (sign must be positive for an even swap count)"
+        );
+
+        // Solve A x = b with a known solution x_true = [1, 2, 3].
+        let x_true = [1.0f64, 2.0, 3.0];
+        let b = array![7.0f64, 19.0, 49.0];
+        let x = lu.solve(&b);
+        for i in 0..3 {
+            assert!(
+                (x[i] - x_true[i]).abs() < 1e-10,
+                "x[{i}] = {}, expected {}",
+                x[i],
+                x_true[i]
+            );
+        }
+
+        // Cross-check by residual: A x must reproduce b.
+        for i in 0..3 {
+            let axi = a[[i, 0]] * x[0] + a[[i, 1]] * x[1] + a[[i, 2]] * x[2];
+            assert!((axi - b[i]).abs() < 1e-10, "residual row {i}: {axi} != {}", b[i]);
+        }
+    }
+
+    /// Empty tridiagonal systems must not panic on the `n - 1` arithmetic and
+    /// must return empty results (regression for the usize subtract-overflow).
+    #[test]
+    fn test_tridiag_empty_inputs_no_overflow() {
+        let empty1: Array1<f64> = Array1::from_vec(Vec::new());
+
+        let x = tridiag_solve_ndarray(&empty1, &empty1, &empty1, &empty1).unwrap();
+        assert_eq!(x.len(), 0);
+
+        let x_spd = tridiag_solve_spd_ndarray(&empty1, &empty1, &empty1).unwrap();
+        assert_eq!(x_spd.len(), 0);
+
+        let b_empty: Array2<f64> = Array2::zeros((0, 3));
+        let x_multi =
+            tridiag_solve_multiple_ndarray(&empty1, &empty1, &empty1, &b_empty).unwrap();
+        assert_eq!(x_multi.dim(), (0, 3));
     }
 
     #[test]

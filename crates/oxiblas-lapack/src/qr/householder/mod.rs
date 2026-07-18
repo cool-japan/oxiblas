@@ -878,7 +878,6 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     /// ```
     pub fn compute_auto(a: MatRef<'_, T>) -> Result<Self, QrError> {
         const AUTO_BLOCK_THRESHOLD: usize = 128;
-        const BLOCK_SIZE: usize = 64;
 
         let m = a.nrows();
         let n = a.ncols();
@@ -886,7 +885,8 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
 
         // For large matrices, use blocked algorithm
         if k >= AUTO_BLOCK_THRESHOLD {
-            Self::compute_blocked(a, BLOCK_SIZE)
+            let nb = crate::workspace::optimal_block_size_qr(m, n);
+            Self::compute_blocked(a, nb)
         } else {
             Self::compute(a)
         }

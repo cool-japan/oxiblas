@@ -243,7 +243,11 @@ fn apply_symmetric_equilibration<T: Field + Real + bytemuck::Zeroable>(
 
 /// Estimate reciprocal condition number for Cholesky factorization.
 ///
-/// Uses the relationship kappa(A) = kappa(L)^2 for A = LL^T.
+/// Uses the relationship `rcond(A) = 1 / (||A||_1 * ||A^-1||_1)`, where
+/// `||A^-1||_1` is estimated with the full Hager/Higham one-norm power
+/// iteration ([`hager_higham_inv_1norm_spd`]) applied through the existing
+/// Cholesky factor's triangular solves — LAPACK's `xPOCON` approach —
+/// rather than sampling only the first few standard-basis columns.
 fn estimate_rcond_cholesky<T: Field + Real + bytemuck::Zeroable>(
     chol: &Cholesky<T>,
     anorm: T,
@@ -253,31 +257,10 @@ fn estimate_rcond_cholesky<T: Field + Real + bytemuck::Zeroable>(
         return T::zero();
     }
 
-    // For A = LL^T, we estimate ||A^(-1)||_1 by solving A*y = e_j for the
-    // column that gives the largest norm.
-
-    let mut ainv_norm_est = T::zero();
-
-    // Try a few columns to estimate ||A^(-1)||_1
-    for j in 0..n.min(5) {
-        let mut e_j = Mat::zeros(n, 1);
-        e_j[(j, 0)] = T::one();
-
-        let y = match chol.solve(e_j.as_ref()) {
-            Ok(y) => y,
-            Err(_) => return T::zero(),
-        };
-
-        // Compute ||y||_1
-        let mut y_norm = T::zero();
-        for i in 0..n {
-            y_norm = y_norm + Scalar::abs(y[(i, 0)]);
-        }
-
-        if y_norm > ainv_norm_est {
-            ainv_norm_est = y_norm;
-        }
-    }
+    let ainv_norm_est = match hager_higham_inv_1norm_spd(chol, n) {
+        Some(v) => v,
+        None => return T::zero(),
+    };
 
     // rcond = 1 / (||A||_1 * ||A^(-1)||_1)
     let kappa_est = anorm * ainv_norm_est;
@@ -287,6 +270,150 @@ fn estimate_rcond_cholesky<T: Field + Real + bytemuck::Zeroable>(
     } else {
         T::one() / kappa_est
     }
+}
+
+/// LAPACK-style cap on the number of Hager/Higham power-iteration
+/// refinements (mirrors `xLACN2`'s `ITMAX = 5`).
+const HAGER_HIGHAM_ITMAX: usize = 5;
+
+/// Estimates `||A^-1||_1` for a symmetric positive definite matrix `A`
+/// using the Hager/Higham one-norm power-iteration estimator — the same
+/// algorithm LAPACK's `[SD]LACN2` implements internally for `xPOCON` and
+/// `xGECON` — applying `A^-1` exclusively through the already-computed
+/// Cholesky factor's triangular solves (`Ly = b` forward substitution
+/// followed by `L^T x = y` back substitution, see [`Cholesky::solve`])
+/// rather than sampling a handful of unit-vector columns.
+///
+/// Because `A` is symmetric positive definite, `A^-1` is symmetric too, so
+/// applying the operator and applying its transpose are literally the same
+/// triangular solve. This lets the classic two-operator Hager/Higham
+/// iteration (which normally alternates `A^-1 x` and `A^-T x`) collapse to
+/// repeated calls to `chol.solve`, while still exercising the full n×n
+/// system rather than a fixed small subset of columns.
+///
+/// Returns `None` if any of the underlying triangular solves fail (which
+/// should not happen for a matrix that already produced a valid Cholesky
+/// factorization, but is handled honestly rather than fabricating a value).
+fn hager_higham_inv_1norm_spd<T: Field + Real + bytemuck::Zeroable>(
+    chol: &Cholesky<T>,
+    n: usize,
+) -> Option<T> {
+    if n == 0 {
+        return Some(T::zero());
+    }
+
+    let apply = |v: &Mat<T>| -> Option<Mat<T>> { chol.solve(v.as_ref()).ok() };
+
+    let one_norm = |v: &Mat<T>| -> T {
+        let mut s = T::zero();
+        for i in 0..n {
+            s = s + Scalar::abs(v[(i, 0)]);
+        }
+        s
+    };
+
+    let sign_of = |val: T| -> T {
+        if val >= T::zero() {
+            T::one()
+        } else {
+            -T::one()
+        }
+    };
+
+    let argmax_abs = |v: &Mat<T>| -> usize {
+        let mut j = 0usize;
+        let mut best = Scalar::abs(v[(0, 0)]);
+        for i in 1..n {
+            let a = Scalar::abs(v[(i, 0)]);
+            if a > best {
+                best = a;
+                j = i;
+            }
+        }
+        j
+    };
+
+    // Quick return for the trivial 1x1 case (mirrors LAPACK's DLACN2).
+    if n == 1 {
+        let mut e = Mat::zeros(1, 1);
+        e[(0, 0)] = T::one();
+        let y = apply(&e)?;
+        return Some(Scalar::abs(y[(0, 0)]));
+    }
+
+    // Step 1: x = e/n, y = A^-1 x.
+    let mut x = Mat::zeros(n, 1);
+    let scale = T::one() / T::from_usize(n)?;
+    for i in 0..n {
+        x[(i, 0)] = scale;
+    }
+    let y = apply(&x)?;
+    let mut est = one_norm(&y);
+
+    // sign(y), with the convention sign(0) = +1.
+    let mut isgn = vec![T::zero(); n];
+    for i in 0..n {
+        isgn[i] = sign_of(y[(i, 0)]);
+        x[(i, 0)] = isgn[i];
+    }
+
+    // z = A^-T sign(y) == A^-1 sign(y) since A^-1 is symmetric.
+    let z = apply(&x)?;
+    let mut j = argmax_abs(&z);
+    let mut iter = 2usize;
+
+    loop {
+        // x = e_j (unit vector at the current maximizing index).
+        x = Mat::zeros(n, 1);
+        x[(j, 0)] = T::one();
+
+        let v = apply(&x)?;
+        let est_old = est;
+        est = one_norm(&v);
+
+        let sign_matches = (0..n).all(|i| sign_of(v[(i, 0)]) == isgn[i]);
+        if sign_matches {
+            // Repeated sign vector: the estimate has converged.
+            break;
+        }
+        if est <= est_old {
+            // No further improvement (cycling): stop with the current estimate.
+            break;
+        }
+
+        for i in 0..n {
+            isgn[i] = sign_of(v[(i, 0)]);
+            x[(i, 0)] = isgn[i];
+        }
+
+        let z2 = apply(&x)?;
+        let j_last = j;
+        j = argmax_abs(&z2);
+
+        let converged = z2[(j_last, 0)] == Scalar::abs(z2[(j, 0)]);
+        if converged || iter >= HAGER_HIGHAM_ITMAX {
+            break;
+        }
+        iter += 1;
+    }
+
+    // Final refinement: Higham's alternating-sign test, which can reveal a
+    // larger estimate than the power iteration above found.
+    let mut x_alt = Mat::zeros(n, 1);
+    let mut altsgn = T::one();
+    let denom = T::from_usize(n - 1)?;
+    for i in 0..n {
+        let weight = T::one() + T::from_usize(i)? / denom;
+        x_alt[(i, 0)] = altsgn * weight;
+        altsgn = -altsgn;
+    }
+    let y_alt = apply(&x_alt)?;
+    let temp = T::from_f64(2.0)? * (one_norm(&y_alt) / T::from_usize(3 * n)?);
+    if temp > est {
+        est = temp;
+    }
+
+    Some(est)
 }
 
 /// Compute forward and backward error bounds for Cholesky solve.
@@ -496,6 +623,41 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             ExpertCholeskySolveError::NotPositiveDefinite
+        );
+    }
+
+    #[test]
+    fn test_solve_cholesky_expert_rcond_beyond_first_five_columns() {
+        // Regression test for the "only samples the first 5 columns" bug:
+        // build a diagonal SPD matrix of size > 5 where the tiny
+        // eigenvalue (and hence essentially all of the ill-conditioning)
+        // lives entirely in the LAST diagonal entry, well past the old
+        // code's `n.min(5)` sampling range.
+        let n = 7;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n - 1 {
+            a[(i, i)] = 1.0;
+        }
+        let tiny = 1e-8;
+        a[(n - 1, n - 1)] = tiny;
+
+        let mut b: Mat<f64> = Mat::zeros(n, 1);
+        for i in 0..n {
+            b[(i, 0)] = 1.0;
+        }
+
+        let result = solve_cholesky_expert(a.as_ref(), b.as_ref(), false).unwrap();
+
+        // True condition number is 1/tiny = 1e8, so the true rcond is
+        // ~tiny = 1e-8. The old "first 5 columns" sampler never probed
+        // index n-1 = 6 and would report a fabricated rcond near 1.0
+        // (looking perfectly conditioned). The real full-matrix estimator
+        // must catch the severe ill-conditioning hiding at the last
+        // diagonal entry.
+        assert!(
+            result.rcond < 1e-6,
+            "rcond {} should reflect the true ill-conditioning (expected ~1e-8)",
+            result.rcond
         );
     }
 

@@ -25,6 +25,7 @@
 //! ```
 
 use ndarray::{Array1, Array2};
+use num_traits::Float;
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_sparse::csc::CscMatrix;
 use oxiblas_sparse::csr::CsrMatrix;
@@ -33,16 +34,59 @@ use oxiblas_sparse::csr::CsrMatrix;
 // Dense to Sparse Conversions
 // =============================================================================
 
-/// Converts a dense Array2 to CSR (Compressed Sparse Row) format.
+/// Decides whether a dense entry must be retained when converting to a
+/// sparse format.
 ///
-/// Non-zero elements are identified by comparing their absolute value
-/// against the scalar epsilon threshold.
+/// `NaN` entries are **always** retained: a `NaN` is technically a non-zero
+/// value (it never compares equal to zero, or to anything else), and
+/// silently discarding it during a dense-to-sparse conversion would corrupt
+/// the represented data. This holds regardless of the sparsification mode.
+///
+/// Otherwise:
+/// - `tolerance == None` — **exact-zero sparsification** (the default):
+///   an entry is retained unless it compares exactly equal to zero
+///   (`value != 0`). This never changes the numerical content of the
+///   matrix: any nonzero value, however small in magnitude (e.g.
+///   `1e-300`), is a distinct number from zero and is preserved.
+/// - `tolerance == Some(tol)` — explicit, user-opted-in **approximate**
+///   sparsification: an entry is retained iff `abs(value) > tol`.
+#[inline]
+fn retain_entry<T: Scalar>(val: T, tolerance: Option<<T as Scalar>::Real>) -> bool {
+    // A NaN component (real or imaginary) makes this entry impossible to
+    // classify as "zero" - never silently drop it.
+    if val.real().is_nan() || val.imag().is_nan() {
+        return true;
+    }
+
+    match tolerance {
+        Some(tol) => Scalar::abs(val) > tol,
+        None => val != T::zero(),
+    }
+}
+
+/// Converts a dense Array2 to CSR (Compressed Sparse Row) format using
+/// **exact-zero** sparsification.
+///
+/// An entry is dropped only if it compares exactly equal to zero
+/// (`value == 0`). This is the mathematically correct default: a value of
+/// `1e-300` is not the same as a mathematical zero, so it is always kept,
+/// and the numerical content of the matrix is never silently altered by
+/// this conversion.
+///
+/// `NaN` entries are never silently dropped: because a `NaN` never compares
+/// equal to zero (or to anything else), `NaN`-containing entries are always
+/// treated as non-zero and stored explicitly in the sparse result.
+///
+/// If you instead want tolerance-based (approximate) sparsification - e.g.
+/// to prune round-off noise below some magnitude - use
+/// [`array2_to_csr_with_tolerance`] and pass an explicit tolerance. This
+/// crate never applies a silent tolerance-based default.
 ///
 /// # Arguments
 /// * `arr` - Dense 2D array
 ///
 /// # Returns
-/// CSR matrix containing only the non-zero elements
+/// CSR matrix containing every entry that is not exactly zero
 ///
 /// # Example
 /// ```ignore
@@ -54,8 +98,31 @@ use oxiblas_sparse::csr::CsrMatrix;
 /// assert_eq!(csr.nnz(), 2);
 /// ```
 pub fn array2_to_csr<T: Scalar + Clone + Field>(arr: &Array2<T>) -> CsrMatrix<T> {
+    array2_to_csr_with_tolerance(arr, None)
+}
+
+/// Converts a dense Array2 to CSR (Compressed Sparse Row) format, with an
+/// explicit, opt-in tolerance for approximate sparsification.
+///
+/// # Arguments
+/// * `arr` - Dense 2D array
+/// * `tolerance` - `None` selects exact-zero sparsification (see
+///   [`array2_to_csr`]). `Some(tol)` explicitly opts into dropping any
+///   entry with `abs(value) <= tol`; this must be a deliberate,
+///   user-supplied choice, never a silent default, because it changes the
+///   numerical content of the matrix.
+///
+/// `NaN` entries are **always** retained (stored explicitly) regardless of
+/// `tolerance`, since a `NaN` is technically non-zero and silently
+/// discarding it would be data corruption.
+///
+/// # Returns
+/// CSR matrix containing the retained entries
+pub fn array2_to_csr_with_tolerance<T: Scalar + Clone + Field>(
+    arr: &Array2<T>,
+    tolerance: Option<<T as Scalar>::Real>,
+) -> CsrMatrix<T> {
     let (nrows, ncols) = arr.dim();
-    let eps = <T as Scalar>::epsilon();
 
     let mut row_ptrs = Vec::with_capacity(nrows + 1);
     let mut col_indices = Vec::new();
@@ -66,7 +133,7 @@ pub fn array2_to_csr<T: Scalar + Clone + Field>(arr: &Array2<T>) -> CsrMatrix<T>
     for i in 0..nrows {
         for j in 0..ncols {
             let val = arr[[i, j]];
-            if Scalar::abs(val) > eps {
+            if retain_entry(val, tolerance) {
                 col_indices.push(j);
                 values.push(val);
             }
@@ -102,19 +169,55 @@ pub fn csr_to_array2<T: Scalar + Clone + Field>(csr: &CsrMatrix<T>) -> Array2<T>
     result
 }
 
-/// Converts a dense Array2 to CSC (Compressed Sparse Column) format.
+/// Converts a dense Array2 to CSC (Compressed Sparse Column) format using
+/// **exact-zero** sparsification.
 ///
-/// Non-zero elements are identified by comparing their absolute value
-/// against the scalar epsilon threshold.
+/// An entry is dropped only if it compares exactly equal to zero
+/// (`value == 0`). This is the mathematically correct default: a value of
+/// `1e-300` is not the same as a mathematical zero, so it is always kept,
+/// and the numerical content of the matrix is never silently altered by
+/// this conversion.
+///
+/// `NaN` entries are never silently dropped: because a `NaN` never compares
+/// equal to zero (or to anything else), `NaN`-containing entries are always
+/// treated as non-zero and stored explicitly in the sparse result.
+///
+/// If you instead want tolerance-based (approximate) sparsification - e.g.
+/// to prune round-off noise below some magnitude - use
+/// [`array2_to_csc_with_tolerance`] and pass an explicit tolerance. This
+/// crate never applies a silent tolerance-based default.
 ///
 /// # Arguments
 /// * `arr` - Dense 2D array
 ///
 /// # Returns
-/// CSC matrix containing only the non-zero elements
+/// CSC matrix containing every entry that is not exactly zero
 pub fn array2_to_csc<T: Scalar + Clone + Field>(arr: &Array2<T>) -> CscMatrix<T> {
+    array2_to_csc_with_tolerance(arr, None)
+}
+
+/// Converts a dense Array2 to CSC (Compressed Sparse Column) format, with an
+/// explicit, opt-in tolerance for approximate sparsification.
+///
+/// # Arguments
+/// * `arr` - Dense 2D array
+/// * `tolerance` - `None` selects exact-zero sparsification (see
+///   [`array2_to_csc`]). `Some(tol)` explicitly opts into dropping any
+///   entry with `abs(value) <= tol`; this must be a deliberate,
+///   user-supplied choice, never a silent default, because it changes the
+///   numerical content of the matrix.
+///
+/// `NaN` entries are **always** retained (stored explicitly) regardless of
+/// `tolerance`, since a `NaN` is technically non-zero and silently
+/// discarding it would be data corruption.
+///
+/// # Returns
+/// CSC matrix containing the retained entries
+pub fn array2_to_csc_with_tolerance<T: Scalar + Clone + Field>(
+    arr: &Array2<T>,
+    tolerance: Option<<T as Scalar>::Real>,
+) -> CscMatrix<T> {
     let (nrows, ncols) = arr.dim();
-    let eps = <T as Scalar>::epsilon();
 
     let mut col_ptrs = Vec::with_capacity(ncols + 1);
     let mut row_indices = Vec::new();
@@ -125,7 +228,7 @@ pub fn array2_to_csc<T: Scalar + Clone + Field>(arr: &Array2<T>) -> CscMatrix<T>
     for j in 0..ncols {
         for i in 0..nrows {
             let val = arr[[i, j]];
-            if Scalar::abs(val) > eps {
+            if retain_entry(val, tolerance) {
                 row_indices.push(i);
                 values.push(val);
             }
@@ -549,6 +652,94 @@ mod tests {
         let a = array![[1.0f64, 2.0], [3.0, 4.0]];
         let csr = array2_to_csr(&a);
         assert_eq!(csr.nnz(), 4);
+    }
+
+    #[test]
+    fn test_array2_to_csr_exact_zero_sparsification_retains_tiny_values() {
+        // A value far below machine epsilon must still be retained: it is
+        // not the mathematical zero, and exact-zero sparsification must
+        // never silently discard it.
+        let tiny = 1e-300f64;
+        let a = array![[tiny, 0.0], [0.0, 1.0]];
+        let csr = array2_to_csr(&a);
+        assert_eq!(csr.nnz(), 2);
+        assert_eq!(csr.get(0, 0), Some(&tiny));
+    }
+
+    #[test]
+    fn test_array2_to_csc_exact_zero_sparsification_retains_tiny_values() {
+        let tiny = 1e-300f64;
+        let a = array![[tiny, 0.0], [0.0, 1.0]];
+        let csc = array2_to_csc(&a);
+        assert_eq!(csc.nnz(), 2);
+        assert_eq!(csc.get(0, 0), Some(&tiny));
+    }
+
+    #[test]
+    fn test_array2_to_csr_never_drops_nan() {
+        let a = array![[f64::NAN, 0.0], [0.0, 1.0]];
+        let csr = array2_to_csr(&a);
+        // NaN is technically non-zero and must be stored, not discarded.
+        assert_eq!(csr.nnz(), 2);
+        let stored = csr.get(0, 0).copied().expect("NaN entry must be stored");
+        assert!(stored.is_nan());
+    }
+
+    #[test]
+    fn test_array2_to_csc_never_drops_nan() {
+        let a = array![[f64::NAN, 0.0], [0.0, 1.0]];
+        let csc = array2_to_csc(&a);
+        assert_eq!(csc.nnz(), 2);
+        let stored = csc.get(0, 0).copied().expect("NaN entry must be stored");
+        assert!(stored.is_nan());
+    }
+
+    #[test]
+    fn test_array2_to_csr_exact_zero_drops_exact_zero_only() {
+        // -0.0 compares equal to 0.0 and must still be dropped.
+        let a = array![[0.0f64, -0.0], [1.0, 0.0]];
+        let csr = array2_to_csr(&a);
+        assert_eq!(csr.nnz(), 1);
+    }
+
+    #[test]
+    fn test_array2_to_csr_with_tolerance_is_opt_in() {
+        // Without an explicit tolerance, a small-but-nonzero entry is kept.
+        let small = 1e-10f64;
+        let a = array![[small, 1.0]];
+        let default_csr = array2_to_csr(&a);
+        assert_eq!(default_csr.nnz(), 2);
+
+        // With an explicit tolerance, the caller may opt into dropping it.
+        let tol_csr = array2_to_csr_with_tolerance(&a, Some(1e-6));
+        assert_eq!(tol_csr.nnz(), 1);
+        assert_eq!(tol_csr.get(0, 1), Some(&1.0));
+    }
+
+    #[test]
+    fn test_array2_to_csc_with_tolerance_is_opt_in() {
+        let small = 1e-10f64;
+        let a = array![[small, 1.0]];
+        let default_csc = array2_to_csc(&a);
+        assert_eq!(default_csc.nnz(), 2);
+
+        let tol_csc = array2_to_csc_with_tolerance(&a, Some(1e-6));
+        assert_eq!(tol_csc.nnz(), 1);
+        assert_eq!(tol_csc.get(0, 1), Some(&1.0));
+    }
+
+    #[test]
+    fn test_array2_to_csr_with_tolerance_still_never_drops_nan() {
+        // Even with an explicit tolerance, NaN must never be silently
+        // dropped: it cannot be meaningfully compared against a tolerance.
+        let a = array![[f64::NAN, 1.0]];
+        let tol_csr = array2_to_csr_with_tolerance(&a, Some(1e-6));
+        assert_eq!(tol_csr.nnz(), 2);
+        let stored = tol_csr
+            .get(0, 0)
+            .copied()
+            .expect("NaN entry must be stored even with tolerance");
+        assert!(stored.is_nan());
     }
 
     #[test]

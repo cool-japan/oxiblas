@@ -19,6 +19,7 @@ oxiblas-lapack.workspace = true
 oxiblas-sparse = { workspace = true, optional = true }
 ndarray.workspace = true
 num-complex.workspace = true
+num-traits.workspace = true
 bytemuck.workspace = true
 
 [features]

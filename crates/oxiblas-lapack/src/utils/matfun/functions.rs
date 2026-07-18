@@ -1124,7 +1124,15 @@ fn solve_sylvester_same<T: Field + Real + bytemuck::Zeroable>(
         return Ok(Mat::zeros(0, 0));
     }
     let n2 = n * n;
+    // With the column-major vec() convention (vec(X)[j*n + i] = X[i, j]) the
+    // Sylvester operator A·X + X·A vectorises to (I ⊗ A) + (Aᵀ ⊗ I):
+    //   vec(A·X) = vec(A·X·I) = (I  ⊗ A) vec(X)
+    //   vec(X·A) = vec(I·X·A) = (Aᵀ ⊗ I) vec(X)
+    // The transpose on the second Kronecker factor is essential: without it the
+    // operator only matches A·X + X·Aᵀ, so the Frechet derivative of sqrtm would
+    // be wrong for any non-symmetric A.
     let mut kron_sum = Mat::<T>::zeros(n2, n2);
+    // First term: I ⊗ A. Block (k, k) carries A, so entry (k*n + i, k*n + j) = A[i, j].
     for k in 0..n {
         for i in 0..n {
             for j in 0..n {
@@ -1132,10 +1140,11 @@ fn solve_sylvester_same<T: Field + Real + bytemuck::Zeroable>(
             }
         }
     }
+    // Second term: Aᵀ ⊗ I. Entry (i*n + k, j*n + k) = Aᵀ[i, j] = A[j, i].
     for i in 0..n {
         for j in 0..n {
             for k in 0..n {
-                kron_sum[(i * n + k, j * n + k)] = kron_sum[(i * n + k, j * n + k)] + a[(i, j)];
+                kron_sum[(i * n + k, j * n + k)] = kron_sum[(i * n + k, j * n + k)] + a[(j, i)];
             }
         }
     }
@@ -1627,6 +1636,45 @@ mod tests {
             "Frechet[1,1] = {}",
             frechet[(1, 1)]
         );
+    }
+    #[test]
+    fn test_frechet_sqrtm_nonsymmetric_finite_diff() {
+        // Non-symmetric A whose principal square root is itself non-symmetric.
+        // A = [[4, 1], [0, 9]]  =>  sqrt(A) = [[2, 0.2], [0, 3]].
+        // This is exactly the regime where using A instead of Aᵀ in the
+        // Sylvester (Kronecker) operator produces a wrong Frechet derivative:
+        // the buggy operator solves S·L + L·Sᵀ = E instead of S·L + L·S = E.
+        let a = Mat::from_rows(&[&[4.0f64, 1.0], &[0.0, 9.0]]);
+        let e = Mat::from_rows(&[&[0.05f64, 0.2], &[0.1, 0.07]]);
+        let (_sqrt_a, frechet) = frechet_sqrtm(a.as_ref(), e.as_ref()).unwrap();
+
+        // Central finite-difference approximation of the Frechet derivative:
+        //   L(A, E) ≈ (sqrt(A + h·E) - sqrt(A - h·E)) / (2h)
+        let h = 1e-5;
+        let mut a_plus = Mat::zeros(2, 2);
+        let mut a_minus = Mat::zeros(2, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                a_plus[(i, j)] = a[(i, j)] + h * e[(i, j)];
+                a_minus[(i, j)] = a[(i, j)] - h * e[(i, j)];
+            }
+        }
+        let sqrt_plus = sqrtm(a_plus.as_ref()).unwrap();
+        let sqrt_minus = sqrtm(a_minus.as_ref()).unwrap();
+
+        for i in 0..2 {
+            for j in 0..2 {
+                let fd = (sqrt_plus[(i, j)] - sqrt_minus[(i, j)]) / (2.0 * h);
+                assert!(
+                    (frechet[(i, j)] - fd).abs() < 1e-5,
+                    "Frechet[{},{}] = {}, finite diff = {}",
+                    i,
+                    j,
+                    frechet[(i, j)],
+                    fd
+                );
+            }
+        }
     }
     #[test]
     fn test_frechet_logm_1x1() {

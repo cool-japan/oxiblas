@@ -38,9 +38,6 @@
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
-/// Default block size for blocked Hessenberg reduction.
-const DEFAULT_BLOCK_SIZE: usize = 64;
-
 /// Error type for Hessenberg reduction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HessenbergError {
@@ -289,7 +286,8 @@ impl<T: Field + Real + bytemuck::Zeroable> Hessenberg<T> {
     /// assert!(h[(3, 1)].abs() < 1e-10);
     /// ```
     pub fn compute_blocked(a: MatRef<'_, T>) -> Result<Self, HessenbergError> {
-        Self::compute_blocked_with_block_size(a, DEFAULT_BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_hessenberg(a.nrows());
+        Self::compute_blocked_with_block_size(a, nb)
     }
 
     /// Reduces a matrix to upper Hessenberg form with specified block size.

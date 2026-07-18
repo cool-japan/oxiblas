@@ -62,12 +62,29 @@
 //! # Memory Layout
 //!
 //! OxiBLAS uses column-major (Fortran) order internally. This crate handles
-//! both row-major and column-major ndarray layouts:
+//! both row-major and column-major ndarray layouts, but be aware of which
+//! conversion path a given API uses:
 //!
-//! - **Column-major arrays**: Zero-copy or minimal-copy operations
-//! - **Row-major arrays**: Automatic conversion (with copy) when needed
+//! - The **BLAS/LAPACK convenience wrappers** in this crate (e.g. `matmul`,
+//!   `lu_ndarray`, `qr_ndarray`, `solve_ndarray`, ...) internally build an
+//!   owned [`oxiblas_matrix::Mat`], via [`conversions::array2_to_mat`].
+//!   That is always a **copying** conversion - `Mat` allocates its own
+//!   cache-line-aligned, potentially padded buffer that cannot adopt
+//!   `ndarray`'s `Vec`-backed storage - so a copy happens whether the
+//!   source array is row-major, column-major, or otherwise strided.
+//! - Only the explicit **view conversions** in [`conversions`] - e.g.
+//!   [`conversions::array_view_to_mat_ref`],
+//!   [`conversions::array_view_mut_to_mat_mut`],
+//!   [`conversions::array_viewd_to_mat_ref`] - are genuinely zero-copy:
+//!   they borrow the source array's existing buffer as a `MatRef`/`MatMut`
+//!   with no allocation, when the array is contiguous along one axis with
+//!   a non-negative stride (`None` otherwise). Use these directly if you
+//!   are writing your own numerical code against `MatRef`/`MatMut` and
+//!   want to avoid a copy.
 //!
-//! For best performance, use column-major arrays when possible:
+//! Column-major arrays remain the preferred layout for interop with other
+//! Fortran-order tooling and for the zero-copy view conversions above; the
+//! convenience wrappers themselves copy the same way regardless of layout:
 //!
 //! ```
 //! use ndarray::{Array2, ShapeBuilder};
@@ -205,8 +222,9 @@ pub mod prelude {
     // Sparse integration
     #[cfg(feature = "sparse")]
     pub use crate::sparse::{
-        SparseNdarrayError, array2_to_csc, array2_to_csr, csc_to_array2, csr_to_array2,
-        sparse_solve_ndarray, sparse_solve_ndarray_with_options, spmv_full_ndarray, spmv_ndarray,
+        SparseNdarrayError, array2_to_csc, array2_to_csc_with_tolerance, array2_to_csr,
+        array2_to_csr_with_tolerance, csc_to_array2, csr_to_array2, sparse_solve_ndarray,
+        sparse_solve_ndarray_with_options, spmv_full_ndarray, spmv_ndarray,
     };
 }
 

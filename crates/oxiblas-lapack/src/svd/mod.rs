@@ -74,6 +74,7 @@
 //! let qc = ormbr(&factors, BidiagVect::Q, Side::Left, Trans::NoTrans, c.as_ref()).unwrap();
 //! ```
 
+mod bidiag_dc;
 mod bidiag_reduce;
 mod bidiagonal;
 mod complex;

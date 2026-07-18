@@ -116,7 +116,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 ### P2 — MEDIUM (verified during adversarial review; originally reported higher)
 
-- [ ] `.github/workflows.disabled/ci.yml:1` — **CI is entirely disabled — the whole workflows directory is renamed .disabled, so no automated validation runs** _(release, easy)_
+- [x] `.github/workflows.disabled/ci.yml:1` — **CI is entirely disabled — the whole workflows directory is renamed .disabled, so no automated validation runs** _(release, easy)_
   - Fix: Rename `.github/workflows.disabled/` back to `.github/workflows/` (after fixing the branch-trigger bug below), or explicitly document that CI is intentionally disabled and remove/adjust README-internal.md.
 - [x] `crates/oxiblas-blas/src/cblas/basic.rs:1065` — **beta==0 not special-cased: NaN/Inf in uninitialized C propagates (violates BLAS 'C need not be set when beta=0' contract)** _(bug, easy)_
   - Fix: Replace `*cp *= beta` with `if beta == 0 { *cp = <zero> } else { *cp *= beta }` in the beta-scaling loops of zgemm/cgemm/gemm-fallback and gemv (and confirm the level3::gemm fast path already zeroes on beta==0).
@@ -234,13 +234,13 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **stub** (7)
 
-- [ ] `Cargo.toml:31` — **Orphaned oxiblas-ffi crate (37,260 lines, 302 dead tests) sits in the tree but is excluded from the workspace** _(stub, medium)_
+- [x] `Cargo.toml:31` — **Orphaned oxiblas-ffi crate (37,260 lines, 302 dead tests) sits in the tree but is excluded from the workspace** _(stub, medium)_
 - [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:284` — **pack_b_streaming is a stub: advertised non-temporal streaming stores do not exist (AVX-512 TODO)** _(stub, medium)_
 - [x] `crates/oxiblas-core/src/memory/arena.rs:403` — **BlasArenaConfig.auto_grow/max_capacity are dead knobs; arena APIs unused by any BLAS code despite umbrella-crate claims** _(stub, medium)_
 - [x] `crates/oxiblas-core/src/simd.rs:27` — **Entire ~7,000-line SIMD abstraction layer is orphaned — no BLAS/LAPACK kernel uses it** _(stub, hard)_
 - [x] `crates/oxiblas-core/src/tuning.rs:228` — **AutoTuner runs no benchmarks and tune_gemm poisons the global TuningCache** _(stub, medium)_
-- [ ] `crates/oxiblas-ffi/Cargo.toml:4` — **Retired oxiblas-ffi crate (37k LOC) is orphaned: excluded from members but not in workspace.exclude, so it cannot build standalone and rots untested** _(stub, medium)_
-- [ ] `examples/basic_blas.rs:5` — **Orphaned root examples/ directory contains 4 broken example files referencing APIs/modules that no longer exist** _(stub, easy)_
+- [x] `crates/oxiblas-ffi/Cargo.toml:4` — **Retired oxiblas-ffi crate (37k LOC) is orphaned: excluded from members but not in workspace.exclude, so it cannot build standalone and rots untested** _(stub, medium)_
+- [x] `examples/basic_blas.rs:5` — **Orphaned root examples/ directory contains 4 broken example files referencing APIs/modules that no longer exist** _(stub, easy)_
 
 **policy** (6)
 
@@ -253,7 +253,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **release** (3)
 
-- [ ] `.github/workflows.disabled/release.yml:84` — **Release workflow still publishes retired oxiblas-ffi, which is not a workspace member and will fail cargo publish** _(release, easy)_
+- [x] `.github/workflows.disabled/release.yml:84` — **Release workflow still publishes retired oxiblas-ffi, which is not a workspace member and will fail cargo publish** _(release, easy)_
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:1433` — **no_std x86_64 build broken: is_x86_feature_detected! used unconditionally** _(release, easy)_
 - [x] `crates/oxiblas/Cargo.toml:1` — **No [package.metadata.docs.rs] on any publishable crate — docs.rs will build with default features only, hiding f16/f128/sparse/ndarray/serde/mmap/nalgebra APIs** _(release, easy)_
 
@@ -273,10 +273,10 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **docs** (4)
 
-- [ ] `README.md:124` — **README example commands `cargo run --example NAME` fail at the workspace root (virtual manifest requires a package selector)** _(docs, easy)_
-- [ ] `examples/basic_blas.rs:5` — **Root example basic_blas.rs imports nonexistent oxiblas::blas::{dot,axpy,gemv,gemm} paths and calls gemv with wrong arity** _(docs, easy)_
-- [ ] `examples/eigenvalue.rs:5` — **Root example eigenvalue.rs imports nonexistent module oxiblas::lapack::eigenvalue and nonexistent function syev** _(docs, easy)_
-- [ ] `examples/lapack_solve.rs:6` — **Root example lapack_solve.rs imports nonexistent module oxiblas::lapack::factorization and nonexistent free fn lu, plus broken gemv verify call** _(docs, easy)_
+- [x] `README.md:124` — **README example commands `cargo run --example NAME` fail at the workspace root (virtual manifest requires a package selector)** _(docs, easy)_
+- [x] `examples/basic_blas.rs:5` — **Root example basic_blas.rs imports nonexistent oxiblas::blas::{dot,axpy,gemv,gemm} paths and calls gemv with wrong arity** _(docs, easy)_
+- [x] `examples/eigenvalue.rs:5` — **Root example eigenvalue.rs imports nonexistent module oxiblas::lapack::eigenvalue and nonexistent function syev** _(docs, easy)_
+- [x] `examples/lapack_solve.rs:6` — **Root example lapack_solve.rs imports nonexistent module oxiblas::lapack::factorization and nonexistent free fn lu, plus broken gemv verify call** _(docs, easy)_
 
 ### P3 — LOW (reported, not adversarially verified)
 
@@ -338,7 +338,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **release** (2)
 
 - [x] `crates/oxiblas-blas/src/level3/XX2vDM7e:1` — **Zero-byte junk file XX2vDM7e committed in level3 source directory** _(release, easy)_
-- [ ] `crates/oxiblas-ffi/Cargo.toml:1` — **Orphaned oxiblas-ffi crate remains in-tree but is excluded from the workspace** _(release, easy)_
+- [x] `crates/oxiblas-ffi/Cargo.toml:1` — **Orphaned oxiblas-ffi crate remains in-tree but is excluded from the workspace** _(release, easy)_
 
 **performance** (2)
 
@@ -354,9 +354,9 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 **docs** (22)
 
-- [ ] `.github/README-internal.md:8` — **README-internal.md documents CI as active on main/develop while workflows are disabled and the branch is master** _(docs, easy)_
+- [x] `.github/README-internal.md:8` — **README-internal.md documents CI as active on main/develop while workflows are disabled and the branch is master** _(docs, easy)_
 - [x] `CHANGELOG.md:270` — **Stale 'Release Checklist' in CHANGELOG references version 0.1.0 and leaves publish-readiness items unchecked** _(docs, easy)_ — resolved as part of the 0.2.2 release-mechanics pass: retitled as historical/v0.1.0-scoped, all items marked complete
-- [ ] `README.md:696` — **README Project Status metrics are stale (Version 0.2.1, ~223,935 lines / 371 files) versus actual codebase** _(docs, easy)_
+- [x] `README.md:696` — **README Project Status metrics are stale (Version 0.2.1, ~223,935 lines / 371 files) versus actual codebase** _(docs, easy)_
 - [x] `crates/oxiblas-blas/src/accuracy.rs:26` — **Accuracy-bound doc table contradicts the implemented error-bound functions** _(docs, easy)_
 - [x] `crates/oxiblas-blas/src/complex_interleaved.rs:357` — **'in-place' conversions allocate full auxiliary buffers, contradicting their doc claim** _(docs, medium)_
 - [x] `crates/oxiblas-blas/src/level1/scal.rs:28` — **scal(0, x) memsets to zero, scrubbing NaN/Inf, unlike reference DSCAL which multiplies** _(docs, easy)_
@@ -485,8 +485,8 @@ There is no more open scope from the original 2026-07-16 audit or its Iteration-
 **workspace-root (5, queued for Iter4):**
 - [x] `README.md:648` — Mixed-precision iterative refinement example imports nonexistent `oxiblas_lapack::refine` (real path: `oxiblas_lapack::solve`) _(docs, medium)_
 - [x] `README.md:662` — Batched BLAS example imports nonexistent `oxiblas_blas::batched` (real path: `oxiblas_blas::level3::batched`) _(docs, medium)_
-- [ ] `.github/workflows.disabled/benchmarks.yml:64` — references a nonexistent `gemm` bench target(also :128); also fix the 3-names-in-one---bench bug at :72 _(release, medium)_
-- [ ] `.github/workflows.disabled/ci.yml:5` — triggers only on main/develop, but the repo's default branch is master (distinct from the "CI disabled" issue at :1) _(release, low)_
+- [x] `.github/workflows.disabled/benchmarks.yml:64` — references a nonexistent `gemm` bench target(also :128); also fix the 3-names-in-one---bench bug at :72 _(release, medium)_
+- [x] `.github/workflows.disabled/ci.yml:5` — triggers only on main/develop, but the repo's default branch is master (distinct from the "CI disabled" issue at :1) _(release, low)_
 - [x] `examples/sparse_iterative.rs:1` — root examples/ is entirely orphaned (no owning package, never compiled by CI); same disposition as the already-tracked basic_blas.rs/eigenvalue.rs/lapack_solve.rs _(docs, low)_
 
 ### oxiblas-ffi disposition (decision needed)

@@ -132,7 +132,7 @@ impl<T: Scalar> CowMat<T> {
     /// Creates a COW matrix from an owned Mat.
     ///
     /// Since `mat` is already uniquely owned, this takes ownership of its
-    /// backing buffer directly (via [`Mat::into_raw_parts`]) instead of
+    /// backing buffer directly (via `Mat::into_raw_parts`) instead of
     /// allocating a fresh buffer and copying every element -- an O(1) move
     /// rather than an O(nrows * ncols) copy.
     pub fn from_mat(mat: Mat<T>) -> Self {

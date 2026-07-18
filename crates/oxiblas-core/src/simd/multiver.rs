@@ -8,7 +8,7 @@
 //!   multi-versioning layer (`has_avx512f`, `has_avx2`, `has_sse42`, `has_fma`,
 //!   `has_neon`, `cache_line_bytes`, `vector_width_bytes`, `has_simd128`) and a
 //!   `detect()` that returns `&'static Self` when `std` is enabled.  Its values
-//!   are copied verbatim from [`dispatch::SimdCapabilities`] so the two can
+//!   are copied verbatim from [`crate::simd::dispatch::SimdCapabilities`] so the two can
 //!   never diverge.
 //! - The [`simd_dispatch_caps!`] macro for named-arm dispatch.
 //!
@@ -121,7 +121,7 @@ impl SimdCapabilityInfo {
         Self::from_legacy(legacy)
     }
 
-    /// Build from the authoritative [`dispatch::SimdCapabilities`].
+    /// Build from the authoritative [`crate::simd::dispatch::SimdCapabilities`].
     ///
     /// Every field is copied verbatim.  The dispatch layer already performs
     /// accurate runtime SSE4.2 detection *and* applies the `force-scalar` /
@@ -134,14 +134,14 @@ impl SimdCapabilityInfo {
         Self::mirror(legacy)
     }
 
-    /// Build from the authoritative [`dispatch::SimdCapabilities`] (no_std path,
+    /// Build from the authoritative [`crate::simd::dispatch::SimdCapabilities`] (no_std path,
     /// passed by value).
     #[cfg(not(feature = "std"))]
     fn from_legacy(legacy: LegacyCaps) -> Self {
         Self::mirror(&legacy)
     }
 
-    /// Field-by-field copy from [`dispatch::SimdCapabilities`].  This is the
+    /// Field-by-field copy from [`crate::simd::dispatch::SimdCapabilities`].  This is the
     /// only construction path for [`SimdCapabilityInfo`], guaranteeing it stays
     /// a faithful view of the single source of truth.
     #[inline]
@@ -197,7 +197,7 @@ impl SimdCapabilityInfo {
     /// Returns the [`LegacyLevel`] that best summarises these capabilities.
     ///
     /// The tier ordering (SVE before NEON, plus the wasm `simd128` tier) mirrors
-    /// [`dispatch::SimdCapabilities::optimal_level`] exactly.
+    /// [`crate::simd::dispatch::SimdCapabilities::optimal_level`] exactly.
     #[inline]
     pub fn optimal_level(&self) -> LegacyLevel {
         if self.has_avx512_full() {

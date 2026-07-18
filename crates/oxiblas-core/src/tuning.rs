@@ -340,8 +340,8 @@ fn generate_candidates(m: usize, n: usize, k: usize) -> Vec<TuningConfig> {
 /// Runtime auto-tuner for GEMM block sizes.
 ///
 /// `tune_gemm` runs a small, bounded set of *real* timed micro-benchmarks
-/// on the current machine (see [`generate_candidates`] and
-/// [`time_candidate`]) and keeps whichever candidate measured fastest.
+/// on the current machine (see `generate_candidates` and
+/// `time_candidate`) and keeps whichever candidate measured fastest.
 /// Only that genuinely-measured winner is written into the shared
 /// [`TuningCache`], so other code reading the cache never observes a
 /// value that was fabricated rather than measured.

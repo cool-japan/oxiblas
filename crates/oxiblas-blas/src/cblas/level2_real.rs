@@ -19,7 +19,7 @@
 //! Following reference BLAS, a negative increment traverses the logical vector
 //! from its last element toward the first: logical element `i` lives at pointer
 //! offset `i*inc` when `inc >= 0`, and `(i - (n-1))*inc` when `inc < 0` (which
-//! is `(n-1-i)*|inc| >= 0`). See [`vec_offset`].
+//! is `(n-1-i)*|inc| >= 0`). See `vec_offset`.
 
 use super::types::*;
 use crate::level2;

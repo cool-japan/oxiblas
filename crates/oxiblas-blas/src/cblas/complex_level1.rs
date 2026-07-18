@@ -8,7 +8,7 @@
 //! Unit-stride paths defer to the SIMD-accelerated native kernels
 //! (`level1::scal`/`axpy`/`copy`/`swap`); strided paths use scalar loops.
 //! Increments follow the reference BLAS convention, including negative
-//! increments (see [`vec_offset`]).
+//! increments (see `vec_offset`).
 
 use crate::level1;
 use num_complex::{Complex, Complex32, Complex64};

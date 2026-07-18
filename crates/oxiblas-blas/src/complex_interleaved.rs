@@ -470,7 +470,7 @@ fn permute_in_place<T: Copy>(data: &mut [T], dest: impl Fn(usize) -> usize) {
 /// Real/imaginary de-interleaving is equivalent to transposing a conceptual
 /// `n x 2` matrix (rows = complex elements, columns = `[re, im]`) into a
 /// `2 x n` matrix (rows = `[all re, all im]`). This is performed with a
-/// genuine in-place cycle-following permutation ([`permute_in_place`]):
+/// genuine in-place cycle-following permutation (`permute_in_place`):
 /// every element is written to its final position exactly once, and the
 /// only auxiliary memory used is a small bit-vector for cycle-visitation
 /// bookkeeping -- not a full `O(n)`-element buffer of `T`.

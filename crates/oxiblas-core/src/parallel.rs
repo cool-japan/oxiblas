@@ -1221,6 +1221,7 @@ mod tests {
 
     // ---- OxiblasThreadConfig tests ------------------------------------------
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_default() {
         let cfg = OxiblasThreadConfig::default();
@@ -1229,6 +1230,7 @@ mod tests {
         assert!(cfg.thread_name.is_none());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_builder() {
         let cfg = OxiblasThreadConfig::new()
@@ -1240,6 +1242,7 @@ mod tests {
         assert_eq!(cfg.thread_name.as_deref(), Some("oxiblas-worker"));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_effective_threads_zero() {
         let cfg = OxiblasThreadConfig::new().num_threads(0);
@@ -1247,6 +1250,7 @@ mod tests {
         assert!(cfg.effective_threads() >= 1);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_effective_threads_explicit() {
         let cfg = OxiblasThreadConfig::new().num_threads(3);

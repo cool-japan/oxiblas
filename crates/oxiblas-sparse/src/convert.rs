@@ -124,6 +124,36 @@ pub fn csc_to_csr<T: Scalar + Clone>(csc: &CscMatrix<T>) -> CsrMatrix<T> {
     unsafe { CsrMatrix::new_unchecked(nrows, ncols, row_ptrs, col_indices, values) }
 }
 
+/// Flushes a per-row (or per-column) COO accumulation buffer into the
+/// output CSR/CSC arrays.
+///
+/// Duplicate entries at the same (row, col) have already been summed into
+/// `buf_indices`/`buf_values` while the row (or column) was being scanned.
+/// This drops any entries that summed to exactly zero (within epsilon) and
+/// appends the survivors to the output arrays.
+///
+/// Crucially, this is called exactly once per row/column, *after* every
+/// entry belonging to that row/column has been accumulated. That keeps
+/// zero-pruning entirely local to one row/column: it can never run after
+/// `values.len()` has already been captured into a `row_ptrs`/`col_ptrs`
+/// boundary for a *later* row/column, which is what previously let a
+/// pruned zero corrupt the pointer array and misattribute later entries
+/// to the wrong row/column.
+fn flush_coo_group<T: Scalar<Real = T> + Clone + Field + Real>(
+    buf_indices: &mut Vec<usize>,
+    buf_values: &mut Vec<T>,
+    out_indices: &mut Vec<usize>,
+    out_values: &mut Vec<T>,
+) {
+    let eps = <T as Scalar>::epsilon();
+    for (idx, val) in buf_indices.drain(..).zip(buf_values.drain(..)) {
+        if Scalar::abs(val.clone()) > eps {
+            out_indices.push(idx);
+            out_values.push(val);
+        }
+    }
+}
+
 /// Converts a COO matrix to CSR format, summing duplicate entries.
 ///
 /// Time complexity: O(nnz log nnz) due to sorting
@@ -140,62 +170,60 @@ pub fn coo_to_csr<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
     let mut indices: Vec<usize> = (0..coo.len()).collect();
     indices.sort_by_key(|&i| (coo.row_indices()[i], coo.col_indices()[i]));
 
-    // Build CSR data, summing duplicates
+    // Build CSR data, summing duplicates. Each row is accumulated into a
+    // scratch buffer first; only once the *entire* row has been summed do
+    // we prune exact-zero results and append the survivors to the output
+    // arrays, then push the row_ptrs boundary. Zero-pruning therefore
+    // never straddles a row boundary (see `flush_coo_group`).
     let mut row_ptrs = Vec::with_capacity(nrows + 1);
     let mut col_indices = Vec::with_capacity(coo.len());
     let mut values: Vec<T> = Vec::with_capacity(coo.len());
 
     row_ptrs.push(0);
-    let mut current_row = 0;
+    let mut current_row = 0usize;
+
+    let mut row_col_buf: Vec<usize> = Vec::new();
+    let mut row_val_buf: Vec<T> = Vec::new();
 
     for &idx in &indices {
         let row = coo.row_indices()[idx];
         let col = coo.col_indices()[idx];
         let val = coo.values()[idx].clone();
 
-        // Fill in empty rows
-        while current_row < row {
+        if row != current_row {
+            // Row boundary: flush the completed row, then fill any fully
+            // empty rows between it and the new row.
+            flush_coo_group(&mut row_col_buf, &mut row_val_buf, &mut col_indices, &mut values);
             row_ptrs.push(values.len());
             current_row += 1;
+
+            while current_row < row {
+                row_ptrs.push(values.len());
+                current_row += 1;
+            }
         }
 
-        // Check for duplicate
-        if !values.is_empty() && col_indices.last() == Some(&col) && current_row == row {
-            // Same position as last entry, accumulate
-            let last = values.len() - 1;
-            values[last] = values[last].clone() + val;
+        // Accumulate into the current row's buffer, summing duplicates at
+        // the same column (adjacent, since entries are sorted).
+        if row_col_buf.last() == Some(&col) {
+            let last = row_val_buf.len() - 1;
+            row_val_buf[last] = row_val_buf[last].clone() + val;
         } else {
-            // Skip zeros after accumulation
-            if !values.is_empty() {
-                let last = values.len() - 1;
-                if Scalar::abs(values[last].clone()) <= <T as Scalar>::epsilon() {
-                    values.pop();
-                    col_indices.pop();
-                }
-            }
-            // New entry
-            if Scalar::abs(val.clone()) > <T as Scalar>::epsilon() {
-                col_indices.push(col);
-                values.push(val);
-            }
+            row_col_buf.push(col);
+            row_val_buf.push(val);
         }
     }
 
-    // Clean up last entry if it became zero
-    if !values.is_empty() {
-        let last = values.len() - 1;
-        if Scalar::abs(values[last].clone()) <= <T as Scalar>::epsilon() {
-            values.pop();
-            col_indices.pop();
-        }
-    }
+    // Flush the final row's buffer.
+    flush_coo_group(&mut row_col_buf, &mut row_val_buf, &mut col_indices, &mut values);
+    row_ptrs.push(values.len());
+    current_row += 1;
 
-    // Fill remaining row pointers
+    // Fill any trailing empty rows.
     while current_row < nrows {
         row_ptrs.push(values.len());
         current_row += 1;
     }
-    row_ptrs.push(values.len());
 
     // SAFETY: We've constructed valid CSR data
     unsafe { CsrMatrix::new_unchecked(nrows, ncols, row_ptrs, col_indices, values) }
@@ -217,62 +245,60 @@ pub fn coo_to_csc<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
     let mut indices: Vec<usize> = (0..coo.len()).collect();
     indices.sort_by_key(|&i| (coo.col_indices()[i], coo.row_indices()[i]));
 
-    // Build CSC data, summing duplicates
+    // Build CSC data, summing duplicates. Mirrors `coo_to_csr`: each column
+    // is accumulated into a scratch buffer first; only once the *entire*
+    // column has been summed do we prune exact-zero results and append the
+    // survivors, then push the col_ptrs boundary. Zero-pruning therefore
+    // never straddles a column boundary (see `flush_coo_group`).
     let mut col_ptrs = Vec::with_capacity(ncols + 1);
     let mut row_indices = Vec::with_capacity(coo.len());
     let mut values: Vec<T> = Vec::with_capacity(coo.len());
 
     col_ptrs.push(0);
-    let mut current_col = 0;
+    let mut current_col = 0usize;
+
+    let mut col_row_buf: Vec<usize> = Vec::new();
+    let mut col_val_buf: Vec<T> = Vec::new();
 
     for &idx in &indices {
         let row = coo.row_indices()[idx];
         let col = coo.col_indices()[idx];
         let val = coo.values()[idx].clone();
 
-        // Fill in empty columns
-        while current_col < col {
+        if col != current_col {
+            // Column boundary: flush the completed column, then fill any
+            // fully empty columns between it and the new column.
+            flush_coo_group(&mut col_row_buf, &mut col_val_buf, &mut row_indices, &mut values);
             col_ptrs.push(values.len());
             current_col += 1;
+
+            while current_col < col {
+                col_ptrs.push(values.len());
+                current_col += 1;
+            }
         }
 
-        // Check for duplicate
-        if !values.is_empty() && row_indices.last() == Some(&row) && current_col == col {
-            // Same position as last entry, accumulate
-            let last = values.len() - 1;
-            values[last] = values[last].clone() + val;
+        // Accumulate into the current column's buffer, summing duplicates
+        // at the same row (adjacent, since entries are sorted).
+        if col_row_buf.last() == Some(&row) {
+            let last = col_val_buf.len() - 1;
+            col_val_buf[last] = col_val_buf[last].clone() + val;
         } else {
-            // Skip zeros after accumulation
-            if !values.is_empty() {
-                let last = values.len() - 1;
-                if Scalar::abs(values[last].clone()) <= <T as Scalar>::epsilon() {
-                    values.pop();
-                    row_indices.pop();
-                }
-            }
-            // New entry
-            if Scalar::abs(val.clone()) > <T as Scalar>::epsilon() {
-                row_indices.push(row);
-                values.push(val);
-            }
+            col_row_buf.push(row);
+            col_val_buf.push(val);
         }
     }
 
-    // Clean up last entry if it became zero
-    if !values.is_empty() {
-        let last = values.len() - 1;
-        if Scalar::abs(values[last].clone()) <= <T as Scalar>::epsilon() {
-            values.pop();
-            row_indices.pop();
-        }
-    }
+    // Flush the final column's buffer.
+    flush_coo_group(&mut col_row_buf, &mut col_val_buf, &mut row_indices, &mut values);
+    col_ptrs.push(values.len());
+    current_col += 1;
 
-    // Fill remaining column pointers
+    // Fill any trailing empty columns.
     while current_col < ncols {
         col_ptrs.push(values.len());
         current_col += 1;
     }
-    col_ptrs.push(values.len());
 
     // SAFETY: We've constructed valid CSC data
     unsafe { CscMatrix::new_unchecked(nrows, ncols, col_ptrs, row_indices, values) }
@@ -953,6 +979,76 @@ mod tests {
         assert_eq!(csr.nnz(), 2);
         assert_eq!(csr.get(0, 0), Some(&3.0)); // 1 + 2
         assert_eq!(csr.get(1, 1), Some(&3.0));
+    }
+
+    #[test]
+    fn test_coo_to_csr_row_ptrs_length() {
+        // Regression test: row_ptrs must have exactly nrows + 1 entries.
+        // A stray trailing push used to make it nrows + 2.
+        let nrows = 4;
+        let row_indices = vec![0, 1, 3];
+        let col_indices = vec![0, 1, 0];
+        let values = vec![1.0f64, 2.0, 3.0];
+
+        let coo = CooMatrix::new(nrows, 2, row_indices, col_indices, values).unwrap();
+        let csr = coo_to_csr(&coo);
+
+        assert_eq!(csr.row_ptrs().len(), nrows + 1);
+    }
+
+    #[test]
+    fn test_coo_to_csr_zero_cancellation_does_not_misattribute_row() {
+        // Row 0 holds two entries at the same column that cancel to
+        // exactly zero; row 1 is empty; row 2 holds a single surviving
+        // entry. Before the fix, deferring zero-pruning past the row
+        // boundary corrupted row_ptrs so that row 2's entry was
+        // misattributed to row 0 (and row 2 appeared empty).
+        let row_indices = vec![0, 0, 2];
+        let col_indices = vec![0, 0, 1];
+        let values = vec![5.0f64, -5.0, 9.0];
+
+        let coo = CooMatrix::new(3, 2, row_indices, col_indices, values).unwrap();
+        let csr = coo_to_csr(&coo);
+
+        assert_eq!(csr.row_ptrs().len(), 3 + 1);
+        assert_eq!(csr.nnz(), 1);
+        assert_eq!(csr.get(0, 0), None);
+        assert_eq!(csr.get(1, 1), None);
+        assert_eq!(csr.get(2, 1), Some(&9.0));
+    }
+
+    #[test]
+    fn test_coo_to_csc_col_ptrs_length() {
+        // Regression test: col_ptrs must have exactly ncols + 1 entries.
+        // A stray trailing push used to make it ncols + 2.
+        let ncols = 4;
+        let row_indices = vec![0, 1, 0];
+        let col_indices = vec![0, 1, 3];
+        let values = vec![1.0f64, 2.0, 3.0];
+
+        let coo = CooMatrix::new(2, ncols, row_indices, col_indices, values).unwrap();
+        let csc = coo_to_csc(&coo);
+
+        assert_eq!(csc.col_ptrs().len(), ncols + 1);
+    }
+
+    #[test]
+    fn test_coo_to_csc_zero_cancellation_does_not_misattribute_column() {
+        // Mirror of the CSR regression test: column 0 cancels to exactly
+        // zero, column 1 is empty, column 2 holds a single surviving
+        // entry.
+        let row_indices = vec![0, 0, 1];
+        let col_indices = vec![0, 0, 2];
+        let values = vec![5.0f64, -5.0, 9.0];
+
+        let coo = CooMatrix::new(2, 3, row_indices, col_indices, values).unwrap();
+        let csc = coo_to_csc(&coo);
+
+        assert_eq!(csc.col_ptrs().len(), 3 + 1);
+        assert_eq!(csc.nnz(), 1);
+        assert_eq!(csc.get(0, 0), None);
+        assert_eq!(csc.get(0, 1), None);
+        assert_eq!(csc.get(1, 2), Some(&9.0));
     }
 
     #[test]

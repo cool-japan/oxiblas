@@ -38,6 +38,13 @@ pub enum MultifrontalError {
         /// Description of the error.
         message: String,
     },
+    /// Right-hand side vector length does not match the matrix dimension.
+    DimensionMismatch {
+        /// Expected length (matrix dimension).
+        expected: usize,
+        /// Actual length of the provided right-hand side.
+        actual: usize,
+    },
 }
 
 impl core::fmt::Display for MultifrontalError {
@@ -54,6 +61,12 @@ impl core::fmt::Display for MultifrontalError {
             }
             Self::AssemblyError { message } => {
                 write!(f, "Assembly error: {message}")
+            }
+            Self::DimensionMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "RHS length mismatch: expected {expected}, got {actual}"
+                )
             }
         }
     }
@@ -318,7 +331,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> FrontalMatrix<T> {
 /// ```ignore
 /// use oxiblas_sparse::linalg::MultifrontalCholesky;
 /// let chol = MultifrontalCholesky::new(&a)?;
-/// let x = chol.solve(&b);
+/// let x = chol.solve(&b)?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct MultifrontalCholesky<T: Scalar> {
@@ -524,9 +537,19 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
     ///
     /// Performs forward substitution (L * y = P * b) then
     /// backward substitution (L^T * z = y), then applies P^T.
-    pub fn solve(&self, b: &[T]) -> Vec<T> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultifrontalError::DimensionMismatch`] if `b.len()` does not
+    /// match the matrix dimension.
+    pub fn solve(&self, b: &[T]) -> Result<Vec<T>, MultifrontalError> {
         let n = self.n;
-        assert_eq!(b.len(), n, "RHS length must match matrix dimension");
+        if b.len() != n {
+            return Err(MultifrontalError::DimensionMismatch {
+                expected: n,
+                actual: b.len(),
+            });
+        }
 
         // Apply permutation: b_perm = P * b
         let mut x = vec![T::zero(); n];
@@ -546,7 +569,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
             result[self.perm[i]] = x[i].clone();
         }
 
-        result
+        Ok(result)
     }
 
     /// Forward substitution: L * y = b.
@@ -794,12 +817,47 @@ fn symbolic_factorization<T: Scalar>(
 /// Permutes a symmetric matrix: returns P * A * P^T.
 ///
 /// Stores the full symmetric matrix (both triangles) in the result.
+///
+/// `a` may store either the full symmetric matrix or just one triangle;
+/// entries that live in another column but reference the current row are
+/// recovered via a precomputed row index (built once in a single O(nnz)
+/// pass over the CSC structure) rather than by rescanning every column of
+/// `a` for each output column, which would degrade to O(n^2) work overall.
 fn permute_symmetric_csc<T: Scalar + Clone + Field>(
     a: &CscMatrix<T>,
     perm: &[usize],
     perm_inv: &[usize],
 ) -> CscMatrix<T> {
     let n = a.nrows();
+    let nnz = a.row_indices().len();
+
+    // Build a row-major view of A's nonzeros: for each row `r`, the list of
+    // (col, value) pairs whose row index is `r`. This is the transpose's
+    // CSC structure, computed via a standard counting-sort pass over the
+    // existing CSC column pointers (O(n + nnz)), so that later we can find
+    // "which other columns reference row `old_j`" in O(deg(old_j)) instead
+    // of scanning all n columns of `a`.
+    let mut row_ptr = vec![0usize; n + 1];
+    for &row in a.row_indices() {
+        row_ptr[row + 1] += 1;
+    }
+    for r in 0..n {
+        row_ptr[r + 1] += row_ptr[r];
+    }
+    let mut row_col = vec![0usize; nnz];
+    let mut row_val: Vec<T> = vec![T::zero(); nnz];
+    let mut cursor = row_ptr.clone();
+    for old_k in 0..n {
+        let k_start = a.col_ptrs()[old_k];
+        let k_end = a.col_ptrs()[old_k + 1];
+        for idx in k_start..k_end {
+            let row = a.row_indices()[idx];
+            let pos = cursor[row];
+            row_col[pos] = old_k;
+            row_val[pos] = a.values()[idx].clone();
+            cursor[row] += 1;
+        }
+    }
 
     let mut col_ptrs = vec![0usize; n + 1];
     let mut row_indices = Vec::new();
@@ -810,7 +868,7 @@ fn permute_symmetric_csc<T: Scalar + Clone + Field>(
 
         let mut entries: Vec<(usize, T)> = Vec::new();
 
-        // Get entries from column old_j of A
+        // Get entries from column old_j of A (its actual nonzeros only).
         let start = a.col_ptrs()[old_j];
         let end = a.col_ptrs()[old_j + 1];
 
@@ -821,21 +879,17 @@ fn permute_symmetric_csc<T: Scalar + Clone + Field>(
         }
 
         // Also pick up entries from other columns that have row = old_j
-        // (to handle the upper triangle mapping to lower)
-        for old_k in 0..n {
+        // (to handle the upper triangle mapping to lower), using the
+        // precomputed row index instead of scanning every column.
+        let r_start = row_ptr[old_j];
+        let r_end = row_ptr[old_j + 1];
+        for ridx in r_start..r_end {
+            let old_k = row_col[ridx];
             if old_k == old_j {
                 continue;
             }
             let new_k = perm_inv[old_k];
-            let k_start = a.col_ptrs()[old_k];
-            let k_end = a.col_ptrs()[old_k + 1];
-
-            for idx in k_start..k_end {
-                if a.row_indices()[idx] == old_j {
-                    entries.push((new_k, a.values()[idx].clone()));
-                    break;
-                }
-            }
+            entries.push((new_k, row_val[ridx].clone()));
         }
 
         // Sort by row index and deduplicate
@@ -970,7 +1024,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 1x1 SPD matrix should succeed");
 
         let b = vec![10.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("1x1 solve should succeed");
 
         assert!(
             (x[0] - 2.0).abs() < 1e-10,
@@ -986,7 +1040,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 2x2 SPD matrix should succeed");
 
         let b = vec![5.0, 5.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("2x2 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..2 {
@@ -1007,7 +1061,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 3x3 SPD matrix should succeed");
 
         let b = vec![1.0, 2.0, 3.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("3x3 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..3 {
@@ -1028,7 +1082,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 5x5 SPD matrix should succeed");
 
         let b = vec![1.0, 2.0, 3.0, 2.0, 1.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("5x5 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..5 {
@@ -1049,7 +1103,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 8x8 Laplacian should succeed");
 
         let b = vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("8x8 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         let residual: f64 = (0..8).map(|i| (ax[i] - b[i]).powi(2)).sum::<f64>().sqrt();
@@ -1068,7 +1122,7 @@ mod tests {
         let chol = MultifrontalCholesky::new(&a).expect("factorization of identity should succeed");
 
         let b = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("identity solve should succeed");
 
         for i in 0..5 {
             assert!(
@@ -1103,6 +1157,34 @@ mod tests {
             .expect("matrix construction should succeed");
         let result = MultifrontalCholesky::new(&a);
         assert!(matches!(result, Err(MultifrontalError::NotSquare { .. })));
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_solve_rhs_length_mismatch() {
+        let a = make_spd_3x3();
+        let chol = MultifrontalCholesky::new(&a).expect("factorization should succeed");
+
+        // RHS too short.
+        let b_short = vec![1.0, 2.0];
+        let result = chol.solve(&b_short);
+        assert!(matches!(
+            result,
+            Err(MultifrontalError::DimensionMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+
+        // RHS too long.
+        let b_long = vec![1.0, 2.0, 3.0, 4.0];
+        let result = chol.solve(&b_long);
+        assert!(matches!(
+            result,
+            Err(MultifrontalError::DimensionMismatch {
+                expected: 3,
+                actual: 4
+            })
+        ));
     }
 
     #[test]
@@ -1206,7 +1288,7 @@ mod tests {
 
         let b = vec![2.0, -1.0, 3.0, -2.0, 1.0];
 
-        let x_mf = mf_chol.solve(&b);
+        let x_mf = mf_chol.solve(&b).expect("multifrontal solve should succeed");
         let x_direct = direct_chol.solve(&b);
 
         for i in 0..5 {
@@ -1228,5 +1310,95 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("empty matrix factorization should succeed");
         assert_eq!(chol.n(), 0);
         assert_eq!(chol.nnz_l(), 0);
+    }
+
+    /// Densifies a CSC matrix into a row-major dense matrix for test comparisons.
+    fn densify(a: &CscMatrix<f64>) -> Vec<Vec<f64>> {
+        let n = a.nrows();
+        let mut dense = vec![vec![0.0; n]; n];
+        for col in 0..n {
+            let start = a.col_ptrs()[col];
+            let end = a.col_ptrs()[col + 1];
+            for idx in start..end {
+                let row = a.row_indices()[idx];
+                dense[row][col] = a.values()[idx];
+            }
+        }
+        dense
+    }
+
+    #[test]
+    fn test_permute_symmetric_csc_identity_lower_triangle_only() {
+        // A = [4 1 0 0]
+        //     [1 4 1 0]
+        //     [0 1 4 1]
+        //     [0 0 1 4]
+        // Stored with only the lower triangle (row >= col) present, to
+        // exercise the "recover entries from other columns" path.
+        let values = vec![4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 4.0];
+        let row_indices = vec![0, 1, 1, 2, 2, 3, 3];
+        let col_ptrs = vec![0, 2, 4, 6, 7];
+        let a = CscMatrix::new(4, 4, col_ptrs, row_indices, values)
+            .expect("lower-triangular matrix construction should succeed");
+
+        let perm: Vec<usize> = vec![0, 1, 2, 3];
+        let perm_inv: Vec<usize> = vec![0, 1, 2, 3];
+        let ap = permute_symmetric_csc(&a, &perm, &perm_inv);
+
+        let dense = densify(&ap);
+        let expected = vec![
+            vec![4.0, 1.0, 0.0, 0.0],
+            vec![1.0, 4.0, 1.0, 0.0],
+            vec![0.0, 1.0, 4.0, 1.0],
+            vec![0.0, 0.0, 1.0, 4.0],
+        ];
+        assert_eq!(
+            dense, expected,
+            "identity permutation should fully symmetrize the lower-triangular input"
+        );
+    }
+
+    #[test]
+    fn test_permute_symmetric_csc_nontrivial_permutation() {
+        // Same lower-triangular-only tridiagonal 4x4 matrix as above.
+        let values = vec![4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 4.0];
+        let row_indices = vec![0, 1, 1, 2, 2, 3, 3];
+        let col_ptrs = vec![0, 2, 4, 6, 7];
+        let a = CscMatrix::new(4, 4, col_ptrs, row_indices, values)
+            .expect("lower-triangular matrix construction should succeed");
+        let a_dense = densify(&a);
+        // Full symmetric dense reference (both triangles).
+        let mut a_full = vec![vec![0.0; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                a_full[i][j] = if a_dense[i][j] != 0.0 {
+                    a_dense[i][j]
+                } else {
+                    a_dense[j][i]
+                };
+            }
+        }
+
+        // Reverse permutation: new index i <- old index perm[i].
+        let perm: Vec<usize> = vec![3, 2, 1, 0];
+        let mut perm_inv = vec![0usize; 4];
+        for (i, &p) in perm.iter().enumerate() {
+            perm_inv[p] = i;
+        }
+
+        let ap = permute_symmetric_csc(&a, &perm, &perm_inv);
+        let dense = densify(&ap);
+
+        // Expected: (P*A*P^T)[i][j] = A_full[perm[i]][perm[j]]
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (dense[i][j] - a_full[perm[i]][perm[j]]).abs() < 1e-12,
+                    "P*A*P^T mismatch at ({i},{j}): {} vs {}",
+                    dense[i][j],
+                    a_full[perm[i]][perm[j]]
+                );
+            }
+        }
     }
 }

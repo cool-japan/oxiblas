@@ -21,10 +21,18 @@ use oxiblas_core::scalar::Scalar;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::connected_components;
 ///
+/// // Two disconnected edges: 0-1 and 2-3.
+/// let values = vec![1.0, 1.0, 1.0, 1.0];
+/// let col_indices = vec![1, 0, 3, 2];
+/// let row_ptrs = vec![0, 1, 2, 3, 4];
+/// let matrix = CsrMatrix::new(4, 4, row_ptrs, col_indices, values).unwrap();
+///
 /// let result = connected_components(&matrix);
+/// assert_eq!(result.num_components, 2);
 /// println!("Number of components: {}", result.num_components);
 /// ```
 pub fn connected_components<T: Scalar>(a: &CsrMatrix<T>) -> ConnectedComponentsResult {
@@ -163,10 +171,18 @@ fn build_symmetric_adjacency_csc<T: Scalar>(a: &CscMatrix<T>) -> Vec<Vec<usize>>
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::bandwidth_profile;
 ///
+/// // Tridiagonal 3x3 matrix: nonzeros stay within 1 of the diagonal.
+/// let values = vec![2.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0];
+/// let col_indices = vec![0, 1, 0, 1, 2, 1, 2];
+/// let row_ptrs = vec![0, 2, 5, 7];
+/// let matrix = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+///
 /// let result = bandwidth_profile(&matrix);
+/// assert_eq!(result.bandwidth, 1);
 /// println!("Bandwidth: {}", result.bandwidth);
 /// println!("Profile: {}", result.profile);
 /// ```
@@ -291,10 +307,18 @@ pub fn bandwidth_profile_csc<T: Scalar>(a: &CscMatrix<T>) -> BandwidthProfileRes
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::level_sets;
 ///
+/// // Path graph 0 - 1 - 2 - 3.
+/// let values = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+/// let col_indices = vec![1, 0, 2, 1, 3, 2];
+/// let row_ptrs = vec![0, 1, 3, 5, 6];
+/// let matrix = CsrMatrix::new(4, 4, row_ptrs, col_indices, values).unwrap();
+///
 /// let result = level_sets(&matrix, 0);
+/// assert_eq!(result.max_level, 3);
 /// println!("Max level: {}", result.max_level);
 /// ```
 pub fn level_sets<T: Scalar>(a: &CsrMatrix<T>, root: usize) -> LevelSetResult {
@@ -448,10 +472,18 @@ pub fn degree_sequence<T: Scalar>(a: &CsrMatrix<T>) -> Vec<usize> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::is_bipartite;
 ///
+/// // Complete bipartite graph K(2,2): {0, 1} vs {2, 3}.
+/// let values = vec![1.0; 8];
+/// let col_indices = vec![2, 3, 2, 3, 0, 1, 0, 1];
+/// let row_ptrs = vec![0, 2, 4, 6, 8];
+/// let matrix = CsrMatrix::new(4, 4, row_ptrs, col_indices, values).unwrap();
+///
 /// let result = is_bipartite(&matrix);
+/// assert!(result.is_bipartite);
 /// if result.is_bipartite {
 ///     println!("Left partition: {:?}", result.left);
 ///     println!("Right partition: {:?}", result.right);
@@ -524,10 +556,18 @@ pub fn is_bipartite<T: Scalar>(a: &CsrMatrix<T>) -> BipartiteResult {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::bipartite_matching;
 ///
+/// // Complete bipartite graph K(2,2): {0, 1} vs {2, 3}.
+/// let values = vec![1.0; 8];
+/// let col_indices = vec![2, 3, 2, 3, 0, 1, 0, 1];
+/// let row_ptrs = vec![0, 2, 4, 6, 8];
+/// let matrix = CsrMatrix::new(4, 4, row_ptrs, col_indices, values).unwrap();
+///
 /// if let Some(result) = bipartite_matching(&matrix) {
+///     assert_eq!(result.matching_size, 2);
 ///     println!("Matching size: {}", result.matching_size);
 ///     for (l, r) in &result.edges {
 ///         println!("Edge: {} - {}", l, r);
@@ -914,10 +954,29 @@ where
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::CsrMatrix;
 /// use oxiblas_sparse::graph::partition_graph_kway;
 ///
+/// // Path graph on 8 vertices: 0 - 1 - ... - 7.
+/// let mut col_indices = Vec::new();
+/// let mut row_ptrs = vec![0usize];
+/// for i in 0..8usize {
+///     if i > 0 {
+///         col_indices.push(i - 1);
+///     }
+///     if i < 7 {
+///         col_indices.push(i + 1);
+///     }
+///     row_ptrs.push(col_indices.len());
+/// }
+/// let values = vec![1.0; col_indices.len()];
+/// let matrix = CsrMatrix::new(8, 8, row_ptrs, col_indices, values).unwrap();
+///
 /// let result = partition_graph_kway(&matrix, 4);
+/// assert_eq!(result.num_partitions, 4);
+/// assert_eq!(result.partition.len(), 8);
+/// assert_eq!(result.partition_sizes.iter().sum::<usize>(), 8);
 /// println!("Edge cut: {}", result.edge_cut);
 /// ```
 pub fn partition_graph_kway<T: Scalar>(a: &CsrMatrix<T>, k: usize) -> PartitionResult {

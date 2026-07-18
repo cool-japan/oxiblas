@@ -194,7 +194,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> ShiftInvertLanc
         let shifted_csr = self.build_shifted_matrix(a)?;
 
         // Convert to CSC for factorization
-        let shifted_csc = csr_to_csc(&shifted_csr);
+        let shifted_csc = csr_to_csc(&shifted_csr)?;
 
         // Factorize the shifted matrix
         let (solve_fn, _use_cholesky) = if self.config.symmetric {

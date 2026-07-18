@@ -11,7 +11,7 @@
 //! - `row_ptrs` has length m+1
 
 use oxiblas_core::scalar::{Field, Scalar};
-use std::ops::Index;
+use std::collections::HashSet;
 
 /// Error type for CSR matrix operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +40,21 @@ pub enum CsrError {
     /// Row pointers not monotonically increasing.
     InvalidRowPtrOrder,
     /// Duplicate entry at same position.
+    ///
+    /// A given `(row, col)` position must be represented by at most one
+    /// entry: with two entries at the same position, [`CsrMatrix::get`]
+    /// can only ever surface the first (since it returns on the first
+    /// column match within the row), silently discarding the second
+    /// value and any updates encoded in it. That is a structurally
+    /// corrupt matrix, not merely an inefficient one, so it is rejected
+    /// at construction time rather than accepted and silently
+    /// mis-resolved.
+    ///
+    /// Note: column indices within a row are *not* required to be sorted
+    /// ascending — every accessor in this type (`get`, `row_iter`, `iter`)
+    /// performs a linear scan over the row and is agnostic to order, so a
+    /// permuted (but duplicate-free) row is a perfectly valid CSR
+    /// representation here.
     DuplicateEntry {
         /// Row of duplicate.
         row: usize,
@@ -158,6 +173,29 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
         for &col in &col_indices {
             if col >= ncols {
                 return Err(CsrError::InvalidColumnIndex { index: col, ncols });
+            }
+        }
+
+        // Validate that no row contains a duplicate column index. Order
+        // within a row is deliberately *not* constrained here — `get`,
+        // `row_iter`, and `iter` all linear-scan a row and are agnostic to
+        // permutation, so only an actual repeated `(row, col)` position is
+        // structurally invalid (it makes the stored value at that
+        // position ambiguous, see `CsrError::DuplicateEntry`).
+        //
+        // Detection is order-independent (a `HashSet` per row) rather than
+        // "check adjacent pairs", precisely because rows are not required
+        // to be pre-sorted.
+        let mut seen_cols = HashSet::new();
+        for row in 0..nrows {
+            let start = row_ptrs[row];
+            let end = row_ptrs[row + 1];
+
+            seen_cols.clear();
+            for &col in &col_indices[start..end] {
+                if !seen_cols.insert(col) {
+                    return Err(CsrError::DuplicateEntry { row, col });
+                }
             }
         }
 
@@ -437,17 +475,22 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
     }
 }
 
-impl<T: Scalar + Clone> Index<(usize, usize)> for CsrMatrix<T>
-where
-    T: Field,
-{
-    type Output = T;
-
-    fn index(&self, (row, col): (usize, usize)) -> &Self::Output {
-        self.get(row, col)
-            .expect("Index out of bounds or zero element")
-    }
-}
+// Note: `CsrMatrix` deliberately does not implement `std::ops::Index`.
+//
+// A sparse matrix cannot honor `Index`'s `&Self::Output` contract for a
+// structurally-absent (implicit zero) position: there is no `T` value
+// stored at that location to borrow from, so the only implementations
+// available are (a) panicking, which violates the crate's no-panic policy
+// and is a surprising trap for out-of-bounds *or* merely-empty positions
+// alike, or (b) manufacturing a reference to a shared zero, which would
+// require `T: 'static` plus interior storage (e.g. a thread-local or
+// `OnceLock` per instantiation of `T`) purely to satisfy the trait shape
+// and is unnecessary complexity for what the crate does not actually
+// need. Use the checked accessors instead:
+//   - [`CsrMatrix::get`] returns `Option<&T>` (`None` for implicit zeros
+//     and out-of-bounds positions alike).
+//   - [`CsrMatrix::get_or_zero`] returns an owned `T`, `T::zero()` for
+//     implicit zeros (requires `T: Field`).
 
 #[cfg(test)]
 mod tests {
@@ -567,5 +610,100 @@ mod tests {
 
         let result = CsrMatrix::new(1, 3, row_ptrs, col_indices, values);
         assert!(matches!(result, Err(CsrError::InvalidColumnIndex { .. })));
+    }
+
+    #[test]
+    fn test_csr_duplicate_entry_rejected() {
+        // Row 0 has column 1 listed twice: (0,1)=1.0 and (0,1)=2.0.
+        let values = vec![1.0f64, 2.0, 3.0];
+        let col_indices = vec![1, 1, 2];
+        let row_ptrs = vec![0, 3];
+
+        let result = CsrMatrix::new(1, 3, row_ptrs, col_indices, values);
+        assert_eq!(
+            result.unwrap_err(),
+            CsrError::DuplicateEntry { row: 0, col: 1 }
+        );
+    }
+
+    #[test]
+    fn test_csr_duplicate_entry_rejected_non_adjacent() {
+        // Duplicate columns need not be adjacent in storage order to be
+        // caught: row 0 stores columns [2, 1, 1] - the two `1`s are a
+        // structural duplicate regardless of the intervening `2`.
+        let values = vec![1.0f64, 2.0, 3.0];
+        let col_indices = vec![2, 1, 1];
+        let row_ptrs = vec![0, 3];
+
+        let result = CsrMatrix::new(1, 3, row_ptrs, col_indices, values);
+        assert_eq!(
+            result.unwrap_err(),
+            CsrError::DuplicateEntry { row: 0, col: 1 }
+        );
+    }
+
+    #[test]
+    fn test_csr_unsorted_but_duplicate_free_indices_accepted() {
+        // Row 0 columns are [2, 0] - out of ascending order but unique.
+        // Ordering within a row is not part of this crate's CSR contract
+        // (every accessor linear-scans the row), so this must succeed.
+        let values = vec![1.0f64, 2.0];
+        let col_indices = vec![2, 0];
+        let row_ptrs = vec![0, 2];
+
+        let csr = CsrMatrix::new(1, 3, row_ptrs, col_indices, values).unwrap();
+        assert_eq!(csr.get(0, 2), Some(&1.0));
+        assert_eq!(csr.get(0, 0), Some(&2.0));
+    }
+
+    #[test]
+    fn test_csr_sorted_unique_indices_accepted() {
+        // Ascending, unique per row: must construct successfully.
+        let values = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
+        let col_indices = vec![0, 2, 1, 0, 2];
+        let row_ptrs = vec![0, 2, 3, 5];
+
+        let result = CsrMatrix::new(3, 3, row_ptrs, col_indices, values);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_csr_empty_and_singleton_rows_accepted() {
+        // Empty rows and single-entry rows must never trip the duplicate
+        // check (no pair exists to compare within the row).
+        let values = vec![1.0f64];
+        let col_indices = vec![0];
+        let row_ptrs = vec![0, 0, 1, 1];
+
+        let result = CsrMatrix::new(3, 2, row_ptrs, col_indices, values);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_csr_duplicate_across_different_rows_accepted() {
+        // The same column index appearing in *different* rows is not a
+        // duplicate - only a repeat within a single row is invalid.
+        let values = vec![1.0f64, 2.0];
+        let col_indices = vec![0, 0];
+        let row_ptrs = vec![0, 1, 2];
+
+        let result = CsrMatrix::new(2, 2, row_ptrs, col_indices, values);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_csr_no_index_operator_use_get_instead() {
+        // `CsrMatrix` intentionally has no `Index` impl (see module note);
+        // `get` and `get_or_zero` are the supported accessors and must
+        // never panic for implicit-zero (structurally-absent) positions.
+        let values = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
+        let col_indices = vec![0, 2, 1, 0, 2];
+        let row_ptrs = vec![0, 2, 3, 5];
+
+        let csr = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+
+        assert_eq!(csr.get(0, 1), None);
+        assert_eq!(csr.get_or_zero(0, 1), 0.0);
+        assert_eq!(csr.get_or_zero(0, 0), 1.0);
     }
 }

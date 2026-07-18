@@ -19,7 +19,9 @@
 //!
 //! - **Full reorthogonalization**: Optional full reorthogonalization for numerical stability
 //! - **Configurable convergence**: Adjustable tolerance and iteration limits
-//! - **Multiple selection criteria**: Largest/smallest magnitude or algebraic eigenvalues
+//! - **Multiple selection criteria**: Largest/smallest magnitude or algebraic eigenvalues,
+//!   or eigenvalues nearest a user-supplied target (see [`Lanczos::with_target`]) via
+//!   `WhichEigenvalues::NearTarget`
 //!
 //! # Example
 //!
@@ -152,12 +154,51 @@ impl Default for LanczosConfig<f32> {
 /// ```
 pub struct Lanczos<T> {
     config: LanczosConfig<T>,
+    /// Target value used for `WhichEigenvalues::NearTarget` selection.
+    ///
+    /// Ritz values are ranked by `|ritz_value - target|` when
+    /// `config.which == WhichEigenvalues::NearTarget`. Defaults to zero (see
+    /// [`Lanczos::with_target`]).
+    target: T,
 }
 
 impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> Lanczos<T> {
     /// Create a new Lanczos solver with the given configuration.
     pub fn new(config: LanczosConfig<T>) -> Self {
-        Self { config }
+        Self {
+            config,
+            target: T::zero(),
+        }
+    }
+
+    /// Set the target value used for `WhichEigenvalues::NearTarget` selection.
+    ///
+    /// When `config.which == WhichEigenvalues::NearTarget`, [`Lanczos::compute`]
+    /// returns the `num_eigenvalues` Ritz values `lambda` that minimize
+    /// `|lambda - target|` (genuinely nearest to `target`), rather than falling
+    /// back to smallest-magnitude selection. If this method is never called the
+    /// target defaults to zero, so `NearTarget` selection reduces to
+    /// "eigenvalues nearest the origin" (equivalent to `SmallestMagnitude`) by
+    /// construction, not as a silent, unrelated fallback.
+    ///
+    /// # Convergence caveat
+    ///
+    /// This solver performs plain (non shift-and-inverted) Lanczos: the Krylov
+    /// subspace is still built from `A` directly, and only the final Ritz-value
+    /// *selection* criterion honors `target`. Plain Lanczos naturally converges
+    /// extremal (largest/smallest-magnitude) Ritz values fastest; Ritz values
+    /// near an arbitrary interior `target` can converge slowly, or spuriously,
+    /// within `max_iterations` / `krylov_dimension`. Always check
+    /// `LanczosResult::residual_norms` and `LanczosResult::converged` before
+    /// trusting the returned eigenpairs. For reliable convergence to interior
+    /// eigenvalues near a target, prefer
+    /// [`super::shift_invert::ShiftInvertLanczos`] (operates on `(A - sigma*I)^-1`)
+    /// or [`super::thick_restart::ThickRestartLanczos`] with
+    /// `EigenvalueTarget::Interior`, both of which use spectral transformations
+    /// designed for interior targets instead of relying on selection alone.
+    pub fn with_target(mut self, target: T) -> Self {
+        self.target = target;
+        self
     }
 
     /// Compute eigenvalues (and optionally eigenvectors) of a symmetric matrix.
@@ -546,11 +587,16 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> Lanczos<T> {
                 indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             }
             WhichEigenvalues::NearTarget => {
-                // For NearTarget, would need shift-and-invert
-                // For now, same as SmallestMagnitude
+                // Rank Ritz values by proximity to the user-supplied target
+                // (see `Lanczos::with_target`) rather than by raw magnitude.
+                // This selects the eigenvalues genuinely closest to `target`;
+                // it does not perform shift-and-invert, so convergence quality
+                // for interior targets is not guaranteed (see doc comment on
+                // `with_target` for the caveat and better-suited solvers).
+                let target = self.target.clone();
                 indexed.sort_by(|a, b| {
-                    Scalar::abs(a.1.clone())
-                        .partial_cmp(&Scalar::abs(b.1.clone()))
+                    Scalar::abs(a.1.clone() - target.clone())
+                        .partial_cmp(&Scalar::abs(b.1.clone() - target.clone()))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }

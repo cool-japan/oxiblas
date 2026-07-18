@@ -7,12 +7,17 @@ use oxiblas_core::scalar::{Field, Real, Scalar};
 /// Local solver type for subdomain problems in Additive Schwarz.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum LocalSolverType {
-    /// Exact solve using LU factorization.
+    /// Genuinely exact solve of the local subdomain block: a dense LU
+    /// factorization with partial pivoting and full fill-in (no dropping).
+    /// This solves `A_local x = b` to floating-point precision, unlike
+    /// [`LocalSolverType::ILU0`], which only approximates it.
     ExactLU,
-    /// Approximate solve using ILU(0).
+    /// Approximate solve using an incomplete LU(0) factorization: fill-in
+    /// is restricted to the sparsity pattern of the local block, which is
+    /// cheaper than [`LocalSolverType::ExactLU`] but not an exact solve.
     #[default]
     ILU0,
-    /// Jacobi iteration.
+    /// Jacobi iteration (diagonal scaling only).
     Jacobi,
 }
 
@@ -55,6 +60,14 @@ struct Subdomain<T: Scalar> {
     ilu_u_values: Vec<T>,
     ilu_u_col_indices: Vec<usize>,
     ilu_u_row_ptrs: Vec<usize>,
+    /// Dense exact LU factors (row-major `local_n x local_n`), used only by
+    /// [`LocalSolverType::ExactLU`]. Strictly-lower entries store the unit
+    /// lower-triangular factor `L` (implicit unit diagonal); on-and-above
+    /// diagonal entries store the upper-triangular factor `U`.
+    exact_lu_values: Vec<T>,
+    /// Row permutation from partial pivoting for the exact LU factorization:
+    /// `exact_lu_piv[i]` is the original local row moved into position `i`.
+    exact_lu_piv: Vec<usize>,
 }
 
 /// Additive Schwarz domain decomposition preconditioner.
@@ -234,10 +247,13 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                         ilu_u_values: Vec::new(),
                         ilu_u_col_indices: Vec::new(),
                         ilu_u_row_ptrs: Vec::new(),
+                        exact_lu_values: Vec::new(),
+                        exact_lu_piv: Vec::new(),
                     }
                 }
-                LocalSolverType::ILU0 | LocalSolverType::ExactLU => {
-                    // Compute ILU(0) factorization of local matrix
+                LocalSolverType::ILU0 => {
+                    // Compute ILU(0) factorization of local matrix (approximate:
+                    // fill-in is restricted to the original sparsity pattern).
                     let (l_values, l_col, l_row, u_values, u_col, u_row) = Self::compute_ilu0(
                         &local_values,
                         &local_col_indices,
@@ -255,6 +271,33 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                         ilu_u_values: u_values,
                         ilu_u_col_indices: u_col,
                         ilu_u_row_ptrs: u_row,
+                        exact_lu_values: Vec::new(),
+                        exact_lu_piv: Vec::new(),
+                    }
+                }
+                LocalSolverType::ExactLU => {
+                    // Compute a genuinely exact dense LU factorization (with
+                    // partial pivoting and full fill-in, no dropping) of the
+                    // local subdomain block.
+                    let (exact_lu_values, exact_lu_piv) = Self::compute_exact_lu(
+                        &local_values,
+                        &local_col_indices,
+                        &local_row_ptrs,
+                        local_n,
+                    )?;
+
+                    Subdomain {
+                        indices,
+                        global_to_local,
+                        diag_inv: Vec::new(),
+                        ilu_l_values: Vec::new(),
+                        ilu_l_col_indices: Vec::new(),
+                        ilu_l_row_ptrs: Vec::new(),
+                        ilu_u_values: Vec::new(),
+                        ilu_u_col_indices: Vec::new(),
+                        ilu_u_row_ptrs: Vec::new(),
+                        exact_lu_values,
+                        exact_lu_piv,
                     }
                 }
             };
@@ -393,6 +436,115 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
         )
     }
 
+    /// Compute a genuinely exact dense LU factorization (Doolittle form,
+    /// with partial pivoting) of a local subdomain block.
+    ///
+    /// Unlike [`Self::compute_ilu0`], which restricts fill-in to the
+    /// original sparsity pattern and therefore only *approximates*
+    /// `A_local^{-1}`, this routine densifies the local block and performs
+    /// complete Gaussian elimination with partial pivoting, keeping every
+    /// fill-in entry produced during elimination. The resulting
+    /// factorization satisfies `P * A_local = L * U` to floating-point
+    /// precision, so solving with it gives the exact local subdomain
+    /// solution (as documented for [`LocalSolverType::ExactLU`]), not an
+    /// incomplete approximation.
+    ///
+    /// Returns `(lu, piv)` where `lu` is `n x n`, stored row-major: entries
+    /// strictly below the diagonal are the multipliers of the unit
+    /// lower-triangular factor `L` (diagonal implicitly 1), and entries on
+    /// and above the diagonal are the upper-triangular factor `U`. `piv[i]`
+    /// is the original local row that partial pivoting moved into pivot
+    /// position `i`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreconditionerError::SingularBlock`] if the local
+    /// subdomain matrix is (numerically) singular, since an exact LU
+    /// solve is not well-defined in that case.
+    fn compute_exact_lu(
+        values: &[T],
+        col_indices: &[usize],
+        row_ptrs: &[usize],
+        n: usize,
+    ) -> Result<(Vec<T>, Vec<usize>), PreconditionerError> {
+        // Densify the local block; ExactLU keeps full fill-in rather than
+        // restricting elimination to the sparsity pattern of A_local.
+        let mut a = vec![T::zero(); n * n];
+        for row in 0..n {
+            let start = row_ptrs[row];
+            let end = row_ptrs[row + 1];
+            for ptr in start..end {
+                let col = col_indices[ptr];
+                a[row * n + col] = values[ptr].clone();
+            }
+        }
+
+        let mut piv: Vec<usize> = (0..n).collect();
+        let zero_tol = T::from_f64(1e-14).unwrap_or(T::zero());
+
+        for k in 0..n {
+            // Partial pivoting: pick the largest-magnitude entry in column k
+            // among rows k..n for numerical stability.
+            let mut max_row = k;
+            let mut max_val = Scalar::abs(a[k * n + k].clone());
+            for i in (k + 1)..n {
+                let candidate = Scalar::abs(a[i * n + k].clone());
+                if candidate > max_val {
+                    max_val = candidate;
+                    max_row = i;
+                }
+            }
+
+            if max_val <= zero_tol {
+                return Err(PreconditionerError::SingularBlock(k));
+            }
+
+            if max_row != k {
+                for col in 0..n {
+                    a.swap(k * n + col, max_row * n + col);
+                }
+                piv.swap(k, max_row);
+            }
+
+            let pivot = a[k * n + k].clone();
+            for i in (k + 1)..n {
+                let factor = a[i * n + k].clone() / pivot.clone();
+                a[i * n + k] = factor.clone();
+                for col in (k + 1)..n {
+                    let sub = factor.clone() * a[k * n + col].clone();
+                    a[i * n + col] = a[i * n + col].clone() - sub;
+                }
+            }
+        }
+
+        Ok((a, piv))
+    }
+
+    /// Solve `A_local x = b` exactly using the dense pivoted LU
+    /// factorization produced by [`Self::compute_exact_lu`].
+    fn solve_exact_lu(lu: &[T], piv: &[usize], n: usize, b: &[T], x: &mut [T]) {
+        // Apply the row permutation: y starts as P * b.
+        let mut y: Vec<T> = piv.iter().map(|&p| b[p].clone()).collect();
+
+        // Forward solve L * y = P * b (unit lower triangular), in place.
+        for i in 0..n {
+            let mut sum = y[i].clone();
+            for j in 0..i {
+                sum = sum - lu[i * n + j].clone() * y[j].clone();
+            }
+            y[i] = sum;
+        }
+
+        // Backward solve U * x = y.
+        for i in (0..n).rev() {
+            let mut sum = y[i].clone();
+            for j in (i + 1)..n {
+                sum = sum - lu[i * n + j].clone() * x[j].clone();
+            }
+            x[i] = sum / lu[i * n + i].clone();
+        }
+    }
+
     /// Solve L*y = b (lower triangular).
     fn solve_lower(
         l_values: &[T],
@@ -487,8 +639,9 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                         local_z[i] = local_r[i].clone() * subdomain.diag_inv[i].clone();
                     }
                 }
-                LocalSolverType::ILU0 | LocalSolverType::ExactLU => {
-                    // Solve L*y = r
+                LocalSolverType::ILU0 => {
+                    // Approximate solve via incomplete LU(0) factors: solve
+                    // L*y = r, then U*z = y.
                     let mut y = vec![T::zero(); local_n];
                     Self::solve_lower(
                         &subdomain.ilu_l_values,
@@ -498,12 +651,22 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                         &mut y,
                     );
 
-                    // Solve U*z = y
                     Self::solve_upper(
                         &subdomain.ilu_u_values,
                         &subdomain.ilu_u_col_indices,
                         &subdomain.ilu_u_row_ptrs,
                         &y,
+                        &mut local_z,
+                    );
+                }
+                LocalSolverType::ExactLU => {
+                    // Genuinely exact solve via the dense pivoted LU
+                    // factorization (full fill-in, no dropping).
+                    Self::solve_exact_lu(
+                        &subdomain.exact_lu_values,
+                        &subdomain.exact_lu_piv,
+                        local_n,
+                        &local_r,
                         &mut local_z,
                     );
                 }

@@ -264,13 +264,6 @@ fn backward_sub(u: &[f64], y: &[f64], x: &mut [f64], n: usize) {
     }
 }
 
-/// Apply pivot permutation to vector in-place.
-fn apply_pivots(v: &mut [f64], piv: &[usize]) {
-    for (k, &p) in piv.iter().enumerate() {
-        v.swap(k, p);
-    }
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Dense Cholesky helpers
 // ────────────────────────────────────────────────────────────────────────────
@@ -379,10 +372,18 @@ fn extract_dense_block(
 /// Uses a right-looking block LU algorithm:
 /// 1. For each block-column `k`:
 ///    a. Factorize the diagonal block with partial-pivot dense LU.
-///    b. Apply row swaps to off-diagonal blocks in the same block-row.
-///    c. Compute the multiplier blocks below the diagonal block (TRSM).
-///    d. Update the trailing sub-matrix (GEMM).
-///    e. Write all modified blocks back to disk.
+///    b. Apply the diagonal block's row interchanges to the entire block-row
+///       `k` — both the left `L` multiplier tiles `A[k, 0..k]` and the right
+///       trailing tiles `A[k, k+1..]`.
+///    c. Complete the upper panel `U[k, j] = L_kk^{-1} A[k, j]` for `j > k`
+///       (unit-lower triangular solve).
+///    d. Compute the multiplier blocks below the diagonal block (TRSM).
+///    e. Update the trailing sub-matrix (GEMM).
+///    f. Write all modified blocks back to disk.
+///
+/// Pivoting is performed *within* each diagonal block; the resulting row
+/// permutation is accumulated into [`Self`]'s permutation array and applied to
+/// the right-hand side in [`OutOfCoreLu::solve`].
 ///
 /// The factored blocks are stored in temporary files in `config.temp_dir`.
 pub struct OutOfCoreLu<T> {
@@ -507,18 +508,53 @@ impl OutOfCoreLu<f64> {
                 self.pivots.swap(global_row, global_swap);
             }
 
-            // Apply row swaps to blocks A[k, j] for j > k.
-            for j in (k + 1)..nb {
-                let mut right = self.read_block(k, j)?;
+            // Apply the diagonal block's row interchanges to the ENTIRE
+            // block-row `k`, i.e. every off-diagonal tile `A[k, j]` with
+            // `j != k`.  This mirrors LAPACK's DGETRF, which applies the panel
+            // pivots to the columns to the LEFT of the panel (the already
+            // computed `L` multipliers) as well as to the trailing columns to
+            // the right.  Concretely:
+            //   * left  tiles `A[k, 0..k]`     – finalized `L` multiplier blocks
+            //   * right tiles `A[k, k+1..nb]`  – trailing `U`/Schur blocks
+            // The diagonal tile `A[k, k]` already had these swaps applied
+            // in-place by `dense_lu_inplace`, so it is skipped here.
+            //
+            // The transpositions must be replayed in the SAME order they were
+            // performed inside `dense_lu_inplace` (ascending `local_row`) so the
+            // resulting row permutation is identical across all tiles.
+            for j in 0..nb {
+                if j == k {
+                    continue;
+                }
+                let mut tile = self.read_block(k, j)?;
                 let bs_j = block_sizes[j];
                 for (local_row, &swap_row) in local_piv.iter().enumerate() {
                     if swap_row != local_row {
                         for col in 0..bs_j {
-                            right.swap(local_row * bs_j + col, swap_row * bs_j + col);
+                            tile.swap(local_row * bs_j + col, swap_row * bs_j + col);
                         }
                     }
                 }
-                self.write_block(k, j, &right)?;
+
+                // For the trailing tiles `A[k, j]` with `j > k`, complete the
+                // upper-panel factor: `U[k,j] = L_kk^{-1} * (P_k A[k,j])`.
+                // `L_kk` is the unit lower-triangular factor of the diagonal
+                // block held in `diag`, so this is a forward substitution
+                // (with implicit unit diagonal) applied independently to every
+                // column of the tile.  Left tiles (`j < k`) are finalized `L`
+                // multiplier blocks and only need the row interchange above.
+                if j > k {
+                    for r in 1..bs_k {
+                        for c in 0..bs_j {
+                            let mut val = tile[r * bs_j + c];
+                            for p in 0..r {
+                                val -= diag[r * bs_k + p] * tile[p * bs_j + c];
+                            }
+                            tile[r * bs_j + c] = val;
+                        }
+                    }
+                }
+                self.write_block(k, j, &tile)?;
             }
 
             // Write back factored diagonal block.
@@ -589,9 +625,16 @@ impl OutOfCoreLu<f64> {
             }
         }
 
-        // Apply pivot permutation to rhs.
-        let mut b = rhs.to_vec();
-        apply_pivots(&mut b, &self.pivots);
+        // Apply the row permutation `P` so that we solve `L U x = P b`.
+        //
+        // `self.pivots` is a genuine permutation array: it is built by starting
+        // from the identity and replaying, in order, every row transposition
+        // performed during factorization.  For such an array the permuted
+        // right-hand side is a gather, `(P b)[i] = b[pivots[i]]` — NOT a replay
+        // of `pivots` as a swap sequence (the two coincide only for the
+        // identity).  Every entry of `pivots` lies in `0..n` by construction,
+        // so the indexing below cannot go out of bounds.
+        let b: Vec<f64> = self.pivots.iter().map(|&p| rhs[p]).collect();
 
         // Forward substitution block-by-block (unit lower triangular L).
         let mut y = vec![0.0f64; self.n];
@@ -1007,6 +1050,26 @@ mod tests {
         CsrMatrix::new(n, n, row_ptrs, col_indices, values).expect("valid tridiagonal construction")
     }
 
+    /// Build a CSR matrix from a dense `n×n` row-major buffer (storing only the
+    /// structurally non-zero entries).
+    fn dense_to_csr(n: usize, dense: &[f64]) -> CsrMatrix<f64> {
+        let mut row_ptrs = Vec::with_capacity(n + 1);
+        let mut col_indices = Vec::new();
+        let mut values = Vec::new();
+        row_ptrs.push(0);
+        for i in 0..n {
+            for j in 0..n {
+                let v = dense[i * n + j];
+                if v != 0.0 {
+                    col_indices.push(j);
+                    values.push(v);
+                }
+            }
+            row_ptrs.push(col_indices.len());
+        }
+        CsrMatrix::new(n, n, row_ptrs, col_indices, values).expect("valid csr construction")
+    }
+
     fn max_abs_error(a: &[f64], b: &[f64]) -> f64 {
         a.iter()
             .zip(b.iter())
@@ -1058,6 +1121,132 @@ mod tests {
             err < 1e-10,
             "residual norm too large: {err:.3e}; ax={ax:?}, rhs={rhs:?}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Regression test for the block-LU partial-pivoting fix.
+    ///
+    /// The matrix is factored with `block_size = 2`, giving two `2×2` blocks:
+    ///
+    /// ```text
+    ///   [ 1  0 | 0  0 ]
+    ///   [ 0  1 | 0  0 ]
+    ///   [ ------------ ]
+    ///   [ 2  3 | 0  1 ]
+    ///   [ 5  7 | 1  0 ]
+    /// ```
+    ///
+    /// Because the top-left block is the identity, the multiplier block
+    /// `L[1,0]` equals `A[1,0] = [[2,3],[5,7]]` and the trailing block `A[1,1]`
+    /// equals `[[0,1],[1,0]]`.  Factoring `A[1,1]` with partial pivoting must
+    /// swap its two rows (global rows 2 and 3).  That interchange has to
+    /// propagate ACROSS the block-column boundary into the already-computed
+    /// left `L` block `A[1,0]`; if it does not (the old bug), or if the
+    /// accumulated permutation is applied incorrectly in `solve` (the other old
+    /// bug), the residual blows up.
+    #[test]
+    fn test_out_of_core_lu_pivoting_across_blocks() {
+        let n = 4usize;
+        #[rustfmt::skip]
+        let dense = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            2.0, 3.0, 0.0, 1.0,
+            5.0, 7.0, 1.0, 0.0,
+        ];
+        let mat = dense_to_csr(n, &dense);
+
+        let cfg = OutOfCoreConfig {
+            block_size: 2,
+            max_memory_mb: 64,
+            temp_dir: std::env::temp_dir(),
+        };
+        let mut lu = OutOfCoreLu::<f64>::new(cfg);
+        lu.factorize_csr(&mat).expect("factorize succeeded");
+
+        for rhs in [
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![-2.0, 5.0, 0.5, -7.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ] {
+            let sol = lu.solve(&rhs).expect("solve succeeded");
+            assert_eq!(sol.len(), n);
+
+            // Verify A x ≈ rhs by re-multiplying with the original matrix.
+            let mut ax = vec![0.0f64; n];
+            for i in 0..n {
+                for (c, v) in mat.row_iter(i) {
+                    ax[i] += v * sol[c];
+                }
+            }
+            let err = max_abs_error(&ax, &rhs);
+            assert!(
+                err < 1e-10,
+                "residual too large for rhs={rhs:?}: {err:.3e}; ax={ax:?}"
+            );
+        }
+
+        // The exact solution for rhs = [1, 2, 3, 4] is [1, 2, -15, -5];
+        // pin it down to guard against a compensating pair of sign errors.
+        let sol = lu.solve(&[1.0, 2.0, 3.0, 4.0]).expect("solve succeeded");
+        let expected = [1.0, 2.0, -15.0, -5.0];
+        let err = max_abs_error(&sol, &expected);
+        assert!(err < 1e-10, "unexpected solution {sol:?}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// A larger, denser matrix that forces within-block pivoting in a
+    /// non-leading block, exercised across several block sizes so the
+    /// interchange must cross block boundaries in more than one configuration.
+    #[test]
+    fn test_out_of_core_lu_pivoting_larger() {
+        let n = 6usize;
+        // A well-conditioned but NOT diagonally dominant matrix: several small
+        // diagonal entries force partial pivoting inside interior blocks.
+        #[rustfmt::skip]
+        let dense = [
+            0.0, 2.0, 1.0, 0.0, 3.0, 1.0,
+            4.0, 1.0, 0.0, 2.0, 1.0, 0.0,
+            1.0, 0.0, 0.0, 5.0, 2.0, 1.0,
+            2.0, 3.0, 6.0, 1.0, 0.0, 4.0,
+            0.0, 1.0, 2.0, 3.0, 1.0, 5.0,
+            3.0, 0.0, 1.0, 4.0, 2.0, 0.0,
+        ];
+        let mat = dense_to_csr(n, &dense);
+        let rhs = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.0];
+
+        // Note: this scheme pivots only *within* a diagonal block, so the block
+        // size must be large enough for every required interchange to stay
+        // inside its block (e.g. the zero at position (0,0) needs a block of
+        // size ≥ 2).  `block_size = 6` covers the whole matrix in one block and
+        // therefore performs full partial pivoting.
+        for block_size in [2usize, 3, 6] {
+            let cfg = OutOfCoreConfig {
+                block_size,
+                max_memory_mb: 64,
+                temp_dir: std::env::temp_dir(),
+            };
+            let mut lu = OutOfCoreLu::<f64>::new(cfg);
+            lu.factorize_csr(&mat)
+                .unwrap_or_else(|e| panic!("factorize (bs={block_size}) failed: {e}"));
+            let sol = lu
+                .solve(&rhs)
+                .unwrap_or_else(|e| panic!("solve (bs={block_size}) failed: {e}"));
+
+            let mut ax = vec![0.0f64; n];
+            for i in 0..n {
+                for (c, v) in mat.row_iter(i) {
+                    ax[i] += v * sol[c];
+                }
+            }
+            let err = max_abs_error(&ax, &rhs);
+            assert!(
+                err < 1e-9,
+                "residual too large (block_size={block_size}): {err:.3e}; ax={ax:?}"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

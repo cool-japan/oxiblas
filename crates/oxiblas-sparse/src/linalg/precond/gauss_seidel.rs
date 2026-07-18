@@ -217,7 +217,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SOR<T> {
 ///
 /// SSOR applies SOR forward then backward, creating a symmetric preconditioner:
 /// ```text
-/// M^{-1} = (D + ωL) D^{-1} (D + ωU)
+/// M_SSOR = 1 / (ω(2-ω)) * (D + ωL) D^{-1} (D + ωU)
+/// M_SSOR^{-1} = ω(2-ω) * (D + ωU)^{-1} D (D + ωL)^{-1}
 /// ```
 ///
 /// This symmetry is beneficial for conjugate gradient methods.
@@ -350,6 +351,23 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SSOR<T> {
             }
 
             z[i] = sum / diag;
+        }
+
+        // The two sweeps above solved (D + ωL) temp = r followed by
+        // (D + ωU) z = D * temp, which together give
+        // z = (D + ωU)^{-1} D (D + ωL)^{-1} r.
+        //
+        // The standard SSOR preconditioner is
+        //   M_SSOR^{-1} = ω(2-ω) (D + ωU)^{-1} D (D + ωL)^{-1}
+        // so the missing ω(2-ω) scaling factor must be applied to the result
+        // of the backward sweep. It cannot be folded into the sweep itself:
+        // the backward substitution recursion needs the *unscaled*
+        // intermediate values of z, so the factor is applied once, here, to
+        // the final solution.
+        let two = T::one() + T::one();
+        let scale = self.omega.clone() * (two - self.omega.clone());
+        for zi in z.iter_mut() {
+            *zi = zi.clone() * scale.clone();
         }
     }
 

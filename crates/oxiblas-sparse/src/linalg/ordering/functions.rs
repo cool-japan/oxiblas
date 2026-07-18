@@ -74,82 +74,257 @@ pub(super) fn postorder_tree(parent: &[Option<usize>]) -> Vec<usize> {
     }
     order
 }
-/// Computes column counts for L (number of entries in each column).
+/// Computes column counts for L (number of entries in each column of the
+/// Cholesky factor, including the diagonal), *with* fill-in.
+///
+/// This is the Gilbert-Ng-Peyton column-count algorithm (Gilbert, Ng &
+/// Peyton, "An Efficient Algorithm to Compute Row and Column Counts for
+/// Sparse Cholesky Factorization", 1994), as described in Davis, "Direct
+/// Methods for Sparse Linear Systems", Algorithm 4.2 / `cs_counts`.
+///
+/// Unlike a naive tree walk that only counts *original* nonzeros of `a`,
+/// this algorithm correctly accounts for fill-in entries introduced by
+/// elimination: for every subdiagonal entry `a[i, j]` (`i > j`), the "least
+/// common ancestor" of `i`'s previously-seen owning column within the
+/// elimination tree is found (with union-find-style path compression so the
+/// whole procedure runs in near-linear time), and a `+1`/`-1` delta pair is
+/// applied so that, after the deltas are summed up the tree from children to
+/// parents, `counts[v]` equals the exact number of nonzeros predicted for
+/// column `v` of `L`.
 pub(super) fn column_counts<T: Scalar>(
     a: &CscMatrix<T>,
     parent: &[Option<usize>],
-    _post_order: &[usize],
+    post_order: &[usize],
 ) -> Vec<usize> {
     let n = a.nrows();
-    let mut counts = vec![1usize; n];
-    for j in 0..n {
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Step 1: `first[v]` = postorder index of the earliest-visited node in
+    // the subtree rooted at `v` (i.e. the postorder position of `v`'s first
+    // descendant leaf, or of `v` itself if `v` is a leaf). Also initializes
+    // `delta[v] = 1` for leaves (every leaf contributes its own diagonal
+    // entry) and `0` otherwise.
+    let mut first: Vec<Option<usize>> = vec![None; n];
+    let mut delta: Vec<i64> = vec![0; n];
+    for (k, &leaf_start) in post_order.iter().enumerate() {
+        if first[leaf_start].is_none() {
+            delta[leaf_start] = 1;
+        }
+        let mut node = Some(leaf_start);
+        while let Some(v) = node {
+            if first[v].is_some() {
+                break;
+            }
+            first[v] = Some(k);
+            node = parent[v];
+        }
+    }
+
+    // Step 2: sweep the matrix column by column in postorder, using a
+    // union-find "ancestor" structure (with the classic Gilbert-Ng-Peyton
+    // `leaf` test) to detect, for every row `i`, which columns `j < i` are
+    // "skeleton" contributors to row `i`'s fill pattern, folding out
+    // redundant contributions via least-common-ancestor deltas.
+    let mut maxfirst: Vec<Option<usize>> = vec![None; n];
+    let mut prevleaf: Vec<Option<usize>> = vec![None; n];
+    let mut ancestor: Vec<usize> = (0..n).collect();
+
+    for &j in post_order {
+        if let Some(p) = parent[j] {
+            delta[p] -= 1;
+        }
+        let Some(first_j) = first[j] else {
+            // Unreachable: `first` was fully populated for every node in
+            // step 1. Skip defensively rather than panicking.
+            continue;
+        };
         let col_start = a.col_ptrs()[j];
         let col_end = a.col_ptrs()[j + 1];
         for idx in col_start..col_end {
             let i = a.row_indices()[idx];
-            if i > j {
-                counts[j] += 1;
-                let mut k = i;
-                while let Some(p) = parent[k] {
-                    if p <= j {
-                        break;
+            if i <= j {
+                continue;
+            }
+            if let Some(mf) = maxfirst[i] {
+                if first_j <= mf {
+                    continue;
+                }
+            }
+            maxfirst[i] = Some(first_j);
+            match prevleaf[i] {
+                None => {
+                    // `j` is the first column found to touch row `i`: it is
+                    // a genuine skeleton entry, contributing to column j.
+                    delta[j] += 1;
+                    prevleaf[i] = Some(j);
+                }
+                Some(jprev) => {
+                    // Find the root `q` of `jprev`'s partial-elimination-
+                    // forest set, with path compression.
+                    let mut q = jprev;
+                    while ancestor[q] != q {
+                        q = ancestor[q];
                     }
-                    k = p;
+                    let mut s = jprev;
+                    while s != q {
+                        let next = ancestor[s];
+                        ancestor[s] = q;
+                        s = next;
+                    }
+                    // `j` contributes to the skeleton, but overlaps with the
+                    // subtree already rooted at `q`; cancel the overlap.
+                    delta[j] += 1;
+                    delta[q] -= 1;
+                    prevleaf[i] = Some(j);
                 }
             }
         }
+        if let Some(p) = parent[j] {
+            ancestor[j] = p;
+        }
     }
+
+    // Step 3: sum deltas up the elimination tree (children before parents).
+    // `parent[v] > v` always holds for this elimination-tree convention, so
+    // a single increasing sweep over natural indices is a valid topological
+    // (bottom-up) order.
+    let mut counts = delta;
+    for v in 0..n {
+        if let Some(p) = parent[v] {
+            counts[p] += counts[v];
+        }
+    }
+
     counts
+        .into_iter()
+        .map(|c| {
+            debug_assert!(
+                c >= 1,
+                "column count must be >= 1 (diagonal entry always present)"
+            );
+            c.max(1) as usize
+        })
+        .collect()
 }
-/// Computes the row indices for L pattern.
+/// Computes the row indices for L's pattern (`Struct(L_{*j})` for every
+/// column `j`), given the elimination tree and the column boundaries
+/// produced by [`column_counts`].
+///
+/// This implements the elimination-tree fill theorem (Davis, "Direct
+/// Methods for Sparse Linear Systems", Theorem 4.2 / 4.3):
+///
+/// ```text
+/// Struct(L_{*j}) = A_j  union  ( union over children c of j : Struct(L_{*c}) \ {c} )
+/// ```
+///
+/// where `A_j = { i >= j : A[i, j] != 0 }` is column `j`'s own nonzero
+/// pattern at or below the diagonal. Each child's pattern (minus its own
+/// row) consists entirely of rows `>= parent(c) == j` by definition of the
+/// elimination tree, so the union above is exactly `L`'s true (fill-in
+/// included) column pattern. Nodes are processed in increasing index order,
+/// which is a valid bottom-up (children-before-parents) topological order
+/// for this elimination tree, since `parent[v] > v` always holds.
 pub(super) fn compute_l_pattern<T: Scalar>(
     a: &CscMatrix<T>,
     parent: &[Option<usize>],
     l_col_ptrs: &[usize],
 ) -> Vec<usize> {
     let n = a.nrows();
+    if n == 0 {
+        return Vec::new();
+    }
     let nnz = l_col_ptrs[n];
     let mut l_row_indices = vec![0usize; nnz];
-    let mut write_pos = l_col_ptrs[0..n].to_vec();
-    let mut visited = vec![false; n];
-    for j in 0..n {
-        for k in 0..n {
-            visited[k] = false;
+
+    // Immediate children of each node in the elimination tree.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (c, &p) in parent.iter().enumerate() {
+        if let Some(pnode) = p {
+            children[pnode].push(c);
         }
-        l_row_indices[write_pos[j]] = j;
-        write_pos[j] += 1;
-        visited[j] = true;
+    }
+
+    // `patterns[j]` holds the fully computed, sorted row pattern of column
+    // `j` of L, kept alive only until it is merged into its parent (each
+    // node has exactly one parent in a tree, so it is consumed via `take`
+    // the moment its parent is processed).
+    let mut patterns: Vec<Option<Vec<usize>>> = vec![None; n];
+
+    // `mark[row] == j` means `row` has already been added to the pattern
+    // currently being built for column `j`. Since `j` increases strictly
+    // across iterations, this doubles as a per-column "visited" set without
+    // needing an O(n) reset per column.
+    let mut mark = vec![usize::MAX; n];
+
+    for j in 0..n {
+        let mut pattern: Vec<usize> = Vec::new();
+        // The diagonal entry is always present in Struct(L_{*j}).
+        mark[j] = j;
+        pattern.push(j);
+        // A_j: direct nonzeros of A in column j, at or below the diagonal.
         let col_start = a.col_ptrs()[j];
         let col_end = a.col_ptrs()[j + 1];
         for idx in col_start..col_end {
             let i = a.row_indices()[idx];
-            if i > j && !visited[i] {
-                visited[i] = true;
-                let mut k = i;
-                while k > j {
-                    if !visited[k] {
-                        visited[k] = true;
-                    }
-                    if write_pos[j] < l_col_ptrs[j + 1] {
-                        l_row_indices[write_pos[j]] = k;
-                        write_pos[j] += 1;
-                    }
-                    match parent[k] {
-                        Some(p) if p > j => k = p,
-                        _ => break,
+            if i > j && mark[i] != j {
+                mark[i] = j;
+                pattern.push(i);
+            }
+        }
+        // Union in each child's pattern (minus the child's own row); by the
+        // elimination-tree fill theorem these rows are all >= j.
+        for &c in &children[j] {
+            if let Some(child_pattern) = patterns[c].take() {
+                for &row in &child_pattern {
+                    if row != c && mark[row] != j {
+                        mark[row] = j;
+                        pattern.push(row);
                     }
                 }
             }
         }
-        let col_start = l_col_ptrs[j];
-        let col_end = write_pos[j];
-        l_row_indices[col_start..col_end].sort_unstable();
+        pattern.sort_unstable();
+
+        let expected_start = l_col_ptrs[j];
+        let expected_end = l_col_ptrs[j + 1];
+        let expected_len = expected_end - expected_start;
+        debug_assert_eq!(
+            pattern.len(),
+            expected_len,
+            "column {j}: computed L pattern size does not match column_counts \
+             (elimination-tree fill theorem should guarantee an exact match)"
+        );
+        // Defensive bound (should always be exact given correct inputs):
+        // never write past the slice allocated for this column.
+        let write_len = pattern.len().min(expected_len);
+        l_row_indices[expected_start..expected_start + write_len]
+            .copy_from_slice(&pattern[..write_len]);
+
+        patterns[j] = Some(pattern);
     }
     l_row_indices
 }
-/// Approximate Minimum Degree ordering.
+/// Minimum Degree ordering (greedy elimination, exact degree updates).
 ///
-/// Computes a fill-reducing ordering for sparse Cholesky factorization.
+/// Computes a fill-reducing ordering for sparse Cholesky factorization by
+/// repeatedly eliminating the vertex of smallest *current* degree in the
+/// elimination graph and updating the affected vertices' degrees.
+///
+/// # Honesty note: this is not the AMD algorithm
+///
+/// Despite the function name (kept for API stability), this is **not** the
+/// Approximate Minimum Degree (AMD) algorithm of Amestoy, Davis & Duff. Real
+/// AMD tracks *upper bounds* on degree via a quotient-graph / clique
+/// representation and only refreshes them lazily as elements are absorbed,
+/// which is what lets it run close to `O(nnz)` on typical sparse matrices.
+/// This implementation instead recomputes the *exact* degree of every
+/// affected vertex after each elimination step and rebuilds fill edges with
+/// linear `Vec::contains` scans, giving it `O(n^2)` (or worse) worst-case
+/// time complexity. The resulting ordering quality is often comparable to
+/// AMD on small/medium matrices, but the algorithm and its complexity are
+/// not those of AMD.
 pub fn approximate_minimum_degree<T: Scalar>(a: &CscMatrix<T>) -> Vec<usize> {
     let n = a.nrows();
     if n == 0 {
@@ -494,7 +669,14 @@ fn widen_separator(
     }
     sep_set.into_iter().collect()
 }
-/// Local AMD ordering for a subgraph.
+/// Local minimum-degree ordering for a subgraph (exact degree, not AMD).
+///
+/// Used internally by [`nested_dissection_recursive`] to order the leaves of
+/// the recursion once a subgraph is small enough (or the depth limit is
+/// reached). Like [`approximate_minimum_degree`], this recomputes exact
+/// degrees after every elimination step rather than approximating them, so
+/// despite the name it is not the Approximate Minimum Degree algorithm; see
+/// that function's docs for details.
 fn local_amd(adj: &[Vec<usize>], active: &[usize]) -> Vec<usize> {
     if active.is_empty() {
         return Vec::new();
@@ -676,14 +858,28 @@ fn find_independent_set(
     }
     independent
 }
-/// Column Approximate Minimum Degree ordering for unsymmetric matrices.
+/// Column minimum-degree ordering for unsymmetric matrices (not real COLAMD).
 ///
-/// Computes a column permutation that reduces fill-in during LU factorization.
-/// Unlike AMD which works on symmetric matrices, COLAMD is designed for
-/// unsymmetric (or rectangular) matrices.
+/// Computes a column permutation intended to reduce fill-in during LU or QR
+/// factorization of an unsymmetric (or rectangular) matrix, by running
+/// exact minimum-degree elimination on the column intersection graph of `a`
+/// (the graph whose edges are the nonzero pattern of `a^T * a`).
 ///
-/// The algorithm operates on A^T * A implicitly without forming it explicitly,
-/// using the column intersection graph.
+/// # Honesty note: this is not the COLAMD algorithm
+///
+/// Despite the function name (kept for API stability), this is **not** the
+/// COLAMD algorithm of Davis, Gilbert, Larimore & Ng. The defining
+/// performance feature of real COLAMD is that it *never* forms `A^T * A` or
+/// the column intersection graph explicitly — it operates directly on `A`'s
+/// row/column structure through a quotient-graph representation, keeping
+/// time and memory close to `O(nnz(A))`. This implementation does exactly
+/// what COLAMD avoids: it explicitly materializes `col_adj`, the full
+/// column-intersection adjacency (which can have up to `O(nnz(A)^2)`
+/// entries in the worst case), and then performs *exact* (not approximate)
+/// minimum-degree elimination on it using linear `Vec::contains` scans for
+/// edge dedup. It still produces a valid fill-reducing column permutation,
+/// but can be substantially slower and more memory-hungry than COLAMD on
+/// the same input.
 ///
 /// # Arguments
 ///
@@ -764,10 +960,23 @@ pub fn colamd<T: Scalar>(a: &CscMatrix<T>) -> Vec<usize> {
     }
     order
 }
-/// COLAMD with aggressive absorption for dense rows.
+/// Column minimum-degree ordering with dense-row filtering (not real COLAMD).
 ///
-/// Dense rows (with many non-zeros) are detected and handled specially
-/// to avoid creating large cliques in the column graph.
+/// Runs the same algorithm as [`colamd`] — exact minimum-degree elimination
+/// on the explicitly-formed column intersection graph — except rows with
+/// more than `dense_threshold` fraction of nonzero columns are excluded
+/// before the graph is built, to avoid the large near-complete cliques that
+/// dense rows would otherwise induce in the column intersection graph.
+///
+/// # Honesty note: this is not the COLAMD algorithm
+///
+/// The name references COLAMD's "aggressive absorption" pass, but this
+/// function does not perform aggressive absorption in the COLAMD sense
+/// (merging indistinguishable / absorbed supervariables discovered during
+/// elimination). It only pre-filters dense rows before falling back to the
+/// same explicit `A^T * A`-graph, exact-minimum-degree procedure as
+/// [`colamd`]; see that function's docs for why this is not the real COLAMD
+/// algorithm.
 ///
 /// # Arguments
 ///
@@ -1112,6 +1321,59 @@ mod tests {
         let sym = SymbolicCholesky::new(&a);
         assert_eq!(sym.n(), 5);
         assert!(sym.nnz() >= 5, "L should have at least diagonal entries");
+    }
+    /// A 4-cycle graph (0-1, 0-2, 1-3, 2-3, plus diagonal), stored as a full
+    /// symmetric CSC matrix. Eliminating node 0 in natural order (0,1,2,3)
+    /// introduces a *fill* edge between 1 and 2 (both are neighbors of 0),
+    /// so the true Cholesky column counts are [3, 3, 2, 1] (total nnz(L)=9).
+    ///
+    /// The pre-fix `column_counts` only counted *original* nonzeros of `A`
+    /// and performed a dead tree-walk that never updated any counter, so it
+    /// produced [3, 2, 2, 1] (total 8) for this matrix: column 1's fill
+    /// entry at row 2 was silently dropped, which in turn made
+    /// `compute_l_pattern`'s write-position guard silently truncate that
+    /// column's pattern.
+    fn make_fill_in_matrix() -> CscMatrix<f64> {
+        let col_ptrs = vec![0, 3, 6, 9, 12];
+        let row_indices = vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3];
+        let values = vec![1.0; 12];
+        CscMatrix::new(4, 4, col_ptrs, row_indices, values).unwrap()
+    }
+    #[test]
+    fn test_column_counts_accounts_for_fill_in() {
+        let a = make_fill_in_matrix();
+        let parent = elimination_tree(&a);
+        // Sanity check: natural elimination order should produce the chain
+        // 0 -> 1 -> 2 -> 3 given the fill edge (1,2) introduced by
+        // eliminating node 0.
+        assert_eq!(parent, vec![Some(1), Some(2), Some(3), None]);
+        let post_order = postorder_tree(&parent);
+        let counts = column_counts(&a, &parent, &post_order);
+        assert_eq!(
+            counts,
+            vec![3, 3, 2, 1],
+            "column counts must include the fill-in entry at (row=2, col=1) \
+             introduced by eliminating node 0"
+        );
+    }
+    #[test]
+    fn test_symbolic_cholesky_fill_in_pattern_is_not_truncated() {
+        let a = make_fill_in_matrix();
+        let sym = SymbolicCholesky::new(&a);
+        // Total nnz(L) must be exactly 9, not the truncated 8 that the
+        // dead tree-walk bug used to produce.
+        assert_eq!(sym.nnz(), 9);
+        assert_eq!(sym.l_col_ptrs(), &[0, 3, 6, 8, 9]);
+        // Column 1 (0-indexed) must contain the fill-in row 2, in addition
+        // to the diagonal (1) and the original entry (3).
+        let col1 = &sym.l_row_indices()[sym.l_col_ptrs()[1]..sym.l_col_ptrs()[2]];
+        let mut col1_sorted = col1.to_vec();
+        col1_sorted.sort_unstable();
+        assert_eq!(
+            col1_sorted,
+            vec![1, 2, 3],
+            "L's column 1 must include the fill-in entry at row 2"
+        );
     }
     #[test]
     fn test_amd() {

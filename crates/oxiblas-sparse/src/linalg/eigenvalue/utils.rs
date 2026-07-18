@@ -5,7 +5,10 @@
 
 use crate::csc::CscMatrix;
 use crate::csr::CsrMatrix;
+use num_traits::FromPrimitive;
 use oxiblas_core::scalar::{Field, Real, Scalar};
+
+use super::error::EigenvalueError;
 
 // =============================================================================
 // Vector Operations
@@ -60,15 +63,38 @@ pub fn norm<T: Scalar<Real = T> + Clone + Field + Real>(v: &[T]) -> T {
 // =============================================================================
 
 /// Compute C = A - sigma * B (sparse matrix subtraction).
+///
+/// # Errors
+///
+/// Returns [`EigenvalueError::NotSquare`] if `a` is not square, or
+/// [`EigenvalueError::DimensionMismatch`] if `b`'s dimensions do not match
+/// `a`'s. Returns [`EigenvalueError::ComputationError`] if the resulting
+/// sparsity pattern fails to form a valid CSR matrix (should not occur for
+/// well-formed inputs, but is surfaced rather than panicking).
 pub fn subtract_scaled_matrices<T: Scalar + Clone>(
     a: &CsrMatrix<T>,
     b: &CsrMatrix<T>,
     sigma: T,
-) -> CsrMatrix<T> {
+) -> Result<CsrMatrix<T>, EigenvalueError> {
     let n = a.nrows();
-    assert_eq!(a.ncols(), n);
-    assert_eq!(b.nrows(), n);
-    assert_eq!(b.ncols(), n);
+    if a.ncols() != n {
+        return Err(EigenvalueError::NotSquare {
+            nrows: n,
+            ncols: a.ncols(),
+        });
+    }
+    if b.nrows() != n {
+        return Err(EigenvalueError::DimensionMismatch {
+            expected: n,
+            actual: b.nrows(),
+        });
+    }
+    if b.ncols() != n {
+        return Err(EigenvalueError::DimensionMismatch {
+            expected: n,
+            actual: b.ncols(),
+        });
+    }
 
     // Use symbolic addition to find sparsity pattern
     let mut row_ptrs = vec![0usize; n + 1];
@@ -135,20 +161,46 @@ pub fn subtract_scaled_matrices<T: Scalar + Clone>(
         row_ptrs[i + 1] = col_indices.len();
     }
 
-    CsrMatrix::new(n, n, row_ptrs, col_indices, values)
-        .expect("CSR matrix construction with valid parameters")
+    CsrMatrix::new(n, n, row_ptrs, col_indices, values).map_err(|e| {
+        EigenvalueError::ComputationError(format!(
+            "failed to construct CSR matrix in subtract_scaled_matrices: {e}"
+        ))
+    })
 }
 
 /// Compute C = A + sigma * B (sparse matrix addition).
+///
+/// # Errors
+///
+/// Returns [`EigenvalueError::NotSquare`] if `a` is not square, or
+/// [`EigenvalueError::DimensionMismatch`] if `b`'s dimensions do not match
+/// `a`'s. Returns [`EigenvalueError::ComputationError`] if the resulting
+/// sparsity pattern fails to form a valid CSR matrix (should not occur for
+/// well-formed inputs, but is surfaced rather than panicking).
 pub fn add_scaled_matrices<T: Scalar + Clone>(
     a: &CsrMatrix<T>,
     b: &CsrMatrix<T>,
     sigma: T,
-) -> CsrMatrix<T> {
+) -> Result<CsrMatrix<T>, EigenvalueError> {
     let n = a.nrows();
-    assert_eq!(a.ncols(), n);
-    assert_eq!(b.nrows(), n);
-    assert_eq!(b.ncols(), n);
+    if a.ncols() != n {
+        return Err(EigenvalueError::NotSquare {
+            nrows: n,
+            ncols: a.ncols(),
+        });
+    }
+    if b.nrows() != n {
+        return Err(EigenvalueError::DimensionMismatch {
+            expected: n,
+            actual: b.nrows(),
+        });
+    }
+    if b.ncols() != n {
+        return Err(EigenvalueError::DimensionMismatch {
+            expected: n,
+            actual: b.ncols(),
+        });
+    }
 
     let mut row_ptrs = vec![0usize; n + 1];
     let mut col_indices = Vec::new();
@@ -212,19 +264,31 @@ pub fn add_scaled_matrices<T: Scalar + Clone>(
         row_ptrs[i + 1] = col_indices.len();
     }
 
-    CsrMatrix::new(n, n, row_ptrs, col_indices, values)
-        .expect("CSR matrix construction with valid parameters")
+    CsrMatrix::new(n, n, row_ptrs, col_indices, values).map_err(|e| {
+        EigenvalueError::ComputationError(format!(
+            "failed to construct CSR matrix in add_scaled_matrices: {e}"
+        ))
+    })
 }
 
 /// Convert CSR matrix to CSC format.
-pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CscMatrix<T> {
+///
+/// # Errors
+///
+/// Returns [`EigenvalueError::ComputationError`] if the resulting sparsity
+/// pattern fails to form a valid CSC matrix (should not occur for a
+/// well-formed `csr` input, but is surfaced rather than panicking).
+pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> Result<CscMatrix<T>, EigenvalueError> {
     let nrows = csr.nrows();
     let ncols = csr.ncols();
     let nnz = csr.nnz();
 
     if nnz == 0 {
-        return CscMatrix::new(nrows, ncols, vec![0; ncols + 1], vec![], vec![])
-            .expect("CSC matrix construction with valid parameters");
+        return CscMatrix::new(nrows, ncols, vec![0; ncols + 1], vec![], vec![]).map_err(|e| {
+            EigenvalueError::ComputationError(format!(
+                "failed to construct empty CSC matrix in csr_to_csc: {e}"
+            ))
+        });
     }
 
     // Count entries per column
@@ -256,6 +320,131 @@ pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CscMatrix<T> {
         }
     }
 
-    CscMatrix::new(nrows, ncols, col_ptrs, row_indices, values)
-        .expect("CSC matrix construction with valid parameters")
+    CscMatrix::new(nrows, ncols, col_ptrs, row_indices, values).map_err(|e| {
+        EigenvalueError::ComputationError(format!("failed to construct CSC matrix in csr_to_csc: {e}"))
+    })
+}
+
+// =============================================================================
+// Dense symmetric eigenvalue problem (Jacobi)
+// =============================================================================
+
+/// Compute all eigenpairs of a small dense symmetric matrix via the cyclic
+/// Jacobi rotation method.
+///
+/// `h` is an `m x m` symmetric matrix stored row-major (`h[i][j]`). The routine
+/// applies two-sided Jacobi rotations `A <- J^T A J` to drive the off-diagonal
+/// to zero, accumulating the rotations to build the eigenvectors. It returns
+/// `(eigenvalues, eigenvectors)` sorted ascending by eigenvalue, where
+/// `eigenvectors[k]` is the length-`m` (orthonormal) eigenvector associated
+/// with `eigenvalues[k]`.
+///
+/// Jacobi is backward stable and computes even tiny/clustered eigenvalues to
+/// high relative accuracy, which is exactly what a Rayleigh-Ritz projection
+/// needs; it is intended for the small projected matrices (`m` at most a few
+/// hundred) that arise there.
+pub fn dense_symmetric_jacobi_evd<T>(h: &[Vec<T>]) -> (Vec<T>, Vec<Vec<T>>)
+where
+    T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive,
+{
+    let m = h.len();
+    if m == 0 {
+        return (vec![], vec![]);
+    }
+
+    // Working copy of the matrix and the eigenvector accumulator (identity).
+    let mut a: Vec<Vec<T>> = h.to_vec();
+    let mut v: Vec<Vec<T>> = (0..m)
+        .map(|i| {
+            (0..m)
+                .map(|j| if i == j { T::one() } else { T::zero() })
+                .collect()
+        })
+        .collect();
+
+    let eps = <T as Scalar>::epsilon();
+    let two = T::from_f64(2.0).unwrap_or_else(|| T::one() + T::one());
+    // A generous sweep budget; a symmetric matrix converges quadratically and
+    // in practice needs far fewer than this many sweeps.
+    let max_sweeps = 100usize;
+
+    for _sweep in 0..max_sweeps {
+        // Off-diagonal Frobenius norm; stop once it is negligible.
+        let mut off = T::zero();
+        for p in 0..m {
+            for q in (p + 1)..m {
+                off = off + a[p][q].clone() * a[p][q].clone();
+            }
+        }
+        if Real::sqrt(off) <= eps {
+            break;
+        }
+
+        for p in 0..m {
+            for q in (p + 1)..m {
+                let apq = a[p][q].clone();
+                if Scalar::abs(apq.clone()) <= eps {
+                    continue;
+                }
+                let app = a[p][p].clone();
+                let aqq = a[q][q].clone();
+
+                // Rotation that annihilates a[p][q]:
+                //   theta = (aqq - app) / (2 * apq)
+                //   t     = sign(theta) / (|theta| + sqrt(theta^2 + 1))
+                //   c     = 1 / sqrt(t^2 + 1),  s = t * c
+                let theta = (aqq - app) / (two.clone() * apq.clone());
+                let sign = if theta >= T::zero() {
+                    T::one()
+                } else {
+                    T::zero() - T::one()
+                };
+                let t = sign
+                    / (Scalar::abs(theta.clone())
+                        + Real::sqrt(theta.clone() * theta.clone() + T::one()));
+                let c = T::one() / Real::sqrt(t.clone() * t.clone() + T::one());
+                let s = t * c.clone();
+
+                // Right-multiply by J (update columns p and q).
+                for row in a.iter_mut() {
+                    let akp = row[p].clone();
+                    let akq = row[q].clone();
+                    row[p] = c.clone() * akp.clone() - s.clone() * akq.clone();
+                    row[q] = s.clone() * akp + c.clone() * akq;
+                }
+                // Left-multiply by J^T (update rows p and q).
+                for k in 0..m {
+                    let apk = a[p][k].clone();
+                    let aqk = a[q][k].clone();
+                    a[p][k] = c.clone() * apk.clone() - s.clone() * aqk.clone();
+                    a[q][k] = s.clone() * apk + c.clone() * aqk;
+                }
+                // Accumulate the rotation into the eigenvector matrix.
+                for row in v.iter_mut() {
+                    let vkp = row[p].clone();
+                    let vkq = row[q].clone();
+                    row[p] = c.clone() * vkp.clone() - s.clone() * vkq.clone();
+                    row[q] = s.clone() * vkp + c.clone() * vkq;
+                }
+            }
+        }
+    }
+
+    // Eigenvalues sit on the diagonal; eigenvectors are the columns of `v`.
+    let mut pairs: Vec<(T, Vec<T>)> = (0..m)
+        .map(|j| {
+            let eval = a[j][j].clone();
+            let evec: Vec<T> = (0..m).map(|i| v[i][j].clone()).collect();
+            (eval, evec)
+        })
+        .collect();
+    pairs.sort_by(|(a_val, _), (b_val, _)| {
+        a_val
+            .partial_cmp(b_val)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let eigenvalues = pairs.iter().map(|(e, _)| e.clone()).collect();
+    let eigenvectors = pairs.into_iter().map(|(_, vec)| vec).collect();
+    (eigenvalues, eigenvectors)
 }

@@ -239,6 +239,165 @@ fn test_arnoldi_general_matrix() {
 }
 
 #[test]
+fn test_arnoldi_residual_fields_populated() {
+    // Every returned eigenpair must carry a residual norm and a convergence flag,
+    // with matching lengths and consistent aggregate flag.
+    let a = make_larger_symmetric_matrix(15);
+    let config = LanczosConfig {
+        num_eigenvalues: 3,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: 12,
+        tolerance: 1e-8,
+        ..Default::default()
+    };
+    let result = Arnoldi::new(config).compute(&a, None).unwrap();
+
+    assert_eq!(result.residual_norms.len(), result.eigenvalues_real.len());
+    assert_eq!(result.converged_flags.len(), result.eigenvalues_real.len());
+
+    // Residual norms must be finite and non-negative.
+    for r in &result.residual_norms {
+        assert!(r.is_finite(), "residual must be finite, got {r}");
+        assert!(*r >= 0.0, "residual must be non-negative, got {r}");
+    }
+
+    // Aggregate flag must agree with the per-pair flags and the requested count.
+    let converged_count = result.converged_flags.iter().filter(|&&c| c).count();
+    assert_eq!(result.converged, converged_count >= 3);
+
+    // A per-pair flag is set iff its residual meets the tolerance.
+    for (r, &flag) in result
+        .residual_norms
+        .iter()
+        .zip(result.converged_flags.iter())
+    {
+        assert_eq!(flag, *r <= 1e-8, "flag/residual mismatch at r={r}");
+    }
+}
+
+#[test]
+fn test_arnoldi_reports_true_convergence_on_happy_breakdown() {
+    // Upper-triangular matrix; the all-ones start vector spans a 2-dimensional
+    // invariant subspace, so Arnoldi finds exactly two *exact* eigenpairs.
+    // Requesting two eigenvalues, both must be reported as genuinely converged.
+    let values = vec![2.0, 1.0, 3.0, 1.0, 4.0];
+    let col_indices = vec![0, 1, 1, 2, 2];
+    let row_ptrs = vec![0, 2, 4, 5];
+    let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+
+    let config = LanczosConfig {
+        num_eigenvalues: 2,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: 10,
+        tolerance: 1e-8,
+        ..Default::default()
+    };
+    let result = Arnoldi::new(config).compute(&a, None).unwrap();
+
+    assert_eq!(result.eigenvalues_real.len(), 2);
+    for r in &result.residual_norms {
+        assert!(
+            *r <= 1e-8,
+            "exact Ritz pair should have tiny residual, got {r}"
+        );
+    }
+    assert!(
+        result.converged_flags.iter().all(|&c| c),
+        "all returned eigenpairs should be flagged converged"
+    );
+    assert!(
+        result.converged,
+        "converged must be true when every requested eigenpair meets tolerance"
+    );
+}
+
+#[test]
+fn test_arnoldi_reports_honest_nonconvergence() {
+    // Regression guard: with a Krylov subspace far smaller than the matrix, the
+    // Ritz pairs have NOT numerically converged. The old code reported
+    // `converged = actual_dim >= m.min(n)` = true unconditionally as soon as the
+    // subspace filled up; the residual-based check must report false instead.
+    let a = make_larger_symmetric_matrix(40);
+    let config = LanczosConfig {
+        num_eigenvalues: 4,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: 8,
+        tolerance: 1e-8,
+        ..Default::default()
+    };
+    let result = Arnoldi::new(config).compute(&a, None).unwrap();
+
+    // The subspace filled to its target size (iterations == krylov dimension)...
+    assert_eq!(result.iterations, 8);
+    // ...but that alone must NOT mark the run as converged.
+    assert!(
+        !result.converged,
+        "an under-resolved Krylov subspace must not report convergence"
+    );
+    // At least one residual must genuinely exceed the tolerance.
+    assert!(
+        result.residual_norms.iter().any(|r| *r > 1e-8),
+        "residual norms should reflect the lack of convergence"
+    );
+    // Residuals stay finite (inverse iteration on the near-singular block is
+    // regularized, so no NaN/Inf leaks through).
+    for r in &result.residual_norms {
+        assert!(r.is_finite(), "residual must be finite, got {r}");
+    }
+}
+
+#[test]
+fn test_arnoldi_complex_path_residuals() {
+    // Non-symmetric matrix whose leading 2x2 block [[1,-1],[1,1]] has the complex
+    // conjugate eigenpair 1 +/- i, plus a real eigenvalue 3. This drives the
+    // complex-conjugate branch of the residual computation (the 2n x 2n real
+    // inverse-iteration system).
+    // A = [[1,-1, 0],
+    //      [1, 1, 0],
+    //      [0, 0, 3]]
+    let values = vec![1.0, -1.0, 1.0, 1.0, 3.0];
+    let col_indices = vec![0, 1, 0, 1, 2];
+    let row_ptrs = vec![0, 2, 4, 5];
+    let a = CsrMatrix::<f64>::new(3, 3, row_ptrs, col_indices, values).unwrap();
+
+    let config = LanczosConfig {
+        num_eigenvalues: 3,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: 10,
+        tolerance: 1e-6,
+        ..Default::default()
+    };
+    let result = Arnoldi::new(config).compute(&a, None).unwrap();
+
+    // The complex-conjugate branch must have been exercised.
+    let has_complex_pair = result.eigenvalues_imag.iter().any(|im| im.abs() > 0.1);
+    assert!(
+        has_complex_pair,
+        "should surface a complex conjugate pair, imag={:?}",
+        result.eigenvalues_imag
+    );
+
+    // Every residual (real and complex parts) is finite and non-negative, and
+    // each per-pair flag agrees exactly with the tolerance test -- the complex
+    // path is a genuine residual computation via a matrix-vector product, so a
+    // pair is only flagged converged when it truly meets the tolerance.
+    assert_eq!(result.residual_norms.len(), result.eigenvalues_real.len());
+    for (r, &flag) in result
+        .residual_norms
+        .iter()
+        .zip(result.converged_flags.iter())
+    {
+        assert!(
+            r.is_finite() && *r >= 0.0,
+            "residual must be finite and non-negative, got {r}"
+        );
+        assert_eq!(flag, *r <= 1e-6, "flag/residual mismatch at r={r}");
+    }
+    let count = result.converged_flags.iter().filter(|&&c| c).count();
+    assert_eq!(result.converged, count >= 3);
+}
+
+#[test]
 fn test_lanczos_smallest_algebraic() {
     let a = make_larger_symmetric_matrix(10);
 
@@ -277,6 +436,77 @@ fn test_lanczos_smallest_algebraic() {
         min_ev < 2.0,
         "At least one eigenvalue should be less than 2, got {}",
         min_ev
+    );
+}
+
+#[test]
+fn test_lanczos_near_target_selects_target_nearest_eigenvalue() {
+    // Eigenvalues of this 3x3 matrix are approximately 5.414, 4.0, 2.586.
+    // Use krylov_dimension == n so the Krylov subspace spans all of R^3: the
+    // Ritz values are then (numerically) exact eigenvalues of A, isolating the
+    // *selection* criterion from Lanczos convergence quality.
+    //
+    // An explicit, asymmetric starting vector is used because the default
+    // all-ones starting vector happens to be exactly orthogonal to this
+    // matrix's eigenvector for eigenvalue 4.0 (a quirk of this particular
+    // Toeplitz-tridiagonal test matrix), which would make that eigenvalue
+    // unreachable by *any* Krylov method regardless of selection criterion.
+    let a = make_symmetric_matrix();
+    let init = [1.0, 0.3, 0.1];
+
+    let near_target_config = LanczosConfig {
+        num_eigenvalues: 1,
+        which: WhichEigenvalues::NearTarget,
+        krylov_dimension: 3,
+        tolerance: 1e-10,
+        ..Default::default()
+    };
+    let near_target_result = Lanczos::new(near_target_config)
+        .with_target(4.0)
+        .compute(&a, Some(&init))
+        .unwrap();
+
+    assert_eq!(near_target_result.eigenvalues.len(), 1);
+    let selected = near_target_result.eigenvalues[0];
+    assert!(
+        (selected - 4.0).abs() < 1e-6,
+        "NearTarget with target=4.0 should select the eigenvalue nearest 4.0 \
+         (expected ~4.0), got {selected}"
+    );
+
+    // Prove the fix: the pre-fix code silently fell back to SmallestMagnitude
+    // (which would have returned ~2.586 here, not ~4.0).
+    let smallest_magnitude_config = LanczosConfig {
+        num_eigenvalues: 1,
+        which: WhichEigenvalues::SmallestMagnitude,
+        krylov_dimension: 3,
+        tolerance: 1e-10,
+        ..Default::default()
+    };
+    let smallest_result = Lanczos::new(smallest_magnitude_config)
+        .compute(&a, Some(&init))
+        .unwrap();
+    assert!(
+        (smallest_result.eigenvalues[0] - selected).abs() > 1.0,
+        "NearTarget(4.0) selection must differ from SmallestMagnitude selection"
+    );
+
+    // With no `with_target` call the target defaults to zero, so NearTarget
+    // reduces to "nearest the origin", i.e. matches SmallestMagnitude for a
+    // matrix with only positive eigenvalues.
+    let default_target_config = LanczosConfig {
+        num_eigenvalues: 1,
+        which: WhichEigenvalues::NearTarget,
+        krylov_dimension: 3,
+        tolerance: 1e-10,
+        ..Default::default()
+    };
+    let default_result = Lanczos::new(default_target_config)
+        .compute(&a, Some(&init))
+        .unwrap();
+    assert!(
+        (default_result.eigenvalues[0] - smallest_result.eigenvalues[0]).abs() < 1e-6,
+        "NearTarget with default (unset) target should match SmallestMagnitude"
     );
 }
 
@@ -650,6 +880,201 @@ fn test_iram_general_matrix() {
         (3.0..=6.0).contains(&max_real),
         "Largest eigenvalue should be near 5, got {max_real}"
     );
+}
+
+#[test]
+fn test_hessenberg_eigensolver_and_ritz_vector() {
+    // H = [[2,1,0],[1,2,1],[0,1,2]] has eigenvalues 2 +/- sqrt(2) and 2, with
+    // (unit) eigenvectors [1, sqrt2, 1]/2, [1, 0, -1]/sqrt2 and [1, -sqrt2, 1]/2.
+    // This directly exercises the shifted-QR eigenvalue routine and the Ritz
+    // eigenvector routine (inverse iteration on (H - lambda*I)) independently of
+    // the outer Arnoldi iteration.
+    let h = vec![
+        vec![2.0, 1.0, 0.0],
+        vec![1.0, 2.0, 1.0],
+        vec![0.0, 1.0, 2.0],
+    ];
+    let cfg = IRAMConfig::<f64> {
+        num_eigenvalues: 3,
+        which: WhichEigenvalues::LargestMagnitude,
+        max_iterations: 100,
+        tolerance: 1e-12,
+        compute_eigenvectors: true,
+        krylov_dimension: 3,
+        symmetric: false,
+    };
+    let iram = IRAM::new(cfg);
+
+    let (re, im) = iram.solve_hessenberg_eigenvalues(&h, 3).unwrap();
+    let mut sorted = re.clone();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let sqrt2 = 2.0_f64.sqrt();
+    let expected = [2.0 + sqrt2, 2.0, 2.0 - sqrt2];
+    for (got, want) in sorted.iter().zip(expected.iter()) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "eigenvalue {got} should equal {want}"
+        );
+    }
+    for imi in &im {
+        assert!(imi.abs() < 1e-12, "eigenvalues must be real, got imag {imi}");
+    }
+
+    // Each Ritz eigenvector must satisfy H y = lambda y to machine precision,
+    // and vectors for distinct eigenvalues must not be parallel (the old power
+    // iteration returned the dominant eigenvector for every eigenvalue).
+    let mut vecs = Vec::new();
+    for &lam in &re {
+        let y = iram.hessenberg_ritz_vector(&h, 3, lam);
+        assert_eq!(y.len(), 3);
+        let mut hy = [0.0; 3];
+        for (i, hyi) in hy.iter_mut().enumerate() {
+            for (j, yj) in y.iter().enumerate() {
+                *hyi += h[i][j] * yj;
+            }
+        }
+        let res: f64 = (0..3).map(|i| (hy[i] - lam * y[i]).powi(2)).sum::<f64>().sqrt();
+        assert!(
+            res < 1e-9,
+            "Ritz vector for lambda={lam} has residual ||Hy - lambda y||={res}"
+        );
+        vecs.push(y);
+    }
+    for i in 0..vecs.len() {
+        for j in (i + 1)..vecs.len() {
+            let d: f64 = vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+            assert!(
+                d.abs() < 0.9,
+                "Ritz vectors {i},{j} should be distinct (|dot|={})",
+                d.abs()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_iram_general_residual_per_eigenvalue() {
+    // With a truncated Krylov basis (ncv < n) the Arnoldi residual beta = ||f||
+    // is nonzero, so the per-eigenvalue residual estimate beta*|e_m^T y_i| must
+    // differ across the requested Ritz values. The old code reported a single
+    // shared Hessenberg entry for every eigenvalue, making them all identical.
+    let n = 12usize;
+    let mut values = Vec::new();
+    let mut col_indices = Vec::new();
+    let mut row_ptrs = vec![0usize];
+    for i in 0..n {
+        values.push((n - i) as f64);
+        col_indices.push(i);
+        if i + 1 < n {
+            values.push(0.3);
+            col_indices.push(i + 1);
+        }
+        row_ptrs.push(values.len());
+    }
+    let a = CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap();
+
+    let config = IRAMConfig {
+        num_eigenvalues: 3,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: 6, // strictly smaller than n => nonzero residual
+        max_iterations: 200,
+        tolerance: 1e-10,
+        symmetric: false,
+        compute_eigenvectors: false,
+    };
+    let iram = IRAM::new(config);
+    let result = iram.compute(&a, None).unwrap();
+
+    assert_eq!(result.residual_norms.len(), 3);
+    // The estimates must not be all identical (the defining symptom of the bug).
+    let r = &result.residual_norms;
+    let max_spread = r
+        .iter()
+        .flat_map(|ri| r.iter().map(move |rj| (ri - rj).abs()))
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_spread > 0.0,
+        "per-eigenvalue residual estimates should differ, got {r:?}"
+    );
+}
+
+#[test]
+fn test_iram_general_eigenvectors_residual() {
+    // Non-symmetric upper-bidiagonal matrix: A[i,i] = n-i, A[i,i+1] = 0.5.
+    // Eigenvalues are the (distinct, real) diagonal entries n, n-1, ..., 1.
+    // This exercises the general (non-symmetric) eigenvector path. A full
+    // Krylov basis (ncv == n) makes the Ritz values exact so the test isolates
+    // the eigenvector reconstruction rather than the restart convergence.
+    let n = 6usize;
+    let mut values = Vec::new();
+    let mut col_indices = Vec::new();
+    let mut row_ptrs = vec![0usize];
+    for i in 0..n {
+        values.push((n - i) as f64);
+        col_indices.push(i);
+        if i + 1 < n {
+            values.push(0.5);
+            col_indices.push(i + 1);
+        }
+        row_ptrs.push(values.len());
+    }
+    let a = CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap();
+
+    let config = IRAMConfig {
+        num_eigenvalues: 3,
+        which: WhichEigenvalues::LargestMagnitude,
+        krylov_dimension: n,
+        max_iterations: 300,
+        tolerance: 1e-8,
+        symmetric: false,
+        compute_eigenvectors: true,
+    };
+    let iram = IRAM::new(config);
+    let result = iram.compute(&a, None).unwrap();
+
+    let evecs = result.eigenvectors.expect("eigenvectors requested");
+    assert_eq!(evecs.len(), 3, "should return 3 eigenvectors");
+
+    // Each computed eigenpair (lambda, x) must satisfy the eigen relation
+    // A*x = lambda*x measured against the ORIGINAL operator A. The old code
+    // used power iteration on H (dominant eigenvalue only), which failed this
+    // for every non-dominant requested eigenvalue.
+    for (k, x) in evecs.iter().enumerate() {
+        assert_eq!(x.len(), n, "eigenvector {k} has wrong dimension");
+        let xnorm: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(xnorm > 0.5, "eigenvector {k} must be nonzero (norm {xnorm})");
+
+        let lambda = result.eigenvalues_real[k];
+        let mut ax = vec![0.0; n];
+        crate::ops::spmv(1.0, &a, x, 0.0, &mut ax);
+        let res: f64 = ax
+            .iter()
+            .zip(x.iter())
+            .map(|(axi, xi)| (axi - lambda * xi).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            res < 1e-3,
+            "eigenpair {k} (lambda={lambda}): ||A x - lambda x|| = {res} too large"
+        );
+    }
+
+    // Distinct eigenvalues => the eigenvectors must be genuinely different, not
+    // all collapsed onto the dominant one.
+    for i in 0..evecs.len() {
+        for j in (i + 1)..evecs.len() {
+            let dot_ij: f64 = evecs[i]
+                .iter()
+                .zip(evecs[j].iter())
+                .map(|(vi, vj)| vi * vj)
+                .sum();
+            assert!(
+                dot_ij.abs() < 0.99,
+                "eigenvectors {i} and {j} should not be parallel (|dot|={})",
+                dot_ij.abs()
+            );
+        }
+    }
 }
 
 #[test]
@@ -1705,6 +2130,62 @@ fn test_interval_eigen_edge_case_single() {
     );
 }
 
+#[test]
+fn test_interval_eigen_non_tridiagonal_general_path() {
+    // Non-tridiagonal symmetric matrix (nonzero at (0,2) and (2,0)):
+    //   A = [2 0 1]
+    //       [0 5 0]
+    //       [1 0 2]
+    // The 2x2 block on coords {0,2}, [[2,1],[1,2]], has eigenvalues 1 and 3;
+    // combined with the middle entry 5 the spectrum is {1, 3, 5}. This
+    // exercises the general Lanczos + verified-Ritz path (NOT the exact
+    // tridiagonal fast path).
+    let values = vec![2.0_f64, 1.0, 5.0, 1.0, 2.0];
+    let col_indices = vec![0_usize, 2, 1, 0, 2];
+    let row_ptrs = vec![0_usize, 2, 3, 5];
+    let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+
+    // Full Krylov subspace (krylov_dimension == n) => tridiagonal is
+    // orthogonally similar to A, so the verified count is exact.
+    let config = IntervalEigenConfig {
+        low: 2.0,
+        high: 6.0,
+        max_iterations: 100,
+        tolerance: 1e-8,
+        compute_eigenvectors: true,
+        krylov_dimension: 3,
+        full_reorthogonalization: true,
+    };
+    let result = IntervalEigen::new(config).compute(&a, None).unwrap();
+
+    // Eigenvalues 3 and 5 lie in [2, 6].
+    assert_eq!(
+        result.count, 2,
+        "Should find eigenvalues 3 and 5 in [2, 6], got {}",
+        result.count
+    );
+    assert!(result.converged, "Full Krylov subspace should converge");
+
+    let mut evs = result.eigenvalues.clone();
+    evs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert!((evs[0] - 3.0).abs() < 1e-4, "First eigenvalue ~3, got {}", evs[0]);
+    assert!((evs[1] - 5.0).abs() < 1e-4, "Second eigenvalue ~5, got {}", evs[1]);
+
+    // The verified residual bound must actually hold for each reported pair.
+    for &res in &result.residual_norms {
+        assert!(res < 1e-8, "Reported eigenpair must satisfy the residual bound, got {res}");
+    }
+
+    // A disjoint sub-interval should find only eigenvalue 1.
+    let low_result = eigenvalues_in_interval(&a, 0.0, 2.0).unwrap();
+    assert_eq!(low_result.count, 1, "Only eigenvalue 1 lies in [0, 2]");
+    assert!(
+        (low_result.eigenvalues[0] - 1.0).abs() < 1e-4,
+        "Eigenvalue should be ~1.0, got {}",
+        low_result.eigenvalues[0]
+    );
+}
+
 // =====================================================================
 // Polynomial Filtered Lanczos Tests
 // =====================================================================
@@ -1893,4 +2374,62 @@ fn test_polynomial_filtered_empty_interval() {
         result.iterations > 0,
         "Should perform at least one iteration"
     );
+}
+
+#[test]
+fn test_polynomial_filtered_interior_amplification() {
+    // Diagonal matrix A = diag(1, 2, ..., 10). The extreme eigenvalues are 1
+    // and 10; the target interval [3.5, 5.5] contains ONLY the strictly
+    // interior eigenvalues 4 and 5. A filter that does not genuinely amplify
+    // the target interval (e.g. one that peaks at an extreme of the spectrum)
+    // could never isolate these interior eigenvalues, so this directly
+    // exercises the Chebyshev band-pass filter.
+    let n = 10;
+    let values: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+    let col_indices: Vec<usize> = (0..n).collect();
+    let row_ptrs: Vec<usize> = (0..=n).collect();
+    let a = CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap();
+
+    let config = PolynomialFilterConfig {
+        num_eigenvalues: 2,
+        target_low: 3.5,
+        target_high: 5.5,
+        spectral_low: Some(0.5),
+        spectral_high: Some(10.5),
+        polynomial_degree: 25,
+        krylov_dimension: 10,
+        max_iterations: 50,
+        tolerance: 1e-8,
+        compute_eigenvectors: true,
+        full_reorthogonalization: true,
+    };
+
+    let solver = PolynomialFilteredLanczos::new(config);
+    let result = solver.compute(&a, None).unwrap();
+
+    assert_eq!(
+        result.eigenvalues.len(),
+        2,
+        "Should isolate the two interior eigenvalues 4 and 5, got {:?}",
+        result.eigenvalues
+    );
+    assert!(result.converged, "Interior eigenvalues should converge");
+
+    let mut evs = result.eigenvalues.clone();
+    evs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert!(
+        (evs[0] - 4.0).abs() < 1e-6,
+        "First interior eigenvalue should be ~4, got {}",
+        evs[0]
+    );
+    assert!(
+        (evs[1] - 5.0).abs() < 1e-6,
+        "Second interior eigenvalue should be ~5, got {}",
+        evs[1]
+    );
+
+    // Every reported pair must satisfy the residual bound against A.
+    for &res in &result.residual_norms {
+        assert!(res <= 1e-8, "Residual bound must hold, got {res}");
+    }
 }

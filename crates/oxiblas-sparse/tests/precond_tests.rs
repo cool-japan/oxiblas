@@ -524,7 +524,10 @@ fn test_spai_effectiveness() {
     let tol = 1e-8;
     let max_iter = 500;
 
-    // SPAI preconditioner
+    // SPAI preconditioner. SPAI computes a (one-sided) sparse approximate
+    // inverse M ~= A^{-1}; even for a symmetric A this M is generically
+    // nonsymmetric, so the mathematically appropriate Krylov method is GMRES
+    // rather than CG (CG assumes a symmetric preconditioner).
     let config = SPAIConfig::default();
     let spai = SPAI::new(&a, config).unwrap();
     let precond = |r: &[f64]| -> Vec<f64> {
@@ -532,11 +535,11 @@ fn test_spai_effectiveness() {
         spai.apply(r, &mut z);
         z
     };
-    let result_pcg = pcg(&a, &b, &x0, precond, tol, max_iter).unwrap();
+    let result_pgmres = pgmres(&a, &b, &x0, precond, n, tol, max_iter).unwrap();
 
-    assert!(result_pcg.converged, "SPAI PCG should converge");
+    assert!(result_pgmres.converged, "SPAI GMRES should converge");
 
-    let rel_res = relative_residual(&a, &result_pcg.x, &b);
+    let rel_res = relative_residual(&a, &result_pgmres.x, &b);
     assert!(rel_res < 1e-6, "Residual too large: {rel_res}");
 }
 
@@ -600,6 +603,92 @@ fn test_additive_schwarz_effectiveness() {
 
     let rel_res = relative_residual(&a, &result_pcg.x, &b);
     assert!(rel_res < 1e-8, "Residual too large: {rel_res}");
+}
+
+#[test]
+fn test_additive_schwarz_exact_lu_effectiveness() {
+    let n = 50;
+    let a = make_poisson_1d(n);
+    let b: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+    let x0 = vec![0.0; n];
+    let tol = 1e-10;
+    let max_iter = 500;
+
+    let config = AdditiveSchwarzConfig {
+        num_subdomains: 4,
+        overlap: 2,
+        local_solver: LocalSolverType::ExactLU,
+    };
+    let schwarz = AdditiveSchwarz::new(&a, config).unwrap();
+    let precond = |r: &[f64]| -> Vec<f64> {
+        let mut z = vec![0.0; r.len()];
+        schwarz.apply(r, &mut z);
+        z
+    };
+    let result_pcg = pcg(&a, &b, &x0, precond, tol, max_iter).unwrap();
+
+    assert!(
+        result_pcg.converged,
+        "Additive Schwarz (ExactLU) PCG should converge"
+    );
+
+    let rel_res = relative_residual(&a, &result_pcg.x, &b);
+    assert!(rel_res < 1e-8, "Residual too large: {rel_res}");
+}
+
+/// Verifies that `LocalSolverType::ExactLU` is a genuinely exact local
+/// solve, not merely an alias for the approximate `ILU0` local solve.
+///
+/// With a single subdomain (no partitioning), Additive Schwarz reduces to
+/// directly solving `A z = r`. On the 2D Poisson (5-point stencil) matrix,
+/// Gaussian elimination produces fill-in outside the original sparsity
+/// pattern, so `ILU0` -- which restricts fill-in to that pattern -- cannot
+/// be an exact solve, while `ExactLU`'s dense, fully-filled-in, pivoted
+/// factorization must reproduce `A^{-1} r` to floating-point precision.
+#[test]
+fn test_additive_schwarz_exact_lu_is_actually_exact() {
+    let grid = 6; // 36 unknowns
+    let a = make_poisson_2d(grid);
+    let n = grid * grid;
+    let r: Vec<f64> = (1..=n).map(|i| i as f64 * 0.1).collect();
+
+    let exact_config = AdditiveSchwarzConfig {
+        num_subdomains: 1,
+        overlap: 0,
+        local_solver: LocalSolverType::ExactLU,
+    };
+    let exact_schwarz = AdditiveSchwarz::new(&a, exact_config).unwrap();
+    let mut z_exact = vec![0.0; n];
+    exact_schwarz.apply(&r, &mut z_exact);
+    let exact_res = relative_residual(&a, &z_exact, &r);
+    assert!(
+        exact_res < 1e-9,
+        "ExactLU single-subdomain solve should reproduce A^-1 r almost exactly, got residual {exact_res}"
+    );
+
+    let ilu0_config = AdditiveSchwarzConfig {
+        num_subdomains: 1,
+        overlap: 0,
+        local_solver: LocalSolverType::ILU0,
+    };
+    let ilu0_schwarz = AdditiveSchwarz::new(&a, ilu0_config).unwrap();
+    let mut z_ilu0 = vec![0.0; n];
+    ilu0_schwarz.apply(&r, &mut z_ilu0);
+    let ilu0_res = relative_residual(&a, &z_ilu0, &r);
+
+    // ILU0 on the 2D Poisson stencil drops fill-in outside the original
+    // sparsity pattern, so it must NOT be an exact solve.
+    assert!(
+        ilu0_res > 1e-4,
+        "ILU0 should be a strictly approximate solve on this matrix, got residual {ilu0_res}"
+    );
+
+    // ExactLU must be dramatically closer to exact than ILU0 -- this is the
+    // load-bearing assertion that ExactLU is not just an alias for ILU0.
+    assert!(
+        exact_res < ilu0_res * 1e-3,
+        "ExactLU ({exact_res}) should be far more accurate than ILU0 ({ilu0_res})"
+    );
 }
 
 // =============================================================================

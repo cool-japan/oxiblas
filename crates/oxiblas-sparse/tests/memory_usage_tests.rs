@@ -1,8 +1,34 @@
 //! Memory usage tests for sparse operations
 //!
-//! Validates that sparse operations use reasonable memory and don't leak.
-//! Tests focus on verifying that data structures have expected sizes and
-//! that repeated operations don't cause unbounded growth.
+//! These tests install a custom [`GlobalAlloc`] wrapper ([`TrackingAllocator`])
+//! as this test binary's `#[global_allocator]`. It counts, at the byte
+//! level, how much heap memory is currently outstanding (allocated minus
+//! freed) as well as how many allocation requests have been made. That
+//! gives the tests something real to check: a "no leak" test captures a
+//! baseline live-byte count, exercises a create/use/drop cycle many times,
+//! and then asserts the live-byte count has come back down to (approximately)
+//! the baseline. A previous version of this file used names like
+//! `*_no_leak` and `*_memory` without ever consulting the allocator, so the
+//! tests passed unconditionally regardless of whether the code actually
+//! leaked - this version fixes that.
+//!
+//! `cargo test` runs multiple `#[test]` functions concurrently, but each one
+//! gets its own dedicated OS thread, and every heap object these tests
+//! create is both allocated *and* dropped on that same thread. The counters
+//! below are therefore kept **per-thread** (`thread_local!`) rather than as
+//! process-global atomics: a test only ever observes allocation activity
+//! caused by its own code, so it is immune to unrelated background
+//! allocations happening concurrently on other threads (e.g. the test
+//! harness itself spawning/joining sibling test threads, which also goes
+//! through the global allocator but on threads these tests never touch).
+//! This makes the tests both leak-detecting *and* safe to run at full
+//! `cargo test` concurrency, with no shared lock required.
+//!
+//! A few tests (in "Part 3" below) intentionally do *not* use the tracking
+//! allocator: they check that a `CsrMatrix`'s logical footprint
+//! (`size_of_val` of its backing slices) scales linearly with `nnz` rather
+//! than quadratically with `n`. That is a structural/algorithmic property,
+//! not a leak check, so it is left as direct slice-size arithmetic.
 
 use oxiblas_sparse::convert::{coo_to_csr, csc_to_coo, csr_to_coo, csr_to_csc};
 use oxiblas_sparse::linalg::cg;
@@ -11,6 +37,125 @@ use oxiblas_sparse::linalg::lu::{ILU0, SparseLU};
 use oxiblas_sparse::linalg::precond::{BlockJacobi, GaussSeidel, Jacobi};
 use oxiblas_sparse::ops::{spmm_sparse, spmv};
 use oxiblas_sparse::{CooMatrixBuilder, CsrMatrix};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+// ============================================================================
+// Allocator tracking infrastructure
+// ============================================================================
+
+thread_local! {
+    /// Number of bytes currently outstanding (allocated by *this thread* via
+    /// the global allocator, minus bytes freed by this thread). This is not
+    /// an estimate: it is a direct, per-thread tally of every
+    /// `alloc`/`dealloc`/`realloc` call routed through [`TrackingAllocator`].
+    /// Const-initialized so no heap allocation is needed to bring the slot
+    /// into existence on a new thread (which would otherwise re-enter the
+    /// allocator being defined here).
+    static LIVE_BYTES: Cell<usize> = const { Cell::new(0) };
+
+    /// Total number of `alloc`/`alloc_zeroed`/`realloc`-to-larger-size
+    /// requests this thread has made so far. Used by tests that assert a
+    /// hot loop performs *no* new allocations at all (e.g. `spmv` reusing
+    /// pre-sized buffers).
+    static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A [`GlobalAlloc`] wrapper around [`System`] that maintains running,
+/// per-thread totals of live bytes and allocation requests, so tests can
+/// detect real memory leaks instead of merely checking that code runs
+/// without panicking.
+struct TrackingAllocator;
+
+// Safety: `TrackingAllocator` forwards every call directly to `System`,
+// which is itself a valid `GlobalAlloc` implementation; the only added
+// behavior is `Cell` bookkeeping in thread-local storage around the
+// delegated calls, which performs no allocation of its own (the `Cell`s are
+// const-initialized) and therefore cannot re-enter the allocator.
+unsafe impl GlobalAlloc for TrackingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Safety: `layout` is passed through unchanged to `System::alloc`,
+        // satisfying the same preconditions the caller of this method
+        // already guaranteed.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.with(|b| b.set(b.get() + layout.size()));
+            ALLOCATION_COUNT.with(|c| c.set(c.get() + 1));
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Safety: `ptr`/`layout` are forwarded unchanged; the caller already
+        // guarantees they describe a live allocation from this allocator.
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.with(|b| b.set(b.get().saturating_sub(layout.size())));
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // Safety: same contract as `alloc` above.
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            LIVE_BYTES.with(|b| b.set(b.get() + layout.size()));
+            ALLOCATION_COUNT.with(|c| c.set(c.get() + 1));
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Safety: all arguments are forwarded unchanged to `System::realloc`,
+        // whose preconditions match this method's.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            let old_size = layout.size();
+            if new_size >= old_size {
+                let grew_by = new_size - old_size;
+                LIVE_BYTES.with(|b| b.set(b.get() + grew_by));
+                ALLOCATION_COUNT.with(|c| c.set(c.get() + 1));
+            } else {
+                let shrank_by = old_size - new_size;
+                LIVE_BYTES.with(|b| b.set(b.get().saturating_sub(shrank_by)));
+            }
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+/// Snapshot of the calling thread's [`LIVE_BYTES`] counter.
+fn current_allocated_bytes() -> usize {
+    LIVE_BYTES.with(Cell::get)
+}
+
+/// Snapshot of the calling thread's [`ALLOCATION_COUNT`] counter.
+fn current_allocation_count() -> usize {
+    ALLOCATION_COUNT.with(Cell::get)
+}
+
+/// Maximum number of bytes a "no leak" test may still have outstanding
+/// after its loop completes, relative to its pre-loop baseline. The tracked
+/// counters are exact, per-thread accounting of every `alloc`/`dealloc`
+/// call this test's own thread makes (not a process-wide or RSS estimate),
+/// so a genuine leak that scales with loop iteration count or problem size
+/// will exceed this budget by orders of magnitude; the small allowance here
+/// only guards against benign allocator-internal rounding.
+const LEAK_TOLERANCE_BYTES: usize = 4096;
+
+/// Asserts that the live-byte count has returned to within
+/// [`LEAK_TOLERANCE_BYTES`] of `baseline`, which must have been captured via
+/// [`current_allocated_bytes`] immediately before the loop under test (after
+/// a warm-up iteration to absorb one-time setup costs).
+fn assert_returned_to_baseline(baseline: usize, label: &str) {
+    let after = current_allocated_bytes();
+    let leaked = after.saturating_sub(baseline);
+    assert!(
+        leaked <= LEAK_TOLERANCE_BYTES,
+        "{label}: {leaked} bytes still live after the loop (baseline {baseline} bytes, \
+         now {after} bytes) - this indicates a memory leak"
+    );
+}
 
 /// Helper to estimate memory usage of CSR matrix (bytes)
 fn estimate_csr_memory(a: &CsrMatrix<f64>) -> usize {
@@ -61,21 +206,40 @@ fn create_laplacian_2d(nx: usize, ny: usize) -> CsrMatrix<f64> {
 }
 
 // ============================================================================
-// Part 1: Basic memory usage tests (existing, improved)
+// Part 1: Basic memory usage tests (now backed by real allocator tracking)
 // ============================================================================
 
 #[test]
 fn test_spmv_no_allocation() {
-    // Test that SpMV doesn't allocate when output buffer is pre-allocated
+    // Set up the matrix and buffers once; only the repeated `spmv` calls in
+    // the loop below are measured for allocation activity.
     let n = 1000;
     let a = create_laplacian(n);
     let x = vec![1.0; n];
     let mut y = vec![0.0; n];
 
-    // Perform SpMV multiple times - should not panic
+    // Warm up once so that any first-touch behavior happens before we start
+    // measuring.
+    spmv(1.0, &a, &x, 0.0, &mut y);
+    let baseline = current_allocated_bytes();
+    let allocations_before = current_allocation_count();
+
+    // Perform SpMV multiple times with pre-allocated buffers - `spmv` reads
+    // `a`/`x` and writes into `y` without touching the heap, so this must
+    // not allocate any new memory.
     for _ in 0..100 {
         spmv(1.0, &a, &x, 0.0, &mut y);
     }
+
+    let allocations_after = current_allocation_count();
+    assert_eq!(
+        allocations_after,
+        allocations_before,
+        "spmv performed {} unexpected heap allocation(s) over 100 calls with \
+         pre-allocated buffers",
+        allocations_after - allocations_before
+    );
+    assert_returned_to_baseline(baseline, "test_spmv_no_allocation");
 
     // Verify result is computed correctly
     assert_eq!(y.len(), n);
@@ -117,8 +281,11 @@ fn test_cg_solver_memory() {
     let b = vec![1.0; n];
     let x0 = vec![0.0; n];
 
-    let result = cg(&a, &b, &x0, 1e-6, 100);
+    // Warm up so one-time setup costs (if any) happen before the baseline.
+    let _ = cg(&a, &b, &x0, 1e-6, 1);
+    let baseline = current_allocated_bytes();
 
+    let result = cg(&a, &b, &x0, 1e-6, 100);
     assert!(result.is_ok(), "CG should converge");
     let cg_result = result.expect("CG should succeed");
 
@@ -129,6 +296,19 @@ fn test_cg_solver_memory() {
     for &val in &cg_result.x {
         assert!(val.is_finite(), "CG produced non-finite values");
     }
+
+    // The solve legitimately allocates Krylov vectors while it runs; make
+    // sure the measurement infrastructure actually observed that (otherwise
+    // the leak check below would be vacuous).
+    let during = current_allocated_bytes();
+    assert!(
+        during > baseline,
+        "CG solve did not appear to allocate anything (baseline {baseline}, during {during}); \
+         the tracking allocator may not be wired up correctly"
+    );
+
+    drop(cg_result);
+    assert_returned_to_baseline(baseline, "test_cg_solver_memory");
 }
 
 #[test]
@@ -138,9 +318,11 @@ fn test_gmres_memory() {
     let b = vec![1.0; n];
     let x0 = vec![0.0; n];
 
+    let _ = gmres(&a, &b, &x0, 20, 1e-6, 1);
+    let baseline = current_allocated_bytes();
+
     // GMRES with restart=20
     let result = gmres(&a, &b, &x0, 20, 1e-6, 50);
-
     assert!(result.is_ok(), "GMRES should converge");
     let gmres_result = result.expect("GMRES should succeed");
 
@@ -150,6 +332,15 @@ fn test_gmres_memory() {
     for &val in &gmres_result.x {
         assert!(val.is_finite(), "GMRES produced non-finite values");
     }
+
+    let during = current_allocated_bytes();
+    assert!(
+        during > baseline,
+        "GMRES solve did not appear to allocate anything (baseline {baseline}, during {during})"
+    );
+
+    drop(gmres_result);
+    assert_returned_to_baseline(baseline, "test_gmres_memory");
 }
 
 #[test]
@@ -157,9 +348,12 @@ fn test_ilu0_memory_usage() {
     let n = 500;
     let a = create_laplacian(n);
 
+    // Warm up.
+    let _ = ILU0::new(&a);
+    let baseline = current_allocated_bytes();
+
     let ilu = ILU0::new(&a);
     assert!(ilu.is_ok(), "ILU0 construction should succeed");
-
     let ilu = ilu.expect("ILU0 should succeed");
 
     // Verify we can apply it as a preconditioner
@@ -170,6 +364,11 @@ fn test_ilu0_memory_usage() {
     for &val in &x {
         assert!(val.is_finite(), "ILU0 apply produced non-finite values");
     }
+
+    drop(x);
+    drop(b);
+    drop(ilu);
+    assert_returned_to_baseline(baseline, "test_ilu0_memory_usage");
 }
 
 #[test]
@@ -178,9 +377,11 @@ fn test_sparse_lu_memory_usage() {
     let a_csr = create_laplacian(n);
     let a = a_csr.to_csc(); // SparseLU requires CSC format
 
+    let _ = SparseLU::new(&a);
+    let baseline = current_allocated_bytes();
+
     let lu = SparseLU::new(&a);
     assert!(lu.is_ok(), "Sparse LU construction should succeed");
-
     let lu = lu.expect("Sparse LU should succeed");
 
     // Verify we can solve with it
@@ -194,6 +395,11 @@ fn test_sparse_lu_memory_usage() {
             "Sparse LU solve produced non-finite values"
         );
     }
+
+    drop(x);
+    drop(b);
+    drop(lu);
+    assert_returned_to_baseline(baseline, "test_sparse_lu_memory_usage");
 }
 
 // ============================================================================
@@ -202,8 +408,19 @@ fn test_sparse_lu_memory_usage() {
 
 #[test]
 fn test_csr_create_use_drop_no_leak() {
-    // Create many matrices, use them, and drop them.
-    // If there's a memory leak, this will accumulate and eventually OOM.
+    // Warm up once (outside measurement) so first-touch allocations don't
+    // pollute the baseline.
+    {
+        let a = create_laplacian(100);
+        let x = vec![1.0; 100];
+        let mut y = vec![0.0; 100];
+        spmv(1.0, &a, &x, 0.0, &mut y);
+    }
+    let baseline = current_allocated_bytes();
+
+    // Create many matrices, use them, and drop them. If there's a memory
+    // leak, LIVE_BYTES will grow with each iteration instead of returning
+    // to baseline once the loop finishes.
     for iteration in 0..200 {
         let n = 100 + (iteration % 50);
         let a = create_laplacian(n);
@@ -215,23 +432,33 @@ fn test_csr_create_use_drop_no_leak() {
 
         // Verify usage
         assert_eq!(y.len(), n);
-        // a and y are dropped here
+        // a, x, y are dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_csr_create_use_drop_no_leak");
 }
 
 #[test]
 fn test_csc_create_use_drop_no_leak() {
+    {
+        let csr = create_laplacian(200);
+        let _csc = csr.to_csc();
+    }
+    let baseline = current_allocated_bytes();
+
     for _ in 0..200 {
         let csr = create_laplacian(200);
         let csc = csr.to_csc();
         assert_eq!(csc.nnz(), csr.nnz());
         // csr and csc dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_csc_create_use_drop_no_leak");
 }
 
 #[test]
 fn test_coo_create_use_drop_no_leak() {
-    for _ in 0..200 {
+    fn build_and_convert() -> CsrMatrix<f64> {
         let mut builder = CooMatrixBuilder::new(100, 100);
         for i in 0..100 {
             builder.add(i, i, 2.0);
@@ -240,13 +467,26 @@ fn test_coo_create_use_drop_no_leak() {
             }
         }
         let coo = builder.build();
-        let _csr = coo.to_csr();
+        coo.to_csr()
+    }
+
+    let _ = build_and_convert();
+    let baseline = current_allocated_bytes();
+
+    for _ in 0..200 {
+        let _csr = build_and_convert();
         // all dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_coo_create_use_drop_no_leak");
 }
 
 // ============================================================================
 // Part 3: Memory scales linearly with nnz (not n*n)
+//
+// These tests check a structural/algorithmic property (logical footprint
+// vs. nnz, computed directly from slice lengths) rather than live allocator
+// state, so they do not consult the tracking counters at all.
 // ============================================================================
 
 #[test]
@@ -317,8 +557,7 @@ fn test_2d_laplacian_memory_scales_linearly() {
 
 #[test]
 fn test_csr_csc_coo_roundtrip_no_leak() {
-    // Perform many roundtrip conversions to detect memory leaks
-    for _ in 0..50 {
+    fn roundtrip_once() {
         let original = create_laplacian_2d(10, 10);
         let original_nnz = original.nnz();
 
@@ -346,6 +585,16 @@ fn test_csr_csc_coo_roundtrip_no_leak() {
         }
         // All intermediates dropped here
     }
+
+    roundtrip_once();
+    let baseline = current_allocated_bytes();
+
+    // Perform many roundtrip conversions to detect memory leaks
+    for _ in 0..50 {
+        roundtrip_once();
+    }
+
+    assert_returned_to_baseline(baseline, "test_csr_csc_coo_roundtrip_no_leak");
 }
 
 #[test]
@@ -375,6 +624,14 @@ fn test_repeated_conversions_no_growth() {
     let mut current = create_laplacian(500);
     let original_nnz = current.nnz();
 
+    // Warm up one roundtrip so the loop below starts from a stable baseline.
+    {
+        let csc = csr_to_csc(&current);
+        let coo = csc_to_coo(&csc);
+        current = coo_to_csr(&coo);
+    }
+    let baseline = current_allocated_bytes();
+
     // Perform 50 roundtrip conversions
     for _ in 0..50 {
         let csc = csr_to_csc(&current);
@@ -390,6 +647,11 @@ fn test_repeated_conversions_no_growth() {
         current.nnz(),
         original_nnz
     );
+
+    // `current` (the final CSR matrix) is still alive here, so the baseline
+    // comparison naturally accounts for its footprint - only the discarded
+    // intermediates from each iteration should have been freed.
+    assert_returned_to_baseline(baseline, "test_repeated_conversions_no_growth");
 }
 
 // ============================================================================
@@ -403,6 +665,9 @@ fn test_cg_repeated_solves_no_accumulation() {
     let b = vec![1.0; n];
     let x0 = vec![0.0; n];
 
+    let _ = cg(&a, &b, &x0, 1e-6, 200);
+    let baseline = current_allocated_bytes();
+
     // Run CG many times - should not accumulate memory
     for iteration in 0..100 {
         let result = cg(&a, &b, &x0, 1e-6, 200);
@@ -415,6 +680,8 @@ fn test_cg_repeated_solves_no_accumulation() {
         assert_eq!(cg_result.x.len(), n);
         // Result is dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_cg_repeated_solves_no_accumulation");
 }
 
 #[test]
@@ -423,6 +690,9 @@ fn test_gmres_repeated_solves_no_accumulation() {
     let a = create_laplacian(n);
     let b = vec![1.0; n];
     let x0 = vec![0.0; n];
+
+    let _ = gmres(&a, &b, &x0, 10, 1e-6, 100);
+    let baseline = current_allocated_bytes();
 
     // Run GMRES many times with different restart values
     for iteration in 0..50 {
@@ -437,6 +707,8 @@ fn test_gmres_repeated_solves_no_accumulation() {
         assert_eq!(gmres_result.x.len(), n);
         // Result and all Krylov vectors are dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_gmres_repeated_solves_no_accumulation");
 }
 
 #[test]
@@ -445,6 +717,10 @@ fn test_iterative_solver_with_varying_rhs() {
     let a = create_laplacian(n);
     let x0 = vec![0.0; n];
 
+    let warmup_b = vec![0.0; n];
+    let _ = cg(&a, &warmup_b, &x0, 1e-6, 500);
+    let baseline = current_allocated_bytes();
+
     // Solve with many different right-hand sides
     for k in 0..50 {
         let b: Vec<f64> = (0..n).map(|i| ((i + k) as f64).sin()).collect();
@@ -452,6 +728,8 @@ fn test_iterative_solver_with_varying_rhs() {
         assert!(result.is_ok(), "CG failed for rhs #{k}");
         // All intermediates dropped each iteration
     }
+
+    assert_returned_to_baseline(baseline, "test_iterative_solver_with_varying_rhs");
 }
 
 // ============================================================================
@@ -462,6 +740,14 @@ fn test_iterative_solver_with_varying_rhs() {
 fn test_jacobi_preconditioner_setup_teardown() {
     let n = 300;
     let a = create_laplacian(n);
+
+    {
+        let warm = Jacobi::new(&a).expect("Jacobi creation should succeed");
+        let x = vec![1.0; n];
+        let mut y = vec![0.0; n];
+        warm.apply(&x, &mut y);
+    }
+    let baseline = current_allocated_bytes();
 
     // Create and destroy many Jacobi preconditioners
     for _ in 0..200 {
@@ -478,6 +764,8 @@ fn test_jacobi_preconditioner_setup_teardown() {
         }
         // jacobi dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_jacobi_preconditioner_setup_teardown");
 }
 
 #[test]
@@ -503,6 +791,14 @@ fn test_block_jacobi_setup_teardown() {
     // Use uniform block sizes of 10
     let block_sizes: Vec<usize> = std::iter::repeat_n(10, n / 10).collect();
 
+    {
+        let warm = BlockJacobi::new(&a, &block_sizes).expect("BlockJacobi creation should succeed");
+        let x = vec![1.0; n];
+        let mut y = vec![0.0; n];
+        warm.apply(&x, &mut y);
+    }
+    let baseline = current_allocated_bytes();
+
     for _ in 0..100 {
         let bj = BlockJacobi::new(&a, &block_sizes).expect("BlockJacobi creation should succeed");
 
@@ -519,12 +815,22 @@ fn test_block_jacobi_setup_teardown() {
         }
         // bj dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_block_jacobi_setup_teardown");
 }
 
 #[test]
 fn test_gauss_seidel_setup_teardown() {
     let n = 200;
     let a = create_laplacian(n);
+
+    {
+        let warm = GaussSeidel::new(&a).expect("GaussSeidel creation should succeed");
+        let x = vec![1.0; n];
+        let mut y = vec![0.0; n];
+        warm.apply(&x, &mut y);
+    }
+    let baseline = current_allocated_bytes();
 
     for _ in 0..100 {
         let gs = GaussSeidel::new(&a).expect("GaussSeidel creation should succeed");
@@ -542,12 +848,21 @@ fn test_gauss_seidel_setup_teardown() {
         }
         // gs dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_gauss_seidel_setup_teardown");
 }
 
 #[test]
 fn test_ilu0_setup_teardown() {
     let n = 300;
     let a = create_laplacian(n);
+
+    {
+        let warm = ILU0::new(&a).expect("ILU0 creation should succeed");
+        let b = vec![1.0; n];
+        let _ = warm.apply(&b);
+    }
+    let baseline = current_allocated_bytes();
 
     for _ in 0..100 {
         let ilu = ILU0::new(&a).expect("ILU0 creation should succeed");
@@ -561,6 +876,8 @@ fn test_ilu0_setup_teardown() {
         }
         // ilu dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_ilu0_setup_teardown");
 }
 
 #[test]
@@ -573,6 +890,9 @@ fn test_preconditioner_reapply_no_growth() {
     let x = vec![1.0; n];
     let mut y = vec![0.0; n];
 
+    jacobi.apply(&x, &mut y);
+    let baseline = current_allocated_bytes();
+
     for _ in 0..1000 {
         jacobi.apply(&x, &mut y);
     }
@@ -582,6 +902,8 @@ fn test_preconditioner_reapply_no_growth() {
     for &val in &y {
         assert!(val.is_finite());
     }
+
+    assert_returned_to_baseline(baseline, "test_preconditioner_reapply_no_growth");
 }
 
 // ============================================================================
@@ -635,12 +957,20 @@ fn test_repeated_operations_no_growth() {
     let a = create_laplacian(n);
     let x = vec![1.0; n];
 
+    {
+        let mut y = vec![0.0; n];
+        spmv(1.0, &a, &x, 0.0, &mut y);
+    }
+    let baseline = current_allocated_bytes();
+
     // Create many temporary results - if there's a leak, this will accumulate
     for _ in 0..1000 {
         let mut y = vec![0.0; n];
         spmv(1.0, &a, &x, 0.0, &mut y);
         // y is dropped here
     }
+
+    assert_returned_to_baseline(baseline, "test_repeated_operations_no_growth");
 }
 
 #[test]
@@ -671,7 +1001,15 @@ fn test_preconditioner_memory() {
     let n = 300;
     let a = create_laplacian(n);
 
+    // Warm up.
+    {
+        let warm = Jacobi::new(&a).expect("Jacobi creation should succeed");
+        drop(warm);
+    }
+    let baseline = current_allocated_bytes();
+
     let jacobi = Jacobi::new(&a).expect("Jacobi creation should succeed");
+    let after_construct = current_allocated_bytes();
 
     let x = vec![1.0; n];
     let mut y = vec![0.0; n];
@@ -687,7 +1025,24 @@ fn test_preconditioner_memory() {
         assert!(val.is_finite(), "Jacobi apply produced non-finite values");
     }
 
-    // Jacobi preconditioner stores only diagonal (n * f64)
+    // Jacobi preconditioner stores only the diagonal (n * sizeof(f64)); check
+    // that its real, allocator-measured footprint is actually in that
+    // ballpark rather than just computing a number nobody checks.
+    let constructed_bytes = after_construct.saturating_sub(baseline);
     let expected_size = n * std::mem::size_of::<f64>();
-    assert!(expected_size > 0, "Expected size should be positive");
+    assert!(
+        constructed_bytes >= expected_size,
+        "Jacobi construction allocated only {constructed_bytes} bytes, expected at least \
+         {expected_size} (n * sizeof(f64)) for storing the diagonal"
+    );
+    assert!(
+        constructed_bytes <= expected_size * 4,
+        "Jacobi construction allocated {constructed_bytes} bytes, far more than the \
+         {expected_size} expected for storing just the diagonal"
+    );
+
+    drop(jacobi);
+    drop(x);
+    drop(y);
+    assert_returned_to_baseline(baseline, "test_preconditioner_memory");
 }

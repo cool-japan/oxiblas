@@ -131,53 +131,42 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
             w_j[j] = T::one();
 
             if config.modified_gs {
-                // Modified Gram-Schmidt: orthogonalize against columns 0..j
+                // Modified Gram-Schmidt biconjugation (Benzi-Tuma).
+                //
+                // A-biorthogonalize z_j against the previously computed z_k and
+                // w_j against the previously computed w_k so that the resulting
+                // factors satisfy W^T A Z = D (diagonal). Both A-inner-products
+                // must be evaluated as *full* dot products over all n rows: a
+                // partial sum over the sparse structure of a single factor is
+                // NOT the A-inner-product and yields the wrong coefficient.
                 for k in 0..j {
-                    // Compute A * z_k (we need this for biorthogonalization)
+                    // az = A * z_k and atw = A^T * w_k (dense, over all n rows).
                     Self::sparse_mv_csc(&a_csc, &z_cols[k], &mut az, n);
-                    Self::sparse_mv_csc_t(&a_csc, &w_cols[k], &mut atw, n);
+                    Self::sparse_mv_at(a, &w_cols[k], &mut atw);
 
-                    // Compute z_j^T * A * z_k
-                    let mut zjt_a_zk = T::zero();
-                    for (row, _val) in &z_cols[k] {
-                        zjt_a_zk = zjt_a_zk + z_j[*row].clone() * az[*row].clone();
-                    }
-                    for idx in a_csc.col_ptrs()[k]..a_csc.col_ptrs()[k + 1] {
-                        let row = a_csc.row_indices()[idx];
-                        zjt_a_zk = zjt_a_zk + z_j[row].clone() * a_csc.values()[idx].clone();
-                    }
-
-                    // Compute w_k^T * A * z_j
+                    // A-inner-products as full dot products over all n rows:
+                    //   w_k^T A z_j = (A^T w_k) . z_j = dot(atw, z_j)
+                    //   w_j^T A z_k = w_j . (A z_k)   = dot(w_j, az)
                     let mut wkt_a_zj = T::zero();
-                    for (row, val) in &w_cols[k] {
-                        wkt_a_zj = wkt_a_zj + val.clone() * az[*row].clone();
+                    let mut wjt_a_zk = T::zero();
+                    for i in 0..n {
+                        wkt_a_zj = wkt_a_zj + atw[i].clone() * z_j[i].clone();
+                        wjt_a_zk = wjt_a_zk + w_j[i].clone() * az[i].clone();
                     }
 
-                    // Update: z_j = z_j - (z_j^T * A * z_k) / d_k * z_k
-                    if Scalar::abs(d_inv[k].clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    // Skip orthogonalization against a numerically negligible pivot.
+                    let tiny = T::from_f64(1e-14).unwrap_or(T::zero());
+                    if Scalar::abs(d_inv[k].clone()) > tiny.clone() {
+                        // d_k = 1 / d_inv[k]
                         let dk = T::one() / d_inv[k].clone();
-                        if Scalar::abs(dk.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
-                            let alpha = zjt_a_zk / dk.clone();
+                        if Scalar::abs(dk.clone()) > tiny {
+                            // z_j <- z_j - (w_k^T A z_j / d_k) * z_k
+                            let alpha = wkt_a_zj / dk.clone();
                             for (row, val) in &z_cols[k] {
                                 z_j[*row] = z_j[*row].clone() - alpha.clone() * val.clone();
                             }
-                        }
-                    }
-
-                    // Similarly update w_j
-                    let mut wjt_a_wk = T::zero();
-                    for (row, _val) in &w_cols[k] {
-                        wjt_a_wk = wjt_a_wk + w_j[*row].clone() * atw[*row].clone();
-                    }
-                    for idx in a_csc.col_ptrs()[k]..a_csc.col_ptrs()[k + 1] {
-                        let row = a_csc.row_indices()[idx];
-                        wjt_a_wk = wjt_a_wk + w_j[row].clone() * a_csc.values()[idx].clone();
-                    }
-
-                    if Scalar::abs(d_inv[k].clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
-                        let dk = T::one() / d_inv[k].clone();
-                        if Scalar::abs(dk.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
-                            let beta = wjt_a_wk / dk.clone();
+                            // w_j <- w_j - (w_j^T A z_k / d_k) * w_k
+                            let beta = wjt_a_zk / dk;
                             for (row, val) in &w_cols[k] {
                                 w_j[*row] = w_j[*row].clone() - beta.clone() * val.clone();
                             }
@@ -221,53 +210,54 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
             let z_threshold = drop_tol.clone() * z_norm;
             let w_threshold = drop_tol.clone() * w_norm;
 
-            // Store sparse z_j (only lower triangular part, i >= j)
+            // Store sparse z_j. The AINV Z-factor is unit upper triangular, so
+            // z_j has support in rows i <= j. Keep the unit diagonal plus the
+            // off-diagonal entries (i < j) above the drop threshold.
             let mut z_entries: Vec<(usize, T)> = Vec::new();
-            for i in j..n {
+            for i in 0..j {
                 if Scalar::abs(z_j[i].clone()) >= z_threshold {
                     z_entries.push((i, z_j[i].clone()));
                 }
             }
 
-            // Ensure at least diagonal entry
-            if z_entries.is_empty() || z_entries[0].0 != j {
-                z_entries.insert(0, (j, T::one()));
-            }
-
-            // Limit number of entries
-            if z_entries.len() > config.max_nnz_per_col {
-                // Keep the largest entries
+            // Cap the off-diagonal fill, keeping the entries largest in magnitude,
+            // while always reserving room for the diagonal entry.
+            let z_max_off = config.max_nnz_per_col.saturating_sub(1);
+            if z_entries.len() > z_max_off {
                 z_entries.sort_by(|a, b| {
                     Scalar::abs(b.1.clone())
                         .partial_cmp(&Scalar::abs(a.1.clone()))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                z_entries.truncate(config.max_nnz_per_col);
-                z_entries.sort_by_key(|(i, _)| *i);
+                z_entries.truncate(z_max_off);
             }
+
+            // Always retain the (unit) diagonal entry, then restore row order.
+            z_entries.push((j, z_j[j].clone()));
+            z_entries.sort_by_key(|(i, _)| *i);
             z_cols[j] = z_entries;
 
-            // Store sparse w_j (only lower triangular part, i >= j)
+            // Store sparse w_j. The AINV W-factor is likewise unit upper
+            // triangular (support in rows i <= j).
             let mut w_entries: Vec<(usize, T)> = Vec::new();
-            for i in j..n {
+            for i in 0..j {
                 if Scalar::abs(w_j[i].clone()) >= w_threshold {
                     w_entries.push((i, w_j[i].clone()));
                 }
             }
 
-            if w_entries.is_empty() || w_entries[0].0 != j {
-                w_entries.insert(0, (j, T::one()));
-            }
-
-            if w_entries.len() > config.max_nnz_per_col {
+            let w_max_off = config.max_nnz_per_col.saturating_sub(1);
+            if w_entries.len() > w_max_off {
                 w_entries.sort_by(|a, b| {
                     Scalar::abs(b.1.clone())
                         .partial_cmp(&Scalar::abs(a.1.clone()))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                w_entries.truncate(config.max_nnz_per_col);
-                w_entries.sort_by_key(|(i, _)| *i);
+                w_entries.truncate(w_max_off);
             }
+
+            w_entries.push((j, w_j[j].clone()));
+            w_entries.sort_by_key(|(i, _)| *i);
             w_cols[j] = w_entries;
         }
 
@@ -341,18 +331,22 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
         }
     }
 
-    /// Compute y = A^T * w where w is stored as sparse column entries
-    fn sparse_mv_csc_t(a_csc: &CscMatrix<T>, w_col: &[(usize, T)], y: &mut [T], _n: usize) {
+    /// Compute y = A^T * w where w is stored as sparse column entries.
+    ///
+    /// Using the CSR (row) storage of A, scattering row `i` of A weighted by
+    /// `w[i]` accumulates `y[col] += A[i, col] * w[i]`, i.e. `y = A^T w`.
+    /// (Scattering *columns* of A, as a CSC traversal would, computes `A w`
+    /// instead, which is only correct for symmetric A.)
+    fn sparse_mv_at(a: &CsrMatrix<T>, w_col: &[(usize, T)], y: &mut [T]) {
         for val in y.iter_mut() {
             *val = T::zero();
         }
-        for (row, w_val) in w_col {
-            // Row 'row' of A^T (= column 'row' of A) multiplied by w_val
-            let start = a_csc.col_ptrs()[*row];
-            let end = a_csc.col_ptrs()[*row + 1];
+        for (i, w_val) in w_col {
+            let start = a.row_ptrs()[*i];
+            let end = a.row_ptrs()[*i + 1];
             for idx in start..end {
-                let j = a_csc.row_indices()[idx];
-                y[j] = y[j].clone() + a_csc.values()[idx].clone() * w_val.clone();
+                let col = a.col_indices()[idx];
+                y[col] = y[col].clone() + a.values()[idx].clone() * w_val.clone();
             }
         }
     }
@@ -421,5 +415,192 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
     /// Returns the dimension of the preconditioner.
     pub fn dim(&self) -> usize {
         self.n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linalg::iterative::{cg, pcg};
+
+    /// Densify a CSC-stored factor (columns of (row, value)) into an n x n matrix.
+    fn densify(vals: &[f64], rows: &[usize], col_ptrs: &[usize], n: usize) -> Vec<Vec<f64>> {
+        let mut m = vec![vec![0.0f64; n]; n];
+        for c in 0..n {
+            for idx in col_ptrs[c]..col_ptrs[c + 1] {
+                m[rows[idx]][c] = vals[idx];
+            }
+        }
+        m
+    }
+
+    /// Densify a CSR matrix into an n x n matrix.
+    fn dense_from_csr(a: &CsrMatrix<f64>) -> Vec<Vec<f64>> {
+        let n = a.nrows();
+        let mut m = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for idx in a.row_ptrs()[i]..a.row_ptrs()[i + 1] {
+                m[i][a.col_indices()[idx]] = a.values()[idx];
+            }
+        }
+        m
+    }
+
+    fn matmul(a: &[Vec<f64>], b: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
+        let mut c = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for k in 0..n {
+                let aik = a[i][k];
+                if aik == 0.0 {
+                    continue;
+                }
+                for j in 0..n {
+                    c[i][j] += aik * b[k][j];
+                }
+            }
+        }
+        c
+    }
+
+    /// Build the 1D Laplacian tridiagonal SPD matrix diag = `diag`, off = -1.
+    fn laplacian(n: usize, diag: f64) -> CsrMatrix<f64> {
+        let mut values = Vec::new();
+        let mut col_indices = Vec::new();
+        let mut row_ptrs = vec![0usize];
+        for i in 0..n {
+            if i > 0 {
+                values.push(-1.0);
+                col_indices.push(i - 1);
+            }
+            values.push(diag);
+            col_indices.push(i);
+            if i < n - 1 {
+                values.push(-1.0);
+                col_indices.push(i + 1);
+            }
+            row_ptrs.push(col_indices.len());
+        }
+        CsrMatrix::new(n, n, row_ptrs, col_indices, values).expect("valid CSR")
+    }
+
+    #[test]
+    fn test_ainv_biorthogonality_spd() {
+        // 4x4 SPD tridiagonal matrix. With no dropping the factored inverse is
+        // exact, so W^T A Z must be (numerically) diagonal and A * M ~= I.
+        let n = 4;
+        let a = laplacian(n, 4.0);
+
+        let config = AINVConfig {
+            drop_tolerance: 0.0,
+            max_nnz_per_col: n,
+            modified_gs: true,
+        };
+        let ainv = AINV::new(&a, config).expect("AINV builds");
+
+        let z = densify(&ainv.z_values, &ainv.z_row_indices, &ainv.z_col_ptrs, n);
+        let w = densify(&ainv.w_values, &ainv.w_row_indices, &ainv.w_col_ptrs, n);
+        let a_dense = dense_from_csr(&a);
+
+        // W^T A Z must be diagonal.
+        let az = matmul(&a_dense, &z, n);
+        // wtaz[i][j] = sum_p W[p][i] * (A Z)[p][j]
+        let mut wtaz = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for p in 0..n {
+                    s += w[p][i] * az[p][j];
+                }
+                wtaz[i][j] = s;
+            }
+        }
+        for i in 0..n {
+            assert!(
+                wtaz[i][i].abs() > 1e-6,
+                "diagonal of W^T A Z must be nonzero, got {} at {}",
+                wtaz[i][i],
+                i
+            );
+            for j in 0..n {
+                if i != j {
+                    assert!(
+                        wtaz[i][j].abs() < 1e-8,
+                        "W^T A Z must be diagonal; off-diagonal ({},{}) = {}",
+                        i,
+                        j,
+                        wtaz[i][j]
+                    );
+                }
+            }
+        }
+
+        // A * M ~= I, where column c of M is M applied to e_c.
+        let mut m_mat = vec![vec![0.0f64; n]; n];
+        for c in 0..n {
+            let mut e = vec![0.0f64; n];
+            e[c] = 1.0;
+            let mut col = vec![0.0f64; n];
+            ainv.apply(&e, &mut col);
+            for (r, val) in col.iter().enumerate() {
+                m_mat[r][c] = *val;
+            }
+        }
+        let am = matmul(&a_dense, &m_mat, n);
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (am[i][j] - expected).abs() < 1e-8,
+                    "A*M must be identity; ({},{}) = {}",
+                    i,
+                    j,
+                    am[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ainv_pcg_reduces_iterations() {
+        // 1D Laplacian (diag 2, off -1): reasonably ill-conditioned SPD system.
+        let n = 30;
+        let a = laplacian(n, 2.0);
+
+        let b: Vec<f64> = vec![1.0; n];
+        let x0: Vec<f64> = vec![0.0; n];
+        let tol = 1e-8_f64;
+        let max_iter = 500;
+
+        // Unpreconditioned CG baseline.
+        let cg_res = cg(&a, &b, &x0, tol, max_iter).expect("cg runs");
+        assert!(cg_res.converged, "baseline CG should converge");
+
+        // AINV-preconditioned CG. With no dropping the factored inverse is
+        // exact, so PCG converges in a single step.
+        let config = AINVConfig {
+            drop_tolerance: 0.0,
+            max_nnz_per_col: n,
+            modified_gs: true,
+        };
+        let ainv = AINV::new(&a, config).expect("AINV builds");
+        let precond = |r: &[f64]| {
+            let mut z = vec![0.0f64; n];
+            ainv.apply(r, &mut z);
+            z
+        };
+        let pcg_res = pcg(&a, &b, &x0, precond, tol, max_iter).expect("pcg runs");
+
+        assert!(pcg_res.converged, "AINV-preconditioned CG should converge");
+        assert!(
+            pcg_res.iterations < cg_res.iterations,
+            "AINV should reduce PCG iterations: pcg={} vs cg={}",
+            pcg_res.iterations,
+            cg_res.iterations
+        );
+        assert!(
+            pcg_res.iterations <= 2,
+            "exact AINV should make PCG converge almost immediately, got {}",
+            pcg_res.iterations
+        );
     }
 }

@@ -240,22 +240,15 @@ where
 
     let b_norm = norm(b);
 
-    // y = M^{-1} * r (preconditioned residual)
-    let mut y = precond(&r);
-
-    // beta1 = sqrt(r^T * y) = sqrt(r^T * M^{-1} * r) (M-norm of r)
-    let ry = dot(&r, &y);
-    if ry <= T::zero() {
-        return Err(IterativeError::Breakdown {
-            iteration: 0,
-            description: "Preconditioner not positive definite".to_string(),
-        });
-    }
-    let beta1 = Real::sqrt(ry);
-    residual_history.push(norm(&r));
-
-    // Check for immediate convergence
+    // Immediate-convergence / zero-initial-residual check.
+    //
+    // If x0 is already the exact solution then the initial residual r = b - A*x0
+    // is zero. In that degenerate-but-valid case the preconditioned quantity
+    // r^T M^{-1} r is exactly zero, and reporting it as "preconditioner not
+    // positive definite" would be a false positive. Return the initial guess as
+    // converged BEFORE any preconditioner positive-definiteness test runs.
     let r_norm = norm(&r);
+    residual_history.push(r_norm.clone());
     if r_norm <= tol.clone() * b_norm.clone() {
         return Ok(MinresResult {
             x,
@@ -267,6 +260,22 @@ where
     }
 
     let tol_abs = tol.clone() * b_norm.clone();
+
+    // y = M^{-1} * r (preconditioned residual)
+    let mut y = precond(&r);
+
+    // beta1 = sqrt(r^T * y) = sqrt(r^T * M^{-1} * r) (M-norm of r).
+    // r is nonzero here (immediate convergence is handled above), so for a
+    // genuine SPD preconditioner ry is strictly positive; ry <= 0 is a real
+    // breakdown (the preconditioner is not positive definite w.r.t. r).
+    let ry = dot(&r, &y);
+    if ry <= T::zero() {
+        return Err(IterativeError::Breakdown {
+            iteration: 0,
+            description: "Preconditioner not positive definite".to_string(),
+        });
+    }
+    let beta1 = Real::sqrt(ry);
 
     // Initialize preconditioned Lanczos vectors
     // v = M^{-1} r / beta1 (preconditioned direction)
@@ -429,4 +438,56 @@ where
         converged: false,
         residual_history,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::csr::CsrMatrix;
+
+    fn spd_tridiag() -> CsrMatrix<f64> {
+        // A = [4 1 0; 1 4 1; 0 1 4] (symmetric positive definite)
+        let values = vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0];
+        let col_indices = vec![0, 1, 0, 1, 2, 1, 2];
+        let row_ptrs = vec![0, 2, 5, 7];
+        CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap()
+    }
+
+    /// Regression test: a zero initial residual (x0 already the exact solution)
+    /// must NOT be reported as "preconditioner not positive definite". pminres
+    /// should return the initial guess immediately as converged.
+    #[test]
+    fn test_pminres_zero_initial_residual_no_false_breakdown() {
+        let a = spd_tridiag();
+        // x_exact = [1, 1, 1]  =>  b = A * x_exact = [5, 6, 5]
+        let b = vec![5.0, 6.0, 5.0];
+        let x0 = vec![1.0, 1.0, 1.0]; // already the exact solution => r0 = 0
+        let precond = |r: &[f64]| -> Vec<f64> { r.iter().map(|&v| v / 4.0).collect() };
+
+        let result = pminres(&a, &b, &x0, precond, 1e-10, 100)
+            .expect("zero initial residual must not trigger a spurious breakdown");
+
+        assert!(result.converged, "should be reported converged");
+        assert_eq!(result.iterations, 0, "no iterations needed");
+        for i in 0..3 {
+            assert!(
+                (result.x[i] - 1.0).abs() < 1e-12,
+                "initial guess should be returned unchanged at index {i}"
+            );
+        }
+    }
+
+    /// A genuinely non-positive-definite preconditioner on a nonzero residual
+    /// must still be reported as a breakdown (the fix must not mask real errors).
+    #[test]
+    fn test_pminres_indefinite_precond_still_breaks_down() {
+        let a = spd_tridiag();
+        let b = vec![5.0, 6.0, 5.0];
+        let x0 = vec![0.0, 0.0, 0.0]; // nonzero residual
+        // Negative-definite "preconditioner": r^T M^{-1} r < 0.
+        let precond = |r: &[f64]| -> Vec<f64> { r.iter().map(|&v| -v).collect() };
+
+        let result = pminres(&a, &b, &x0, precond, 1e-10, 100);
+        assert!(matches!(result, Err(IterativeError::Breakdown { .. })));
+    }
 }

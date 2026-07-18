@@ -39,6 +39,9 @@ use super::error::EigenvalueError;
 // for better performance in tight loops
 #[allow(unused_imports)]
 use super::utils::{dot, norm};
+// Dense symmetric eigensolver for the small Rayleigh-Ritz projection used by
+// the polynomial-filtered solver.
+use super::utils::dense_symmetric_jacobi_evd;
 
 // ============================================================================
 // Interval Eigenvalue Solver
@@ -134,13 +137,24 @@ pub struct IntervalEigenResult<T> {
 ///
 /// # Algorithm
 ///
-/// 1. Build Krylov subspace using Lanczos iteration: A = Q T Q^T
-/// 2. Use Sturm sequence to count eigenvalues of T in [low, high]
-/// 3. Apply bisection to locate each eigenvalue
-/// 4. Compute Ritz vectors if eigenvectors are requested
+/// * **Exact path (symmetric tridiagonal / diagonal `A`).** The Sturm sequence
+///   is applied *directly* to `A`'s diagonal/off-diagonal bands. The Sturm
+///   (inertia) count of a symmetric tridiagonal is exact, so the count and
+///   locations of eigenvalues in [low, high] are exact to the bisection
+///   tolerance — no Ritz approximation. A diagonal matrix is the special case.
 ///
-/// This is particularly efficient when the interval contains a small
-/// fraction of the total eigenvalues.
+/// * **General path (arbitrary symmetric `A`).** A Lanczos tridiagonal
+///   `T = Q^T A Q` is built with full reorthogonalization; its Sturm count in
+///   [low, high] yields *candidate* eigenvalues. Because eigenvalues of `T`
+///   (Ritz values) only approximate `A`'s, each candidate is verified against
+///   `A`: the Ritz vector `x = Q y` is formed and the residual
+///   `||A x - theta x||` measured. By the Lanczos / Bauer-Fike bound a Ritz
+///   value with residual `r` lies within `r` of a true eigenvalue of `A`, so
+///   only *converged* candidates (`r <= tolerance`) are reported — approximate
+///   Ritz values are never treated as exact interval members. For a full
+///   Krylov subspace (`krylov_dimension >= n`) `T` is orthogonally similar to
+///   `A`, residuals vanish, and the count is exact; otherwise `converged` is
+///   `false`, signalling that `krylov_dimension` should be increased.
 ///
 /// # Example
 ///
@@ -203,21 +217,33 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             ));
         }
 
-        let krylov_dim = self.config.krylov_dimension.min(n);
+        // Exact path: when `A` is (symmetric) tridiagonal — a diagonal matrix
+        // being the special case — the Sturm sequence applies directly to
+        // `A`'s bands, giving an exact interval count/location (no Ritz
+        // approximation).
+        if let Some((diag_a, off_a)) = Self::symmetric_tridiagonal_bands(a) {
+            return self.compute_from_bands(a, &diag_a, &off_a);
+        }
 
-        // Step 1: Run Lanczos to build tridiagonal T
+        // General path: Sturm count of the Lanczos tridiagonal `T = Q^T A Q`
+        // gives *candidate* eigenvalues; because Ritz values only approximate
+        // `A`'s eigenvalues, each candidate is verified against `A` below.
+        let krylov_dim = self.config.krylov_dimension.min(n);
         let (alpha, beta, q_basis, iterations) =
             self.lanczos_iteration(a, initial_vector, krylov_dim)?;
 
-        // Step 2: Count eigenvalues of T in [low, high] using Sturm sequence
-        let count_in_interval = self
+        let candidate_count = self
             .sturm_count(&alpha, &beta, self.config.high.clone())
             .saturating_sub(self.sturm_count(&alpha, &beta, self.config.low.clone()));
 
-        if count_in_interval == 0 {
+        if candidate_count == 0 {
             return Ok(IntervalEigenResult {
                 eigenvalues: vec![],
-                eigenvectors: None,
+                eigenvectors: if self.config.compute_eigenvectors {
+                    Some(vec![])
+                } else {
+                    None
+                },
                 iterations,
                 residual_norms: vec![],
                 converged: true,
@@ -225,28 +251,167 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IntervalEigen<T
             });
         }
 
-        // Step 3: Find eigenvalues in interval using bisection
-        let eigenvalues = self.find_eigenvalues_in_interval(&alpha, &beta, count_in_interval)?;
+        let candidates = self.find_eigenvalues_in_interval(&alpha, &beta, candidate_count)?;
 
-        // Step 4: Compute eigenvectors if requested
+        // Verify every candidate against `A` (Ritz vector + residual), always —
+        // even when eigenvectors are not requested — so the reported count
+        // reflects genuine eigenvalues of `A`, not raw Ritz values. A residual
+        // below tolerance bounds the distance to a true eigenvalue of `A`
+        // (Lanczos/Bauer-Fike); unconverged Ritz values are not reported.
+        let (ritz_vectors, residuals) =
+            self.compute_ritz_vectors(a, &alpha, &beta, &q_basis, &candidates)?;
+        let verify_tol = self.config.tolerance.clone();
+        let mut eigenvalues = Vec::with_capacity(candidates.len());
+        let mut eigenvectors = Vec::with_capacity(candidates.len());
+        let mut residual_norms = Vec::with_capacity(candidates.len());
+        for ((lambda, ritz_vec), residual) in
+            candidates.iter().zip(ritz_vectors).zip(residuals)
+        {
+            let in_interval = *lambda >= self.config.low && *lambda <= self.config.high;
+            if in_interval && residual < verify_tol {
+                eigenvalues.push(lambda.clone());
+                eigenvectors.push(ritz_vec);
+                residual_norms.push(residual);
+            }
+        }
+
+        // Exact when every candidate converged; else the count is a lower bound.
+        let converged = eigenvalues.len() == candidate_count;
+
+        Ok(IntervalEigenResult {
+            count: eigenvalues.len(),
+            eigenvalues,
+            eigenvectors: if self.config.compute_eigenvectors {
+                Some(eigenvectors)
+            } else {
+                None
+            },
+            iterations,
+            residual_norms,
+            converged,
+        })
+    }
+
+    /// Return the main diagonal and first super-diagonal of `a` when `a` is
+    /// (structurally) symmetric tridiagonal (every stored nonzero on the main,
+    /// sub- or super-diagonal; a diagonal matrix is the special case). Returns
+    /// `None` when any nonzero lies strictly outside the band, deferring to the
+    /// general Lanczos path. For symmetric `A` the super-diagonal equals the
+    /// sub-diagonal and the Sturm sequence uses only the squared off-diagonal.
+    fn symmetric_tridiagonal_bands(a: &CsrMatrix<T>) -> Option<(Vec<T>, Vec<T>)> {
+        let n = a.nrows();
+        let row_ptrs = a.row_ptrs();
+        let col_indices = a.col_indices();
+        let values = a.values();
+
+        let mut diag = vec![T::zero(); n];
+        let mut off = vec![T::zero(); n.saturating_sub(1)];
+
+        for i in 0..n {
+            for idx in row_ptrs[i]..row_ptrs[i + 1] {
+                let j = col_indices[idx];
+                let v = values[idx].clone();
+                let dist = j.abs_diff(i);
+                if dist > 1 {
+                    // A genuine nonzero outside the band disqualifies the exact
+                    // path; an explicitly stored zero is harmless.
+                    if Scalar::abs(v) > T::zero() {
+                        return None;
+                    }
+                    continue;
+                }
+                if i == j {
+                    diag[i] = v;
+                } else if j == i + 1 {
+                    off[i] = v;
+                }
+                // Sub-diagonal (j == i - 1) is redundant for symmetric `A`.
+            }
+        }
+
+        Some((diag, off))
+    }
+
+    /// Exact interval solve when `A` is symmetric tridiagonal: the Sturm
+    /// sequence and bisection run directly on `A`'s bands (exact count and
+    /// locations, no Ritz approximation). Eigenvectors, when requested, come
+    /// from inverse iteration on the same bands (`A` is the tridiagonal), with
+    /// the residual `||A x - lambda x||` reported for each.
+    fn compute_from_bands(
+        &self,
+        a: &CsrMatrix<T>,
+        diag_a: &[T],
+        off_a: &[T],
+    ) -> Result<IntervalEigenResult<T>, EigenvalueError> {
+        let n = diag_a.len();
+
+        let count = self
+            .sturm_count(diag_a, off_a, self.config.high.clone())
+            .saturating_sub(self.sturm_count(diag_a, off_a, self.config.low.clone()));
+
+        if count == 0 {
+            return Ok(IntervalEigenResult {
+                eigenvalues: vec![],
+                eigenvectors: if self.config.compute_eigenvectors {
+                    Some(vec![])
+                } else {
+                    None
+                },
+                iterations: 0,
+                residual_norms: vec![],
+                converged: true,
+                count: 0,
+            });
+        }
+
+        let eigenvalues = self.find_eigenvalues_in_interval(diag_a, off_a, count)?;
+
         let (eigenvectors, residual_norms) =
             if self.config.compute_eigenvectors && !eigenvalues.is_empty() {
-                let (evecs, residuals) =
-                    self.compute_ritz_vectors(a, &alpha, &beta, &q_basis, &eigenvalues)?;
-                (Some(evecs), residuals)
+                let eps = T::from_f64(1e-15).unwrap_or_else(T::zero);
+                let mut evecs = Vec::with_capacity(eigenvalues.len());
+                let mut resids = Vec::with_capacity(eigenvalues.len());
+                for lambda in &eigenvalues {
+                    // Eigenvector of `A` via inverse iteration on its bands.
+                    let mut x =
+                        self.inverse_iteration_tridiagonal(diag_a, off_a, lambda.clone())?;
+
+                    // Normalize.
+                    let mut norm_sq = T::zero();
+                    for xi in &x {
+                        norm_sq = norm_sq + xi.clone() * xi.clone();
+                    }
+                    let norm = Real::sqrt(norm_sq);
+                    if norm > eps {
+                        for xi in &mut x {
+                            *xi = xi.clone() / norm.clone();
+                        }
+                    }
+
+                    // Residual ||A x - lambda x||.
+                    let mut ax = vec![T::zero(); n];
+                    spmv(T::one(), a, &x, T::zero(), &mut ax);
+                    let mut res_sq = T::zero();
+                    for i in 0..n {
+                        let diff = ax[i].clone() - lambda.clone() * x[i].clone();
+                        res_sq = res_sq + diff.clone() * diff;
+                    }
+                    resids.push(Real::sqrt(res_sq));
+                    evecs.push(x);
+                }
+                (Some(evecs), resids)
             } else {
                 (None, vec![T::zero(); eigenvalues.len()])
             };
-
-        let converged = residual_norms.iter().all(|r| *r < self.config.tolerance);
 
         Ok(IntervalEigenResult {
             count: eigenvalues.len(),
             eigenvalues,
             eigenvectors,
-            iterations,
+            iterations: 0,
             residual_norms,
-            converged,
+            // The eigenvalue count and locations are exact for tridiagonal `A`.
+            converged: true,
         })
     }
 
@@ -684,7 +849,12 @@ pub fn eigenvalues_in_interval<T: Scalar<Real = T> + Clone + Field + Real + From
 
 /// Count eigenvalues of a sparse symmetric matrix in an interval.
 ///
-/// Uses Lanczos to approximate eigenvalues and Sturm sequence to count.
+/// For a symmetric tridiagonal (or diagonal) matrix the count is exact: the
+/// Sturm sequence is applied directly to `A`'s bands. For a general symmetric
+/// matrix the count is the number of *converged* Ritz eigenpairs of a Lanczos
+/// tridiagonal that fall inside the interval and are verified against `A`
+/// (see [`IntervalEigen`]); increase `krylov_dim` towards `n` for a guaranteed
+/// count.
 ///
 /// # Arguments
 ///
@@ -839,13 +1009,24 @@ pub struct PolynomialFilteredResult<T> {
 /// specified interval without matrix factorization. Particularly useful
 /// for large sparse matrices where shift-invert would be too expensive.
 ///
-/// The filter is designed to:
-/// 1. Amplify eigenvalues in the target interval [a, b]
-/// 2. Dampen eigenvalues outside the interval
+/// The filter is a degree-`polynomial_degree` polynomial `p(A)` that
+/// approximates the indicator (band-pass window) of the target interval
+/// `[a, b]` over the spectral range `[lambda_min, lambda_max]`:
 ///
-/// This is achieved using Chebyshev polynomials that map:
-/// - Target interval [a, b] -> [-1, 1] (mild transformation)
-/// - Unwanted spectrum -> large values (strong damping)
+/// 1. `p(lambda) ~ 1` for eigenvalues in the target interval `[a, b]`.
+/// 2. `p(lambda) ~ 0` for eigenvalues outside it.
+///
+/// It is built as `p(lambda) = sum_k g_k * mu_k * T_k(x(lambda))` where the
+/// affine map `x(lambda) = (2*lambda - lambda_max - lambda_min) /
+/// (lambda_max - lambda_min)` sends the spectrum onto `[-1, 1]`, `T_k` is the
+/// Chebyshev polynomial of the first kind (applied to `A` through its
+/// three-term recurrence — repeated sparse matrix-vector products), the `mu_k`
+/// are the Chebyshev coefficients of the window indicator, and the `g_k` are
+/// Jackson damping factors that suppress the Gibbs oscillations of the
+/// truncated expansion. Running Lanczos on `p(A)` amplifies the components of
+/// eigenvectors whose eigenvalues lie in the target interval relative to the
+/// rest of the spectrum, so interior eigenvalues emerge without any matrix
+/// factorization.
 pub struct PolynomialFilteredLanczos<T> {
     config: PolynomialFilterConfig<T>,
 }
@@ -916,104 +1097,132 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         let mut converged_eigenvectors: Vec<Vec<T>> = Vec::new();
         let mut converged_residuals: Vec<T> = Vec::new();
 
+        // Eigenvalues separated by less than this are treated as the same
+        // eigenvalue when de-duplicating discoveries across outer iterations.
+        let dedup_tol = {
+            let width = Scalar::abs(lambda_max.clone() - lambda_min.clone());
+            let rel = width * Real::sqrt(<T as Scalar>::epsilon());
+            let abs = self.config.tolerance.clone()
+                * T::from_f64(8.0).unwrap_or_else(T::zero);
+            if rel > abs {
+                rel
+            } else {
+                abs
+            }
+        };
+
         for iter in 0..self.config.max_iterations {
-            // Apply polynomial filter to current vectors
+            // Apply the polynomial filter to the current block of vectors; the
+            // filter amplifies the components lying in the target interval.
             let filtered_vectors: Vec<Vec<T>> = v_basis
                 .iter()
                 .map(|v| self.apply_filter(a, v, &filter_coeffs, &lambda_min, &lambda_max))
                 .collect();
 
-            // Orthonormalize filtered vectors
+            // Orthonormalize the filtered block.
             let ortho_vectors = self.orthonormalize(&filtered_vectors);
             if ortho_vectors.is_empty() {
                 break;
             }
 
-            // Build filtered Krylov subspace
-            let (alpha, beta, q_basis) = self.filtered_lanczos(
-                a,
-                &ortho_vectors[0],
-                krylov_dim,
-                &filter_coeffs,
-                &lambda_min,
-                &lambda_max,
-            )?;
+            // Block-enriched subspace: the union of the filtered Krylov
+            // subspaces grown from each independent filtered start vector. A
+            // single start vector captures only a one-dimensional slice of an
+            // eigenspace whose eigenvalues the filter maps to (nearly) identical
+            // values; several independent starts let the subspace span such
+            // (near-)degenerate eigenspaces so their eigenvalues can be resolved.
+            let mut subspace: Vec<Vec<T>> = Vec::new();
+            for start in &ortho_vectors {
+                let (_alpha, _beta, q_basis) = self.filtered_lanczos(
+                    a,
+                    start,
+                    krylov_dim,
+                    &filter_coeffs,
+                    &lambda_min,
+                    &lambda_max,
+                )?;
+                subspace.extend(q_basis);
+            }
 
-            if alpha.is_empty() {
+            // Orthonormalize the union (removing overlaps and dependencies).
+            let q = self.orthonormalize(&subspace);
+            if q.is_empty() {
                 break;
             }
 
-            // Solve tridiagonal eigenvalue problem
-            // Note: These eigenvalues are for p(A), not A
-            // We need to sort by the filtered eigenvalues (largest values from filter are enhanced)
-            let (eig_vals, eig_vecs) = self.solve_tridiagonal_evd(&alpha, &beta);
+            // Rayleigh-Ritz projection onto the ORIGINAL matrix A: form the
+            // small dense symmetric matrix H = Q^T A Q and diagonalize it. Its
+            // eigenpairs approximate eigenpairs of A directly (the filter only
+            // built a subspace rich in the target eigenvectors), recovering the
+            // true eigenvalues — including any the filter mapped to equal values.
+            let m = q.len();
+            let mut aq: Vec<Vec<T>> = Vec::with_capacity(m);
+            for qi in &q {
+                let mut av = vec![T::zero(); n];
+                spmv(T::one(), a, qi, T::zero(), &mut av);
+                aq.push(av);
+            }
+            let mut h = vec![vec![T::zero(); m]; m];
+            for i in 0..m {
+                for j in i..m {
+                    let mut hij = T::zero();
+                    for l in 0..n {
+                        hij = hij + q[i][l].clone() * aq[j][l].clone();
+                    }
+                    h[i][j] = hij.clone();
+                    h[j][i] = hij;
+                }
+            }
+            let (ritz_vals, ritz_vecs) = dense_symmetric_jacobi_evd(&h);
 
-            // Sort by largest filtered eigenvalue (these correspond to eigenvalues in target interval)
-            // The polynomial filter enhances eigenvalues in target interval to large values
-            let mut sorted_indices: Vec<(usize, T)> = eig_vals
-                .iter()
-                .enumerate()
-                .map(|(i, ev)| (i, ev.clone()))
-                .collect();
-            sorted_indices.sort_by(|(_, a_val), (_, b_val)| {
-                // Sort by largest eigenvalue first (filter enhances target eigenvalues)
-                b_val
-                    .partial_cmp(a_val)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            // Examine Ritz values in order of proximity to the target interval.
+            let target_center = (self.config.target_low.clone()
+                + self.config.target_high.clone())
+                / T::from_f64(2.0).unwrap_or_else(T::zero);
+            let mut order: Vec<usize> = (0..ritz_vals.len()).collect();
+            order.sort_by(|&i, &j| {
+                let di = Scalar::abs(ritz_vals[i].clone() - target_center.clone());
+                let dj = Scalar::abs(ritz_vals[j].clone() - target_center.clone());
+                di.partial_cmp(&dj).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // Compute Ritz vectors and actual eigenvalues using Rayleigh quotient with original matrix A
-            // Note: The eigenvalues from tridiagonal EVD are for p(A), not A
-            // We need to compute Rayleigh quotient with A to get actual eigenvalues
-            for (idx, _) in sorted_indices.iter().take(self.config.num_eigenvalues * 2)
-            // Check more candidates since some may be outside interval
-            {
-                // Compute Ritz vector from Krylov basis
-                let ritz_vec = self.compute_ritz_vector(&q_basis, &eig_vecs[*idx]);
-                if ritz_vec.is_empty() {
+            for &idx in &order {
+                let theta = ritz_vals[idx].clone();
+
+                // Only accept eigenvalues that lie inside the target interval.
+                if theta < self.config.target_low || theta > self.config.target_high {
                     continue;
                 }
 
-                // Compute actual eigenvalue using Rayleigh quotient: lambda = (v^T * A * v) / (v^T * v)
-                let mut ax = vec![T::zero(); ritz_vec.len()];
-                spmv(T::one(), a, &ritz_vec, T::zero(), &mut ax);
-
-                let vtav: T = ritz_vec
+                // Skip eigenvalues already discovered in a previous iteration.
+                if converged_eigenvalues
                     .iter()
-                    .zip(ax.iter())
-                    .map(|(vi, axi)| vi.clone() * axi.clone())
-                    .fold(T::zero(), |acc, x| acc + x);
-                let vtv: T = ritz_vec
-                    .iter()
-                    .map(|vi| vi.clone() * vi.clone())
-                    .fold(T::zero(), |acc, x| acc + x);
-
-                if vtv <= T::from_f64(1e-14).unwrap_or_else(T::zero) {
-                    continue;
-                }
-
-                let eigenvalue = vtav / vtv.clone();
-
-                // Check if actual eigenvalue is in target interval
-                if eigenvalue.clone() < self.config.target_low.clone()
-                    || eigenvalue.clone() > self.config.target_high.clone()
+                    .any(|e| Scalar::abs(e.clone() - theta.clone()) <= dedup_tol)
                 {
                     continue;
                 }
 
-                // Compute residual: ||A*x - lambda*x||
+                // Form the full Ritz vector x = Q y (already normalized).
+                let ritz_vec = self.compute_ritz_vector(&q, &ritz_vecs[idx]);
+                if ritz_vec.is_empty() {
+                    continue;
+                }
+
+                // Verify against A: residual ||A x - theta x||.
+                let mut ax = vec![T::zero(); n];
+                spmv(T::one(), a, &ritz_vec, T::zero(), &mut ax);
                 let residual: T = Real::sqrt(
                     ax.iter()
                         .zip(ritz_vec.iter())
                         .map(|(axi, xi)| {
-                            let diff = axi.clone() - eigenvalue.clone() * xi.clone();
+                            let diff = axi.clone() - theta.clone() * xi.clone();
                             diff.clone() * diff
                         })
                         .fold(T::zero(), |acc, x| acc + x),
                 );
 
                 if residual <= self.config.tolerance {
-                    converged_eigenvalues.push(eigenvalue.clone());
+                    converged_eigenvalues.push(theta.clone());
                     converged_residuals.push(residual);
                     if self.config.compute_eigenvectors {
                         converged_eigenvectors.push(ritz_vec);
@@ -1021,7 +1230,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                 }
             }
 
-            // Check if we have enough converged eigenvalues
+            // Check if we have enough converged eigenvalues.
             if converged_eigenvalues.len() >= self.config.num_eigenvalues {
                 return Ok(PolynomialFilteredResult {
                     eigenvalues: converged_eigenvalues,
@@ -1036,17 +1245,18 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
                 });
             }
 
-            // Update starting vectors with best Ritz vectors from filter
+            // Restart: seed the next iteration with the Ritz vectors closest to
+            // the target interval so the filter can refine them further.
             v_basis.clear();
-            for (idx, _) in sorted_indices.iter().take(num_start_vectors) {
-                let ritz_vec = self.compute_ritz_vector(&q_basis, &eig_vecs[*idx]);
+            for &idx in order.iter().take(num_start_vectors) {
+                let ritz_vec = self.compute_ritz_vector(&q, &ritz_vecs[idx]);
                 if !ritz_vec.is_empty() {
                     v_basis.push(ritz_vec);
                 }
             }
 
             if v_basis.is_empty() {
-                // Add random vectors if no candidates
+                // Add random vectors if no candidates were produced.
                 v_basis = self.random_orthonormal_vectors(n, num_start_vectors);
             }
         }
@@ -1160,7 +1370,21 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         Ok((min_val - margin.clone(), max_val + margin))
     }
 
-    /// Compute Chebyshev filter coefficients.
+    /// Coefficients of the degree-`polynomial_degree` Chebyshev band-pass
+    /// filter approximating the indicator of `[target_low, target_high]` over
+    /// the spectral range `[lambda_min, lambda_max]`.
+    ///
+    /// Returns `c_k = g_k * mu_k`, consumed by [`apply_filter`] which evaluates
+    /// `p(A) v = sum_k c_k * T_k((A - center*I)/half_width) v` via the
+    /// Chebyshev three-term recurrence, where the affine map
+    /// `x(lambda) = (2*lambda - lambda_max - lambda_min)/(lambda_max - lambda_min)`
+    /// sends the spectrum onto `[-1, 1]`. The `mu_k` are the Chebyshev
+    /// coefficients of the mapped target window: with `x = cos(theta)` the
+    /// window is `theta in [theta_lo, theta_hi]`, so `mu_0 = (theta_hi -
+    /// theta_lo)/pi` and `mu_k = (2/(k*pi))*(sin(k*theta_hi) - sin(k*theta_lo))`
+    /// for `k >= 1`; the `g_k` are Jackson damping factors (`degree + 1`
+    /// moments) suppressing Gibbs ringing. The result is `~ 1` inside the
+    /// window and `~ 0` outside, genuinely amplifying target eigenvalues.
     fn compute_chebyshev_filter(
         &self,
         lambda_min: &T,
@@ -1171,46 +1395,52 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
         let degree = self.config.polynomial_degree;
         let mut coeffs = vec![T::zero(); degree + 1];
 
-        // Map target interval to [-1, 1] and unwanted to outside
-        // For Chebyshev of first kind: T_n(x) = cos(n * acos(x))
-        // We use Jackson damping for smoother filter
-
-        let two = T::from_f64(2.0).unwrap_or_else(T::zero);
         let pi_f64 = std::f64::consts::PI;
+        let lmin = lambda_min.to_f64().unwrap_or(-1.0);
+        let lmax = lambda_max.to_f64().unwrap_or(1.0);
+        let width = lmax - lmin;
 
-        // Compute Jackson damping coefficients using f64 for trig functions
-        let n_f64 = (degree + 2) as f64;
-        for k in 0..=degree {
-            let k_f64 = k as f64;
-            // g_k = ((n - k) * cos(pi*k/n) + sin(pi*k/n) * cot(pi/n)) / n
-            let ratio = k_f64 * pi_f64 / n_f64;
-            let cos_val = ratio.cos();
-            let sin_val = ratio.sin();
-            let cot_pi_n = (pi_f64 / n_f64).cos() / (pi_f64 / n_f64).sin();
-
-            let g_k = ((n_f64 - k_f64) * cos_val + sin_val * cot_pi_n) / n_f64;
-            coeffs[k] = T::from_f64(g_k).unwrap_or_else(T::zero);
+        // Degenerate spectral range: fall back to the identity filter (p == 1)
+        // so that no spurious amplification or division by zero is introduced.
+        if !(width.abs() > 0.0) {
+            coeffs[0] = T::one();
+            return coeffs;
         }
 
-        // Scale coefficients for the spectral range
-        let scale = two.clone() / (lambda_max.clone() - lambda_min.clone());
-        let center = (lambda_max.clone() + lambda_min.clone()) / two.clone();
+        // Affine map of the spectrum onto [-1, 1], then clamp the target
+        // interval to the representable window.
+        let map = |lambda: f64| (2.0 * lambda - lmax - lmin) / width;
+        let a_low = target_low.to_f64().unwrap_or(lmin);
+        let a_high = target_high.to_f64().unwrap_or(lmax);
+        let mut y_low = map(a_low).clamp(-1.0, 1.0);
+        let mut y_high = map(a_high).clamp(-1.0, 1.0);
+        if y_low > y_high {
+            std::mem::swap(&mut y_low, &mut y_high);
+        }
 
-        // Adjust for target interval
-        let target_center = (target_high.clone() + target_low.clone()) / two.clone();
-        let _target_half_width = (target_high.clone() - target_low.clone()) / two;
+        // In angle space x = cos(theta), the interval [y_low, y_high]
+        // corresponds to theta in [acos(y_high), acos(y_low)] (acos is
+        // decreasing, so acos(y_low) >= acos(y_high)).
+        let theta_hi = y_low.acos();
+        let theta_lo = y_high.acos();
 
-        // Modify coefficients to enhance target interval - use f64 for trig
-        let center_f64 = center.to_f64().unwrap_or(0.0);
-        let target_center_f64 = target_center.to_f64().unwrap_or(0.0);
-        let scale_f64 = scale.to_f64().unwrap_or(1.0);
+        // Jackson kernel damping (number of moments = degree + 1).
+        let n_f64 = (degree + 2) as f64;
+        let cot_pi_n = (pi_f64 / n_f64).cos() / (pi_f64 / n_f64).sin();
 
         for (k, coeff) in coeffs.iter_mut().enumerate() {
             let k_f64 = k as f64;
-            // Enhance contribution near target center
-            let arg = k_f64 * pi_f64 * ((target_center_f64 - center_f64) * scale_f64);
-            let enhancement = arg.cos().abs() + 0.5;
-            *coeff = coeff.clone() * T::from_f64(enhancement).unwrap_or_else(T::zero);
+            let ratio = k_f64 * pi_f64 / n_f64;
+            let g_k = ((n_f64 - k_f64) * ratio.cos() + ratio.sin() * cot_pi_n) / n_f64;
+
+            // Chebyshev coefficient of the window indicator on [-1, 1].
+            let mu_k = if k == 0 {
+                (theta_hi - theta_lo) / pi_f64
+            } else {
+                2.0 / (k_f64 * pi_f64) * ((k_f64 * theta_hi).sin() - (k_f64 * theta_lo).sin())
+            };
+
+            *coeff = T::from_f64(g_k * mu_k).unwrap_or_else(T::zero);
         }
 
         coeffs
@@ -1230,7 +1460,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             return v.to_vec();
         }
 
-        // Scale and shift parameters
+        // Scale and shift parameters. `e` is the spectral half-width and maps
+        // [lambda_min, lambda_max] onto [-1, 1].
         let two = T::from_f64(2.0).unwrap_or_else(T::zero);
         let e = (lambda_max.clone() - lambda_min.clone()) / two.clone();
         let c = (lambda_max.clone() + lambda_min.clone()) / two.clone();
@@ -1247,7 +1478,11 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
             .map(|x| x.clone() * coeffs[0].clone())
             .collect();
 
-        if coeffs.len() == 1 {
+        // Only the constant term is well defined for a single coefficient or a
+        // degenerate spectral range (half-width ~ 0); higher Chebyshev terms
+        // would divide by `e`, so stop here to avoid producing NaNs.
+        let eps = T::from_f64(1e-30).unwrap_or_else(T::zero);
+        if coeffs.len() == 1 || Scalar::abs(e.clone()) <= eps {
             return result;
         }
 

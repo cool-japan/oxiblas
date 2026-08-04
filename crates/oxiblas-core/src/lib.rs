@@ -139,6 +139,7 @@ mod tests {
     #[test]
     fn test_simd_detection() {
         let level = detect_simd_level();
+        #[cfg(feature = "std")]
         println!("Detected SIMD level: {:?}", level);
 
         // When force-scalar is enabled, should be Scalar

@@ -11,17 +11,24 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use oxiblas_lapack::info::{LuInfo, compute_lu_info};
-//! use oxiblas_lapack::lu::Lu;
+//! ```
+//! use oxiblas_lapack::info::compute_lu_info;
+//! use oxiblas_matrix::Mat;
 //!
-//! let lu = Lu::compute(a.as_ref()).unwrap();
+//! // An already-upper-triangular matrix needs no pivoting, so its combined
+//! // LU storage is the matrix itself (L's sub-diagonal is all zero).
+//! let a: Mat<f64> = Mat::from_rows(&[&[4.0, 1.0], &[0.0, 3.0]]);
+//! let lu_matrix = a.clone();
+//! let pivot = [0usize, 1];
+//! let num_swaps = 0; // no row interchanges were needed
+//!
 //! // `a.as_ref()` (the original matrix) is required alongside the
 //! // factors: pivot growth and rcond are both computed against it.
-//! let info = compute_lu_info(a.as_ref(), lu.lu_matrix(), lu.pivot(), num_swaps);
+//! let info = compute_lu_info(a.as_ref(), lu_matrix.as_ref(), &pivot, num_swaps);
 //!
 //! println!("Pivot growth factor: {}", info.pivot_growth);
 //! println!("Estimated condition: {}", info.rcond_estimate);
+//! assert_eq!(info.pivot_growth, 1.0); // no growth: already triangular
 //! if info.is_nearly_singular(1e-12) {
 //!     println!("Warning: Matrix is nearly singular");
 //! }

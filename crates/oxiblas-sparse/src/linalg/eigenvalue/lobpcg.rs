@@ -128,8 +128,19 @@ impl std::error::Error for LobpcgError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{Lobpcg, LobpcgConfig, LobpcgTarget};
+///
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+/// let csr = CsrMatrix::new(
+///     10,
+///     10,
+///     (0..=10).collect(),
+///     (0..10).collect(),
+///     (1..=10).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = LobpcgConfig {
 ///     num_eigenvalues: 3,
@@ -139,6 +150,11 @@ impl std::error::Error for LobpcgError {}
 /// };
 /// let solver = Lobpcg::new(config).unwrap();
 /// let result = solver.compute(&csr).unwrap();
+/// assert_eq!(result.eigenvalues.len(), 3);
+/// // Smallest 3 eigenvalues of diag(1..=10) are 1, 2, 3.
+/// assert!((result.eigenvalues[0] - 1.0).abs() < 1e-6);
+/// assert!((result.eigenvalues[1] - 2.0).abs() < 1e-6);
+/// assert!((result.eigenvalues[2] - 3.0).abs() < 1e-6);
 /// ```
 pub struct Lobpcg {
     config: LobpcgConfig,

@@ -255,24 +255,31 @@ pub fn prefetch_write<T>(ptr: *mut T, locality: PrefetchLocality) {
 /// * `locality` - Hint about data reuse
 #[inline]
 pub fn prefetch_read_range<T>(ptr: *const T, count: usize, locality: PrefetchLocality) {
-    let bytes = count * size_of::<T>();
+    // `count` comes from a caller of a *safe* function that takes a raw
+    // pointer, so it is not guaranteed to describe the real allocation.
+    // `saturating_mul` keeps the byte count from wrapping, and `wrapping_add`
+    // (instead of `add`) keeps an out-of-range offset from being UB: forming a
+    // pointer past the end of an object is undefined even when it is never
+    // dereferenced, and a prefetch hint never dereferences.
+    let bytes = count.saturating_mul(size_of::<T>());
     let num_lines = bytes.div_ceil(CACHE_LINE_SIZE);
 
     for i in 0..num_lines {
         let offset = i * CACHE_LINE_SIZE;
-        prefetch_read(unsafe { (ptr as *const u8).add(offset) }, locality);
+        prefetch_read((ptr as *const u8).wrapping_add(offset), locality);
     }
 }
 
 /// Prefetches a range of memory for writing.
 #[inline]
 pub fn prefetch_write_range<T>(ptr: *mut T, count: usize, locality: PrefetchLocality) {
-    let bytes = count * size_of::<T>();
+    // See `prefetch_read_range` for why this is saturating + wrapping.
+    let bytes = count.saturating_mul(size_of::<T>());
     let num_lines = bytes.div_ceil(CACHE_LINE_SIZE);
 
     for i in 0..num_lines {
         let offset = i * CACHE_LINE_SIZE;
-        prefetch_write(unsafe { (ptr as *mut u8).add(offset) }, locality);
+        prefetch_write((ptr as *mut u8).wrapping_add(offset), locality);
     }
 }
 

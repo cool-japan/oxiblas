@@ -56,20 +56,28 @@
 #![allow(clippy::missing_const_for_fn)]
 // API consistency with Result/Option
 #![allow(clippy::unnecessary_wraps)]
-// Raw pointer casting common in SIMD code
-#![allow(clippy::ptr_as_ptr)]
-// SIMD code uses transmute
-#![allow(clippy::transmute_ptr_to_ref)]
-// Casting in BLAS is intentional
-#![allow(clippy::cast_possible_wrap)]
+// clippy::ptr_as_ptr, clippy::transmute_ptr_to_ref, clippy::cast_possible_wrap,
+// and clippy::transmute_undefined_repr were removed from this allow-list
+// during the 2026-08 hygiene pass: none is in the `clippy::all` group this
+// crate actually enables (pedantic/nursery stay off, see below), so none
+// ever fired here and dropping the allow costs nothing while tightening the
+// lint surface for future code.
 #![allow(clippy::cast_precision_loss)]
-// CBLAS extern functions have well-known semantics
-#![allow(clippy::missing_safety_doc)]
 // Manual assign clearer for BLAS code
 #![allow(clippy::assign_op_pattern)]
-// Transmute in SIMD code is intentional
-#![allow(clippy::transmute_undefined_repr)]
-#![allow(clippy::missing_transmute_annotations)]
+// clippy::missing_transmute_annotations was removed from this allow-list
+// during the 2026-08 hygiene pass: the 8 sites it caught (NEON nrm2 f32/f64
+// abs-via-bitmask transmutes in level1/nrm2.rs) now carry explicit
+// `transmute::<From, To>()` turbofish annotations instead of relying on
+// let-binding type inference.
+//
+// clippy::missing_safety_doc was also removed during the same pass: all 74
+// `pub unsafe extern "C" fn` CBLAS entry points across cblas/{basic,
+// complex_level1,complex_level2,triangular_symmetric,hermitian,
+// level2_real}.rs that lacked a `# Safety` section now have one describing
+// the raw-pointer preconditions the C ABI cannot enforce itself. This was
+// exactly the gap that let unvalidated CBLAS modules land silently before
+// (see the parameter-validation hygiene item tracked separately).
 // SIMD kernels benefit from inline(always)
 #![allow(clippy::inline_always)]
 // Some refs are cfg-gated

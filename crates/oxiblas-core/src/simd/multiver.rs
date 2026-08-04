@@ -324,7 +324,18 @@ mod tests {
     #[test]
     fn test_aarch64_neon_always_true() {
         let caps = SimdCapabilityInfo::detect();
-        assert!(caps.has_neon, "NEON is mandatory on AArch64");
+        // NEON is architecturally mandatory on AArch64 -- but `SimdCapabilityInfo`
+        // is a verbatim mirror of `dispatch::SimdCapabilities` (see `mirror()`
+        // above), which legitimately masks the *reported* capability to
+        // scalar-only when the `force-scalar` ceiling is active (this test
+        // runs under that ceiling whenever the crate is built with
+        // `--all-features`, since force-scalar wins precedence). Ask the same
+        // single source of truth `dispatch.rs` uses (see its
+        // `test_aarch64_neon_always_present`) instead of re-deriving the
+        // threshold here and risking drift from it.
+        if SimdCapabilities::simd_ceiling_bytes() >= 16 {
+            assert!(caps.has_neon, "NEON is mandatory on AArch64");
+        }
         assert!(!caps.has_avx2, "AVX2 must not appear on AArch64");
         assert!(!caps.has_avx512f, "AVX-512 must not appear on AArch64");
     }

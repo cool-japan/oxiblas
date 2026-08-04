@@ -125,16 +125,23 @@ pub struct BlockLanczosResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{BlockLanczos, BlockLanczosConfig, WhichEigenvalues};
 ///
-/// // Create a sparse symmetric matrix
-/// let a = CsrMatrix::<f64>::eye(100);
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=8.
+/// let a = CsrMatrix::<f64>::new(
+///     8,
+///     8,
+///     (0..=8).collect(),
+///     (0..8).collect(),
+///     (1..=8).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = BlockLanczosConfig {
-///     num_eigenvalues: 10,
-///     block_size: 3,
+///     num_eigenvalues: 2,
+///     block_size: 2,
 ///     which: WhichEigenvalues::LargestMagnitude,
 ///     ..Default::default()
 /// };
@@ -142,6 +149,7 @@ pub struct BlockLanczosResult<T> {
 /// let block_lanczos = BlockLanczos::new(config);
 /// let result = block_lanczos.compute(&a, None).unwrap();
 /// println!("Eigenvalues: {:?}", result.eigenvalues);
+/// assert_eq!(result.eigenvalues.len(), 2);
 /// ```
 pub struct BlockLanczos<T> {
     config: BlockLanczosConfig<T>,

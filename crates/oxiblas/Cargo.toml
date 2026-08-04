@@ -47,6 +47,13 @@ max-simd-256 = ["oxiblas-core/max-simd-256", "oxiblas-blas/max-simd-256", "oxibl
 [dev-dependencies]
 criterion.workspace = true
 num-complex.workspace = true
+# Doctest-only: the "ndarray"/"nalgebra" Integration and Migration Guide
+# sections in lib.rs write examples against these crates directly (matching
+# the optional `oxiblas-ndarray`/`oxiblas-matrix::nalgebra_compat`
+# integration surface below), which needs them as direct dependencies of
+# this crate, not just transitively through oxiblas-ndarray/oxiblas-matrix.
+ndarray.workspace = true
+nalgebra.workspace = true
 
 [[bench]]
 name = "gemm_bench"

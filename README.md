@@ -443,7 +443,7 @@ OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD
 - **Fine-tuned blocking parameters:** KC=192, MC=128 (optimized for 256KB L2 cache)
 - **Increased prefetch distance:** 12 iterations (optimized for Intel Xeon E5-2600 memory latency)
 - **Platform-aware cache detection:** Linux sysfs, macOS sysctl, x86_64 CPUID fallback
-- **All 2,922 tests passing** with zero warnings
+- **All tests passing** with zero warnings (see [Project Status](#project-status) below for the current test count)
 
 ### macOS AArch64 Performance (Apple M3)
 
@@ -707,11 +707,11 @@ gemm_batched(
 
 ## Project Status
 
-**Version:** 0.2.2 (2026-07-18)
+**Version:** 0.2.2 (2026-08-04)
 
-- **Lines of Code:** ~248,600 Rust (349 files, excluding the retired `oxiblas-ffi` crate)
+- **Lines of Code:** ~220,400 Rust (365 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
 - **Documentation:** 12 comprehensive examples
-- **Tests:** ~3,300 passing lib tests + ~310 doctests (100% success rate)
+- **Tests:** 3,365 passing lib/integration tests (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 352 passing doctests (100% success rate)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ Extensive LAPACK (LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg)

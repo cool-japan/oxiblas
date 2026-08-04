@@ -167,27 +167,31 @@ pub struct GeneralizedEigenResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{
-///     GeneralizedEigen, GeneralizedEigenConfig, GeneralizedMode, WhichEigenvalues
+///     GeneralizedEigen, GeneralizedEigenConfig, GeneralizedMode, WhichEigenvalues,
 /// };
 ///
-/// // A = stiffness matrix, B = mass matrix
-/// let a = create_stiffness_matrix();
-/// let b = create_mass_matrix(); // SPD
+/// // A = stiffness matrix (diagonal, eigenvalues 1, 2, 3), B = mass matrix (identity).
+/// // With B = I the generalized problem A*x = lambda*B*x reduces to A's own
+/// // eigenvalues, which makes the expected result easy to check.
+/// let a = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![1.0, 2.0, 3.0]).unwrap();
+/// let b = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![1.0, 1.0, 1.0]).unwrap(); // SPD
 ///
 /// let config = GeneralizedEigenConfig {
-///     num_eigenvalues: 5,
+///     num_eigenvalues: 2,
 ///     which: WhichEigenvalues::SmallestMagnitude,
 ///     mode: GeneralizedMode::ShiftInvert,
-///     sigma: 0.0,  // Find smallest eigenvalues
+///     sigma: 0.0, // Find smallest eigenvalues
 ///     symmetric: true,
 ///     ..Default::default()
 /// };
 ///
 /// let solver = GeneralizedEigen::new(config);
 /// let result = solver.compute(&a, &b, None)?;
+/// assert_eq!(result.eigenvalues.len(), 2);
+/// # Ok::<(), oxiblas_sparse::linalg::EigenvalueError>(())
 /// ```
 pub struct GeneralizedEigen<T> {
     config: GeneralizedEigenConfig<T>,

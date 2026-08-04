@@ -25,15 +25,22 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use oxiblas_sparse::csr::CsrMatrix;
 //! use oxiblas_sparse::linalg::eigenvalue::{Lanczos, LanczosConfig, WhichEigenvalues};
 //!
-//! // Create a sparse symmetric matrix
-//! let a = CsrMatrix::<f64>::eye(100);
+//! // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+//! let a = CsrMatrix::<f64>::new(
+//!     10,
+//!     10,
+//!     (0..=10).collect(),
+//!     (0..10).collect(),
+//!     (1..=10).map(|i| i as f64).collect(),
+//! )
+//! .unwrap();
 //!
 //! let config = LanczosConfig {
-//!     num_eigenvalues: 5,
+//!     num_eigenvalues: 2,
 //!     which: WhichEigenvalues::LargestMagnitude,
 //!     ..Default::default()
 //! };
@@ -41,6 +48,7 @@
 //! let lanczos = Lanczos::new(config);
 //! let result = lanczos.compute(&a, None).unwrap();
 //! println!("Eigenvalues: {:?}", result.eigenvalues);
+//! assert_eq!(result.eigenvalues.len(), 2);
 //! ```
 
 use crate::csr::CsrMatrix;
@@ -135,15 +143,22 @@ impl Default for LanczosConfig<f32> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{Lanczos, LanczosConfig, WhichEigenvalues};
 ///
-/// // Create a sparse symmetric matrix
-/// let a = CsrMatrix::<f64>::eye(100);
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+/// let a = CsrMatrix::<f64>::new(
+///     10,
+///     10,
+///     (0..=10).collect(),
+///     (0..10).collect(),
+///     (1..=10).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = LanczosConfig {
-///     num_eigenvalues: 5,
+///     num_eigenvalues: 2,
 ///     which: WhichEigenvalues::LargestMagnitude,
 ///     ..Default::default()
 /// };
@@ -151,6 +166,7 @@ impl Default for LanczosConfig<f32> {
 /// let lanczos = Lanczos::new(config);
 /// let result = lanczos.compute(&a, None).unwrap();
 /// println!("Eigenvalues: {:?}", result.eigenvalues);
+/// assert_eq!(result.eigenvalues.len(), 2);
 /// ```
 pub struct Lanczos<T> {
     config: LanczosConfig<T>,

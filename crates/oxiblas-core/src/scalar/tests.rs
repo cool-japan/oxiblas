@@ -1,5 +1,10 @@
 //! Tests for scalar traits and implementations.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 #[allow(unused_imports)]
 use super::*;
 
@@ -367,7 +372,7 @@ fn test_complex_constructors() {
 
 #[test]
 fn test_complex_polar() {
-    use std::f64::consts::PI;
+    use core::f64::consts::PI;
 
     let z = from_polar(1.0, PI / 2.0);
     assert!((z.re - 0.0).abs() < 1e-10);
@@ -380,7 +385,7 @@ fn test_complex_polar() {
 
 #[test]
 fn test_complex_ext() {
-    use std::f64::consts::PI;
+    use core::f64::consts::PI;
 
     let z = c64(3.0, 4.0);
 

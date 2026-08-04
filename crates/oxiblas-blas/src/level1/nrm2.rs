@@ -271,8 +271,8 @@ fn nrm2_nonfinite_f32(x: &[f32]) -> f32 {
 #[cfg(target_arch = "aarch64")]
 fn nrm2_f64_simd_safe(x: &[f64]) -> f64 {
     use core::arch::aarch64::{
-        float64x2_t, vaddq_f64, vaddvq_f64, vandq_u64, vdupq_n_f64, vdupq_n_u64, vfmaq_f64,
-        vld1q_f64, vmaxq_f64, vmaxvq_f64, vmulq_f64,
+        float64x2_t, uint64x2_t, vaddq_f64, vaddvq_f64, vandq_u64, vdupq_n_f64, vdupq_n_u64,
+        vfmaq_f64, vld1q_f64, vmaxq_f64, vmaxvq_f64, vmulq_f64,
     };
 
     let n = x.len();
@@ -296,14 +296,22 @@ fn nrm2_f64_simd_safe(x: &[f64]) -> f64 {
             let x3 = vld1q_f64(ptr.add(6));
 
             // Absolute value via bit masking
-            let abs0: float64x2_t =
-                core::mem::transmute(vandq_u64(core::mem::transmute(x0), abs_mask));
-            let abs1: float64x2_t =
-                core::mem::transmute(vandq_u64(core::mem::transmute(x1), abs_mask));
-            let abs2: float64x2_t =
-                core::mem::transmute(vandq_u64(core::mem::transmute(x2), abs_mask));
-            let abs3: float64x2_t =
-                core::mem::transmute(vandq_u64(core::mem::transmute(x3), abs_mask));
+            let abs0: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
+                core::mem::transmute::<float64x2_t, uint64x2_t>(x0),
+                abs_mask,
+            ));
+            let abs1: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
+                core::mem::transmute::<float64x2_t, uint64x2_t>(x1),
+                abs_mask,
+            ));
+            let abs2: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
+                core::mem::transmute::<float64x2_t, uint64x2_t>(x2),
+                abs_mask,
+            ));
+            let abs3: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
+                core::mem::transmute::<float64x2_t, uint64x2_t>(x3),
+                abs_mask,
+            ));
 
             max_vec = vmaxq_f64(max_vec, abs0);
             max_vec = vmaxq_f64(max_vec, abs1);
@@ -396,8 +404,8 @@ fn nrm2_f64_simd_safe(x: &[f64]) -> f64 {
 #[cfg(target_arch = "aarch64")]
 fn nrm2_f32_simd_safe(x: &[f32]) -> f32 {
     use core::arch::aarch64::{
-        float32x4_t, vaddq_f32, vaddvq_f32, vandq_u32, vdupq_n_f32, vdupq_n_u32, vfmaq_f32,
-        vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32,
+        float32x4_t, uint32x4_t, vaddq_f32, vaddvq_f32, vandq_u32, vdupq_n_f32, vdupq_n_u32,
+        vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32,
     };
 
     let n = x.len();
@@ -421,14 +429,22 @@ fn nrm2_f32_simd_safe(x: &[f32]) -> f32 {
             let x3 = vld1q_f32(ptr.add(12));
 
             // Absolute value via bit masking
-            let abs0: float32x4_t =
-                core::mem::transmute(vandq_u32(core::mem::transmute(x0), abs_mask));
-            let abs1: float32x4_t =
-                core::mem::transmute(vandq_u32(core::mem::transmute(x1), abs_mask));
-            let abs2: float32x4_t =
-                core::mem::transmute(vandq_u32(core::mem::transmute(x2), abs_mask));
-            let abs3: float32x4_t =
-                core::mem::transmute(vandq_u32(core::mem::transmute(x3), abs_mask));
+            let abs0: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
+                core::mem::transmute::<float32x4_t, uint32x4_t>(x0),
+                abs_mask,
+            ));
+            let abs1: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
+                core::mem::transmute::<float32x4_t, uint32x4_t>(x1),
+                abs_mask,
+            ));
+            let abs2: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
+                core::mem::transmute::<float32x4_t, uint32x4_t>(x2),
+                abs_mask,
+            ));
+            let abs3: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
+                core::mem::transmute::<float32x4_t, uint32x4_t>(x3),
+                abs_mask,
+            ));
 
             max_vec = vmaxq_f32(max_vec, abs0);
             max_vec = vmaxq_f32(max_vec, abs1);

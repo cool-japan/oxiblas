@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A follow-on hardening pass over the 0.2.2 audit closure: soundness fixes for the
+sibling call sites the original audit's fixes missed, plus workspace hygiene
+(lint/dependency/CI policy, doctest and file-size compliance, fuzz coverage).
+No public API breaking changes; a handful of previously-`unsafe fn`-eligible
+constructors are now correctly marked `unsafe fn` (see Changed).
+
+### Fixed
+- `PackedRef::new`/`PackedMut::new` (packed.rs) and `BandedRef::new`/`BandedMut::new`
+  (banded.rs) were still safe `pub fn` over raw pointers with no validation, even
+  though the sibling `MatRef::new`/`MatMut::new` had already been hardened to
+  `unsafe fn` — safe code could construct an out-of-bounds view and read/write past
+  the backing allocation. All four are now `unsafe fn` with `# Safety` docs.
+- `wasm32.rs` SIMD `extract()`/`insert()` still reached `unreachable_unchecked()` on
+  an out-of-range lane index from safe caller code in release builds, after the
+  identical bug had been fixed for x86_64/aarch64 — ported the
+  `lane_index_out_of_range` panic helper to all six wasm32 call sites.
+- `MmapMatMut::create`'s size computation (`row_stride * ncols * size_of::<T>()`)
+  used unchecked arithmetic, so an oversized `(nrows, ncols)` could wrap to a small
+  file while the returned struct still recorded the original huge dimensions,
+  letting ordinary safe accessors write past the mapping. Now uses checked
+  arithmetic and re-validates the layout against the mapped file size.
+- The four CBLAS modules added to close the "CBLAS surface is incomplete" audit
+  finding (`hermitian.rs`, `triangular_symmetric.rs`, `complex_level2.rs`,
+  `complex_level1.rs`) shipped with zero `lda`/`ldb`/`ldc`/null-pointer validation,
+  reproducing the exact bug class `cblas/basic.rs` had already been hardened
+  against. Added a shared `cblas/validate.rs` module and wired
+  `gemv_params_valid`/`gemm_params_valid`/-family checks plus null checks into
+  every `extern "C"` entry point in the four files, no-oping (matching the
+  `xerbla`-then-return convention) on invalid input instead of indexing OOB.
+- `CscMatrix`'s `Index` impl still panicked via `expect()` on a structurally-zero
+  element after the identical `CsrMatrix` impl had been removed for the same
+  reason; removed to match.
+- `packed_len()` (`n*(n+1)/2`) and the banded `ldab*ncols` allocation-size
+  expressions were still plain, wrapping-in-release arithmetic after `mat.rs`'s
+  allocations had been routed through a checked `checked_dim_mul` helper; both now
+  use checked multiplication and panic on overflow instead of silently
+  under-allocating.
+- Matrix Market reader (`mtx.rs`) pre-allocated `Vec::with_capacity(header.nnz)`
+  directly from the untrusted size line, so a ~30-byte crafted file
+  (`3 3 18446744073709551615`) could trigger a capacity-overflow abort before any
+  data line was read. `read_header` now rejects `nnz > nrows*ncols` (coordinate
+  format, checked with `saturating_mul`) and uses checked multiplication for the
+  array-format `nrows*ncols` cell count, so malformed headers return a
+  `MtxError` instead of aborting the process.
+- 57 of 64 public-API doctests marked `` ```ignore `` (never compiled or verified)
+  across `oxiblas-core`, `oxiblas-matrix`, `oxiblas-lapack`, `oxiblas-ndarray`, and
+  `oxiblas-sparse` are now real, executed doctests with concrete inputs and
+  assertions on the results (the audit that closed this finding had only fixed 7 of
+  the 64).
+- `oxiblas-core`'s no_std test-code gating was incomplete for the x86_64 SIMD
+  modules: `simd/x86_64/functions.rs` (a `thread_local!` override plus 16
+  `is_x86_feature_detected!` call sites and a `println!`) and 4 direct-register
+  test functions in `simd/complex.rs` compiled only under `std`, but were not
+  `#[cfg(feature = "std")]`-gated — invisible to `--no-default-features` checks
+  run on an aarch64 host, since that module tree is itself
+  `#[cfg(target_arch = "x86_64")]`-gated and was never actually cross-compiled.
+  Confirmed and fixed by adding `--target x86_64-apple-darwin` to the no_std
+  verification command (see `TODO.md`); see `TODO.md` for the full file list.
+- Two pre-existing test/feature-interaction bugs surfaced by the above
+  verification pass (not caused by it): `simd::dispatch::tests::test_aarch64_neon_always_present`
+  and `simd::multiver::tests::test_aarch64_neon_always_true` both asserted NEON
+  is unconditionally present on AArch64 without accounting for `dispatch.rs`'s
+  own `limited_to()` masking, which correctly reports `has_neon = false` under
+  the `force-scalar` feature (always active under `--all-features`). Fixed by
+  checking `SimdCapabilities::simd_ceiling_bytes() >= 16` before asserting,
+  mirroring the already-correct sibling test `test_compute_respects_feature_ceiling`.
+
+### Changed
+- `PackedRef::new`, `PackedMut::new`, `BandedRef::new`, `BandedMut::new` are now
+  `unsafe fn` (see Fixed above) — existing safe call sites inside this workspace
+  were updated to `unsafe { ... }` blocks with `// SAFETY:` justifications;
+  downstream callers constructing these types directly from raw pointers will need
+  to do the same.
+- Hoisted the last four per-crate dependency version pins
+  (`oxiblas-ndarray`'s `faer`, `oxiblas-benchmarks`'s `ndarray-linalg`/`blas-src`/
+  `cblas-sys`) into `[workspace.dependencies]` so every version lives in one place.
+- `oxiblas-blas`'s crate-wide `#![allow(clippy::missing_safety_doc)]`,
+  `clippy::ptr_as_ptr`, `clippy::transmute_ptr_to_ref`, `clippy::cast_possible_wrap`,
+  `clippy::transmute_undefined_repr`, and `clippy::missing_transmute_annotations`
+  lint suppressions were removed; the 74 CBLAS entry points that were missing a
+  `# Safety` doc section now have one, and 8 NEON transmute call sites in
+  `level1/nrm2.rs` now carry explicit `transmute::<From, To>()` turbofish
+  annotations instead of relying on suppressed lints.
+- Split 4 source files that had grown past the workspace's 2000-line limit into
+  cohesive modules with the public API re-exported from the original path:
+  `oxiblas-blas/src/level2/gemv.rs`, `oxiblas-blas/src/cblas/basic.rs`,
+  `oxiblas-sparse/src/linalg/eigenvalue/tests.rs`, and
+  `oxiblas-sparse/src/linalg/eigenvalue/special.rs`.
+
+### Added
+- `rustfmt.toml`, `clippy.toml` (MSRV pinned to the workspace's `rust-version`),
+  `deny.toml` (COOLJAPAN dependency-ban list, `cargo deny check bans` clean),
+  `SECURITY.md`, and `CONTRIBUTING.md` at the workspace root.
+- `fuzz/` (an independent `cargo-fuzz` workspace, excluded from the main
+  workspace so `cargo build`/`clippy --workspace` never need a nightly
+  toolchain) with two real libFuzzer targets: `mtx_matrix_market` (the Matrix
+  Market parser) and `mmap_header` (the `.oxiblas` memory-mapped-matrix header
+  parser) — the two untrusted-input parsers in the workspace.
+
 ## [0.2.2] - 2026-07-18
 
 A production-readiness hardening release. A systematic multi-agent audit swept the

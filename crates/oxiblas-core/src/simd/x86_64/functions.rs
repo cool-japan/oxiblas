@@ -10,20 +10,38 @@ use super::types::{F32x8, F32x16, F64x4, F64x8};
 // on a SIMD-capable CI host) `else` branches are actually executed by the
 // regression tests. `thread_local` keeps the override isolated to the setting
 // thread so the parallel test runner cannot cross-contaminate.
-#[cfg(test)]
+//
+// `thread_local!` is a `std`-only macro (no `core`/`alloc` equivalent), so the
+// override itself is only available under `test + std`. It is only ever
+// *set* from tests that are themselves gated behind `feature = "std"` (they
+// also need `is_x86_feature_detected!`, which has the same std-only
+// constraint), but `force_scalar_fallback()` is *read* unconditionally from
+// `has_avx2_fma`/`has_avx512f` below under bare `#[cfg(test)]` — so a
+// `not(feature = "std")` stub must still exist and simply reports "never
+// forced", which is accurate: no no_std test can enable the override.
+#[cfg(all(test, feature = "std"))]
 thread_local! {
     static FORCE_SCALAR_FALLBACK: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 fn set_force_scalar_fallback(value: bool) {
     FORCE_SCALAR_FALLBACK.with(|flag| flag.set(value));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 #[inline]
 pub(super) fn force_scalar_fallback() -> bool {
     FORCE_SCALAR_FALLBACK.with(|flag| flag.get())
+}
+
+#[cfg(all(test, not(feature = "std")))]
+#[inline]
+pub(super) fn force_scalar_fallback() -> bool {
+    // No no_std test ever sets the override (they are all gated behind
+    // `feature = "std"` because they also need `is_x86_feature_detected!`),
+    // so "never forced" is always correct here.
+    false
 }
 
 /// True when the CPU can execute the AVX2 + FMA instructions used by the
@@ -243,9 +261,21 @@ pub(super) mod tests {
     // (e.g. `__mmask8`) and the `SimdRegister`/`SimdMask` traits live elsewhere and
     // are only needed by the tests, so import them here rather than widening the
     // production imports of `functions`.
+    //
+    // `SimdRegister` (splat/add/extract/...) is used by the always-present
+    // SSE2/SSE4.2 tests below, so it stays unconditional. `super::*` (needed
+    // only for `set_force_scalar_fallback`), `SimdMask` (only for the AVX-512
+    // `blend` test), and the raw `core::arch::x86_64` intrinsic types (only
+    // for `__mmask8`) are used exclusively by tests that require
+    // `is_x86_feature_detected!` and are therefore `std`-gated below — so
+    // these imports are too, or they'd be flagged unused on a no_std build.
     use super::super::types::*;
+    #[cfg(feature = "std")]
     use super::*;
-    use crate::simd::{SimdMask, SimdRegister};
+    #[cfg(feature = "std")]
+    use crate::simd::SimdMask;
+    use crate::simd::SimdRegister;
+    #[cfg(feature = "std")]
     use core::arch::x86_64::*;
 
     // SSE4.2 tests (always available on x86_64)
@@ -302,6 +332,16 @@ pub(super) mod tests {
     }
 
     // AVX2 tests
+    //
+    // `is_x86_feature_detected!` is a `std`-only macro (runtime CPU-feature
+    // detection needs OS support that isn't available in `core`/`alloc`), so
+    // every test below that calls it is gated behind `feature = "std"`. This
+    // does not narrow no_std coverage: the register types and their
+    // production `has_avx2_fma`-style feature gates already degrade to the
+    // compile-time `cfg!(target_feature = ...)` check under no_std (see the
+    // doc comment on `has_avx2_fma` above), so there is no runtime-detection
+    // behavior left to test without `std`.
+    #[cfg(feature = "std")]
     #[test]
     fn test_f64x4_basic() {
         if !is_x86_feature_detected!("avx2") {
@@ -326,6 +366,7 @@ pub(super) mod tests {
         assert_eq!(fma.extract(0), 7.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_f64x4_reduce() {
         if !is_x86_feature_detected!("avx2") {
@@ -343,6 +384,7 @@ pub(super) mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_f32x8_basic() {
         if !is_x86_feature_detected!("avx2") {
@@ -359,6 +401,7 @@ pub(super) mod tests {
         assert_eq!(fma.extract(0), 7.0);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_load_store() {
         if !is_x86_feature_detected!("avx2") {
@@ -377,6 +420,7 @@ pub(super) mod tests {
     }
 
     // AVX-512BW tests
+    #[cfg(feature = "std")]
     #[test]
     fn test_i16x32_fallback() {
         if !is_x86_feature_detected!("avx512bw") {
@@ -405,6 +449,7 @@ pub(super) mod tests {
         assert_eq!(abs.extract(0), 5);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_i8x64_fallback() {
         if !is_x86_feature_detected!("avx512bw") {
@@ -428,6 +473,7 @@ pub(super) mod tests {
         assert_eq!(ones.reduce_add(), 64);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_u8x64_fallback() {
         if !is_x86_feature_detected!("avx512bw") {
@@ -453,6 +499,7 @@ pub(super) mod tests {
     }
 
     // AVX-512VNNI tests
+    #[cfg(feature = "std")]
     #[test]
     fn test_i32x16_basic() {
         if !is_x86_feature_detected!("avx512f") {
@@ -470,6 +517,7 @@ pub(super) mod tests {
         assert_eq!(prod.extract(0), 6);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_vnni_dpbusd_fallback() {
         if !is_x86_feature_detected!("avx512bw") {
@@ -493,6 +541,7 @@ pub(super) mod tests {
         assert_eq!(result.extract(15), 8);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_vnni_dpwssd_fallback() {
         if !is_x86_feature_detected!("avx512bw") {
@@ -525,6 +574,10 @@ pub(super) mod tests {
         let _vl = Avx512Features::has_avx512vl();
         let _full = Avx512Features::has_full_avx512();
 
+        // `println!` needs `std`; the feature-detection calls above (the
+        // actual point of the test — confirming they don't panic) still run
+        // under no_std.
+        #[cfg(feature = "std")]
         println!(
             "AVX-512 features: BW={}, VNNI={}, DQ={}, VL={}, Full={}",
             _bw, _vnni, _dq, _vl, _full
@@ -579,6 +632,10 @@ pub(super) mod tests {
     /// scalar fallback must reproduce the *same* results for exact inputs. This
     /// actually executes the otherwise-dead fallback branches (add/mul/fma/
     /// reduce) for every feature-gated tier.
+    ///
+    /// Needs `std` for both `is_x86_feature_detected!` and the
+    /// `set_force_scalar_fallback` override (see its definition above).
+    #[cfg(feature = "std")]
     #[test]
     fn test_avx2_fallback_matches_intrinsics() {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
@@ -615,6 +672,7 @@ pub(super) mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_avx512_fallback_matches_intrinsics() {
         if !is_x86_feature_detected!("avx512f") {
@@ -660,6 +718,7 @@ pub(super) mod tests {
 
     /// #5 (and #1): the AVX-512 `blend` and masked load/store must be correct
     /// on both the intrinsic and the fallback path.
+    #[cfg(feature = "std")]
     #[test]
     fn test_avx512_mask_ops_fallback_matches() {
         if !is_x86_feature_detected!("avx512f") {
@@ -683,6 +742,7 @@ pub(super) mod tests {
     }
 
     /// FMA fused-op fallbacks must implement the right algebraic identities.
+    #[cfg(feature = "std")]
     #[test]
     fn test_avx2_fma_variants_fallback() {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {

@@ -22,6 +22,7 @@
 //! is `(n-1-i)*|inc| >= 0`). See `vec_offset`.
 
 use super::types::*;
+use super::validate::{gemv_params_valid, inc_valid, square_lda_valid};
 use crate::level2;
 use oxiblas_core::scalar::{Field, Real};
 use oxiblas_matrix::{MatMut, MatRef};
@@ -71,6 +72,35 @@ unsafe fn scatter<T: Copy>(dst: *mut T, src: &[T], n: usize, inc: isize) {
 // =============================================================================
 
 /// Double precision SYMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dsymv(
     layout: CblasLayout,
@@ -85,13 +115,51 @@ pub unsafe extern "C" fn cblas_dsymv(
     y: *mut f64,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     symv_impl(layout, uplo, n, alpha, a, lda, x, incx, beta, y, incy);
 }
 
 /// Single precision SYMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_ssymv(
     layout: CblasLayout,
@@ -106,7 +174,16 @@ pub unsafe extern "C" fn cblas_ssymv(
     y: *mut f32,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     symv_impl(layout, uplo, n, alpha, a, lda, x, incx, beta, y, incy);
@@ -150,6 +227,30 @@ unsafe fn symv_impl<T: Field>(
 // =============================================================================
 
 /// Double precision SYR.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dsyr(
     layout: CblasLayout,
@@ -161,13 +262,46 @@ pub unsafe extern "C" fn cblas_dsyr(
     a: *mut f64,
     lda: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     syr_impl(layout, uplo, n, alpha, x, incx, a, lda);
 }
 
 /// Single precision SYR.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_ssyr(
     layout: CblasLayout,
@@ -179,7 +313,16 @@ pub unsafe extern "C" fn cblas_ssyr(
     a: *mut f32,
     lda: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     syr_impl(layout, uplo, n, alpha, x, incx, a, lda);
@@ -215,6 +358,35 @@ unsafe fn syr_impl<T: Real>(
 // =============================================================================
 
 /// Double precision SYR2.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dsyr2(
     layout: CblasLayout,
@@ -228,13 +400,51 @@ pub unsafe extern "C" fn cblas_dsyr2(
     a: *mut f64,
     lda: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     syr2_impl(layout, uplo, n, alpha, x, incx, y, incy, a, lda);
 }
 
 /// Single precision SYR2.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_ssyr2(
     layout: CblasLayout,
@@ -248,7 +458,16 @@ pub unsafe extern "C" fn cblas_ssyr2(
     a: *mut f32,
     lda: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     syr2_impl(layout, uplo, n, alpha, x, incx, y, incy, a, lda);
@@ -287,6 +506,35 @@ unsafe fn syr2_impl<T: Real>(
 // =============================================================================
 
 /// Double precision GER.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dger(
     layout: CblasLayout,
@@ -300,13 +548,51 @@ pub unsafe extern "C" fn cblas_dger(
     a: *mut f64,
     lda: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     ger_impl(layout, m, n, alpha, x, incx, y, incy, a, lda);
 }
 
 /// Single precision GER.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from and written to at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_sger(
     layout: CblasLayout,
@@ -320,7 +606,16 @@ pub unsafe extern "C" fn cblas_sger(
     a: *mut f32,
     lda: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     ger_impl(layout, m, n, alpha, x, incx, y, incy, a, lda);
@@ -364,6 +659,30 @@ unsafe fn ger_impl<T: Field>(
 // =============================================================================
 
 /// Double precision TRMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dtrmv(
     layout: CblasLayout,
@@ -376,13 +695,46 @@ pub unsafe extern "C" fn cblas_dtrmv(
     x: *mut f64,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     trmv_impl(layout, uplo, trans, diag, n, a, lda, x, incx);
 }
 
 /// Single precision TRMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_strmv(
     layout: CblasLayout,
@@ -395,7 +747,16 @@ pub unsafe extern "C" fn cblas_strmv(
     x: *mut f32,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     trmv_impl(layout, uplo, trans, diag, n, a, lda, x, incx);
@@ -440,6 +801,30 @@ unsafe fn trmv_impl<T: Field>(
 // =============================================================================
 
 /// Double precision TRSV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dtrsv(
     layout: CblasLayout,
@@ -452,13 +837,46 @@ pub unsafe extern "C" fn cblas_dtrsv(
     x: *mut f64,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     trsv_impl(layout, uplo, trans, diag, n, a, lda, x, incx);
 }
 
 /// Single precision TRSV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `f32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `f32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_strsv(
     layout: CblasLayout,
@@ -471,7 +889,16 @@ pub unsafe extern "C" fn cblas_strsv(
     x: *mut f32,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a void C
+    // ABI cannot surface an error code and unwinding across it would be UB, so
+    // we no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
+    // increment would alias every logical vector element onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
+        return;
+    }
+    if a.is_null() || x.is_null() {
         return;
     }
     trsv_impl(layout, uplo, trans, diag, n, a, lda, x, incx);

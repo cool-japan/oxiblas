@@ -51,16 +51,39 @@ const fn assert_align_is_power_of_two<const ALIGN: usize>() {
 ///
 /// # Custom Allocators
 ///
-/// You can use a custom allocator by specifying the third type parameter:
+/// You can use a custom allocator by specifying the third type parameter.
+/// Any type implementing the [`Alloc`] trait works; here `MyAlloc` simply
+/// forwards to [`Global`] to keep the example self-contained:
 ///
-/// ```ignore
+/// ```
+/// use core::alloc::Layout;
 /// use oxiblas_core::memory::{AlignedVec, Alloc, Global};
 ///
 /// // Use global allocator (default)
 /// let vec: AlignedVec<f64> = AlignedVec::zeros(100);
+/// assert_eq!(vec.len(), 100);
 ///
-/// // Use custom allocator
-/// let custom_vec: AlignedVec<f64, 64, MyAlloc> = AlignedVec::zeros_in(100, MyAlloc::new());
+/// // A custom allocator only needs to implement `Alloc`.
+/// #[derive(Clone)]
+/// struct MyAlloc(Global);
+///
+/// // SAFETY: delegates every call unchanged to `Global`, which upholds the
+/// // `Alloc` trait's safety contract.
+/// unsafe impl Alloc for MyAlloc {
+///     fn allocate(&self, layout: Layout) -> *mut u8 {
+///         self.0.allocate(layout)
+///     }
+///     fn allocate_zeroed(&self, layout: Layout) -> *mut u8 {
+///         self.0.allocate_zeroed(layout)
+///     }
+///     unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+///         unsafe { self.0.deallocate(ptr, layout) }
+///     }
+/// }
+///
+/// let custom_vec: AlignedVec<f64, 64, MyAlloc> =
+///     AlignedVec::zeros_in(100, MyAlloc(Global));
+/// assert_eq!(custom_vec.len(), 100);
 /// ```
 pub struct AlignedVec<T, const ALIGN: usize = DEFAULT_ALIGN, A: Alloc = Global> {
     ptr: NonNull<T>,

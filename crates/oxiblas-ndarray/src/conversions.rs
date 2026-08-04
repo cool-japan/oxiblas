@@ -319,7 +319,12 @@ pub fn array_view_mutd_to_mat_mut<'a, T: Field>(
     if strides[0] == 1 {
         let col_stride = non_negative_stride(strides[1])?;
         let ptr = arr.as_mut_ptr();
-        Some(MatMut::new(ptr, nrows, ncols, col_stride))
+        // SAFETY: `strides[0] == 1` and `col_stride` is the (non-negative)
+        // column stride of a live `ArrayViewMut`, so ndarray guarantees every
+        // `(i, j)` with `i < nrows`, `j < ncols` maps to a distinct,
+        // initialized, aligned element inside the array's allocation; the
+        // exclusive borrow keeps it alive and unaliased for `'a`.
+        Some(unsafe { MatMut::new(ptr, nrows, ncols, col_stride) })
     } else {
         None
     }
@@ -408,7 +413,12 @@ pub fn array_view_mut_to_mat_mut<'a, T: Field>(
     if strides[0] == 1 {
         let col_stride = non_negative_stride(strides[1])?;
         let ptr = arr.as_mut_ptr();
-        Some(MatMut::new(ptr, nrows, ncols, col_stride))
+        // SAFETY: `strides[0] == 1` and `col_stride` is the (non-negative)
+        // column stride of a live `ArrayViewMut`, so ndarray guarantees every
+        // `(i, j)` with `i < nrows`, `j < ncols` maps to a distinct,
+        // initialized, aligned element inside the array's allocation; the
+        // exclusive borrow keeps it alive and unaliased for `'a`.
+        Some(unsafe { MatMut::new(ptr, nrows, ncols, col_stride) })
     } else {
         None
     }

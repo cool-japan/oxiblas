@@ -11,7 +11,8 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "parallel")] {
 //! use oxiblas_lapack::svd::ParallelSvdDc;
 //! use oxiblas_matrix::Mat;
 //!
@@ -23,6 +24,9 @@
 //!
 //! let svd = ParallelSvdDc::compute(a.as_ref()).unwrap();
 //! let sigma = svd.singular_values();
+//! assert_eq!(sigma.len(), 2);
+//! assert!(sigma[0] >= sigma[1]); // sorted in descending order
+//! # }
 //! ```
 
 use oxiblas_core::scalar::{Field, Real, Scalar};
@@ -88,7 +92,8 @@ impl<T: Field + Real + bytemuck::Zeroable + Send + Sync> ParallelSvdDc<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # #[cfg(feature = "parallel")] {
     /// use oxiblas_lapack::svd::ParallelSvdDc;
     /// use oxiblas_matrix::Mat;
     ///
@@ -98,6 +103,8 @@ impl<T: Field + Real + bytemuck::Zeroable + Send + Sync> ParallelSvdDc<T> {
     /// ]);
     ///
     /// let svd = ParallelSvdDc::compute(a.as_ref()).unwrap();
+    /// assert_eq!(svd.singular_values(), &[4.0, 3.0]);
+    /// # }
     /// ```
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, ParallelSvdError> {
         let m = a.nrows();

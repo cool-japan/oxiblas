@@ -429,9 +429,24 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> IC0<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let ic0 = IC0::new(&a)?;
-    /// let x = ic0.apply(&b);  // Preconditioner application
+    /// ```
+    /// use oxiblas_sparse::csr::CsrMatrix;
+    /// use oxiblas_sparse::linalg::cholesky::IC0;
+    ///
+    /// // Symmetric positive definite tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+    /// let a = CsrMatrix::new(
+    ///     3,
+    ///     3,
+    ///     vec![0, 2, 5, 7],
+    ///     vec![0, 1, 0, 1, 2, 1, 2],
+    ///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+    /// )
+    /// .unwrap();
+    ///
+    /// let ic0 = IC0::new(&a).unwrap();
+    /// let b = vec![1.0, 1.0, 1.0];
+    /// let x = ic0.apply(&b); // Preconditioner application
+    /// assert_eq!(x.len(), 3);
     /// ```
     pub fn new(a: &CsrMatrix<T>) -> Result<Self, SparseCholError> {
         if a.nrows() != a.ncols() {

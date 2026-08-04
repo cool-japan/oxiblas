@@ -14,6 +14,7 @@
 //! conjugated result. That is exactly the row-major mapping used below.
 
 use super::types::*;
+use super::validate::{gemv_params_valid, inc_valid, square_lda_valid};
 use crate::level2;
 use num_complex::{Complex, Complex32, Complex64};
 use num_traits::Float;
@@ -51,6 +52,39 @@ unsafe fn gather_c<F: Float>(
 // =============================================================================
 
 /// Complex single precision GEMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `a` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_cgemv(
     layout: CblasLayout,
@@ -66,7 +100,19 @@ pub unsafe extern "C" fn cblas_cgemv(
     y: *mut Complex32,
     incy: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
+    // increment would likewise alias every element of `x`/`y` onto element 0.
+    if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     gemv_c(
@@ -86,6 +132,39 @@ pub unsafe extern "C" fn cblas_cgemv(
 }
 
 /// Complex double precision GEMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `a` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zgemv(
     layout: CblasLayout,
@@ -101,7 +180,19 @@ pub unsafe extern "C" fn cblas_zgemv(
     y: *mut Complex64,
     incy: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
+    // increment would likewise alias every element of `x`/`y` onto element 0.
+    if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     gemv_c(
@@ -178,6 +269,39 @@ unsafe fn gemv_c<F: Float>(
 // =============================================================================
 
 /// Complex single precision HEMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `a` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_chemv(
     layout: CblasLayout,
@@ -192,7 +316,19 @@ pub unsafe extern "C" fn cblas_chemv(
     y: *mut Complex32,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
+    // increment would likewise alias every element of `x`/`y` onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     hemv_c(
@@ -211,6 +347,39 @@ pub unsafe extern "C" fn cblas_chemv(
 }
 
 /// Complex double precision HEMV.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `a` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zhemv(
     layout: CblasLayout,
@@ -225,7 +394,19 @@ pub unsafe extern "C" fn cblas_zhemv(
     y: *mut Complex64,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
+    // increment would likewise alias every element of `x`/`y` onto element 0.
+    if n <= 0 || !square_lda_valid(n, lda) {
+        return;
+    }
+    if !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || x.is_null() || y.is_null() {
         return;
     }
     hemv_c(

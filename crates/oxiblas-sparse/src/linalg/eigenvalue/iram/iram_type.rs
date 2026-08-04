@@ -24,24 +24,32 @@ use super::types::IRAMConfig;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{IRAM, IRAMConfig, WhichEigenvalues};
 ///
-/// // Create a large sparse matrix
-/// let a = CsrMatrix::<f64>::eye(1000);
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+/// let a = CsrMatrix::<f64>::new(
+///     10,
+///     10,
+///     (0..=10).collect(),
+///     (0..10).collect(),
+///     (1..=10).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = IRAMConfig {
-///     num_eigenvalues: 10,
+///     num_eigenvalues: 2,
 ///     which: WhichEigenvalues::LargestMagnitude,
-///     krylov_dimension: 30,  // ncv = 30 > nev = 10
-///     symmetric: true,  // More efficient for symmetric matrices
+///     krylov_dimension: 8, // ncv = 8 > nev = 2
+///     symmetric: true,     // More efficient for symmetric matrices
 ///     ..Default::default()
 /// };
 ///
 /// let iram = IRAM::new(config);
 /// let result = iram.compute(&a, None).unwrap();
 /// println!("Converged: {}, eigenvalues: {:?}", result.converged, result.eigenvalues_real);
+/// assert_eq!(result.eigenvalues_real.len(), 2);
 /// ```
 pub struct IRAM<T> {
     pub(super) config: IRAMConfig<T>,

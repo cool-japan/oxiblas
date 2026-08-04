@@ -1053,6 +1053,11 @@ pub fn complex32_scale_real(a: &[Complex32], scalar: f32, out: &mut [Complex32])
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
@@ -1262,7 +1267,9 @@ mod tests {
     fn test_complex_simd_path_is_taken() {
         let level = detect_simd_level();
         let backend = complex_simd_backend();
+        #[cfg(feature = "std")]
         println!("detect_simd_level() = {level:?}, complex_simd_backend() = {backend:?}");
+        let _ = (&level, &backend);
 
         #[cfg(all(not(feature = "force-scalar"), not(feature = "max-simd-128")))]
         {
@@ -1390,7 +1397,11 @@ mod tests {
     // detection so they never execute an unsupported instruction.
     // -------------------------------------------------------------------------
 
-    #[cfg(target_arch = "x86_64")]
+    // `is_x86_feature_detected!`/`eprintln!` below are `std`-only, so these
+    // direct register-type exercises additionally require `feature = "std"`
+    // (the batch/scalar-vs-SIMD tests above already cover the no_std-safe
+    // dispatch path via `complex_simd_backend()`).
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn test_x86_c64x2_avx2_vs_scalar() {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
@@ -1442,7 +1453,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn test_x86_c32x4_avx2_vs_scalar() {
         if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
@@ -1480,7 +1491,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn test_x86_c64x4_avx512_vs_scalar() {
         if !is_x86_feature_detected!("avx512f") {
@@ -1532,7 +1543,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn test_x86_c32x8_avx512_vs_scalar() {
         if !is_x86_feature_detected!("avx512f") {

@@ -26,14 +26,27 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! use oxiblas_sparse::csr::CsrMatrix;
 //! use oxiblas_sparse::mtx::{read_matrix_market, write_matrix_market};
 //!
-//! // Read a matrix from file
-//! let csr = read_matrix_market::<f64>("matrix.mtx")?;
+//! // Never hardcode a path: build one from the OS temp directory plus a
+//! // name unique to this process.
+//! let path = std::env::temp_dir().join(format!("oxiblas-doctest-{}.mtx", std::process::id()));
+//!
+//! let original =
+//!     CsrMatrix::<f64>::new(2, 2, vec![0, 1, 2], vec![0, 1], vec![1.0, 2.0]).unwrap();
 //!
 //! // Write a matrix to file
-//! write_matrix_market(&csr, "output.mtx", "My matrix")?;
+//! write_matrix_market(&original, &path, Some("My matrix"))?;
+//!
+//! // Read it back
+//! let csr = read_matrix_market::<f64, _>(&path)?;
+//! assert_eq!(csr.nrows(), 2);
+//! assert_eq!(csr.nnz(), 2);
+//!
+//! std::fs::remove_file(&path)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use crate::coo::CooMatrix;
@@ -42,6 +55,20 @@ use num_traits::ToPrimitive;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+
+/// Upper bound on how many entries a reader will pre-allocate from the
+/// **untrusted** `nnz` field of a Matrix Market size line.
+///
+/// The size line is the first thing in the file and is not cross-checkable
+/// against anything until the data lines have been read, so a ~30-byte file can
+/// claim `usize::MAX` non-zeros. Reserving that claim verbatim turns the claim
+/// into an immediate allocation failure (process abort), which is a
+/// denial-of-service reachable from the public `read_matrix_market` API. Files
+/// with more entries than this still load correctly — the vectors just grow.
+///
+/// 1 Mi entries is roughly 8 MiB per index vector on a 64-bit target, which
+/// covers the overwhelming majority of SuiteSparse matrices in one shot.
+const MAX_PREALLOC_ENTRIES: usize = 1 << 20;
 
 /// Error type for Matrix Market operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +309,20 @@ pub fn read_header<R: BufRead>(reader: &mut R) -> Result<MtxHeader, MtxError> {
             let nnz = size_parts[2]
                 .parse::<usize>()
                 .map_err(|_| MtxError::ParseError("Invalid nnz".to_string()))?;
+            // A coordinate matrix cannot declare more stored entries than it
+            // has cells. Rejecting here stops a hand-crafted ~30-byte file
+            // (`3 3 18446744073709551615`) from driving downstream
+            // reservations, and it is the header field callers trust most.
+            // `saturating_mul` is deliberate: if `nrows * ncols` overflows
+            // `usize` the true bound is above any representable `nnz`, so the
+            // saturated value is still a sound upper bound.
+            let max_nnz = nrows.saturating_mul(ncols);
+            if nnz > max_nnz {
+                return Err(MtxError::InvalidData(format!(
+                    "nnz ({nnz}) exceeds the number of cells in a {nrows}x{ncols} \
+                     matrix ({max_nnz})"
+                )));
+            }
             (nrows, ncols, nnz)
         }
         MtxFormat::Array => {
@@ -296,7 +337,14 @@ pub fn read_header<R: BufRead>(reader: &mut R) -> Result<MtxHeader, MtxError> {
             let ncols = size_parts[1]
                 .parse::<usize>()
                 .map_err(|_| MtxError::ParseError("Invalid ncols".to_string()))?;
-            (nrows, ncols, nrows * ncols)
+            // Array (dense) format has one entry per cell. `nrows` and `ncols`
+            // come straight out of an untrusted file, so a plain `*` would
+            // panic in debug and silently wrap to a bogus `nnz` (e.g. 0) in
+            // release for a size line such as `4294967296 4294967296`.
+            let nnz = nrows.checked_mul(ncols).ok_or_else(|| {
+                MtxError::InvalidData(format!("array dimensions overflow usize: {nrows}x{ncols}"))
+            })?;
+            (nrows, ncols, nnz)
         }
     };
 
@@ -351,10 +399,17 @@ pub fn read_matrix_market_from_reader<T: Scalar<Real = T> + Clone + Field + Real
         ));
     }
 
-    // Read data entries
-    let mut rows = Vec::with_capacity(header.nnz);
-    let mut cols = Vec::with_capacity(header.nnz);
-    let mut vals = Vec::with_capacity(header.nnz);
+    // Read data entries.
+    //
+    // `header.nnz` is attacker-controlled: it is whatever the file's size line
+    // claimed. Reserving it outright lets a tiny file request an astronomical
+    // allocation and abort the process before a single data line is read, so
+    // the reservation is capped at `MAX_PREALLOC_ENTRIES`. Honest files simply
+    // let the `Vec`s grow; the cap only costs a few reallocations.
+    let prealloc = header.nnz.min(MAX_PREALLOC_ENTRIES);
+    let mut rows = Vec::with_capacity(prealloc);
+    let mut cols = Vec::with_capacity(prealloc);
+    let mut vals = Vec::with_capacity(prealloc);
 
     for line_result in reader.lines() {
         let line = line_result.map_err(|e| MtxError::IoError(e.to_string()))?;
@@ -717,5 +772,65 @@ mod tests {
 
         let result: Result<CsrMatrix<f64>, _> = read_matrix_market_str(mtx);
         assert!(result.is_err());
+    }
+
+    // --- Regression: untrusted header fields must not drive allocations -----
+
+    #[test]
+    fn test_absurd_nnz_is_rejected_not_preallocated() {
+        // A ~40-byte file claiming usize::MAX non-zeros used to reach three
+        // `Vec::with_capacity(usize::MAX)` calls before a single data line was
+        // read -> allocation failure -> process abort (a DoS reachable through
+        // the public `read_matrix_market` API).
+        let mtx = "%%MatrixMarket matrix coordinate real general\n3 3 18446744073709551615\n";
+
+        let result: Result<CsrMatrix<f64>, _> = read_matrix_market_str(mtx);
+        match result {
+            Err(MtxError::InvalidData(msg)) => assert!(msg.contains("nnz")),
+            Err(other) => panic!("expected InvalidData about nnz, got {other:?}"),
+            Ok(_) => panic!("a 3x3 matrix claiming 2^64-1 non-zeros was accepted"),
+        }
+    }
+
+    #[test]
+    fn test_nnz_above_cell_count_is_rejected() {
+        let mtx = "%%MatrixMarket matrix coordinate real general\n2 2 5\n";
+        let result: Result<CsrMatrix<f64>, _> = read_matrix_market_str(mtx);
+        assert!(matches!(result, Err(MtxError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_large_but_legal_nnz_still_parses() {
+        // The reservation cap must not change observable behavior: a header
+        // claiming far more entries than the file actually contains still
+        // parses the entries that are present.
+        let mtx = "%%MatrixMarket matrix coordinate real general\n3 3 9\n1 1 1.0\n2 2 2.0\n";
+        let csr: CsrMatrix<f64> = read_matrix_market_str(mtx).expect("valid file");
+        assert_eq!(csr.nnz(), 2);
+        assert_eq!(csr.get(0, 0), Some(&1.0));
+        assert_eq!(csr.get(1, 1), Some(&2.0));
+    }
+
+    #[test]
+    fn test_array_header_dimension_overflow_is_rejected() {
+        // `read_header` is public API. Its Array branch computed `nrows * ncols`
+        // with plain multiplication on two untrusted values: a debug-build panic
+        // and a silent wrap to a bogus `nnz` in release.
+        let mtx = "%%MatrixMarket matrix array real general\n4294967296 4294967296\n";
+        let mut reader = std::io::Cursor::new(mtx.as_bytes());
+
+        match read_header(&mut reader) {
+            Err(MtxError::InvalidData(msg)) => assert!(msg.contains("overflow")),
+            Err(other) => panic!("expected InvalidData about overflow, got {other:?}"),
+            Ok(h) => panic!("overflowing array dimensions accepted: nnz={}", h.nnz),
+        }
+    }
+
+    #[test]
+    fn test_array_header_sane_dimensions_still_parse() {
+        let mtx = "%%MatrixMarket matrix array real general\n4 5\n";
+        let mut reader = std::io::Cursor::new(mtx.as_bytes());
+        let header = read_header(&mut reader).expect("sane array header");
+        assert_eq!((header.nrows, header.ncols, header.nnz), (4, 5, 20));
     }
 }

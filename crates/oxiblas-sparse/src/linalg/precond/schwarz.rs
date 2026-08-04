@@ -89,12 +89,24 @@ struct Subdomain<T: Scalar> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::{AdditiveSchwarz, AdditiveSchwarzConfig};
 ///
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let config = AdditiveSchwarzConfig::default();
-/// let schwarz = AdditiveSchwarz::new(&matrix, config)?;
-/// let mut z = vec![0.0; n];
+/// let schwarz = AdditiveSchwarz::new(&matrix, config).unwrap();
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// schwarz.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]

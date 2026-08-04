@@ -516,7 +516,9 @@ pub fn gemm_strided_batched<T: Field + GemmKernel + bytemuck::Zeroable>(
         // within its slice's bounds for the duration of this borrow.
         let a_ref = unsafe { MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda) };
         let b_ref = unsafe { MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb) };
-        let mut c_mut = MatMut::new(c[c_offset..].as_mut_ptr(), m, n, ldc);
+        // SAFETY: as above; the validated `stride_c`/`ldc` keep the `m x n`
+        // view inside `c[c_offset..]` and the batch slots are disjoint.
+        let mut c_mut = unsafe { MatMut::new(c[c_offset..].as_mut_ptr(), m, n, ldc) };
 
         execute_single_gemm(trans_a, trans_b, alpha, &a_ref, &b_ref, beta, &mut c_mut);
     }

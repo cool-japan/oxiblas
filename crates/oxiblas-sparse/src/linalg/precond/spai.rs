@@ -44,12 +44,24 @@ impl Default for SPAIConfig {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::{SPAI, SPAIConfig};
 ///
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let config = SPAIConfig::default();
-/// let spai = SPAI::new(&matrix, config)?;
-/// let mut z = vec![0.0; n];
+/// let spai = SPAI::new(&matrix, config).unwrap();
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// spai.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]

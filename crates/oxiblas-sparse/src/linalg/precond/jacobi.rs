@@ -13,12 +13,26 @@ use oxiblas_core::scalar::{Field, Scalar};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::Jacobi;
 ///
-/// let jacobi = Jacobi::new(&matrix)?;
-/// let mut z = vec![0.0; n];
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::<f64>::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
+/// let jacobi = Jacobi::new(&matrix).unwrap();
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// jacobi.apply(&r, &mut z);
+/// // z_i = r_i / a_ii = 1.0 / 4.0
+/// assert!(z.iter().all(|&v| (v - 0.25).abs() < 1e-12));
 /// ```
 #[derive(Debug, Clone)]
 pub struct Jacobi<T: Scalar> {
@@ -116,12 +130,24 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Jacobi<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::BlockJacobi;
 ///
-/// let block_sizes = vec![10, 10, 10]; // Three blocks of size 10
-/// let block_jacobi = BlockJacobi::new(&matrix, &block_sizes)?;
-/// let mut z = vec![0.0; n];
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
+/// let block_sizes = vec![2, 1]; // One 2x2 block, one 1x1 block (sums to n=3)
+/// let block_jacobi = BlockJacobi::new(&matrix, &block_sizes).unwrap();
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// block_jacobi.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]

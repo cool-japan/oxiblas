@@ -1019,16 +1019,20 @@ mod tests {
     fn test_sve_support_detection() {
         // Test that SVE detection doesn't panic
         let is_available = SveSupport::is_available();
+        #[cfg(feature = "std")]
         let is_sve2 = SveSupport::is_sve2_available();
         let vlen_bits = SveSupport::vector_length_bits();
         let vlen_bytes = SveSupport::vector_length_bytes();
         let f64_lanes = SveSupport::f64_lanes();
         let f32_lanes = SveSupport::f32_lanes();
 
-        println!("SVE available: {}", is_available);
-        println!("SVE2 available: {}", is_sve2);
-        println!("Vector length: {} bits / {} bytes", vlen_bits, vlen_bytes);
-        println!("f64 lanes: {}, f32 lanes: {}", f64_lanes, f32_lanes);
+        #[cfg(feature = "std")]
+        {
+            println!("SVE available: {}", is_available);
+            println!("SVE2 available: {}", is_sve2);
+            println!("Vector length: {} bits / {} bytes", vlen_bits, vlen_bytes);
+            println!("f64 lanes: {}, f32 lanes: {}", f64_lanes, f32_lanes);
+        }
 
         // If SVE is not available, all values should be 0
         if !is_available {

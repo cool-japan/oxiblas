@@ -285,10 +285,24 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> LuFrontalMatrix<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csc::CscMatrix;
 /// use oxiblas_sparse::linalg::MultifrontalLU;
+///
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let a = CscMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let lu = MultifrontalLU::new(&a)?;
-/// let x = lu.solve(&b);
+/// let x = lu.solve(&[1.0, 1.0, 1.0]);
+/// assert_eq!(x.len(), 3);
+/// # Ok::<(), oxiblas_sparse::linalg::MultifrontalError>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct MultifrontalLU<T: Scalar> {

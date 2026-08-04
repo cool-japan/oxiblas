@@ -12,7 +12,8 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "parallel")] {
 //! use oxiblas_lapack::evd::ParallelSymmetricEvd;
 //! use oxiblas_matrix::Mat;
 //!
@@ -24,6 +25,11 @@
 //!
 //! let evd = ParallelSymmetricEvd::compute(a.as_ref()).unwrap();
 //! let eigenvalues = evd.eigenvalues();
+//! assert_eq!(eigenvalues.len(), 3);
+//! // The trace equals the sum of the eigenvalues for any square matrix.
+//! let trace = a[(0, 0)] + a[(1, 1)] + a[(2, 2)];
+//! assert!((eigenvalues.iter().sum::<f64>() - trace).abs() < 1e-9);
+//! # }
 //! ```
 
 use oxiblas_core::scalar::{Field, Real, Scalar};
@@ -101,7 +107,8 @@ impl<T: Field + Real + bytemuck::Zeroable + Send + Sync> ParallelSymmetricEvd<T>
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
+    /// # #[cfg(feature = "parallel")] {
     /// use oxiblas_lapack::evd::ParallelSymmetricEvd;
     /// use oxiblas_matrix::Mat;
     ///
@@ -111,6 +118,12 @@ impl<T: Field + Real + bytemuck::Zeroable + Send + Sync> ParallelSymmetricEvd<T>
     /// ]);
     ///
     /// let evd = ParallelSymmetricEvd::compute(a.as_ref()).unwrap();
+    /// // [[2,1],[1,2]] has eigenvalues 1 and 3 (trace 4, det 3).
+    /// let mut eigenvalues = evd.eigenvalues().to_vec();
+    /// eigenvalues.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    /// assert!((eigenvalues[0] - 1.0).abs() < 1e-9);
+    /// assert!((eigenvalues[1] - 3.0).abs() < 1e-9);
+    /// # }
     /// ```
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, ParallelEvdError> {
         let n = a.nrows();

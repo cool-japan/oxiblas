@@ -302,12 +302,19 @@ impl<T: Scalar> CowMat<T> {
         // Safety: We just ensured we're the only owner
         let inner = Arc::get_mut(&mut self.inner).expect("Should be unique after clone");
 
-        MatMut::new(
-            inner.data.as_mut_ptr(),
-            inner.nrows,
-            inner.ncols,
-            inner.row_stride,
-        )
+        // SAFETY: `inner.data` holds `row_stride * ncols` initialized, aligned
+        // elements and `row_stride >= nrows`, so every in-bounds `(i, j)`
+        // offset is within the allocation and no two indices alias; the
+        // `Arc::get_mut` above proves this handle is unique, and `&mut self`
+        // keeps it alive and exclusive for the view's lifetime.
+        unsafe {
+            MatMut::new(
+                inner.data.as_mut_ptr(),
+                inner.nrows,
+                inner.ncols,
+                inner.row_stride,
+            )
+        }
     }
 
     /// Sets an element, cloning if the data is shared.

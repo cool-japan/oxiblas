@@ -38,12 +38,20 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use oxiblas_matrix::prefetch::{prefetch_read, PrefetchLocality, PREFETCH_DISTANCE_LINES};
+//! ```
+//! use oxiblas_matrix::prefetch::{PREFETCH_DISTANCE_LINES, PrefetchLocality, prefetch_read};
 //!
-//! // Prefetch data for upcoming reads
+//! let data = vec![0.0f64; 1024];
+//! let n = data.len();
+//!
+//! // Prefetch data for upcoming reads. `prefetch_read` takes a raw pointer
+//! // (not a bounds-checked reference) precisely so the lookahead offset can
+//! // run past the end of `data` near the tail of the loop without panicking
+//! // — a prefetch is a hint the CPU is free to discard, so an address that
+//! // ends up out of bounds (or even unmapped) is harmless.
 //! for i in (0..n).step_by(64 / size_of::<f64>()) {
-//!     prefetch_read(&data[i + PREFETCH_DISTANCE_LINES], PrefetchLocality::Medium);
+//!     let ptr = data.as_ptr().wrapping_add(i + PREFETCH_DISTANCE_LINES);
+//!     prefetch_read(ptr, PrefetchLocality::Medium);
 //! }
 //! ```
 
@@ -126,7 +134,11 @@ pub fn prefetch_column<T>(
         // Strided access wider than a cache line: every row needs its own
         // prefetch (see `strided_prefetch_row_indices`).
         for row in strided_prefetch_row_indices(nrows) {
-            let addr = unsafe { ptr.add(row * row_stride) };
+            // `wrapping_add`, not `add`: this is a *safe* function taking a raw
+            // pointer, so `nrows`/`row_stride` may not describe the real
+            // allocation, and merely *forming* an out-of-range pointer with
+            // `add` is UB. A prefetch hint never dereferences the address.
+            let addr = ptr.wrapping_add(row.wrapping_mul(row_stride));
             prefetch_read(addr, locality);
         }
     }
@@ -147,7 +159,8 @@ pub fn prefetch_block<T>(
     locality: PrefetchLocality,
 ) {
     for j in 0..block_cols {
-        let col_ptr = unsafe { ptr.add(j * row_stride) };
+        // `wrapping_add`: see `prefetch_column`.
+        let col_ptr = ptr.wrapping_add(j.wrapping_mul(row_stride));
         prefetch_column(col_ptr, block_rows, 1, locality);
     }
 }
@@ -204,9 +217,11 @@ impl<T> MatrixPrefetcher<T> {
             locality,
         };
 
-        // Prefetch initial columns
+        // Prefetch initial columns.
+        // `wrapping_add`: see `prefetch_column` — this is a safe constructor
+        // over a raw pointer, so the offsets are not guaranteed in-bounds.
         for j in 0..distance.min(ncols) {
-            let col_ptr = unsafe { ptr.add(j * row_stride) };
+            let col_ptr = ptr.wrapping_add(j.wrapping_mul(row_stride));
             prefetch_column(col_ptr, nrows, 1, locality);
         }
 
@@ -220,9 +235,12 @@ impl<T> MatrixPrefetcher<T> {
     pub fn advance(&mut self) {
         self.current_col += 1;
 
-        let prefetch_col = self.current_col + self.distance;
+        let prefetch_col = self.current_col.saturating_add(self.distance);
         if prefetch_col < self.ncols {
-            let col_ptr = unsafe { self.ptr.add(prefetch_col * self.row_stride) };
+            // `wrapping_add`: see `prefetch_column`.
+            let col_ptr = self
+                .ptr
+                .wrapping_add(prefetch_col.wrapping_mul(self.row_stride));
             prefetch_column(col_ptr, self.nrows, 1, self.locality);
         }
     }

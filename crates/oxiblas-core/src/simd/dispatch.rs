@@ -312,7 +312,13 @@ impl SimdCapabilities {
     /// function is warning-clean under **any** feature combination — including
     /// `cargo …​ --all-features`, where all three mutually-exclusive limiter
     /// features are enabled simultaneously and `force-scalar` must win.
-    fn simd_ceiling_bytes() -> usize {
+    ///
+    /// `pub(crate)` (rather than private) so sibling modules that mirror
+    /// [`SimdCapabilities`] (e.g. `multiver::SimdCapabilityInfo`) can ask the
+    /// same single source of truth whether a given capability is currently
+    /// being masked, instead of re-deriving the threshold themselves and
+    /// risking drift from this function's precedence rules.
+    pub(crate) fn simd_ceiling_bytes() -> usize {
         if cfg!(feature = "force-scalar") {
             0
         } else if cfg!(feature = "max-simd-128") {
@@ -603,17 +609,26 @@ pub fn has_neon() -> bool {
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use oxiblas_core::simd::dispatch::{simd_caps, simd_dispatch};
+/// ```
+/// use oxiblas_core::simd::dispatch::simd_caps;
+/// use oxiblas_core::simd_dispatch;
+///
+/// let a = [1.0f64, 2.0, 3.0];
+/// let b = [4.0f64, 5.0, 6.0];
+/// // A real crate would give each branch its own SIMD kernel; this example
+/// // shares one so the result is identical no matter which branch the
+/// // *host running it* actually dispatches to.
+/// let dot = |x: &[f64], y: &[f64]| -> f64 { x.iter().zip(y).map(|(p, q)| p * q).sum() };
 ///
 /// let result = simd_dispatch!(
 ///     simd_caps(),
-///     avx512  => compute_avx512(&a, &b),
-///     avx2    => compute_avx2(&a, &b),
-///     sse42   => compute_sse42(&a, &b),
-///     neon    => compute_neon(&a, &b),
-///     scalar  => compute_scalar(&a, &b),
+///     avx512  => dot(&a, &b),
+///     avx2    => dot(&a, &b),
+///     sse42   => dot(&a, &b),
+///     neon    => dot(&a, &b),
+///     scalar  => dot(&a, &b),
 /// );
+/// assert_eq!(result, 32.0);
 /// ```
 #[macro_export]
 macro_rules! simd_dispatch {
@@ -655,18 +670,29 @@ pub use simd_dispatch;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```
+/// use oxiblas_core::simd::dispatch::SimdDispatcher;
+///
 /// struct DotProductF64<'a> {
 ///     x: &'a [f64],
 ///     y: &'a [f64],
 /// }
 ///
+/// impl DotProductF64<'_> {
+///     // A real crate would give each variant its own SIMD kernel; this
+///     // example shares one implementation so the doctest gives the same
+///     // answer no matter which branch the *host running it* dispatches to.
+///     fn scalar_dot(&self) -> f64 {
+///         self.x.iter().zip(self.y).map(|(a, b)| a * b).sum()
+///     }
+/// }
+///
 /// impl SimdDispatcher for DotProductF64<'_> {
 ///     type Output = f64;
-///     fn dispatch_avx512(&self) -> f64 { /* AVX-512 kernel */ unimplemented!() }
-///     fn dispatch_avx2(&self)   -> f64 { /* AVX2+FMA kernel */ unimplemented!() }
-///     fn dispatch_neon(&self)   -> f64 { /* NEON kernel */ unimplemented!() }
-///     fn dispatch_scalar(&self) -> f64 { self.x.iter().zip(self.y).map(|(a,b)| a*b).sum() }
+///     fn dispatch_avx512(&self) -> f64 { self.scalar_dot() /* AVX-512 kernel */ }
+///     fn dispatch_avx2(&self)   -> f64 { self.scalar_dot() /* AVX2+FMA kernel */ }
+///     fn dispatch_neon(&self)   -> f64 { self.scalar_dot() /* NEON kernel */ }
+///     fn dispatch_scalar(&self) -> f64 { self.scalar_dot() }
 /// }
 ///
 /// let result = DotProductF64 { x: &[1.0, 2.0], y: &[3.0, 4.0] }.dispatch();
@@ -892,7 +918,17 @@ mod tests {
     #[test]
     fn test_aarch64_neon_always_present() {
         let caps = SimdCapabilities::detect();
-        assert!(caps.has_neon, "NEON is mandatory on AArch64");
+        // NEON is architecturally mandatory on AArch64 -- but `limited_to()`
+        // (see Finding 1 below) legitimately masks the *reported* capability
+        // to scalar-only when the `force-scalar` ceiling is active (ceiling
+        // bytes < 16), which happens whenever this test runs under
+        // `--all-features` since force-scalar wins the ceiling precedence.
+        // Mirror `test_compute_respects_feature_ceiling`'s runtime-ceiling
+        // check rather than hardcoding a `force-scalar` cfg predicate here,
+        // so this stays correct if the masking thresholds ever change.
+        if SimdCapabilities::simd_ceiling_bytes() >= 16 {
+            assert!(caps.has_neon, "NEON is mandatory on AArch64");
+        }
         // x86-64 flags must be absent
         assert!(!caps.has_avx2);
         assert!(!caps.has_avx512f);

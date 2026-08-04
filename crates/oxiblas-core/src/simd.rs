@@ -439,11 +439,17 @@ impl SimdChunks {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
     fn test_detect_simd_level() {
         let level = detect_simd_level();
+        #[cfg(feature = "std")]
         println!("Detected SIMD level: {:?}", level);
 
         // When force-scalar is enabled, should always be Scalar
@@ -481,6 +487,7 @@ mod tests {
         let ptr = data.as_ptr();
 
         let chunks = SimdChunks::new(ptr, 100, SimdLevel::Simd256);
+        #[cfg(feature = "std")]
         println!(
             "Chunks: head_end={}, body_end={}",
             chunks.head_end, chunks.body_end

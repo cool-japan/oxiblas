@@ -1131,11 +1131,11 @@ mod tests {
         assert_eq!(b, 4);
 
         // Test for_each
-        let sum = std::sync::atomic::AtomicUsize::new(0);
+        let sum = core::sync::atomic::AtomicUsize::new(0);
         pool.for_each(0..10, |i| {
-            sum.fetch_add(i, std::sync::atomic::Ordering::SeqCst);
+            sum.fetch_add(i, core::sync::atomic::Ordering::SeqCst);
         });
-        assert_eq!(sum.load(std::sync::atomic::Ordering::SeqCst), 45);
+        assert_eq!(sum.load(core::sync::atomic::Ordering::SeqCst), 45);
 
         // Test map_reduce
         let result = pool.map_reduce(0..10, 0, |i| i, |a, b| a + b);
@@ -1154,11 +1154,11 @@ mod tests {
         assert_eq!(result, (0..100).sum::<usize>());
 
         // Test for_each
-        let sum = std::sync::atomic::AtomicUsize::new(0);
+        let sum = core::sync::atomic::AtomicUsize::new(0);
         scope.for_each(10, |i| {
-            sum.fetch_add(i, std::sync::atomic::Ordering::SeqCst);
+            sum.fetch_add(i, core::sync::atomic::Ordering::SeqCst);
         });
-        assert_eq!(sum.load(std::sync::atomic::Ordering::SeqCst), 45);
+        assert_eq!(sum.load(core::sync::atomic::Ordering::SeqCst), 45);
     }
 
     #[test]
@@ -1330,13 +1330,13 @@ mod tests {
     #[test]
     fn test_for_each_range_rayon_with_covers_domain() {
         enable_global_parallelism();
-        let covered = std::sync::atomic::AtomicUsize::new(0);
+        let covered = core::sync::atomic::AtomicUsize::new(0);
         let low = ParThreshold::new(1, 1);
         for_each_range(4_096, Par::RayonWith(4), &low, |range| {
-            covered.fetch_add(range.len(), std::sync::atomic::Ordering::SeqCst);
+            covered.fetch_add(range.len(), core::sync::atomic::Ordering::SeqCst);
         });
         assert_eq!(
-            covered.load(std::sync::atomic::Ordering::SeqCst),
+            covered.load(core::sync::atomic::Ordering::SeqCst),
             4_096,
             "RayonWith ranges did not tile the domain"
         );
@@ -1403,10 +1403,10 @@ mod tests {
         let scope = PoolScope::with_threshold(&pool, ParThreshold::new(1, 1));
 
         let names = std::sync::Mutex::new(std::collections::HashSet::new());
-        let covered = std::sync::atomic::AtomicUsize::new(0);
+        let covered = core::sync::atomic::AtomicUsize::new(0);
         let total = 96usize;
         scope.for_each_range(total, |range| {
-            covered.fetch_add(range.len(), std::sync::atomic::Ordering::SeqCst);
+            covered.fetch_add(range.len(), core::sync::atomic::Ordering::SeqCst);
             let name = std::thread::current().name().map(str::to_string);
             names
                 .lock()
@@ -1423,7 +1423,7 @@ mod tests {
             "ranges executed off-pool (likely on the caller thread): {names:?}"
         );
         assert_eq!(
-            covered.load(std::sync::atomic::Ordering::SeqCst),
+            covered.load(core::sync::atomic::Ordering::SeqCst),
             total,
             "PoolScope ranges did not tile the domain"
         );

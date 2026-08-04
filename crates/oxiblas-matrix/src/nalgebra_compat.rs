@@ -35,7 +35,8 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "nalgebra")] {
 //! use oxiblas_matrix::prelude::*;
 //! use oxiblas_matrix::nalgebra_compat::*;
 //! use nalgebra::DMatrix;
@@ -43,6 +44,7 @@
 //! // Convert from nalgebra to oxiblas (copies: different owned buffers)
 //! let na_mat = DMatrix::from_fn(3, 3, |i, j| (i + j) as f64);
 //! let oxi_mat: Mat<f64> = dmatrix_to_mat(&na_mat);
+//! assert_eq!(oxi_mat[(1, 2)], 3.0);
 //!
 //! // Convert from oxiblas to nalgebra (copies: different owned buffers)
 //! let mat: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
@@ -51,6 +53,7 @@
 //! // Borrow instead of copying: genuine zero-copy view
 //! let view = mat_ref_to_dmatrix_view(mat.as_ref());
 //! assert_eq!(view[(0, 0)], 1.0);
+//! # }
 //! ```
 
 use crate::{Mat, MatMut, MatRef};
@@ -67,7 +70,8 @@ use oxiblas_core::scalar::Scalar;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// # #[cfg(feature = "nalgebra")] {
 /// use oxiblas_matrix::nalgebra_compat::dmatrix_to_mat;
 /// use nalgebra::DMatrix;
 ///
@@ -75,6 +79,7 @@ use oxiblas_core::scalar::Scalar;
 /// let mat = dmatrix_to_mat(&na);
 /// assert_eq!(mat.nrows(), 3);
 /// assert_eq!(mat.ncols(), 4);
+/// # }
 /// ```
 pub fn dmatrix_to_mat<T: Scalar + Clone + Zero>(dm: &DMatrix<T>) -> Mat<T> {
     let nrows = dm.nrows();
@@ -97,13 +102,15 @@ pub fn dmatrix_to_mat<T: Scalar + Clone + Zero>(dm: &DMatrix<T>) -> Mat<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// # #[cfg(feature = "nalgebra")] {
 /// use oxiblas_matrix::{Mat, nalgebra_compat::mat_to_dmatrix};
 ///
 /// let mat: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
 /// let na = mat_to_dmatrix(&mat);
 /// assert_eq!(na[(0, 0)], 1.0);
 /// assert_eq!(na[(1, 1)], 4.0);
+/// # }
 /// ```
 pub fn mat_to_dmatrix<T: Scalar + Clone + Zero + nalgebra::Scalar>(mat: &Mat<T>) -> DMatrix<T> {
     let nrows = mat.nrows();
@@ -118,13 +125,15 @@ pub fn mat_to_dmatrix<T: Scalar + Clone + Zero + nalgebra::Scalar>(mat: &Mat<T>)
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// # #[cfg(feature = "nalgebra")] {
 /// use oxiblas_matrix::{Mat, nalgebra_compat::mat_ref_to_dmatrix};
 ///
 /// let mat: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
 /// let na = mat_ref_to_dmatrix(mat.as_ref());
 /// assert_eq!(na.nrows(), 2);
 /// assert_eq!(na.ncols(), 2);
+/// # }
 /// ```
 pub fn mat_ref_to_dmatrix<T: Scalar + Clone + Zero + nalgebra::Scalar>(
     mat: MatRef<'_, T>,
@@ -267,7 +276,11 @@ pub fn dmatrix_to_mat_ref<T: Scalar + nalgebra::Scalar>(dm: &DMatrix<T>) -> MatR
 pub fn dmatrix_to_mat_mut<T: Scalar + nalgebra::Scalar>(dm: &mut DMatrix<T>) -> MatMut<'_, T> {
     let nrows = dm.nrows();
     let ncols = dm.ncols();
-    MatMut::new(dm.as_mut_ptr(), nrows, ncols, nrows)
+    // SAFETY: a nalgebra `DMatrix` stores `nrows * ncols` initialized, aligned
+    // elements contiguously in column-major order with leading dimension
+    // `nrows`, so every in-bounds `(i, j)` offset is within the allocation and
+    // no two indices alias; `&mut dm` keeps it alive and exclusive for `'_`.
+    unsafe { MatMut::new(dm.as_mut_ptr(), nrows, ncols, nrows) }
 }
 
 /// Creates a `Mat` from a nalgebra `DMatrixView`.

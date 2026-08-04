@@ -165,7 +165,11 @@ pub fn contract_2d<T: Field + GemmKernel + bytemuck::Zeroable>(
 
         // Result: C^T (k×m)
         let mut c = vec![T::zero(); m * k];
-        let c_t = MatMut::new(c.as_mut_ptr(), k, m, k);
+        // SAFETY: `c` was just allocated with exactly `m * k` initialized
+        // elements, which is the full range a `k x m` view with leading
+        // dimension `k` addresses; `c` outlives the view and is not otherwise
+        // borrowed while it is alive.
+        let c_t = unsafe { MatMut::new(c.as_mut_ptr(), k, m, k) };
 
         // Compute C^T = B^T * A^T
         gemm(T::one(), b_t, a_t, T::zero(), c_t);
@@ -299,7 +303,11 @@ pub fn batched_matmul<T: Field + GemmKernel + bytemuck::Zeroable>(
             let a_t = unsafe { MatRef::new(a.data().as_ptr().add(a_offset), k, m, k) };
 
             // Result: C^T (n×m)
-            let c_t = MatMut::new(unsafe { c.data_mut().as_mut_ptr().add(c_offset) }, n, m, n);
+            // SAFETY: `c_offset` is a batch-index-scaled offset and each batch
+            // slot holds exactly `n * m` initialized elements, which is the
+            // full range an `n x m` view with leading dimension `n` addresses;
+            // the view does not outlive the tensor.
+            let c_t = unsafe { MatMut::new(c.data_mut().as_mut_ptr().add(c_offset), n, m, n) };
 
             // Compute C^T = B^T * A^T
             gemm(T::one(), b_t, a_t, T::zero(), c_t);

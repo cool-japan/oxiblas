@@ -14,14 +14,15 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use oxiblas_lapack::error::{LapackError, ErrorCode, InfoCode};
+//! ```
+//! use oxiblas_lapack::error::LapackError;
 //!
 //! // Create from info code
-//! let err = LapackError::from_info(-3);  // Invalid argument 3
+//! let err = LapackError::from_info(-3, "example_operation"); // Invalid argument 3
 //!
-//! // Get info code
-//! let info = err.to_info();  // Returns -3
+//! // Get info code back out
+//! let info = err.to_info();
+//! assert_eq!(info, -3);
 //!
 //! // Rich error information
 //! println!("Error: {}", err);

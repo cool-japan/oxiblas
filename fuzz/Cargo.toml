@@ -1,0 +1,44 @@
+[package]
+name = "oxiblas-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxiblas-sparse]
+path = "../crates/oxiblas-sparse"
+
+[dependencies.oxiblas-matrix]
+path = "../crates/oxiblas-matrix"
+features = ["mmap"]
+
+# Independent workspace: this crate is deliberately NOT a member of the root
+# workspace (see the root Cargo.toml `exclude` list) so that plain
+# `cargo build`/`cargo clippy --workspace` never needs libfuzzer-sys, which
+# requires a nightly compiler and `-Z sanitizer` support that no stable CI
+# job here provides. Build/run fuzz targets explicitly with
+# `cargo +nightly fuzz run <target>` from this directory.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "mtx_matrix_market"
+path = "fuzz_targets/mtx_matrix_market.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mmap_header"
+path = "fuzz_targets/mmap_header.rs"
+test = false
+doc = false
+bench = false

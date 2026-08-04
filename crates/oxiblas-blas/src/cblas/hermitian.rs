@@ -26,6 +26,7 @@
 //! diagonal are set to exactly zero on exit, matching Netlib reference behavior.
 
 use super::types::*;
+use super::validate::{symm_params_valid, syr2k_params_valid, syrk_params_valid};
 use crate::level3;
 use num_complex::{Complex, Complex32, Complex64};
 use num_traits::Float;
@@ -36,6 +37,41 @@ use num_traits::Float;
 
 /// Complex single precision HEMM: `C = alpha*A*B + beta*C` (`Side::Left`) or
 /// `C = alpha*B*A + beta*C` (`Side::Right`), with `A` Hermitian.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `a` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `b` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `ldb`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldb` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `c` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_chemm(
     layout: CblasLayout,
@@ -52,7 +88,15 @@ pub unsafe extern "C" fn cblas_chemm(
     c: *mut Complex32,
     ldc: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference (x)HEMM calls xerbla and returns on a bad shape; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` read wildly out of bounds.
+    if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || b.is_null() || c.is_null() {
         return;
     }
     hemm_impl(
@@ -62,6 +106,41 @@ pub unsafe extern "C" fn cblas_chemm(
 
 /// Complex double precision HEMM: `C = alpha*A*B + beta*C` (`Side::Left`) or
 /// `C = alpha*B*A + beta*C` (`Side::Right`), with `A` Hermitian.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `a` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `b` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `ldb`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldb` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `beta` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `c` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zhemm(
     layout: CblasLayout,
@@ -78,7 +157,15 @@ pub unsafe extern "C" fn cblas_zhemm(
     c: *mut Complex64,
     ldc: i32,
 ) {
-    if m <= 0 || n <= 0 {
+    // Reference (x)HEMM calls xerbla and returns on a bad shape; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. Without this, `lda as usize` turns a negative `lda` into
+    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
+    // the internal `a.add(row + col * lda)` read wildly out of bounds.
+    if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
+        return;
+    }
+    if alpha.is_null() || beta.is_null() || a.is_null() || b.is_null() || c.is_null() {
         return;
     }
     hemm_impl(
@@ -224,6 +311,31 @@ unsafe fn hemm_impl<T: HemmScalar>(
 
 /// Complex single precision HERK: `C = alpha*A*A^H + beta*C` (`NoTrans`) or
 /// `C = alpha*A^H*A + beta*C` (`ConjTrans`), with real `alpha`/`beta`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `c` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_cherk(
     layout: CblasLayout,
@@ -238,7 +350,11 @@ pub unsafe extern "C" fn cblas_cherk(
     c: *mut Complex32,
     ldc: i32,
 ) {
-    if n <= 0 {
+    // See the HEMM guard above: xerbla-then-return, no panic across the C ABI.
+    if n <= 0 || !syrk_params_valid(layout, trans, n, k, lda, ldc) {
+        return;
+    }
+    if a.is_null() || c.is_null() {
         return;
     }
     herk_impl(layout, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
@@ -246,6 +362,31 @@ pub unsafe extern "C" fn cblas_cherk(
 
 /// Complex double precision HERK: `C = alpha*A*A^H + beta*C` (`NoTrans`) or
 /// `C = alpha*A^H*A + beta*C` (`ConjTrans`), with real `alpha`/`beta`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `a` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `c` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zherk(
     layout: CblasLayout,
@@ -260,7 +401,11 @@ pub unsafe extern "C" fn cblas_zherk(
     c: *mut Complex64,
     ldc: i32,
 ) {
-    if n <= 0 {
+    // See the HEMM guard above: xerbla-then-return, no panic across the C ABI.
+    if n <= 0 || !syrk_params_valid(layout, trans, n, k, lda, ldc) {
+        return;
+    }
+    if a.is_null() || c.is_null() {
         return;
     }
     herk_impl(layout, uplo, trans, n, k, alpha, a, lda, beta, c, ldc);
@@ -364,6 +509,39 @@ unsafe fn herk_colmajor<F: Float>(
 /// Complex single precision HER2K:
 /// `C = alpha*A*B^H + conj(alpha)*B*A^H + beta*C` (`NoTrans`) or
 /// `C = alpha*A^H*B + conj(alpha)*B^H*A + beta*C` (`ConjTrans`), with real `beta`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `a` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `b` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from at every `ldb`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldb` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `c` must be non-null, properly aligned for `Complex32`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_cher2k(
     layout: CblasLayout,
@@ -380,7 +558,11 @@ pub unsafe extern "C" fn cblas_cher2k(
     c: *mut Complex32,
     ldc: i32,
 ) {
-    if n <= 0 {
+    // See the HEMM guard above: xerbla-then-return, no panic across the C ABI.
+    if n <= 0 || !syr2k_params_valid(layout, trans, n, k, lda, ldb, ldc) {
+        return;
+    }
+    if alpha.is_null() || a.is_null() || b.is_null() || c.is_null() {
         return;
     }
     her2k_impl(
@@ -391,6 +573,39 @@ pub unsafe extern "C" fn cblas_cher2k(
 /// Complex double precision HER2K:
 /// `C = alpha*A*B^H + conj(alpha)*B*A^H + beta*C` (`NoTrans`) or
 /// `C = alpha*A^H*B + conj(alpha)*B^H*A + beta*C` (`ConjTrans`), with real `beta`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `a` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `lda`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `lda` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `b` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from at every `ldb`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldb` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+/// - `c` must be non-null, properly aligned for `Complex64`, and point to
+///   a buffer large enough to be read from and written to at every `ldc`-strided offset
+///   this function computes, consistent with `layout` and the declared
+///   matrix dimensions (the parameter-validation helper this function
+///   calls checks `ldc` for internal consistency but cannot verify
+///   the pointer's actual allocation size).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zher2k(
     layout: CblasLayout,
@@ -407,7 +622,11 @@ pub unsafe extern "C" fn cblas_zher2k(
     c: *mut Complex64,
     ldc: i32,
 ) {
-    if n <= 0 {
+    // See the HEMM guard above: xerbla-then-return, no panic across the C ABI.
+    if n <= 0 || !syr2k_params_valid(layout, trans, n, k, lda, ldb, ldc) {
+        return;
+    }
+    if alpha.is_null() || a.is_null() || b.is_null() || c.is_null() {
         return;
     }
     her2k_impl(

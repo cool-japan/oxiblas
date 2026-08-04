@@ -22,11 +22,18 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use oxiblas_sparse::linalg::{SparseQr, SparseQrConfig};
+//! ```
+//! use oxiblas_sparse::csr::CsrMatrix;
+//! use oxiblas_sparse::linalg::SparseQr;
+//!
+//! // A square, well-conditioned diagonal system: 2x = 4, 3y = 9.
+//! let a = CsrMatrix::new(2, 2, vec![0, 1, 2], vec![0, 1], vec![2.0, 3.0]).unwrap();
+//! let b = [4.0, 9.0];
 //!
 //! let qr = SparseQr::compute(&a).unwrap();
 //! let x = qr.solve_least_squares(&b).unwrap();
+//! assert!((x[0] - 2.0).abs() < 1e-9);
+//! assert!((x[1] - 3.0).abs() < 1e-9);
 //! ```
 
 use crate::csc::CscMatrix;

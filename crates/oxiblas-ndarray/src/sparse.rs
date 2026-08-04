@@ -12,9 +12,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "sparse")] {
 //! use ndarray::array;
-//! use oxiblas_ndarray::sparse::{array2_to_csr, csr_to_array2, spmv_ndarray};
+//! use oxiblas_ndarray::sparse::{array2_to_csr, spmv_ndarray};
 //!
 //! let dense = array![[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]];
 //! let csr = array2_to_csr(&dense);
@@ -22,6 +23,8 @@
 //!
 //! let x = array![1.0, 1.0, 1.0];
 //! let y = spmv_ndarray(&csr, &x);
+//! assert_eq!(y, array![3.0, 3.0, 9.0]);
+//! # }
 //! ```
 
 use ndarray::{Array1, Array2};
@@ -89,13 +92,15 @@ fn retain_entry<T: Scalar>(val: T, tolerance: Option<<T as Scalar>::Real>) -> bo
 /// CSR matrix containing every entry that is not exactly zero
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// # #[cfg(feature = "sparse")] {
 /// use ndarray::array;
 /// use oxiblas_ndarray::sparse::array2_to_csr;
 ///
 /// let a = array![[1.0, 0.0], [0.0, 2.0]];
 /// let csr = array2_to_csr(&a);
 /// assert_eq!(csr.nnz(), 2);
+/// # }
 /// ```
 pub fn array2_to_csr<T: Scalar + Clone + Field>(arr: &Array2<T>) -> CsrMatrix<T> {
     array2_to_csr_with_tolerance(arr, None)

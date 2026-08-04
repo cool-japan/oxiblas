@@ -10,6 +10,7 @@
 //! Increments follow the reference BLAS convention, including negative
 //! increments (see `vec_offset`).
 
+use super::validate::inc_valid;
 use crate::level1;
 use num_complex::{Complex, Complex32, Complex64};
 use num_traits::Float;
@@ -30,6 +31,26 @@ fn vec_offset(i: usize, n: usize, inc: isize) -> isize {
 // =============================================================================
 
 /// Complex single precision scaling by a complex scalar.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_cscal(
     n: i32,
@@ -37,13 +58,38 @@ pub unsafe extern "C" fn cblas_cscal(
     x: *mut Complex32,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || alpha.is_null() || x.is_null() {
         return;
     }
     scal_c(n as usize, *alpha, x, incx as isize);
 }
 
 /// Complex double precision scaling by a complex scalar.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zscal(
     n: i32,
@@ -51,7 +97,12 @@ pub unsafe extern "C" fn cblas_zscal(
     x: *mut Complex64,
     incx: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || alpha.is_null() || x.is_null() {
         return;
     }
     scal_c(n as usize, *alpha, x, incx as isize);
@@ -71,18 +122,64 @@ unsafe fn scal_c<F: Float>(n: usize, alpha: Complex<F>, x: *mut Complex<F>, inc:
 // =============================================================================
 
 /// Complex single precision scaling by a real scalar.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_csscal(n: i32, alpha: f32, x: *mut Complex32, incx: i32) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || x.is_null() {
         return;
     }
     dscal_c(n as usize, alpha, x, incx as isize);
 }
 
 /// Complex double precision scaling by a real scalar.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zdscal(n: i32, alpha: f64, x: *mut Complex64, incx: i32) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || x.is_null() {
         return;
     }
     dscal_c(n as usize, alpha, x, incx as isize);
@@ -100,6 +197,31 @@ unsafe fn dscal_c<F: Float>(n: usize, alpha: F, x: *mut Complex<F>, inc: isize) 
 // =============================================================================
 
 /// Complex single precision AXPY.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex32` value.
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_caxpy(
     n: i32,
@@ -109,13 +231,46 @@ pub unsafe extern "C" fn cblas_caxpy(
     y: *mut Complex32,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || x.is_null() || y.is_null() {
         return;
     }
     axpy_c(n as usize, *alpha, x, incx as isize, y, incy as isize);
 }
 
 /// Complex double precision AXPY.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `alpha` must be non-null and point to one valid, properly aligned,
+///   initialized `Complex64` value.
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zaxpy(
     n: i32,
@@ -125,7 +280,15 @@ pub unsafe extern "C" fn cblas_zaxpy(
     y: *mut Complex64,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) {
+        return;
+    }
+    if alpha.is_null() || x.is_null() || y.is_null() {
         return;
     }
     axpy_c(n as usize, *alpha, x, incx as isize, y, incy as isize);
@@ -152,6 +315,29 @@ unsafe fn axpy_c<F: Float>(
 // =============================================================================
 
 /// Complex single precision copy.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_ccopy(
     n: i32,
@@ -160,13 +346,41 @@ pub unsafe extern "C" fn cblas_ccopy(
     y: *mut Complex32,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
         return;
     }
     copy_c(n as usize, x, incx as isize, y, incy as isize);
 }
 
 /// Complex double precision copy.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zcopy(
     n: i32,
@@ -175,7 +389,12 @@ pub unsafe extern "C" fn cblas_zcopy(
     y: *mut Complex64,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
         return;
     }
     copy_c(n as usize, x, incx as isize, y, incy as isize);
@@ -198,6 +417,29 @@ unsafe fn copy_c<T: Copy>(n: usize, x: *const T, incx: isize, y: *mut T, incy: i
 // =============================================================================
 
 /// Complex single precision swap.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_cswap(
     n: i32,
@@ -206,13 +448,41 @@ pub unsafe extern "C" fn cblas_cswap(
     y: *mut Complex32,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
         return;
     }
     swap_c(n as usize, x, incx as isize, y, incy as isize);
 }
 
 /// Complex double precision swap.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+/// - `y` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from and written to at every offset the strided walk implied by `incy`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incy` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_zswap(
     n: i32,
@@ -221,7 +491,12 @@ pub unsafe extern "C" fn cblas_zswap(
     y: *mut Complex64,
     incy: i32,
 ) {
-    if n <= 0 {
+    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
+    // cannot surface an error code and unwinding across it would be UB, so we
+    // no-op. A zero increment aliases every logical element onto element 0
+    // (meaningless for a mutating routine), and a null operand would be
+    // dereferenced unconditionally by the loops below.
+    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
         return;
     }
     swap_c(n as usize, x, incx as isize, y, incy as isize);
@@ -246,18 +521,54 @@ unsafe fn swap_c<T: Copy>(n: usize, x: *mut T, incx: isize, y: *mut T, incy: isi
 // =============================================================================
 
 /// Complex single precision Euclidean norm (`scnrm2`).
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_scnrm2(n: i32, x: *const Complex32, incx: i32) -> f32 {
-    if n <= 0 || incx <= 0 {
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0.0;
     }
     nrm2_c(n as usize, x, incx as isize)
 }
 
 /// Complex double precision Euclidean norm (`dznrm2`).
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dznrm2(n: i32, x: *const Complex64, incx: i32) -> f64 {
-    if n <= 0 || incx <= 0 {
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0.0;
     }
     nrm2_c(n as usize, x, incx as isize)
@@ -292,18 +603,54 @@ unsafe fn nrm2_c<F: Float>(n: usize, x: *const Complex<F>, inc: isize) -> F {
 // =============================================================================
 
 /// Complex single precision `scasum`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_scasum(n: i32, x: *const Complex32, incx: i32) -> f32 {
-    if n <= 0 || incx <= 0 {
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0.0;
     }
     asum_c(n as usize, x, incx as isize)
 }
 
 /// Complex double precision `dzasum`.
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dzasum(n: i32, x: *const Complex64, incx: i32) -> f64 {
-    if n <= 0 || incx <= 0 {
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0.0;
     }
     asum_c(n as usize, x, incx as isize)
@@ -323,18 +670,58 @@ unsafe fn asum_c<F: Float>(n: usize, x: *const Complex<F>, inc: isize) -> F {
 // =============================================================================
 
 /// Complex single precision `icamax` (0-based index).
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex32`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_icamax(n: i32, x: *const Complex32, incx: i32) -> i32 {
-    if n <= 0 || incx <= 0 {
+    // `iamax_c` dereferences `*x` unconditionally to seed the running maximum,
+    // so a null `x` must be rejected here rather than inside the loop.
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0;
     }
     iamax_c(n as usize, x, incx as isize) as i32
 }
 
 /// Complex double precision `izamax` (0-based index).
+///
+/// # Safety
+///
+/// This is a C ABI entry point. Scalar arguments (dimensions, leading
+/// dimensions, enum flags) are validated before any pointer is
+/// dereferenced, but — like every BLAS/LAPACK ABI — the raw pointers
+/// themselves are trusted. The caller must ensure:
+///
+/// - `x` must be non-null whenever the dimension it indexes is positive,
+///   properly aligned for `Complex64`, and point to a buffer large enough
+///   to be read from at every offset the strided walk implied by `incx`
+///   reaches (see this module's vector start-offset helper — a negative
+///   `incx` walks the vector back-to-front rather than out of bounds).
+///
+/// - No two pointer parameters may alias in a way that violates Rust's
+///   aliasing rules unless this function's documented semantics
+///   explicitly allow it (for example, an in-place call with an output
+///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_izamax(n: i32, x: *const Complex64, incx: i32) -> i32 {
-    if n <= 0 || incx <= 0 {
+    // `iamax_c` dereferences `*x` unconditionally to seed the running maximum,
+    // so a null `x` must be rejected here rather than inside the loop.
+    if n <= 0 || incx <= 0 || x.is_null() {
         return 0;
     }
     iamax_c(n as usize, x, incx as isize) as i32

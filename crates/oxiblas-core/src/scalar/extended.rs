@@ -200,12 +200,15 @@ use twofloat::TwoFloat;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// # #[cfg(feature = "f128")] {
+/// use num_traits::Float;
 /// use oxiblas_core::scalar::QuadFloat;
 ///
 /// let x = QuadFloat::from(2.0);
 /// let y = x.sqrt();
 /// assert!((y * y - x).abs() < QuadFloat::from(1e-30));
+/// # }
 /// ```
 #[cfg(feature = "f128")]
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]

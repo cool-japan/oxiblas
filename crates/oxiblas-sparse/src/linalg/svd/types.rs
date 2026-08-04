@@ -96,20 +96,27 @@ pub struct TruncatedSVDResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{RandomizedSparseSvd, RandomizedSparseSvdConfig};
 ///
+/// // Diagonal matrix so the top singular values are known exactly.
+/// let matrix = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![5.0, 3.0, 1.0]).unwrap();
+///
 /// let config = RandomizedSparseSvdConfig {
-///     num_singular_values: 10,
-///     oversampling: 5,
+///     num_singular_values: 2,
+///     oversampling: 1, // k + oversampling must be <= min(m, n) = 3
 ///     power_iterations: 2,
-///     ..Default::default()
+///     seed: Some(42),
+///     compute_vectors: false,
 /// };
 ///
 /// let rsvd = RandomizedSparseSvd::new(config);
 /// let result = rsvd.compute(&matrix)?;
 ///
 /// println!("Top singular values: {:?}", result.singular_values);
+/// assert_eq!(result.singular_values.len(), 2);
+/// # Ok::<(), oxiblas_sparse::linalg::svd::SVDError>(())
 /// ```
 pub struct RandomizedSparseSvd {
     config: RandomizedSparseSvdConfig,
@@ -417,18 +424,28 @@ impl RandomizedSparseSvd {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{TruncatedSVD, TruncatedSVDConfig};
 ///
+/// // Diagonal matrix so the singular values are known exactly.
+/// let matrix = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![5.0, 3.0, 1.0]).unwrap();
+///
 /// let config = TruncatedSVDConfig {
-///     num_singular_values: 5,
-///     ..Default::default()
+///     num_singular_values: 2,
+///     max_iterations: 100,
+///     tolerance: 1e-10,
+///     compute_vectors: false,
+///     krylov_dimension: 3,
+///     full_reorthogonalization: true,
 /// };
 ///
 /// let svd_solver = TruncatedSVD::new(config);
 /// let result = svd_solver.compute(&matrix)?;
 ///
 /// println!("Singular values: {:?}", result.singular_values);
+/// assert_eq!(result.singular_values.len(), 2);
+/// # Ok::<(), oxiblas_sparse::linalg::svd::SVDError>(())
 /// ```
 pub struct TruncatedSVD<T> {
     config: TruncatedSVDConfig<T>,
@@ -603,20 +620,31 @@ pub struct RandomizedSparseSvdResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{IncrementalSVD, IncrementalSVDConfig};
 ///
-/// let config = IncrementalSVDConfig::default();
+/// let config = IncrementalSVDConfig {
+///     max_rank: 2,
+///     tolerance: 1e-10,
+///     reorthogonalize: true,
+/// };
 /// let mut isvd = IncrementalSVD::new(config);
 ///
-/// // Initialize with matrix
-/// isvd.initialize(&initial_matrix, 5).unwrap();
+/// // Initialize with a 2x2 matrix
+/// let initial_matrix =
+///     CsrMatrix::new(2, 2, vec![0, 1, 2], vec![0, 1], vec![5.0, 3.0]).unwrap();
+/// isvd.initialize(&initial_matrix, 1).unwrap();
 ///
-/// // Add new rows
+/// // Add a new row (must have the same column count as `initial_matrix`, 2)
+/// let new_rows = vec![vec![1.0, 0.0]];
 /// isvd.add_rows(&new_rows).unwrap();
 ///
 /// // Get current SVD
 /// let (u, s, vt) = isvd.get_svd();
+/// assert_eq!(u.len(), 3); // 2 initial rows + 1 added row
+/// assert!(!s.is_empty());
+/// assert!(!vt.is_empty());
 /// ```
 #[derive(Debug, Clone)]
 pub struct IncrementalSVD<T> {

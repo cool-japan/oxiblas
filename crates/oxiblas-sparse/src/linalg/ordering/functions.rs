@@ -438,9 +438,22 @@ pub fn reverse_cuthill_mckee<T: Scalar>(a: &CscMatrix<T>) -> Vec<usize> {
 /// This implementation uses a level-set based algorithm for finding separators.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csc::CscMatrix;
 /// use oxiblas_sparse::linalg::ordering::nested_dissection;
+///
+/// // Symmetric tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CscMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let perm = nested_dissection(&matrix, None);
+/// assert_eq!(perm.len(), 3);
 /// ```
 pub fn nested_dissection<T: Scalar>(
     a: &CscMatrix<T>,

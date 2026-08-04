@@ -5,17 +5,39 @@
 //!
 //! # Custom Allocator Support
 //!
-//! The matrix type supports custom allocators through the third type parameter:
+//! The matrix type supports custom allocators through the second type
+//! parameter. Any type implementing [`Alloc`] works; here `MyAlloc` simply
+//! forwards to [`Global`] to keep the example self-contained:
 //!
-//! ```ignore
-//! use oxiblas_matrix::Mat;
+//! ```
+//! use core::alloc::Layout;
 //! use oxiblas_core::memory::{Alloc, Global};
+//! use oxiblas_matrix::Mat;
 //!
 //! // Use global allocator (default)
 //! let m: Mat<f64> = Mat::zeros(100, 100);
 //!
+//! // A custom allocator only needs to implement `Alloc`.
+//! #[derive(Clone)]
+//! struct MyAlloc(Global);
+//!
+//! // SAFETY: delegates every call unchanged to `Global`, which upholds the
+//! // `Alloc` trait's safety contract.
+//! unsafe impl Alloc for MyAlloc {
+//!     fn allocate(&self, layout: Layout) -> *mut u8 {
+//!         self.0.allocate(layout)
+//!     }
+//!     fn allocate_zeroed(&self, layout: Layout) -> *mut u8 {
+//!         self.0.allocate_zeroed(layout)
+//!     }
+//!     unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+//!         unsafe { self.0.deallocate(ptr, layout) }
+//!     }
+//! }
+//!
 //! // Use custom allocator
-//! let m_custom: Mat<f64, Global> = Mat::zeros_in(100, 100, my_alloc);
+//! let m_custom: Mat<f64, MyAlloc> = Mat::zeros_in(100, 100, MyAlloc(Global));
+//! assert_eq!(m_custom.nrows(), 100);
 //! ```
 //!
 //! Only construction differs between allocators (`zeros_in`/`filled_in` take
@@ -360,12 +382,19 @@ impl<T: Scalar, A: Alloc> Mat<T, A> {
     /// Returns a mutable view of the matrix.
     #[inline]
     pub fn as_mut(&mut self) -> MatMut<'_, T> {
-        MatMut::new(
-            self.data.as_mut_ptr(),
-            self.nrows,
-            self.ncols,
-            self.row_stride,
-        )
+        // SAFETY: `self.data` holds `row_stride * ncols` initialized, aligned
+        // elements (every constructor routes its length through
+        // `checked_dim_mul`) kept alive by `&mut self` for the view's lifetime,
+        // and `row_stride >= nrows`, so every in-bounds `(i, j)` offset lies
+        // within the allocation and no two indices alias.
+        unsafe {
+            MatMut::new(
+                self.data.as_mut_ptr(),
+                self.nrows,
+                self.ncols,
+                self.row_stride,
+            )
+        }
     }
 
     /// Returns the element at (row, col).

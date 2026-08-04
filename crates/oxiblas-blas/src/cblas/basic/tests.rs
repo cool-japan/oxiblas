@@ -597,7 +597,16 @@ fn test_zdotu_sub_null_dotu_is_noop() {
 fn test_zdotu_sub_null_dotu_with_n_zero_is_noop() {
     // The specific historical bug: n<=0 used to write through `dotu`
     // unconditionally, before any null check existed.
-    unsafe { cblas_zdotu_sub(0, std::ptr::null(), 1, std::ptr::null(), 1, std::ptr::null_mut()) };
+    unsafe {
+        cblas_zdotu_sub(
+            0,
+            std::ptr::null(),
+            1,
+            std::ptr::null(),
+            1,
+            std::ptr::null_mut(),
+        )
+    };
 }
 
 #[test]

@@ -707,11 +707,11 @@ gemm_batched(
 
 ## Project Status
 
-**Version:** 0.2.2 (2026-08-04)
+**Version:** 0.2.2 (2026-08-06)
 
 - **Lines of Code:** ~220,400 Rust (365 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
 - **Documentation:** 12 comprehensive examples
-- **Tests:** 3,365 passing lib/integration tests (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 352 passing doctests (100% success rate)
+- **Tests:** 3,431 passing lib/integration tests (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 373 passing doctests (100% success rate)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ Extensive LAPACK (LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg)

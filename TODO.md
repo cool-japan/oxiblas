@@ -508,7 +508,7 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 - [x] Bump workspace version 0.2.1 → 0.2.2 (workspace `Cargo.toml` line 15 + 7 internal path-dep pins, README.md version/status, TODO.md header) — do this at release time
 - [x] Add `[0.2.2]` section to CHANGELOG.md (currently empty `[Unreleased]`; refresh stale 0.1.0 release checklist at line ~270; fix compare links)
-- [x] Re-enable CI: `.github/workflows.disabled/` → `.github/workflows/` after fixing release.yml (still publishes retired oxiblas-ffi) and README-internal.md branch names
+- [x] ~~Re-enable CI: `.github/workflows.disabled/` → `.github/workflows/` after fixing release.yml (still publishes retired oxiblas-ffi) and README-internal.md branch names~~ — **reverted 2026-08-06**: COOLJAPAN Policy 2026+ CI cost control only permits `pypi-publish.yml`/`npm-publish.yml` active; `benchmarks.yml`, `ci.yml`, `release.yml` moved back to `.disabled` during Phase-0 publish validation
 - [x] Decide fate of orphaned `crates/oxiblas-ffi` (37k LOC, excluded from workspace): delete, or add to `workspace.exclude` and mark clearly retired — decided: `workspace.exclude` + retired README (not deleted, not fixed)
 - [x] Delete zero-byte junk file `crates/oxiblas-blas/src/level3/XX2vDM7e` — already gone (verified absent on disk; presumably cleaned up alongside its Iter1 fix)
 - [x] Add `[package.metadata.docs.rs] all-features = true` to every publishable crate
@@ -522,9 +522,9 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 Production-grade pure Rust BLAS/LAPACK implementation.
 
-## Project Status (v0.2.2 Release - Updated 2026-07-18; test/code counts refreshed 2026-08-04 during the COOLJAPAN hygiene pass)
+## Project Status (v0.2.2 Release - Updated 2026-07-18; test/code counts refreshed 2026-08-06 during Phase-0 publish validation)
 
-- **Tests:** 3,365 tests passing (100% success rate, `cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 352 doctests (this figure and README's "Project Status" section were previously three different, mutually-inconsistent numbers — 2,922/287 here, ~3,300/~310 and "All 2,922" elsewhere in README.md; both now report this one measured figure)
+- **Tests:** 3,431 tests passing (100% success rate, `cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 373 doctests (this figure and README's "Project Status" section were previously three different, mutually-inconsistent numbers — 2,922/287 here, ~3,300/~310 and "All 2,922" elsewhere in README.md; both now report this one measured figure)
 - **Code:** ~220,400 lines of Rust across 365 files (`tokei`, excluding the retired `oxiblas-ffi` crate)
 - **Documentation:** ~16,163 lines of comments, 12 comprehensive examples
 - **Benchmarks:** 14 criterion suites (+ size_variations, precision_bench), 121+ benchmarks

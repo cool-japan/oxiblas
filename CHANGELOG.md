@@ -5,15 +5,30 @@ All notable changes to OxiBLAS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-08-06
 
-A follow-on hardening pass over the 0.2.2 audit closure: soundness fixes for the
-sibling call sites the original audit's fixes missed, plus workspace hygiene
+A production-readiness hardening release. A systematic multi-agent audit swept the
+entire workspace (`oxiblas-core`, `oxiblas-matrix`, `oxiblas-blas`, `oxiblas-lapack`,
+`oxiblas-ndarray`, `oxiblas-sparse`), followed by adversarial re-verification of every
+proposed fix, resulting in a large batch of correctness, honesty, and documentation
+fixes — plus a follow-on hardening pass over that audit closure: soundness fixes for
+the sibling call sites the original audit's fixes missed, plus workspace hygiene
 (lint/dependency/CI policy, doctest and file-size compliance, fuzz coverage).
 No public API breaking changes; a handful of previously-`unsafe fn`-eligible
 constructors are now correctly marked `unsafe fn` (see Changed).
 
 ### Fixed
+- Numerous numerical correctness bugs across BLAS, LAPACK, and sparse routines,
+  including Hermitian/symmetric diagonal handling, SVD and eigensolver convergence
+  and deflation, sparse factorization fill-in, incremental SVD, and IRAM restart
+  logic
+- Several fabricated or stub code paths replaced with real, verified algorithms
+  (e.g. a dead-code MRRR eigensolver path, an untested symmetric divide-and-conquer
+  EVD merge, and fake complex-routine aliases)
+- Panics on edge-case inputs (empty, singular, or near-singular matrices) converted
+  to proper `Result`-based error handling instead of `unwrap()`/`expect()`/`panic!()`
+- Assorted silent-fallback and misleading-documentation issues that could mask
+  incorrect results
 - `PackedRef::new`/`PackedMut::new` (packed.rs) and `BandedRef::new`/`BandedMut::new`
   (banded.rs) were still safe `pub fn` over raw pointers with no validation, even
   though the sibling `MatRef::new`/`MatMut::new` had already been hardened to
@@ -75,6 +90,8 @@ constructors are now correctly marked `unsafe fn` (see Changed).
   mirroring the already-correct sibling test `test_compute_respects_feature_ceiling`.
 
 ### Changed
+- Dependencies updated to latest compatible versions
+- Documentation corrected in numerous places to accurately describe actual behavior
 - `PackedRef::new`, `PackedMut::new`, `BandedRef::new`, `BandedMut::new` are now
   `unsafe fn` (see Fixed above) — existing safe call sites inside this workspace
   were updated to `unsafe { ... }` blocks with `// SAFETY:` justifications;
@@ -97,6 +114,8 @@ constructors are now correctly marked `unsafe fn` (see Changed).
   `oxiblas-sparse/src/linalg/eigenvalue/special.rs`.
 
 ### Added
+- `[package.metadata.docs.rs]` with `all-features = true` on every publishable
+  crate so feature-gated APIs are visible on docs.rs
 - `rustfmt.toml`, `clippy.toml` (MSRV pinned to the workspace's `rust-version`),
   `deny.toml` (COOLJAPAN dependency-ban list, `cargo deny check bans` clean),
   `SECURITY.md`, and `CONTRIBUTING.md` at the workspace root.
@@ -105,35 +124,6 @@ constructors are now correctly marked `unsafe fn` (see Changed).
   toolchain) with two real libFuzzer targets: `mtx_matrix_market` (the Matrix
   Market parser) and `mmap_header` (the `.oxiblas` memory-mapped-matrix header
   parser) — the two untrusted-input parsers in the workspace.
-
-## [0.2.2] - 2026-07-18
-
-A production-readiness hardening release. A systematic multi-agent audit swept the
-entire workspace (`oxiblas-core`, `oxiblas-matrix`, `oxiblas-blas`, `oxiblas-lapack`,
-`oxiblas-ndarray`, `oxiblas-sparse`), followed by adversarial re-verification of every
-proposed fix, resulting in a large batch of correctness, honesty, and documentation
-fixes. No public API breaking changes.
-
-### Fixed
-- Numerous numerical correctness bugs across BLAS, LAPACK, and sparse routines,
-  including Hermitian/symmetric diagonal handling, SVD and eigensolver convergence
-  and deflation, sparse factorization fill-in, incremental SVD, and IRAM restart
-  logic
-- Several fabricated or stub code paths replaced with real, verified algorithms
-  (e.g. a dead-code MRRR eigensolver path, an untested symmetric divide-and-conquer
-  EVD merge, and fake complex-routine aliases)
-- Panics on edge-case inputs (empty, singular, or near-singular matrices) converted
-  to proper `Result`-based error handling instead of `unwrap()`/`expect()`/`panic!()`
-- Assorted silent-fallback and misleading-documentation issues that could mask
-  incorrect results
-
-### Changed
-- Dependencies updated to latest compatible versions
-- Documentation corrected in numerous places to accurately describe actual behavior
-
-### Added
-- `[package.metadata.docs.rs]` with `all-features = true` on every publishable
-  crate so feature-gated APIs are visible on docs.rs
 
 ## [0.2.1] - 2026-03-16
 

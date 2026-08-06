@@ -707,7 +707,7 @@ gemm_batched(
 
 ## Project Status
 
-**Version:** 0.2.2 (2026-08-06)
+**Version:** 0.2.3 (2026-08-06)
 
 - **Lines of Code:** ~220,400 Rust (365 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
 - **Documentation:** 12 comprehensive examples

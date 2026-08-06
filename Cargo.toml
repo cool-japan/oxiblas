@@ -21,7 +21,7 @@ members = [
 exclude = ["crates/oxiblas-ffi", "fuzz"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -30,13 +30,13 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.2", default-features = false }
-oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.2", default-features = false }
-oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.2" }
-oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.2" }
-oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.2" }
-oxiblas = { path = "crates/oxiblas", version = "0.2.2" }
-oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.2" }
+oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.3", default-features = false }
+oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.3", default-features = false }
+oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.3" }
+oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.3" }
+oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.3" }
+oxiblas = { path = "crates/oxiblas", version = "0.2.3" }
+oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.3" }
 # oxiblas-ffi has been retired as of v0.2.0 (Pure Rust ecosystem)
 
 # Essential dependencies

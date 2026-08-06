@@ -104,11 +104,23 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> GaussSeidel<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::SOR;
 ///
-/// let sor = SOR::new(&matrix, 1.5)?; // ω = 1.5
-/// let mut z = vec![0.0; n];
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
+/// let sor = SOR::new(&matrix, 1.5).unwrap(); // ω = 1.5
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// sor.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]
@@ -217,18 +229,31 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SOR<T> {
 ///
 /// SSOR applies SOR forward then backward, creating a symmetric preconditioner:
 /// ```text
-/// M^{-1} = (D + ωL) D^{-1} (D + ωU)
+/// M_SSOR = 1 / (ω(2-ω)) * (D + ωL) D^{-1} (D + ωU)
+/// M_SSOR^{-1} = ω(2-ω) * (D + ωU)^{-1} D (D + ωL)^{-1}
 /// ```
 ///
 /// This symmetry is beneficial for conjugate gradient methods.
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::SSOR;
 ///
-/// let ssor = SSOR::new(&matrix, 1.5)?; // ω = 1.5
-/// let mut z = vec![0.0; n];
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
+/// let ssor = SSOR::new(&matrix, 1.5).unwrap(); // ω = 1.5
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// ssor.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]
@@ -350,6 +375,23 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SSOR<T> {
             }
 
             z[i] = sum / diag;
+        }
+
+        // The two sweeps above solved (D + ωL) temp = r followed by
+        // (D + ωU) z = D * temp, which together give
+        // z = (D + ωU)^{-1} D (D + ωL)^{-1} r.
+        //
+        // The standard SSOR preconditioner is
+        //   M_SSOR^{-1} = ω(2-ω) (D + ωU)^{-1} D (D + ωL)^{-1}
+        // so the missing ω(2-ω) scaling factor must be applied to the result
+        // of the backward sweep. It cannot be folded into the sweep itself:
+        // the backward substitution recursion needs the *unscaled*
+        // intermediate values of z, so the factor is applied once, here, to
+        // the final solution.
+        let two = T::one() + T::one();
+        let scale = self.omega.clone() * (two - self.omega.clone());
+        for zi in z.iter_mut() {
+            *zi = zi.clone() * scale.clone();
         }
     }
 

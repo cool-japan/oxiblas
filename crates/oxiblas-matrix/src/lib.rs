@@ -59,8 +59,6 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::must_use_candidate)]
-// Prefetch functions use raw pointer arithmetic but don't dereference
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 // Loop index variables are common in matrix operations
 #![allow(clippy::needless_range_loop)]
 
@@ -97,7 +95,7 @@ pub use oxiblas_core::memory::{Alloc, Global};
 pub use cow::CowMat;
 pub use mat::Mat;
 pub use mat_mut::MatMut;
-pub use mat_ref::{DiagRef, MatRef, TransposeRef};
+pub use mat_ref::{DiagRef, MatRef};
 
 // Re-exports - specialized types
 pub use banded::{BandedMat, BandedMut, BandedRef, SymmetricBandedMat};
@@ -129,8 +127,9 @@ pub use mmap::{
 // Re-exports - nalgebra conversions
 #[cfg(feature = "nalgebra")]
 pub use nalgebra_compat::{
-    DMatrixOxiblasExt, MatNalgebraExt, dmatrix_to_mat, dmatrix_view_to_mat, dvector_to_mat,
-    mat_ref_to_dmatrix, mat_to_dmatrix, mat_to_dvector,
+    DMatrixOxiblasExt, MatNalgebraExt, dmatrix_to_mat, dmatrix_to_mat_mut, dmatrix_to_mat_ref,
+    dmatrix_view_to_mat, dvector_to_mat, mat_mut_to_dmatrix_view_mut, mat_ref_to_dmatrix,
+    mat_ref_to_dmatrix_view, mat_to_dmatrix, mat_to_dvector,
 };
 
 /// Prelude module for convenient imports.
@@ -142,7 +141,7 @@ pub mod prelude {
     pub use crate::cow::CowMat;
     pub use crate::mat::Mat;
     pub use crate::mat_mut::MatMut;
-    pub use crate::mat_ref::{DiagRef, MatRef, TransposeRef};
+    pub use crate::mat_ref::{DiagRef, MatRef};
 
     // Specialized storage
     pub use crate::banded::{BandedMat, SymmetricBandedMat};

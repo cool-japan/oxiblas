@@ -14,11 +14,10 @@
 //! - `ormbr`/`unmbr`: Apply Q or P to a matrix without forming them explicitly
 //! - `orgbr`/`ungbr`: Generate Q or P explicitly
 
-use oxiblas_core::scalar::{Field, Real, Scalar};
+use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
-/// Default block size for blocked bidiagonalization.
-const DEFAULT_BIDIAG_BLOCK_SIZE: usize = 32;
+use super::complex_bidiag::ComplexBidiagFactors;
 
 /// Error type for bidiagonal operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +192,8 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
     /// // factors.d contains diagonal, factors.e contains superdiagonal
     /// ```
     pub fn compute_blocked(a: MatRef<'_, T>) -> Result<Self, BidiagError> {
-        Self::compute_blocked_with_block_size(a, DEFAULT_BIDIAG_BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_bidiag(a.nrows(), a.ncols());
+        Self::compute_blocked_with_block_size(a, nb)
     }
 
     /// Computes the bidiagonal reduction with a specified block size.
@@ -1370,24 +1370,86 @@ pub fn orgbr<T: Field + Real + bytemuck::Zeroable>(
     factors.generate(vect)
 }
 
-// Complex versions (aliases for now, proper complex support can be added later)
-/// Complex version of ormbr (same as ormbr for real types).
-pub fn unmbr<T: Field + Real + bytemuck::Zeroable>(
-    factors: &BidiagFactors<T>,
+// Complex (unitary) versions of ORMBR/ORGBR.
+//
+// These operate on the genuinely complex bidiagonal factorization produced by
+// [`complex_gebrd`](super::complex_gebrd)/[`ComplexBidiagFactors`], applying and
+// generating the *unitary* factors `Q` and `P` from a complex Householder
+// bidiagonalization. Unlike the real `ormbr`/`orgbr`, they honor the
+// conjugate-transpose (Hermitian adjoint) semantics required for unitary
+// factors, so they must not be conflated with the real routines. This mirrors
+// LAPACK, where `ZUNMBR`/`ZUNGBR` are distinct from `DORMBR`/`DORGBR` and take
+// the complex factorization.
+
+/// Applies the unitary `Q` or `P` (or its conjugate transpose) from a complex
+/// bidiagonal reduction to a matrix `C`.
+///
+/// Equivalent to LAPACK's `ZUNMBR`/`CUNMBR`. See
+/// [`ComplexBidiagFactors::apply`] for the exact `side`/`trans` semantics.
+///
+/// # Example
+///
+/// ```
+/// use oxiblas_lapack::svd::{complex_gebrd, unmbr, BidiagVect, Side, Trans};
+/// use oxiblas_matrix::Mat;
+/// use num_complex::Complex64;
+///
+/// let a: Mat<Complex64> = Mat::from_rows(&[
+///     &[Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)],
+///     &[Complex64::new(3.0, 0.0), Complex64::new(4.0, 2.0)],
+///     &[Complex64::new(0.0, 1.0), Complex64::new(1.0, 1.0)],
+/// ]);
+/// let factors = complex_gebrd(a.as_ref()).unwrap();
+/// // Q^H * A leaves an m x n matrix, ready to be post-multiplied by P.
+/// let qh_a = unmbr(&factors, BidiagVect::Q, Side::Left, Trans::Trans, a.as_ref()).unwrap();
+/// assert_eq!((qh_a.nrows(), qh_a.ncols()), (3, 2));
+/// ```
+pub fn unmbr<T: Field + ComplexScalar + bytemuck::Zeroable>(
+    factors: &ComplexBidiagFactors<T>,
     vect: BidiagVect,
     side: Side,
     trans: Trans,
     c: MatRef<'_, T>,
-) -> Result<Mat<T>, BidiagError> {
-    ormbr(factors, vect, side, trans, c)
+) -> Result<Mat<T>, BidiagError>
+where
+    T::Real: Real,
+{
+    factors.apply(vect, side, trans, c)
 }
 
-/// Complex version of orgbr (same as orgbr for real types).
-pub fn ungbr<T: Field + Real + bytemuck::Zeroable>(
-    factors: &BidiagFactors<T>,
+/// Generates the unitary `Q` or `P` from a complex bidiagonal reduction
+/// explicitly.
+///
+/// Equivalent to LAPACK's `ZUNGBR`/`CUNGBR`. `BidiagVect::Q` yields `Q` and
+/// `BidiagVect::P` yields `P` (whose conjugate transpose is `P^H`), such that
+/// `A = Q * B * P^H` with `B` real bidiagonal. See
+/// [`ComplexBidiagFactors::generate`].
+///
+/// # Example
+///
+/// ```
+/// use oxiblas_lapack::svd::{complex_gebrd, ungbr, BidiagVect};
+/// use oxiblas_matrix::Mat;
+/// use num_complex::Complex64;
+///
+/// let a: Mat<Complex64> = Mat::from_rows(&[
+///     &[Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)],
+///     &[Complex64::new(3.0, 0.0), Complex64::new(4.0, 2.0)],
+///     &[Complex64::new(0.0, 1.0), Complex64::new(1.0, 1.0)],
+/// ]);
+/// let factors = complex_gebrd(a.as_ref()).unwrap();
+/// let q = ungbr(&factors, BidiagVect::Q).unwrap();
+/// let p = ungbr(&factors, BidiagVect::P).unwrap();
+/// assert_eq!((q.nrows(), p.nrows()), (3, 2));
+/// ```
+pub fn ungbr<T: Field + ComplexScalar + bytemuck::Zeroable>(
+    factors: &ComplexBidiagFactors<T>,
     vect: BidiagVect,
-) -> Result<Mat<T>, BidiagError> {
-    orgbr(factors, vect)
+) -> Result<Mat<T>, BidiagError>
+where
+    T::Real: Real,
+{
+    factors.generate(vect)
 }
 
 #[cfg(test)]

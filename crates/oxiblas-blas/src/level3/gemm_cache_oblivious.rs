@@ -144,6 +144,14 @@ fn gemm_recursive<T>(
 /// Cache-oblivious GEMM with configurable base case threshold.
 ///
 /// Allows tuning the recursion base case for different architectures.
+///
+/// The effective threshold is clamped to a minimum of 1: a `threshold` of 0
+/// would make the base-case condition (`m <= threshold && n <= threshold &&
+/// k <= threshold`) unreachable for any dimension > 0, since recursive
+/// splitting on a dimension of size 1 computes `mid = 1/2 = 0` and produces
+/// an empty `0..0` half every time, looping on the same nonempty half
+/// forever. Clamping guarantees every recursive call strictly shrinks its
+/// largest dimension until the base case triggers.
 pub fn gemm_cache_oblivious_with_threshold<T>(
     alpha: T,
     a: MatRef<'_, T>,
@@ -177,7 +185,8 @@ pub fn gemm_cache_oblivious_with_threshold<T>(
         }
     }
 
-    gemm_recursive_threshold(alpha, a, b, c, 0, m, 0, n, 0, k, threshold);
+    let effective_threshold = threshold.max(1);
+    gemm_recursive_threshold(alpha, a, b, c, 0, m, 0, n, 0, k, effective_threshold);
 }
 
 /// Recursive helper with custom threshold
@@ -459,6 +468,60 @@ mod tests {
                     "Threshold 64 failed at ({}, {})",
                     i,
                     j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_oblivious_zero_threshold_terminates_and_is_correct() {
+        // Regression test: threshold = 0 must not cause unbounded recursion
+        // (stack overflow). Before the fix, the base case
+        // `m <= threshold && n <= threshold && k <= threshold` was
+        // unreachable for any dimension > 0 when threshold == 0, and
+        // splitting a size-1 dimension produces an empty `mid..mid` half
+        // plus an unchanged `mid..end` half, so the same call repeats
+        // forever. If this test completes at all (rather than crashing the
+        // test process with a stack overflow), the fix is in effect; the
+        // numerical comparison additionally confirms the clamped threshold
+        // still produces a correct result.
+        let a = Mat::from_slice(
+            5,
+            3,
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            ],
+        );
+        let b = Mat::from_slice(
+            3,
+            4,
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+        );
+        let mut c_zero_threshold = Mat::zeros(5, 4);
+        let mut c_ref = Mat::zeros(5, 4);
+
+        gemm_cache_oblivious_with_threshold(
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            &mut c_zero_threshold.as_mut(),
+            0,
+        );
+        gemm_reference(1.0, a.as_ref(), b.as_ref(), 0.0, &mut c_ref.as_mut());
+
+        for i in 0..5 {
+            for j in 0..4 {
+                let diff: f64 = c_zero_threshold[(i, j)] - c_ref[(i, j)];
+                assert!(
+                    diff.abs() < 1e-9,
+                    "threshold=0 mismatch at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    c_zero_threshold[(i, j)],
+                    c_ref[(i, j)]
                 );
             }
         }

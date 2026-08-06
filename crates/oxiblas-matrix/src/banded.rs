@@ -32,6 +32,46 @@ use alloc::vec::Vec;
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Scalar;
 
+/// Computes the band-storage leading dimension `kl + ku + 1` with checked
+/// arithmetic.
+///
+/// # Panics
+///
+/// Panics if `kl + ku + 1` overflows `usize`.
+#[inline]
+fn checked_ldab(kl: usize, ku: usize) -> usize {
+    kl.checked_add(ku)
+        .and_then(|s| s.checked_add(1))
+        .unwrap_or_else(|| {
+            panic!(
+                "BandedMat: leading dimension overflow (kl + ku + 1 exceeds usize::MAX; \
+             kl={kl}, ku={ku})"
+            )
+        })
+}
+
+/// Computes the band-storage element count `ldab * ncols` with checked
+/// arithmetic.
+///
+/// Every band-storage allocation length (and every length used to validate
+/// one) goes through this helper, so a release-mode wraparound can never
+/// silently produce an under-sized buffer behind the raw-pointer views
+/// (`as_ptr`/`as_mut_ptr`, [`BandedRef`]/[`BandedMut`]) that these types hand
+/// out. Mirrors `Mat`'s `checked_dim_mul`.
+///
+/// # Panics
+///
+/// Panics if `ldab * ncols` overflows `usize`.
+#[inline]
+fn checked_band_len(ldab: usize, ncols: usize) -> usize {
+    ldab.checked_mul(ncols).unwrap_or_else(|| {
+        panic!(
+            "BandedMat: band storage size overflow ({ldab} * {ncols} exceeds \
+             usize::MAX); requested matrix dimensions are too large to allocate"
+        )
+    })
+}
+
 /// A banded matrix using BLAS-style band storage.
 ///
 /// # Storage
@@ -92,8 +132,8 @@ impl<T: Scalar> BandedMat<T> {
     where
         T: bytemuck::Zeroable,
     {
-        let ldab = kl + ku + 1;
-        let total = ldab * ncols;
+        let ldab = checked_ldab(kl, ku);
+        let total = checked_band_len(ldab, ncols);
 
         BandedMat {
             data: AlignedVec::zeros(total),
@@ -107,8 +147,8 @@ impl<T: Scalar> BandedMat<T> {
 
     /// Creates a new banded matrix filled with a specific value.
     pub fn filled(nrows: usize, ncols: usize, kl: usize, ku: usize, value: T) -> Self {
-        let ldab = kl + ku + 1;
-        let total = ldab * ncols;
+        let ldab = checked_ldab(kl, ku);
+        let total = checked_band_len(ldab, ncols);
 
         BandedMat {
             data: AlignedVec::filled(total, value),
@@ -132,8 +172,8 @@ impl<T: Scalar> BandedMat<T> {
     /// # Panics
     /// Panics if the slice length doesn't match `(kl + ku + 1) * ncols`.
     pub fn from_slice(nrows: usize, ncols: usize, kl: usize, ku: usize, data: &[T]) -> Self {
-        let ldab = kl + ku + 1;
-        let expected = ldab * ncols;
+        let ldab = checked_ldab(kl, ku);
+        let expected = checked_band_len(ldab, ncols);
         assert_eq!(
             data.len(),
             expected,
@@ -288,21 +328,68 @@ impl<T: Scalar> BandedMat<T> {
         self.data.as_mut_slice()
     }
 
-    /// Returns a specific band (diagonal) as a slice.
+    /// Borrows this matrix as a [`BandedRef`] view.
+    ///
+    /// This is the safe alternative to the `unsafe` [`BandedRef::new`]: the
+    /// dimensions are taken from a matrix whose buffer is known to hold
+    /// `ldab * ncols` elements, so the view can never over-read.
+    #[inline]
+    pub fn as_banded_ref(&self) -> BandedRef<'_, T> {
+        // SAFETY: `self.data` holds exactly `checked_band_len(ldab, ncols)`
+        // elements (every constructor allocates or validates that length), the
+        // pointer is non-null/aligned/initialized, and the borrow ties the
+        // view's lifetime to `self`.
+        unsafe {
+            BandedRef::new(
+                self.data.as_ptr(),
+                self.nrows,
+                self.ncols,
+                self.kl,
+                self.ku,
+                self.ldab,
+            )
+        }
+    }
+
+    /// Mutably borrows this matrix as a [`BandedMut`] view.
+    ///
+    /// This is the safe alternative to the `unsafe` [`BandedMut::new`].
+    #[inline]
+    pub fn as_banded_mut(&mut self) -> BandedMut<'_, T> {
+        let (nrows, ncols, kl, ku, ldab) = (self.nrows, self.ncols, self.kl, self.ku, self.ldab);
+        // SAFETY: as `as_banded_ref`, and `&mut self` makes the view the only
+        // live handle to the buffer for its lifetime.
+        unsafe { BandedMut::new(self.data.as_mut_ptr(), nrows, ncols, kl, ku, ldab) }
+    }
+
+    /// Returns a specific band (diagonal) as an owned, contiguous vector.
     ///
     /// `band_idx = 0` is the main diagonal, positive values are superdiagonals,
     /// negative values are subdiagonals.
     ///
-    /// Returns the elements of the diagonal along with the starting column index.
-    pub fn get_band(&self, band_idx: isize) -> Option<(&[T], usize)> {
+    /// Returns the elements of the diagonal (in row/column-increasing order)
+    /// along with the logical starting column index of the first returned
+    /// element. Returns `None` if `band_idx` is outside `[-kl, ku]`.
+    ///
+    /// # Notes
+    ///
+    /// In BLAS band storage, successive elements of a single diagonal are
+    /// `ldab` apart in the underlying flat, column-major array (one element
+    /// per column) -- they are not contiguous. This method gathers them
+    /// into a freshly allocated, contiguous `Vec` rather than exposing the
+    /// raw (interleaved) storage range.
+    pub fn get_band(&self, band_idx: isize) -> Option<(Vec<T>, usize)> {
         if band_idx < -(self.kl as isize) || band_idx > self.ku as isize {
             return None;
         }
 
-        // Band row in storage: ku - band_idx
+        // Band row in storage: ku - band_idx (row 0 of storage holds the
+        // highest superdiagonal, row ldab-1 holds the lowest subdiagonal).
         let storage_row = (self.ku as isize - band_idx) as usize;
 
-        // Determine the valid range
+        // Determine the valid range. Superdiagonals (band_idx >= 0) start
+        // at row 0, column `band_idx`. Subdiagonals (band_idx < 0) start at
+        // row `-band_idx`, column 0.
         let start_col = if band_idx >= 0 { band_idx as usize } else { 0 };
 
         let start_row = if band_idx >= 0 {
@@ -311,21 +398,29 @@ impl<T: Scalar> BandedMat<T> {
             (-band_idx) as usize
         };
 
-        let len = (self.nrows - start_row).min(self.ncols - start_col);
+        // `kl`/`ku` bound which band indices are *representable*, not
+        // whether the diagonal actually fits inside the matrix (a caller
+        // may legitimately construct a matrix where kl >= nrows or
+        // ku >= ncols). Use saturating_sub so such degenerate cases yield
+        // an empty diagonal instead of underflowing.
+        let len = self
+            .nrows
+            .saturating_sub(start_row)
+            .min(self.ncols.saturating_sub(start_col));
 
         if len == 0 {
-            return Some((&[], start_col));
+            return Some((Vec::new(), start_col));
         }
 
-        // Collect the diagonal elements
-        // Note: They're not contiguous in memory, so we can't return a simple slice
-        // Instead, we return the starting pointer and the caller can access with stride ldab
-        let start_idx = storage_row + start_col * self.ldab;
-        let end_idx = storage_row + (start_col + len - 1) * self.ldab + 1;
+        // Gather the strided diagonal elements (stride = ldab) into a
+        // contiguous, owned Vec -- the actual requested diagonal, not the
+        // raw interleaved storage range between its first and last element.
+        let data = self.data.as_slice();
+        let elements: Vec<T> = (0..len)
+            .map(|t| data[storage_row + (start_col + t) * self.ldab])
+            .collect();
 
-        // This is a workaround - we return the underlying slice section
-        // The actual diagonal elements are at indices start_idx, start_idx + ldab, ...
-        Some((&self.data.as_slice()[start_idx..end_idx], start_col))
+        Some((elements, start_col))
     }
 
     /// Returns the diagonal elements.
@@ -424,7 +519,10 @@ impl<T: Scalar> BandedMat<T> {
     ///
     /// For symmetric banded storage, we only store `k + 1` rows where `k` is
     /// the number of subdiagonals (or superdiagonals, they're equal).
-    pub fn to_symmetric_banded(&self) -> SymmetricBandedMat<T>
+    ///
+    /// `uplo` selects whether the resulting [`SymmetricBandedMat`] stores the
+    /// upper (`row <= col`) or lower (`row >= col`) triangle of `self`.
+    pub fn to_symmetric_banded(&self, uplo: super::packed::TriangularKind) -> SymmetricBandedMat<T>
     where
         T: bytemuck::Zeroable,
     {
@@ -437,7 +535,7 @@ impl<T: Scalar> BandedMat<T> {
             "Matrix must be square for symmetric storage"
         );
 
-        SymmetricBandedMat::from_banded(self)
+        SymmetricBandedMat::from_banded(self, uplo)
     }
 }
 
@@ -509,8 +607,8 @@ impl<T: Scalar> SymmetricBandedMat<T> {
     where
         T: bytemuck::Zeroable,
     {
-        let ldab = k + 1;
-        let total = ldab * n;
+        let ldab = checked_ldab(k, 0);
+        let total = checked_band_len(ldab, n);
 
         SymmetricBandedMat {
             data: AlignedVec::zeros(total),
@@ -522,7 +620,14 @@ impl<T: Scalar> SymmetricBandedMat<T> {
     }
 
     /// Creates a symmetric banded matrix from a general banded matrix.
-    pub fn from_banded(banded: &BandedMat<T>) -> Self
+    ///
+    /// `uplo` selects whether the elements are taken from (and the result
+    /// stores) the upper (`row <= col`) or lower (`row >= col`) triangle of
+    /// `banded`. This must match the caller's intent: for a matrix that is
+    /// only actually symmetric (or whose caller only cares about one
+    /// triangle), passing the wrong `uplo` silently reads the wrong half of
+    /// the source matrix.
+    pub fn from_banded(banded: &BandedMat<T>, uplo: super::packed::TriangularKind) -> Self
     where
         T: bytemuck::Zeroable,
     {
@@ -535,15 +640,28 @@ impl<T: Scalar> SymmetricBandedMat<T> {
 
         let n = banded.nrows();
         let k = banded.kl();
-        let uplo = super::packed::TriangularKind::Upper;
 
         let mut sb = Self::zeros(n, k, uplo);
 
-        for j in 0..n {
-            let start_i = j.saturating_sub(k);
-            for i in start_i..=j {
-                if let Some(&val) = banded.get(i, j) {
-                    sb.set(i, j, val);
+        match uplo {
+            super::packed::TriangularKind::Upper => {
+                for j in 0..n {
+                    let start_i = j.saturating_sub(k);
+                    for i in start_i..=j {
+                        if let Some(&val) = banded.get(i, j) {
+                            sb.set(i, j, val);
+                        }
+                    }
+                }
+            }
+            super::packed::TriangularKind::Lower => {
+                for j in 0..n {
+                    let end_i = (j + k + 1).min(n);
+                    for i in j..end_i {
+                        if let Some(&val) = banded.get(i, j) {
+                            sb.set(i, j, val);
+                        }
+                    }
                 }
             }
         }
@@ -725,9 +843,23 @@ pub struct BandedRef<'a, T: Scalar> {
 }
 
 impl<'a, T: Scalar> BandedRef<'a, T> {
-    /// Creates a new banded reference.
+    /// Creates a new banded reference from raw components.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `ptr` is non-null, well-aligned, and points to valid, initialized data
+    /// - The data remains valid and immutable for the lifetime `'a`
+    /// - `ldab >= kl + ku + 1`, and the allocation behind `ptr` holds at least
+    ///   `ldab * ncols` elements of `T`
+    ///
+    /// [`get`](Self::get) dereferences `ptr` at the offset returned by
+    /// [`band_index`](Self::band_index) (`ku + row - col + col * ldab`), whose
+    /// maximum is `ldab * ncols - 1` under the contract above; a shorter
+    /// allocation therefore yields out-of-bounds reads. Prefer
+    /// [`BandedMat::as_banded_ref`] whenever an owned matrix is available.
     #[inline]
-    pub fn new(
+    pub unsafe fn new(
         ptr: *const T,
         nrows: usize,
         ncols: usize,
@@ -744,6 +876,31 @@ impl<'a, T: Scalar> BandedRef<'a, T> {
             ldab,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Creates a banded reference over a band-storage slice, validating the
+    /// slice length.
+    ///
+    /// The leading dimension is `kl + ku + 1` (no extra padding).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() != (kl + ku + 1) * ncols`, or if that product
+    /// overflows `usize`. This check is what makes the resulting view sound,
+    /// so it is never elided.
+    #[inline]
+    pub fn from_slice(data: &'a [T], nrows: usize, ncols: usize, kl: usize, ku: usize) -> Self {
+        let ldab = checked_ldab(kl, ku);
+        let expected = checked_band_len(ldab, ncols);
+        assert_eq!(
+            data.len(),
+            expected,
+            "Slice length must equal (kl + ku + 1) * ncols = {expected}"
+        );
+        // SAFETY: `data` is a live shared slice for `'a` (non-null, aligned,
+        // initialized) and the assertion above proves it holds exactly
+        // `ldab * ncols` elements, the full range `band_index` can produce.
+        unsafe { BandedRef::new(data.as_ptr(), nrows, ncols, kl, ku, ldab) }
     }
 
     /// Returns the shape.
@@ -826,9 +983,31 @@ pub struct BandedMut<'a, T: Scalar> {
 }
 
 impl<'a, T: Scalar> BandedMut<'a, T> {
-    /// Creates a new mutable banded reference.
+    /// Creates a new mutable banded reference from raw components.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - `ptr` is non-null, well-aligned, and points to valid, initialized data
+    /// - The data remains valid and *exclusively* borrowed for the lifetime `'a`
+    /// - `ldab >= kl + ku + 1`, and the allocation behind `ptr` holds at least
+    ///   `ldab * ncols` elements of `T`
+    ///
+    /// [`get_mut`](Self::get_mut) / [`set`](Self::set) dereference `ptr` at the
+    /// offset returned by [`band_index`](Self::band_index)
+    /// (`ku + row - col + col * ldab`), whose maximum is `ldab * ncols - 1`
+    /// under the contract above; a shorter allocation therefore yields
+    /// out-of-bounds **writes**. Prefer [`BandedMat::as_banded_mut`] whenever
+    /// an owned matrix is available.
     #[inline]
-    pub fn new(ptr: *mut T, nrows: usize, ncols: usize, kl: usize, ku: usize, ldab: usize) -> Self {
+    pub unsafe fn new(
+        ptr: *mut T,
+        nrows: usize,
+        ncols: usize,
+        kl: usize,
+        ku: usize,
+        ldab: usize,
+    ) -> Self {
         BandedMut {
             ptr,
             nrows,
@@ -838,6 +1017,31 @@ impl<'a, T: Scalar> BandedMut<'a, T> {
             ldab,
             _marker: core::marker::PhantomData,
         }
+    }
+
+    /// Creates a mutable banded reference over a band-storage slice,
+    /// validating the slice length.
+    ///
+    /// The leading dimension is `kl + ku + 1` (no extra padding).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len() != (kl + ku + 1) * ncols`, or if that product
+    /// overflows `usize`. This check is what makes the resulting view sound,
+    /// so it is never elided.
+    #[inline]
+    pub fn from_slice(data: &'a mut [T], nrows: usize, ncols: usize, kl: usize, ku: usize) -> Self {
+        let ldab = checked_ldab(kl, ku);
+        let expected = checked_band_len(ldab, ncols);
+        assert_eq!(
+            data.len(),
+            expected,
+            "Slice length must equal (kl + ku + 1) * ncols = {expected}"
+        );
+        // SAFETY: `data` is a live exclusive slice for `'a` (non-null, aligned,
+        // initialized) and the assertion above proves it holds exactly
+        // `ldab * ncols` elements, the full range `band_index` can produce.
+        unsafe { BandedMut::new(data.as_mut_ptr(), nrows, ncols, kl, ku, ldab) }
     }
 
     /// Returns the shape.
@@ -906,17 +1110,26 @@ impl<'a, T: Scalar> BandedMut<'a, T> {
     /// Creates an immutable reborrow.
     #[inline]
     pub fn rb(&self) -> BandedRef<'_, T> {
-        BandedRef::new(
-            self.ptr, self.nrows, self.ncols, self.kl, self.ku, self.ldab,
-        )
+        // SAFETY: `self` upholds the `BandedMut::new` contract (its own
+        // constructor required it); the reborrow narrows the lifetime and
+        // weakens the access, so every invariant still holds.
+        unsafe {
+            BandedRef::new(
+                self.ptr, self.nrows, self.ncols, self.kl, self.ku, self.ldab,
+            )
+        }
     }
 
     /// Creates a mutable reborrow.
     #[inline]
     pub fn rb_mut(&mut self) -> BandedMut<'_, T> {
-        BandedMut::new(
-            self.ptr, self.nrows, self.ncols, self.kl, self.ku, self.ldab,
-        )
+        // SAFETY: as `rb`, and `&mut self` guarantees the reborrow is the only
+        // live handle for the shortened lifetime.
+        unsafe {
+            BandedMut::new(
+                self.ptr, self.nrows, self.ncols, self.kl, self.ku, self.ldab,
+            )
+        }
     }
 }
 
@@ -1057,6 +1270,139 @@ mod tests {
     }
 
     #[test]
+    fn test_get_band_matches_hand_computed_diagonals() {
+        // 5x5 tridiagonal (kl=1, ku=1) using the exact BLAS storage example
+        // documented at the top of this module.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(5, 5, 1, 1);
+        let entries = [
+            (0, 0, 1.0),
+            (0, 1, 2.0),
+            (1, 0, 3.0),
+            (1, 1, 4.0),
+            (1, 2, 5.0),
+            (2, 1, 6.0),
+            (2, 2, 7.0),
+            (2, 3, 8.0),
+            (3, 2, 9.0),
+            (3, 3, 10.0),
+            (3, 4, 11.0),
+            (4, 3, 12.0),
+            (4, 4, 13.0),
+        ];
+        for &(i, j, v) in &entries {
+            bm.set(i, j, v);
+        }
+
+        // Main diagonal: a00, a11, a22, a33, a44.
+        let (main, start) = bm.get_band(0).expect("main diagonal must exist");
+        assert_eq!(main, vec![1.0, 4.0, 7.0, 10.0, 13.0]);
+        assert_eq!(start, 0);
+
+        // Superdiagonal (band_idx = 1): a01, a12, a23, a34.
+        let (super_diag, start) = bm.get_band(1).expect("superdiagonal must exist");
+        assert_eq!(super_diag, vec![2.0, 5.0, 8.0, 11.0]);
+        assert_eq!(start, 1);
+
+        // Subdiagonal (band_idx = -1): a10, a21, a32, a43. This is the
+        // sub-diagonal case that previously either underflowed or returned
+        // the raw interleaved storage range instead of the actual diagonal.
+        let (sub_diag, start) = bm.get_band(-1).expect("subdiagonal must exist");
+        assert_eq!(sub_diag, vec![3.0, 6.0, 9.0, 12.0]);
+        assert_eq!(start, 0);
+
+        // Outside the declared bandwidth.
+        assert!(bm.get_band(2).is_none());
+        assert!(bm.get_band(-2).is_none());
+    }
+
+    #[test]
+    fn test_get_band_degenerate_bandwidth_does_not_underflow() {
+        // kl (3) exceeds nrows-1 (1) for a 2x2 matrix. Requesting the
+        // farthest representable subdiagonal previously underflowed the
+        // `self.nrows - start_row` computation (panicking in debug builds,
+        // wrapping to a huge length and out-of-bounds slice index in
+        // release builds).
+        let bm: BandedMat<f64> = BandedMat::zeros(2, 2, 3, 0);
+
+        let (elements, start_col) = bm
+            .get_band(-3)
+            .expect("band_idx = -kl must be a representable band index");
+        assert!(elements.is_empty());
+        assert_eq!(start_col, 0);
+
+        // Sanity: the actually-populated diagonal still works correctly.
+        let (main, start) = bm.get_band(0).expect("main diagonal must exist");
+        assert_eq!(main.len(), 2);
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn test_from_banded_honors_lower_uplo() {
+        use crate::packed::TriangularKind;
+
+        // Intentionally non-symmetric tridiagonal matrix so the upper and
+        // lower triangles carry different values -- this lets the test
+        // detect whether `from_banded`/`to_symmetric_banded` actually reads
+        // the requested triangle instead of silently defaulting to Upper.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(4, 4, 1, 1);
+        for i in 0..4 {
+            bm.set(i, i, 10.0 * (i as f64 + 1.0)); // main diagonal: 10, 20, 30, 40
+        }
+        for i in 0..3 {
+            bm.set(i, i + 1, 100.0 * (i as f64 + 1.0)); // upper triangle: 100, 200, 300
+            bm.set(i + 1, i, i as f64 + 1.0); // lower triangle: 1, 2, 3
+        }
+
+        let sb = bm.to_symmetric_banded(TriangularKind::Lower);
+        assert_eq!(sb.uplo(), TriangularKind::Lower);
+
+        // Manually-constructed Lower symmetric banded matrix using the
+        // lower triangle's values (1, 2, 3), not the upper triangle's
+        // (100, 200, 300) that the pre-fix hardcoded-Upper path would have
+        // silently picked up instead.
+        let mut expected: SymmetricBandedMat<f64> =
+            SymmetricBandedMat::zeros(4, 1, TriangularKind::Lower);
+        for i in 0..4 {
+            expected.set(i, i, 10.0 * (i as f64 + 1.0));
+        }
+        for i in 0..3 {
+            expected.set(i + 1, i, i as f64 + 1.0);
+        }
+
+        for i in 0..4 {
+            for j in 0..4 {
+                assert_eq!(sb.get(i, j), expected.get(i, j), "mismatch at ({i}, {j})");
+            }
+        }
+
+        // Directly confirm the lower-triangle values (not the upper ones)
+        // were picked up.
+        assert_eq!(sb.get(1, 0), Some(&1.0));
+        assert_eq!(sb.get(0, 1), Some(&1.0)); // symmetric storage
+        assert_eq!(sb.get(2, 1), Some(&2.0));
+        assert_eq!(sb.get(3, 2), Some(&3.0));
+    }
+
+    #[test]
+    fn test_to_symmetric_banded_upper_still_works() {
+        use crate::packed::TriangularKind;
+
+        // Regression guard: the Upper path (the previous, only behavior)
+        // must keep working once Lower support is added.
+        let mut bm: BandedMat<f64> = BandedMat::zeros(3, 3, 1, 1);
+        bm.set(0, 0, 1.0);
+        bm.set(1, 1, 2.0);
+        bm.set(2, 2, 3.0);
+        bm.set(0, 1, -1.0);
+        bm.set(1, 2, -2.0);
+
+        let sb = bm.to_symmetric_banded(TriangularKind::Upper);
+        assert_eq!(sb.uplo(), TriangularKind::Upper);
+        assert_eq!(sb.get(0, 1), Some(&-1.0));
+        assert_eq!(sb.get(1, 2), Some(&-2.0));
+    }
+
+    #[test]
     fn test_symmetric_banded() {
         use crate::packed::TriangularKind;
 
@@ -1105,14 +1451,18 @@ mod tests {
         bm.set(1, 1, 2.0);
         bm.set(2, 2, 3.0);
 
-        let bref = BandedRef::new(
-            bm.as_ptr(),
-            bm.nrows(),
-            bm.ncols(),
-            bm.kl(),
-            bm.ku(),
-            bm.ldab(),
-        );
+        // SAFETY: the dimensions are read back from `bm` itself, whose buffer
+        // is exactly `ldab * ncols` elements, and `bref` does not outlive it.
+        let bref = unsafe {
+            BandedRef::new(
+                bm.as_ptr(),
+                bm.nrows(),
+                bm.ncols(),
+                bm.kl(),
+                bm.ku(),
+                bm.ldab(),
+            )
+        };
 
         assert_eq!(bref.get(0, 0), Some(&1.0));
         assert_eq!(bref.get(1, 1), Some(&2.0));
@@ -1124,14 +1474,10 @@ mod tests {
         let mut bm: BandedMat<f64> = BandedMat::zeros(3, 3, 1, 1);
 
         {
-            let mut bmut = BandedMut::new(
-                bm.as_mut_ptr(),
-                bm.nrows(),
-                bm.ncols(),
-                bm.kl(),
-                bm.ku(),
-                bm.ldab(),
-            );
+            let (nrows, ncols, kl, ku, ldab) =
+                (bm.nrows(), bm.ncols(), bm.kl(), bm.ku(), bm.ldab());
+            // SAFETY: as above; `bm` is exclusively borrowed for this scope.
+            let mut bmut = unsafe { BandedMut::new(bm.as_mut_ptr(), nrows, ncols, kl, ku, ldab) };
 
             bmut.set(0, 0, 10.0);
             bmut.set(1, 1, 20.0);
@@ -1163,5 +1509,76 @@ mod tests {
         assert_eq!(dense[(0, 0)], 1.0);
         assert_eq!(dense[(0, 2)], 3.0);
         assert_eq!(dense[(1, 3)], 7.0);
+    }
+
+    // --- Regression: band-storage size arithmetic must not wrap -------------
+    //
+    // `let ldab = kl + ku + 1; let total = ldab * ncols;` wrapped silently in
+    // release builds, producing an under-sized buffer for a matrix whose
+    // `band_index` reaches far beyond it (and the same wrapped value was used
+    // as `from_slice`'s length assertion).
+
+    #[test]
+    #[should_panic(expected = "band storage size overflow")]
+    fn test_banded_zeros_size_overflow_panics_not_wraps() {
+        let _: BandedMat<f64> = BandedMat::zeros(4, usize::MAX, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "leading dimension overflow")]
+    fn test_banded_ldab_overflow_panics_not_wraps() {
+        let _: BandedMat<f64> = BandedMat::zeros(4, 4, usize::MAX, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "band storage size overflow")]
+    fn test_symmetric_banded_zeros_size_overflow_panics_not_wraps() {
+        let _: SymmetricBandedMat<f64> =
+            SymmetricBandedMat::zeros(usize::MAX, 3, super::super::packed::TriangularKind::Upper);
+    }
+
+    // --- Regression: safe, validated alternatives to the `unsafe` raw-pointer
+    // view constructors -----------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "Slice length must equal")]
+    fn test_banded_ref_from_slice_rejects_short_slice() {
+        // The unsound path was `BandedRef::new(v.as_ptr(), .., ncols, ..)` on a
+        // buffer far too small, from 100% safe code; `new` is now `unsafe` and
+        // the safe `from_slice` alternative rejects the mismatch.
+        let data = [0.0f64; 4];
+        let _ = BandedRef::from_slice(&data, 100, 100, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Slice length must equal")]
+    fn test_banded_mut_from_slice_rejects_short_slice() {
+        let mut data = [0.0f64; 4];
+        let _ = BandedMut::from_slice(&mut data, 100, 100, 1, 1);
+    }
+
+    #[test]
+    fn test_banded_views_from_owned_matrix_round_trip() {
+        let mut bm: BandedMat<f64> = BandedMat::zeros(4, 4, 1, 1);
+        bm.set(1, 1, 5.0);
+
+        let bref = bm.as_banded_ref();
+        assert_eq!(bref.get(1, 1), Some(&5.0));
+        assert_eq!(bref.get(0, 3), None); // outside the band
+
+        let mut bmut = bm.as_banded_mut();
+        bmut.set(2, 2, 9.0);
+        assert_eq!(bmut.get(2, 2), Some(&9.0));
+        assert_eq!(bm.get(2, 2), Some(&9.0));
+    }
+
+    #[test]
+    fn test_banded_from_slice_accepts_exact_length() {
+        // ldab = kl + ku + 1 = 3, ncols = 4 -> 12 elements.
+        let data = [1.0f64; 12];
+        let bref = BandedRef::from_slice(&data, 4, 4, 1, 1);
+        assert_eq!(bref.shape(), (4, 4));
+        assert_eq!(bref.ldab(), 3);
+        assert_eq!(bref.get(0, 0), Some(&1.0));
     }
 }

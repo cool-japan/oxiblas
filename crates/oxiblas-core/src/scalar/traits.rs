@@ -106,7 +106,15 @@ pub trait Real: Scalar<Real = Self> + num_traits::Float + PartialOrd {
     /// Power function.
     fn powf(self, n: Self) -> Self;
 
-    /// Sign function: 1.0 if positive, -1.0 if negative, 0.0 if zero.
+    /// Sign function, matching `f32::signum`/`f64::signum` (IEEE-754) exactly:
+    /// `1.0` if the value is positive, `+0.0`, or `+INFINITY`; `-1.0` if the
+    /// value is negative, `-0.0`, or `-INFINITY`; `NaN` if the value is `NaN`.
+    ///
+    /// Note this is *not* the mathematical sign function (which would map
+    /// zero to zero) — it always returns a value with magnitude 1.0 for
+    /// finite/infinite non-NaN inputs, preserving the sign bit of zero.
+    /// Every implementation of `Real::signum` in this crate MUST honor
+    /// these exact semantics for consistency across scalar types.
     fn signum(self) -> Self;
 
     /// Fused multiply-add: self * a + b

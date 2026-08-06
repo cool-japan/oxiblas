@@ -1,0 +1,66 @@
+# cargo-deny configuration for OxiBLAS.
+#
+# Scope: this file is deliberately narrow. Only `[graph]` and `[bans]` are
+# populated because the workspace policy requires `cargo deny check bans`
+# specifically (see CLAUDE.md / COOLJAPAN policy); `[licenses]`,
+# `[advisories]`, and `[sources]` are left at cargo-deny's defaults rather
+# than tuned here, since license/advisory policy is a separate concern from
+# the COOLJAPAN dependency-replacement bans this file exists to enforce.
+#
+# Run with: `cargo deny check bans`
+
+[graph]
+all-features = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# Workspace members (oxiblas, oxiblas-core, oxiblas-matrix, oxiblas-blas,
+# oxiblas-lapack, oxiblas-sparse, oxiblas-ndarray, oxiblas-benchmarks) are
+# always allowed regardless of the deny list below.
+allow-workspace = true
+
+deny = [
+    # --- COOLJAPAN ecosystem replacements ---
+    { crate = "bincode", reason = "use oxicode instead (COOLJAPAN policy)" },
+    { crate = "rustfft", reason = "use oxifft instead (COOLJAPAN policy)" },
+    { crate = "quick-xml", reason = "use an oxixml-* crate instead (COOLJAPAN policy)" },
+    { crate = "zip", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "flate2", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "zstd", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "zstd-safe", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "bzip2", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "lz4", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "lz4-sys", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "tar", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "snap", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "brotli", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "miniz_oxide", reason = "use an oxiarc-* crate instead (COOLJAPAN policy)" },
+    { crate = "rusqlite", reason = "use oxisql-sqlite-compat instead (COOLJAPAN policy)" },
+    { crate = "z3", reason = "use oxiz instead (COOLJAPAN policy)" },
+    { crate = "z3-sys", reason = "use oxiz instead (COOLJAPAN policy)" },
+
+    # --- OpenBLAS family: OxiBLAS *is* the sanctioned pure-Rust replacement ---
+    # These crates are unreachable under `[graph] all-features = false`
+    # (this file's setting, matching plain `cargo build`/`cargo test`): they
+    # only enter Cargo.lock through oxiblas-benchmarks' opt-in, non-default
+    # `compare-openblas` feature (that crate is `publish = false` and exists
+    # solely to benchmark OxiBLAS against a system OpenBLAS install; see its
+    # Cargo.toml). No publishable crate's default or non-default feature set
+    # reaches them, so a plain (unwrapped) ban is correct here: it costs
+    # nothing today and still catches any *future* change that makes one of
+    # these reachable outside that one documented, opt-in path. If this file
+    # is ever switched to `all-features = true` for a deeper audit, add
+    # `wrappers = ["oxiblas-benchmarks"]` (or `["openblas-src"]` for
+    # `openblas-build`, `["ndarray-linalg"]` for `lapack-sys`) back to scope
+    # the exception, matching how `oxiblas-benchmarks/Cargo.toml` documents
+    # the same boundary.
+    { crate = "openblas-src", reason = "opt-in benchmark comparison only; use oxiblas as the production BLAS" },
+    { crate = "openblas-build", reason = "transitive build helper for openblas-src's opt-in comparison path only" },
+    { crate = "blas-src", reason = "opt-in benchmark comparison only; use oxiblas as the production BLAS" },
+    { crate = "cblas-sys", reason = "opt-in benchmark comparison only; use oxiblas-blas's cblas module in production" },
+    { crate = "lapack-sys", reason = "transitive dep of ndarray-linalg's opt-in benchmark comparison path only" },
+    { crate = "ndarray-linalg", reason = "opt-in benchmark comparison only; use oxiblas-lapack in production" },
+]

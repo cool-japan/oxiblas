@@ -45,17 +45,28 @@ pub struct MatMut<'a, T: Scalar> {
 }
 
 impl<'a, T: Scalar> MatMut<'a, T> {
-    /// Creates a new mutable matrix view from raw components.
+    /// Creates a new column-major mutable matrix view from raw components.
+    ///
+    /// The resulting view uses `row_stride` as the column-to-column distance
+    /// (the leading dimension) and an implicit row-to-row distance of `1`,
+    /// matching standard column-major (Fortran) storage.
     ///
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `ptr` points to valid, initialized data
-    /// - The data remains valid for the lifetime `'a`
-    /// - No other references to the data exist
-    /// - The strides are correct for the given dimensions
+    /// - `ptr` is non-null, well-aligned, and points to valid, initialized data
+    /// - The data remains valid and *exclusively* borrowed for the lifetime `'a`
+    /// - No other reference to the data exists for that lifetime
+    /// - For every `0 <= i < nrows` and `0 <= j < ncols`, the offset
+    ///   `i + j * row_stride` is in bounds of the underlying allocation
+    ///
+    /// The mutating accessors (`get_mut`, `set`, `IndexMut`, `ptr_at_mut`)
+    /// dereference `ptr` at those offsets, so violating the last bullet is an
+    /// out-of-bounds **write**. Prefer the safe
+    /// [`MatMut::from_column_major`] / [`MatMut::from_strided`] constructors
+    /// whenever a backing slice is available.
     #[inline]
-    pub fn new(ptr: *mut T, nrows: usize, ncols: usize, row_stride: usize) -> Self {
+    pub unsafe fn new(ptr: *mut T, nrows: usize, ncols: usize, row_stride: usize) -> Self {
         MatMut {
             ptr,
             nrows,
@@ -66,10 +77,66 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     }
 
     /// Creates a view from a mutable slice (single column vector).
+    ///
+    /// The view has shape `(slice.len(), 1)`. This never fails: a column vector
+    /// always fits within its backing slice.
     #[inline]
     pub fn from_slice(slice: &'a mut [T]) -> Self {
         let len = slice.len();
-        MatMut::new(slice.as_mut_ptr(), len, 1, 1)
+        // SAFETY: a `len x 1` column vector addresses offsets `0..len`, all
+        // within the exclusive slice, whose pointer is non-null, aligned and
+        // initialized for `'a`.
+        unsafe { MatMut::new(slice.as_mut_ptr(), len, 1, 1) }
+    }
+
+    /// Creates a contiguous column-major mutable view over a slice, validating
+    /// that the slice is large enough.
+    ///
+    /// The leading dimension is taken to be `nrows` (no inter-column padding).
+    /// Returns `None` if `slice.len() < nrows * ncols`.
+    #[inline]
+    pub fn from_column_major(slice: &'a mut [T], nrows: usize, ncols: usize) -> Option<Self> {
+        Self::from_strided(slice, nrows, ncols, nrows)
+    }
+
+    /// Creates a column-major mutable view with an explicit leading dimension,
+    /// validating that every element the view can address lies within `slice`.
+    ///
+    /// Returns `None` if any addressable element would fall outside `slice`
+    /// (or if the offset computation overflows), and also if `row_stride`
+    /// is smaller than `nrows`: a mutable view must not alias itself, and a
+    /// short stride would make distinct `(i, j)` pairs resolve to the same
+    /// element (which would hand out two `&mut` to one location).
+    #[inline]
+    pub fn from_strided(
+        slice: &'a mut [T],
+        nrows: usize,
+        ncols: usize,
+        row_stride: usize,
+    ) -> Option<Self> {
+        if nrows == 0 || ncols == 0 {
+            // No element is ever dereferenced; the pointer only needs valid
+            // provenance, which `slice.as_mut_ptr()` provides.
+            // SAFETY: empty view; no offset is ever formed for an in-range index.
+            return Some(unsafe { Self::new(slice.as_mut_ptr(), nrows, ncols, row_stride) });
+        }
+
+        if row_stride < nrows {
+            return None;
+        }
+
+        // The maximum reachable offset is the far corner `(nrows-1, ncols-1)`.
+        let max_offset = (ncols - 1)
+            .checked_mul(row_stride)?
+            .checked_add(nrows - 1)?;
+        if max_offset < slice.len() {
+            // SAFETY: `max_offset < slice.len()` and offsets are monotonic in
+            // both indices, so every `(i, j)` maps inside `slice`; `row_stride
+            // >= nrows` makes that mapping injective, so no two indices alias.
+            Some(unsafe { Self::new(slice.as_mut_ptr(), nrows, ncols, row_stride) })
+        } else {
+            None
+        }
     }
 
     /// Returns the number of rows.
@@ -128,7 +195,10 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     /// with a shorter lifetime, allowing temporary immutable access.
     #[inline]
     pub fn rb(&self) -> MatRef<'_, T> {
-        MatRef::new(self.ptr, self.nrows, self.ncols, self.row_stride)
+        // SAFETY: `self` already guarantees `ptr` is valid for `nrows * ncols`
+        // (padded to `row_stride`) initialized elements for the borrow's lifetime;
+        // the immutable reborrow only narrows access, so all offsets stay valid.
+        unsafe { MatRef::new(self.ptr, self.nrows, self.ncols, self.row_stride) }
     }
 
     /// Mutable reborrow - creates a new mutable view with a shorter lifetime.
@@ -136,7 +206,10 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     /// This allows passing the view to functions while retaining ownership.
     #[inline]
     pub fn rb_mut(&mut self) -> MatMut<'_, T> {
-        MatMut::new(self.ptr, self.nrows, self.ncols, self.row_stride)
+        // SAFETY: `self` already upholds the `MatMut::new` contract; the
+        // reborrow only narrows the lifetime, and `&mut self` guarantees it is
+        // the sole live handle while it exists.
+        unsafe { MatMut::new(self.ptr, self.nrows, self.ncols, self.row_stride) }
     }
 
     /// Returns a reference to the element at (row, col).
@@ -194,12 +267,18 @@ impl<'a, T: Scalar> MatMut<'a, T> {
             "Submatrix out of bounds"
         );
 
-        MatMut::new(
-            self.ptr_at_mut(row_start, col_start),
-            nrows,
-            ncols,
-            self.row_stride,
-        )
+        // SAFETY: the assertion above proves the submatrix corner
+        // `(row_start + nrows - 1, col_start + ncols - 1)` is within `self`,
+        // whose own contract makes every such offset in bounds; `self` is
+        // consumed by value so the sub-view is the only handle.
+        unsafe {
+            MatMut::new(
+                self.ptr_at_mut(row_start, col_start),
+                nrows,
+                ncols,
+                self.row_stride,
+            )
+        }
     }
 
     /// Returns an immutable column view.
@@ -295,10 +374,15 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     pub fn split_cols(self, mid: usize) -> (Self, Self) {
         assert!(mid <= self.ncols, "Split point out of bounds");
 
-        let left = MatMut::new(self.ptr, self.nrows, mid, self.row_stride);
+        // SAFETY: `mid <= ncols` (asserted), so both halves cover disjoint
+        // column ranges of `self`, every offset of which `self`'s own contract
+        // guarantees is in bounds; `self` is consumed by value.
+        let left = unsafe { MatMut::new(self.ptr, self.nrows, mid, self.row_stride) };
 
         let right_ptr = unsafe { self.ptr.add(mid * self.row_stride) };
-        let right = MatMut::new(right_ptr, self.nrows, self.ncols - mid, self.row_stride);
+        // SAFETY: as above, for the columns `mid..ncols`.
+        let right =
+            unsafe { MatMut::new(right_ptr, self.nrows, self.ncols - mid, self.row_stride) };
 
         (left, right)
     }
@@ -308,10 +392,15 @@ impl<'a, T: Scalar> MatMut<'a, T> {
     pub fn split_rows(self, mid: usize) -> (Self, Self) {
         assert!(mid <= self.nrows, "Split point out of bounds");
 
-        let top = MatMut::new(self.ptr, mid, self.ncols, self.row_stride);
+        // SAFETY: `mid <= nrows` (asserted), so both halves cover disjoint row
+        // ranges of `self`, every offset of which `self`'s own contract
+        // guarantees is in bounds; `self` is consumed by value.
+        let top = unsafe { MatMut::new(self.ptr, mid, self.ncols, self.row_stride) };
 
         let bottom_ptr = unsafe { self.ptr.add(mid) };
-        let bottom = MatMut::new(bottom_ptr, self.nrows - mid, self.ncols, self.row_stride);
+        // SAFETY: as above, for the rows `mid..nrows`.
+        let bottom =
+            unsafe { MatMut::new(bottom_ptr, self.nrows - mid, self.ncols, self.row_stride) };
 
         (top, bottom)
     }

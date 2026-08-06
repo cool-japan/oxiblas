@@ -11,16 +11,19 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use oxiblas_sparse::linalg::convergence::{ConvergenceMonitor, StoppingCriteria};
 //!
 //! // Create a monitor with relative tolerance
 //! let criteria = StoppingCriteria::relative(1e-10);
 //! let mut monitor = ConvergenceMonitor::new(criteria);
 //!
-//! // During iteration, update and check
+//! // During iteration, update and check. A real solver would compute the
+//! // true residual norm each step; this example simulates a geometrically
+//! // decaying one for a self-contained, runnable doctest.
+//! let max_iter = 50;
+//! let mut residual = 1.0f64;
 //! for iter in 0..max_iter {
-//!     let residual = compute_residual();
 //!     monitor.update(residual, iter);
 //!
 //!     if monitor.has_converged() {
@@ -29,10 +32,13 @@
 //!     if monitor.has_stagnated() {
 //!         // Handle stagnation
 //!     }
+//!     residual *= 0.5;
 //! }
+//! assert!(monitor.has_converged());
 //!
 //! // Get detailed convergence info
 //! let info = monitor.convergence_info();
+//! assert!(info.iterations > 0);
 //! ```
 
 use oxiblas_core::scalar::{Field, Real, Scalar};

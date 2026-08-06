@@ -13,6 +13,24 @@ use crate::simd::{SimdRegister, SimdScalar};
 #[cfg(target_arch = "wasm32")]
 use core::arch::wasm32::*;
 
+/// Reports an out-of-range SIMD lane index as a *defined* panic.
+///
+/// `f32x4_extract_lane` / `f32x4_replace_lane` require a **compile-time-constant**
+/// lane, so the runtime `index` is dispatched through a `match`. An index
+/// `>= LANES` is a caller programming error; we turn it into a panic (like slice
+/// indexing) instead of `core::hint::unreachable_unchecked()`, which was
+/// **undefined behavior reachable from safe code** in release builds — the
+/// `SimdRegister::extract` / `insert` trait methods are safe, and the
+/// `debug_assert!` that used to guard them is compiled out of release profiles.
+/// Kept `#[cold]`/`#[inline(never)]` so the valid-index path stays
+/// branch-predictable and the panic string is not duplicated into every lane
+/// accessor. Mirrors the `aarch64`/`x86_64` helpers of the same name.
+#[cold]
+#[inline(never)]
+fn lane_index_out_of_range(index: usize, lanes: usize) -> ! {
+    panic!("SIMD lane index {index} out of range (register has {lanes} lanes)");
+}
+
 // =============================================================================
 // WASM SIMD128 (128-bit) implementations
 // =============================================================================
@@ -76,17 +94,36 @@ impl SimdRegister for F64x2 {
         unsafe { F64x2(f64x2_div(self.0, other.0)) }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, so emulate it
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -195,17 +232,36 @@ impl SimdRegister for F32x4 {
         unsafe { F32x4(f32x4_div(self.0, other.0)) }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, so emulate it
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -237,31 +293,25 @@ impl SimdRegister for F32x4 {
 
     #[inline]
     fn extract(self, index: usize) -> f32 {
-        debug_assert!(index < 4);
-        unsafe {
-            match index {
-                0 => f32x4_extract_lane::<0>(self.0),
-                1 => f32x4_extract_lane::<1>(self.0),
-                2 => f32x4_extract_lane::<2>(self.0),
-                3 => f32x4_extract_lane::<3>(self.0),
-                _ => core::hint::unreachable_unchecked(),
-            }
+        match index {
+            0 => f32x4_extract_lane::<0>(self.0),
+            1 => f32x4_extract_lane::<1>(self.0),
+            2 => f32x4_extract_lane::<2>(self.0),
+            3 => f32x4_extract_lane::<3>(self.0),
+            _ => lane_index_out_of_range(index, Self::LANES),
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f32) -> Self {
-        debug_assert!(index < 4);
-        unsafe {
-            let result = match index {
-                0 => f32x4_replace_lane::<0>(self.0, value),
-                1 => f32x4_replace_lane::<1>(self.0, value),
-                2 => f32x4_replace_lane::<2>(self.0, value),
-                3 => f32x4_replace_lane::<3>(self.0, value),
-                _ => core::hint::unreachable_unchecked(),
-            };
-            F32x4(result)
-        }
+        let result = match index {
+            0 => f32x4_replace_lane::<0>(self.0, value),
+            1 => f32x4_replace_lane::<1>(self.0, value),
+            2 => f32x4_replace_lane::<2>(self.0, value),
+            3 => f32x4_replace_lane::<3>(self.0, value),
+            _ => lane_index_out_of_range(index, Self::LANES),
+        };
+        F32x4(result)
     }
 }
 
@@ -368,17 +418,36 @@ impl SimdRegister for F64x4 {
         }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, emulate
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -547,17 +616,36 @@ impl SimdRegister for F32x8 {
         }
     }
 
+    /// Computes `self * a + b`.
+    ///
+    /// **Not a genuine fused multiply-add.** WASM SIMD128 exposes no native
+    /// FMA instruction, so this is computed as a separate multiply followed
+    /// by a separate add — two roundings, not the single rounding of a true
+    /// hardware FMA (e.g. AVX2+FMA or NEON `vfma`). Results can differ from
+    /// a real FMA in the last bit or two.
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // WASM doesn't have FMA, emulate
+        // NOTE: WASM SIMD128 has no fused multiply-add instruction. This is
+        // an UNFUSED multiply-then-add (two roundings), slightly less
+        // accurate than a genuine single-rounding FMA.
         self.mul(a).add(b)
     }
 
+    /// Computes `self * a - b`.
+    ///
+    /// **Not a genuine fused multiply-subtract** — see [`Self::mul_add`]:
+    /// WASM SIMD128 has no FMA instruction, so this is an unfused
+    /// multiply-then-subtract (two roundings).
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
         self.mul(a).sub(b)
     }
 
+    /// Computes `-(self * a) + b = b - self * a`.
+    ///
+    /// **Not a genuine fused negative-multiply-add** — see
+    /// [`Self::mul_add`]: WASM SIMD128 has no FMA instruction, so this is
+    /// an unfused multiply-then-subtract (two roundings).
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
         b.sub(self.mul(a))
@@ -613,56 +701,50 @@ impl SimdRegister for F32x8 {
 
     #[inline]
     fn extract(self, index: usize) -> f32 {
-        debug_assert!(index < 8);
-        unsafe {
-            if index < 4 {
-                match index {
-                    0 => f32x4_extract_lane::<0>(self.lo),
-                    1 => f32x4_extract_lane::<1>(self.lo),
-                    2 => f32x4_extract_lane::<2>(self.lo),
-                    3 => f32x4_extract_lane::<3>(self.lo),
-                    _ => core::hint::unreachable_unchecked(),
-                }
-            } else {
-                match index {
-                    4 => f32x4_extract_lane::<0>(self.hi),
-                    5 => f32x4_extract_lane::<1>(self.hi),
-                    6 => f32x4_extract_lane::<2>(self.hi),
-                    7 => f32x4_extract_lane::<3>(self.hi),
-                    _ => core::hint::unreachable_unchecked(),
-                }
+        if index < 4 {
+            match index {
+                0 => f32x4_extract_lane::<0>(self.lo),
+                1 => f32x4_extract_lane::<1>(self.lo),
+                2 => f32x4_extract_lane::<2>(self.lo),
+                3 => f32x4_extract_lane::<3>(self.lo),
+                _ => lane_index_out_of_range(index, Self::LANES),
+            }
+        } else {
+            match index {
+                4 => f32x4_extract_lane::<0>(self.hi),
+                5 => f32x4_extract_lane::<1>(self.hi),
+                6 => f32x4_extract_lane::<2>(self.hi),
+                7 => f32x4_extract_lane::<3>(self.hi),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f32) -> Self {
-        debug_assert!(index < 8);
-        unsafe {
-            if index < 4 {
-                let result = match index {
-                    0 => f32x4_replace_lane::<0>(self.lo, value),
-                    1 => f32x4_replace_lane::<1>(self.lo, value),
-                    2 => f32x4_replace_lane::<2>(self.lo, value),
-                    3 => f32x4_replace_lane::<3>(self.lo, value),
-                    _ => core::hint::unreachable_unchecked(),
-                };
-                F32x8 {
-                    lo: result,
-                    hi: self.hi,
-                }
-            } else {
-                let result = match index {
-                    4 => f32x4_replace_lane::<0>(self.hi, value),
-                    5 => f32x4_replace_lane::<1>(self.hi, value),
-                    6 => f32x4_replace_lane::<2>(self.hi, value),
-                    7 => f32x4_replace_lane::<3>(self.hi, value),
-                    _ => core::hint::unreachable_unchecked(),
-                };
-                F32x8 {
-                    lo: self.lo,
-                    hi: result,
-                }
+        if index < 4 {
+            let result = match index {
+                0 => f32x4_replace_lane::<0>(self.lo, value),
+                1 => f32x4_replace_lane::<1>(self.lo, value),
+                2 => f32x4_replace_lane::<2>(self.lo, value),
+                3 => f32x4_replace_lane::<3>(self.lo, value),
+                _ => lane_index_out_of_range(index, Self::LANES),
+            };
+            F32x8 {
+                lo: result,
+                hi: self.hi,
+            }
+        } else {
+            let result = match index {
+                4 => f32x4_replace_lane::<0>(self.hi, value),
+                5 => f32x4_replace_lane::<1>(self.hi, value),
+                6 => f32x4_replace_lane::<2>(self.hi, value),
+                7 => f32x4_replace_lane::<3>(self.hi, value),
+                _ => lane_index_out_of_range(index, Self::LANES),
+            };
+            F32x8 {
+                lo: self.lo,
+                hi: result,
             }
         }
     }
@@ -764,5 +846,64 @@ mod tests {
         let c = F32x8::splat(1.0);
         let fma = a.mul_add(b, c); // 2*3 + 1 = 7
         assert_eq!(fma.extract(0), 7.0);
+    }
+
+    // --- Regression: out-of-range lane index must be a *defined* panic, not UB
+    // via `unreachable_unchecked()` in release builds (the `debug_assert!` that
+    // used to "guard" these safe trait methods is compiled out of release) ----
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f32x4_extract_out_of_range_panics() {
+        let a = F32x4::splat(1.0);
+        // Index 4 is out of range for a 4-lane register.
+        let _ = a.extract(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f32x4_insert_out_of_range_panics() {
+        let a = F32x4::splat(1.0);
+        let _ = a.insert(4, 9.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f32x8_extract_out_of_range_panics() {
+        let a = F32x8::splat(1.0);
+        // Index 8 is out of range for the 8-lane emulated register.
+        let _ = a.extract(8);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f32x8_insert_out_of_range_panics() {
+        let a = F32x8::splat(1.0);
+        let _ = a.insert(8, 9.0);
+    }
+
+    #[test]
+    fn test_f32x8_all_lanes_roundtrip() {
+        // Guard against regressions in the lane dispatch after removing the
+        // `debug_assert!`: every in-range lane must still read/write correctly,
+        // including across the emulated lo/hi 128-bit boundary (lanes 3 -> 4).
+        let mut v = F32x8::zero();
+        for lane in 0..F32x8::LANES {
+            v = v.insert(lane, (lane as f32) + 0.5);
+        }
+        for lane in 0..F32x8::LANES {
+            assert_eq!(v.extract(lane), (lane as f32) + 0.5);
+        }
+    }
+
+    #[test]
+    fn test_f32x4_all_lanes_roundtrip() {
+        let mut v = F32x4::zero();
+        for lane in 0..F32x4::LANES {
+            v = v.insert(lane, (lane as f32) + 0.5);
+        }
+        for lane in 0..F32x4::LANES {
+            assert_eq!(v.extract(lane), (lane as f32) + 0.5);
+        }
     }
 }

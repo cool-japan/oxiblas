@@ -46,6 +46,7 @@
 
 mod gbmv;
 mod gemv;
+mod gemv_strided;
 mod ger;
 mod hbmv;
 mod hemv;
@@ -72,6 +73,7 @@ pub use gbmv::{GbmvError, GbmvTrans, gbmv, gbmv_new};
 pub use gemv::{
     GemvTrans, gemv, gemv_add, gemv_add_inplace, gemv_simple, gemv_sum2, gemv_with_par,
 };
+pub use gemv_strided::gemv_strided;
 pub use ger::{ger, gerc};
 pub use hbmv::{HbmvError, HbmvUplo, hbmv, hbmv_new};
 pub use hemv::{HemvError, HemvUplo, hemv, hemv_new};
@@ -92,4 +94,4 @@ pub use tbsv::{TbsvDiag, TbsvError, TbsvTrans, TbsvUplo, tbsv, tbsv_new};
 pub use tpmv::{TpmvDiag, TpmvError, TpmvTrans, TpmvUplo, tpmv, tpmv_new};
 pub use tpsv::{TpsvDiag, TpsvError, TpsvTrans, TpsvUplo, tpsv, tpsv_new};
 pub use trmv::{DiagKind, TrmvError, TrmvOp, TrmvUplo, trmv, trmv_alloc};
-pub use trsv::{TriangularMode, TriangularSide, trsv, trsv_in_place};
+pub use trsv::{TriangularMode, TrsvDiag, TrsvError, TrsvTrans, trsv, trsv_in_place};

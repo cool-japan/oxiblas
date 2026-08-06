@@ -10,7 +10,7 @@
 //!
 //! Complexity: O(n²) for the bidiagonal SVD, O(mn²) or O(m²n) for bidiagonalization.
 
-use num_traits::{FromPrimitive, One, Zero};
+use num_traits::{One, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -57,13 +57,6 @@ impl<T: Field + ComplexScalar + bytemuck::Zeroable> ComplexSvdDc<T>
 where
     T::Real: Field + Real + bytemuck::Zeroable,
 {
-    /// Maximum iterations for secular equation solver.
-    const MAX_SECULAR_ITER: usize = 100;
-    /// Threshold for switching to direct method.
-    const DIRECT_THRESHOLD: usize = 25;
-    /// Maximum iterations for bidiagonal QR.
-    const MAX_BIDIAG_ITER: usize = 100;
-
     /// Computes the full SVD of a complex matrix A using divide-and-conquer algorithm.
     ///
     /// # Example
@@ -211,447 +204,23 @@ where
         Ok(Self { u, sigma, vh, m, n })
     }
 
-    /// Computes SVD of a real bidiagonal matrix using divide-and-conquer.
+    /// Computes the SVD of the real bidiagonal matrix with diagonal `d` and
+    /// super-diagonal `e` using the shared real divide-and-conquer kernel
+    /// (secular-equation merge with deflation; see [`crate::svd::bidiag_dc`]).
+    ///
+    /// Complex bidiagonalization produces a *real* bidiagonal `B`, so the
+    /// identical real kernel serves the complex front-end.
     fn real_bidiagonal_svd_dc(
         d: &[T::Real],
         e: &[T::Real],
     ) -> Result<(Mat<T::Real>, Vec<T::Real>, Mat<T::Real>), ComplexSvdDcError> {
-        let n = d.len();
-
-        if n == 0 {
-            return Ok((Mat::zeros(0, 0), Vec::new(), Mat::zeros(0, 0)));
-        }
-
-        if n == 1 {
-            let sigma = vec![<T::Real as Scalar>::abs(d[0])];
-            let mut u: Mat<T::Real> = Mat::zeros(1, 1);
-            let mut vt: Mat<T::Real> = Mat::zeros(1, 1);
-            u[(0, 0)] = if d[0] >= T::Real::zero() {
-                T::Real::one()
-            } else {
-                -T::Real::one()
-            };
-            vt[(0, 0)] = T::Real::one();
-            return Ok((u, sigma, vt));
-        }
-
-        // For small matrices, use direct QR iteration
-        if n <= Self::DIRECT_THRESHOLD {
-            return Self::real_bidiagonal_svd_qr(d, e);
-        }
-
-        // Divide: split at middle
-        let mid = n / 2;
-
-        // Copy data for subproblems
-        let d1: Vec<T::Real> = d[..mid].to_vec();
-        let e1: Vec<T::Real> = e[..mid - 1].to_vec();
-        let d2: Vec<T::Real> = d[mid..].to_vec();
-        let e2: Vec<T::Real> = if mid < e.len() {
-            e[mid..].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        // The connecting element
-        let alpha = if mid > 0 && mid - 1 < e.len() {
-            e[mid - 1]
-        } else {
-            T::Real::zero()
-        };
-
-        // Recursively solve subproblems
-        let (u1, sigma1, vt1) = Self::real_bidiagonal_svd_dc(&d1, &e1)?;
-        let (u2, sigma2, vt2) = Self::real_bidiagonal_svd_dc(&d2, &e2)?;
-
-        // Merge: solve the secular equation to combine results
-        Self::merge_real_bidiagonal_svd(u1, sigma1, vt1, u2, sigma2, vt2, alpha, mid, n)
+        crate::svd::bidiag_dc::bidiagonal_svd_dc(d, e).map_err(|err| match err {
+            crate::svd::bidiag_dc::BidiagDcError::NotConverged => ComplexSvdDcError::NotConverged,
+            crate::svd::bidiag_dc::BidiagDcError::SecularEquationFailed => {
+                ComplexSvdDcError::SecularEquationFailed
+            }
+        })
     }
-
-    /// Computes SVD of a small real bidiagonal matrix using QR iteration.
-    fn real_bidiagonal_svd_qr(
-        d: &[T::Real],
-        e: &[T::Real],
-    ) -> Result<(Mat<T::Real>, Vec<T::Real>, Mat<T::Real>), ComplexSvdDcError> {
-        let n = d.len();
-        let mut d_work: Vec<T::Real> = d.to_vec();
-        let mut e_work: Vec<T::Real> = e.to_vec();
-
-        // Initialize U and V as identity
-        let mut u: Mat<T::Real> = Mat::zeros(n, n);
-        let mut vt: Mat<T::Real> = Mat::zeros(n, n);
-        for i in 0..n {
-            u[(i, i)] = T::Real::one();
-            vt[(i, i)] = T::Real::one();
-        }
-
-        let eps = <T::Real as Scalar>::epsilon();
-        let tol = eps * T::Real::from_f64(100.0).unwrap_or(T::Real::one());
-
-        // Use implicit zero-shift QR (Golub-Kahan SVD step)
-        for _iter in 0..Self::MAX_BIDIAG_ITER * n {
-            // Check for convergence and deflation
-            let mut converged = true;
-            for i in 0..e_work.len() {
-                if <T::Real as Scalar>::abs(e_work[i])
-                    > tol
-                        * (<T::Real as Scalar>::abs(d_work[i])
-                            + <T::Real as Scalar>::abs(d_work[i + 1]))
-                {
-                    converged = false;
-                    break;
-                }
-            }
-            if converged {
-                break;
-            }
-
-            // Find the largest unreduced block
-            let mut p = e_work.len();
-            while p > 0
-                && <T::Real as Scalar>::abs(e_work[p - 1])
-                    <= tol
-                        * (<T::Real as Scalar>::abs(d_work[p - 1])
-                            + <T::Real as Scalar>::abs(d_work[p]))
-            {
-                p -= 1;
-            }
-
-            if p == 0 {
-                break;
-            }
-
-            // Apply Golub-Kahan SVD step to the unreduced block [0..p+1]
-            Self::real_golub_kahan_step(&mut d_work, &mut e_work, &mut u, &mut vt, 0, p + 1);
-        }
-
-        // Make all diagonal elements positive
-        for i in 0..n {
-            if d_work[i] < T::Real::zero() {
-                d_work[i] = -d_work[i];
-                for j in 0..n {
-                    u[(j, i)] = -u[(j, i)];
-                }
-            }
-        }
-
-        // Sort singular values in descending order
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| {
-            if d_work[b] > d_work[a] {
-                core::cmp::Ordering::Greater
-            } else if d_work[b] < d_work[a] {
-                core::cmp::Ordering::Less
-            } else {
-                core::cmp::Ordering::Equal
-            }
-        });
-
-        let mut sigma = vec![T::Real::zero(); n];
-        let mut u_sorted: Mat<T::Real> = Mat::zeros(n, n);
-        let mut vt_sorted: Mat<T::Real> = Mat::zeros(n, n);
-
-        for (new_idx, &old_idx) in indices.iter().enumerate() {
-            sigma[new_idx] = d_work[old_idx];
-            for j in 0..n {
-                u_sorted[(j, new_idx)] = u[(j, old_idx)];
-                vt_sorted[(new_idx, j)] = vt[(old_idx, j)];
-            }
-        }
-
-        Ok((u_sorted, sigma, vt_sorted))
-    }
-
-    /// Golub-Kahan SVD step for real bidiagonal matrix (implicit zero-shift).
-    fn real_golub_kahan_step(
-        d: &mut [T::Real],
-        e: &mut [T::Real],
-        u: &mut Mat<T::Real>,
-        vt: &mut Mat<T::Real>,
-        start: usize,
-        end: usize,
-    ) {
-        let n = u.nrows();
-        let last = end - 1;
-
-        // Initial rotation
-        let mut f = d[start] * d[start];
-        let mut g = d[start] * e[start];
-
-        for k in start..last {
-            // Compute Givens rotation to zero g
-            let (c, s, r) = real_givens_rotation(f, g);
-
-            if k > start {
-                e[k - 1] = r;
-            }
-
-            f = c * d[k] + s * e[k];
-            e[k] = -s * d[k] + c * e[k];
-            g = s * d[k + 1];
-            d[k + 1] = c * d[k + 1];
-
-            // Accumulate V^T rotation
-            for j in 0..n {
-                let vk = vt[(k, j)];
-                let vk1 = vt[(k + 1, j)];
-                vt[(k, j)] = c * vk + s * vk1;
-                vt[(k + 1, j)] = -s * vk + c * vk1;
-            }
-
-            // Compute Givens rotation to zero g
-            let (c, s, r) = real_givens_rotation(f, g);
-            d[k] = r;
-            f = c * e[k] + s * d[k + 1];
-            d[k + 1] = -s * e[k] + c * d[k + 1];
-
-            if k < last - 1 {
-                g = s * e[k + 1];
-                e[k + 1] = c * e[k + 1];
-            }
-
-            // Accumulate U rotation
-            for j in 0..n {
-                let uk = u[(j, k)];
-                let uk1 = u[(j, k + 1)];
-                u[(j, k)] = c * uk + s * uk1;
-                u[(j, k + 1)] = -s * uk + c * uk1;
-            }
-        }
-
-        e[last - 1] = f;
-    }
-
-    /// Merges two real bidiagonal SVD results using secular equation.
-    fn merge_real_bidiagonal_svd(
-        u1: Mat<T::Real>,
-        sigma1: Vec<T::Real>,
-        vt1: Mat<T::Real>,
-        u2: Mat<T::Real>,
-        sigma2: Vec<T::Real>,
-        vt2: Mat<T::Real>,
-        alpha: T::Real,
-        mid: usize,
-        n: usize,
-    ) -> Result<(Mat<T::Real>, Vec<T::Real>, Mat<T::Real>), ComplexSvdDcError> {
-        let n1 = sigma1.len();
-        let n2 = sigma2.len();
-
-        if <T::Real as Scalar>::abs(alpha)
-            < <T::Real as Scalar>::epsilon() * T::Real::from_f64(100.0).unwrap_or(T::Real::one())
-        {
-            // Connecting element is zero, just concatenate results
-            let mut u: Mat<T::Real> = Mat::zeros(n, n);
-            let mut vt: Mat<T::Real> = Mat::zeros(n, n);
-            let mut sigma = Vec::with_capacity(n);
-
-            // Copy U1 and U2 into U
-            for i in 0..n1 {
-                for j in 0..n1 {
-                    u[(i, j)] = u1[(i, j)];
-                }
-            }
-            for i in 0..n2 {
-                for j in 0..n2 {
-                    u[(mid + i, mid + j)] = u2[(i, j)];
-                }
-            }
-
-            // Copy Vt1 and Vt2 into Vt
-            for i in 0..n1 {
-                for j in 0..n1 {
-                    vt[(i, j)] = vt1[(i, j)];
-                }
-            }
-            for i in 0..n2 {
-                for j in 0..n2 {
-                    vt[(mid + i, mid + j)] = vt2[(i, j)];
-                }
-            }
-
-            // Merge and sort singular values
-            sigma.extend(sigma1.iter().copied());
-            sigma.extend(sigma2.iter().copied());
-            sigma.sort_by(|a, b| {
-                if *b > *a {
-                    core::cmp::Ordering::Greater
-                } else if *b < *a {
-                    core::cmp::Ordering::Less
-                } else {
-                    core::cmp::Ordering::Equal
-                }
-            });
-
-            return Ok((u, sigma, vt));
-        }
-
-        // For non-zero alpha, solve the secular equation
-        let mut d = vec![T::Real::zero(); n];
-        let mut z = vec![T::Real::zero(); n];
-
-        // First n1 elements from sigma1
-        for (i, &s) in sigma1.iter().enumerate() {
-            d[i] = s * s;
-            z[i] = alpha * vt1[(n1 - 1, i)];
-        }
-
-        // Remaining elements from sigma2
-        for (i, &s) in sigma2.iter().enumerate() {
-            d[n1 + i] = s * s;
-            z[n1 + i] = alpha * vt2[(0, i)];
-        }
-
-        // Sort d and permute z accordingly
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| {
-            if d[a] > d[b] {
-                core::cmp::Ordering::Less
-            } else if d[a] < d[b] {
-                core::cmp::Ordering::Greater
-            } else {
-                core::cmp::Ordering::Equal
-            }
-        });
-
-        let d_sorted: Vec<T::Real> = indices.iter().map(|&i| d[i]).collect();
-        let z_sorted: Vec<T::Real> = indices.iter().map(|&i| z[i]).collect();
-
-        // Solve secular equations
-        let (new_sigma_sq, q_cols) = Self::solve_real_secular_equations(&d_sorted, &z_sorted)?;
-
-        let sigma: Vec<T::Real> = new_sigma_sq
-            .iter()
-            .map(|&s| <T::Real as Real>::sqrt(s))
-            .collect();
-
-        // Build U and V^T from the solutions
-        let mut u: Mat<T::Real> = Mat::zeros(n, n);
-        let mut vt: Mat<T::Real> = Mat::zeros(n, n);
-
-        for j in 0..n {
-            for i in 0..n {
-                vt[(j, indices[i])] = q_cols[j][i];
-            }
-        }
-
-        for i in 0..n {
-            for j in 0..n {
-                let orig_idx = indices[j];
-                if orig_idx < n1 {
-                    if i < mid {
-                        u[(i, j)] = u1[(i, orig_idx)];
-                    }
-                } else if i >= mid && i < mid + n2 {
-                    u[(i, j)] = u2[(i - mid, orig_idx - n1)];
-                }
-            }
-        }
-
-        // Orthogonalize columns
-        real_orthogonalize_columns(&mut u);
-
-        Ok((u, sigma, vt))
-    }
-
-    /// Solves the secular equations for real bidiagonal SVD.
-    fn solve_real_secular_equations(
-        d: &[T::Real],
-        z: &[T::Real],
-    ) -> Result<(Vec<T::Real>, Vec<Vec<T::Real>>), ComplexSvdDcError> {
-        let n = d.len();
-        let eps = <T::Real as Scalar>::epsilon();
-        let tol = eps * T::Real::from_f64(1000.0).unwrap_or(T::Real::one());
-
-        let mut sigma_sq = vec![T::Real::zero(); n];
-        let mut q_cols = vec![vec![T::Real::zero(); n]; n];
-
-        // Compute sum of z^2
-        let mut z_norm_sq = T::Real::zero();
-        for i in 0..n {
-            z_norm_sq = z_norm_sq + z[i] * z[i];
-        }
-
-        if z_norm_sq < tol {
-            // z is essentially zero, eigenvalues are just d
-            for i in 0..n {
-                sigma_sq[i] = d[i];
-                q_cols[i][i] = T::Real::one();
-            }
-            return Ok((sigma_sq, q_cols));
-        }
-
-        // For each eigenvalue, solve the secular equation using Newton's method
-        for k in 0..n {
-            let lower = d[k];
-            let upper = if k > 0 {
-                d[k - 1]
-            } else {
-                lower + z_norm_sq + T::Real::one()
-            };
-
-            let mut lambda = (lower + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
-
-            // Newton iteration
-            for _iter in 0..Self::MAX_SECULAR_ITER {
-                let (f, df) = real_secular_function_and_derivative(d, z, lambda);
-
-                if <T::Real as Scalar>::abs(f) < tol {
-                    break;
-                }
-
-                if <T::Real as Scalar>::abs(df) < eps {
-                    let (f_lower, _) = real_secular_function_and_derivative(d, z, lower + tol);
-                    if f_lower * f < T::Real::zero() {
-                        lambda =
-                            (lower + lambda) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
-                    } else {
-                        lambda =
-                            (lambda + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
-                    }
-                } else {
-                    let delta = f / df;
-                    let new_lambda = lambda - delta;
-
-                    if new_lambda <= lower {
-                        lambda =
-                            (lower + lambda) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
-                    } else if new_lambda >= upper {
-                        lambda =
-                            (lambda + upper) / T::Real::from_f64(2.0).unwrap_or_else(T::Real::zero);
-                    } else {
-                        lambda = new_lambda;
-                    }
-                }
-            }
-
-            sigma_sq[k] = lambda;
-
-            // Compute eigenvector
-            for i in 0..n {
-                let denom = d[i] - lambda;
-                if <T::Real as Scalar>::abs(denom) > eps {
-                    q_cols[k][i] = z[i] / denom;
-                } else {
-                    q_cols[k][i] = T::Real::one();
-                }
-            }
-
-            // Normalize
-            let mut norm_sq = T::Real::zero();
-            for i in 0..n {
-                norm_sq = norm_sq + q_cols[k][i] * q_cols[k][i];
-            }
-            let norm = <T::Real as Real>::sqrt(norm_sq);
-            if norm > eps {
-                for i in 0..n {
-                    q_cols[k][i] = q_cols[k][i] / norm;
-                }
-            }
-        }
-
-        Ok((sigma_sq, q_cols))
-    }
-
     /// Returns the singular values (real, non-negative, sorted in descending order).
     pub fn singular_values(&self) -> &[T::Real] {
         &self.sigma
@@ -768,113 +337,6 @@ where
     }
 }
 
-/// Computes a real Givens rotation to zero out an element.
-fn real_givens_rotation<R: Field + Real>(f: R, g: R) -> (R, R, R) {
-    let eps = <R as Scalar>::epsilon();
-
-    if <R as Scalar>::abs(g) < eps {
-        (R::one(), R::zero(), f)
-    } else if <R as Scalar>::abs(f) < eps {
-        (
-            R::zero(),
-            if g >= R::zero() { R::one() } else { -R::one() },
-            <R as Scalar>::abs(g),
-        )
-    } else {
-        let h = <R as Real>::sqrt(f * f + g * g);
-        let c = <R as Scalar>::abs(f) / h;
-        let s = g / h * (if f >= R::zero() { R::one() } else { -R::one() });
-        let r = if f >= R::zero() { h } else { -h };
-        (c, s, r)
-    }
-}
-
-/// Secular function and derivative for real bidiagonal SVD.
-fn real_secular_function_and_derivative<R: Field + Real>(d: &[R], z: &[R], lambda: R) -> (R, R) {
-    let eps = <R as Scalar>::epsilon();
-    let mut f = R::one();
-    let mut df = R::zero();
-
-    for i in 0..d.len() {
-        let denom = d[i] - lambda;
-        if <R as Scalar>::abs(denom) > eps {
-            let term = z[i] * z[i] / denom;
-            f = f + term;
-            df = df + term / denom;
-        }
-    }
-
-    (f, df)
-}
-
-/// Orthogonalizes columns of a real matrix using modified Gram-Schmidt.
-fn real_orthogonalize_columns<R: Field + Real>(mat: &mut Mat<R>) {
-    let m = mat.nrows();
-    let n = mat.ncols();
-    let eps = <R as Scalar>::epsilon();
-    let tol = eps * R::from_f64(100.0).unwrap_or(R::one());
-
-    for j in 0..n {
-        // Compute norm
-        let mut norm_sq = R::zero();
-        for i in 0..m {
-            norm_sq = norm_sq + mat[(i, j)] * mat[(i, j)];
-        }
-
-        if norm_sq < tol {
-            for basis in 0..m {
-                mat[(basis, j)] = R::one();
-
-                for k in 0..j {
-                    let mut dot = R::zero();
-                    for i in 0..m {
-                        dot = dot + mat[(i, j)] * mat[(i, k)];
-                    }
-                    for i in 0..m {
-                        mat[(i, j)] = mat[(i, j)] - dot * mat[(i, k)];
-                    }
-                }
-
-                let mut new_norm_sq = R::zero();
-                for i in 0..m {
-                    new_norm_sq = new_norm_sq + mat[(i, j)] * mat[(i, j)];
-                }
-                if new_norm_sq > tol {
-                    let norm = <R as Real>::sqrt(new_norm_sq);
-                    for i in 0..m {
-                        mat[(i, j)] = mat[(i, j)] / norm;
-                    }
-                    break;
-                }
-                for i in 0..m {
-                    mat[(i, j)] = R::zero();
-                }
-            }
-        } else {
-            for k in 0..j {
-                let mut dot = R::zero();
-                for i in 0..m {
-                    dot = dot + mat[(i, j)] * mat[(i, k)];
-                }
-                for i in 0..m {
-                    mat[(i, j)] = mat[(i, j)] - dot * mat[(i, k)];
-                }
-            }
-
-            let mut new_norm_sq = R::zero();
-            for i in 0..m {
-                new_norm_sq = new_norm_sq + mat[(i, j)] * mat[(i, j)];
-            }
-            if new_norm_sq > tol {
-                let norm = <R as Real>::sqrt(new_norm_sq);
-                for i in 0..m {
-                    mat[(i, j)] = mat[(i, j)] / norm;
-                }
-            }
-        }
-    }
-}
-
 /// Complex bidiagonalization for tall or square matrices (m >= n).
 /// Returns (U, d, e, V) where A = U · B · V^H and B is real bidiagonal.
 fn complex_bidiagonalize_tall<T: Field + ComplexScalar + bytemuck::Zeroable>(
@@ -921,17 +383,6 @@ where
             phase_d[j] = alpha / T::from_real(beta);
         }
 
-        #[cfg(test)]
-        println!(
-            "j={}: Left H: tau=({:.4},{:.4}), beta={:.4}, alpha=({:.4},{:.4})",
-            j,
-            tau.real(),
-            tau.imag(),
-            beta,
-            alpha.real(),
-            alpha.imag()
-        );
-
         // Apply to remaining columns
         complex_apply_householder_left(&mut work, j, m, n, tau);
 
@@ -962,33 +413,6 @@ where
                 hvec.push(work[(j, i)]);
             }
             householder_right.push(hvec);
-
-            #[cfg(test)]
-            {
-                println!(
-                    "j={}: Right G: tau=({:.4},{:.4}), beta={:.4}, alpha=({:.4},{:.4})",
-                    j,
-                    tau.real(),
-                    tau.imag(),
-                    beta,
-                    alpha.real(),
-                    alpha.imag()
-                );
-                println!(
-                    "orig_row = {:?}",
-                    orig_row
-                        .iter()
-                        .map(|x| (x.real(), x.imag()))
-                        .collect::<Vec<_>>()
-                );
-                println!(
-                    "hvec = {:?}",
-                    householder_right[j]
-                        .iter()
-                        .map(|x| (x.real(), x.imag()))
-                        .collect::<Vec<_>>()
-                );
-            }
 
             // Apply to row j using ORIGINAL row values (not the modified work row)
             // The result should be [alpha, 0, 0, ...]
@@ -1021,18 +445,6 @@ where
                 tau,
                 &householder_right[j],
             );
-
-            // Debug: print work matrix after applying right Householder
-            #[cfg(test)]
-            {
-                println!("work after j={} right H:", j);
-                for i in 0..m.min(4) {
-                    for jj in 0..n.min(4) {
-                        print!("({:.4},{:.4}) ", work[(i, jj)].real(), work[(i, jj)].imag());
-                    }
-                    println!();
-                }
-            }
         }
     }
 
@@ -1094,37 +506,6 @@ where
                     v[(r, i)] = v[(r, i)] - tw * hvec[i - start - 1].conj();
                 }
             }
-        }
-    }
-
-    // DEBUG: Save U and V before phase absorption to verify bidiagonal structure
-    #[cfg(test)]
-    {
-        // Make copies
-        let u_before = u.clone();
-        let v_before = v.clone();
-
-        // Also copy the original A for checking
-        let mut a_copy: Mat<T> = Mat::zeros(m, n);
-        for i in 0..m {
-            for j in 0..n {
-                a_copy[(i, j)] = a[(i, j)];
-            }
-        }
-
-        // Compute U_before^H * A * V_before
-        println!("DEBUG: U^H * A * V BEFORE phase absorption:");
-        for i in 0..m.min(4) {
-            for j in 0..n.min(4) {
-                let mut sum = T::zero();
-                for kk in 0..m {
-                    for l in 0..n {
-                        sum = sum + u_before[(kk, i)].conj() * a_copy[(kk, l)] * v_before[(l, j)];
-                    }
-                }
-                print!("({:.4}, {:.4})  ", sum.real(), sum.imag());
-            }
-            println!();
         }
     }
 
@@ -1902,6 +1283,93 @@ mod tests {
                     j,
                     diff
                 );
+            }
+        }
+    }
+
+    /// Deterministic pseudo-random values in `[-1, 1)` (no external rng).
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    #[test]
+    fn test_complex_svd_dc_across_sizes() {
+        use crate::svd::ComplexSvd;
+
+        // Sizes straddle the DIRECT_THRESHOLD (25): 5, 25 use the direct shifted
+        // QR path; 26, 50, 100, 200 exercise the divide-and-conquer secular
+        // merge with deflation on the real bidiagonal matrix.
+        for &n in &[5usize, 25, 26, 50, 100, 200] {
+            let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ (n as u64);
+            let mut a: Mat<Complex64> = Mat::zeros(n, n);
+            for i in 0..n {
+                for j in 0..n {
+                    a[(i, j)] = Complex64::new(lcg(&mut state), lcg(&mut state));
+                }
+            }
+
+            let dc = ComplexSvdDc::compute(a.as_ref()).unwrap();
+            let s_dc = dc.singular_values();
+            let smax = s_dc[0].max(1.0);
+
+            // Unitarity: UᴴU = I and VᴴV = I.
+            let u = dc.u();
+            let vh = dc.vh();
+            for i in 0..n {
+                for j in 0..n {
+                    let mut uhu = Complex64::new(0.0, 0.0);
+                    let mut vhv = Complex64::new(0.0, 0.0);
+                    for k in 0..n {
+                        uhu += u[(k, i)].conj() * u[(k, j)];
+                        vhv += vh[(i, k)] * vh[(j, k)].conj();
+                    }
+                    let expect = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (uhu.re - expect).abs() < 1e-6 && uhu.im.abs() < 1e-6,
+                        "n={n}: UhU[{i},{j}]={uhu}"
+                    );
+                    assert!(
+                        (vhv.re - expect).abs() < 1e-9 && vhv.im.abs() < 1e-9,
+                        "n={n}: VhV[{i},{j}]={vhv}"
+                    );
+                }
+            }
+
+            // Reconstruction A = U Σ Vᴴ is tight.
+            let rec = dc.reconstruct();
+            let mut rec_err = 0.0f64;
+            for i in 0..n {
+                for j in 0..n {
+                    rec_err = rec_err.max((rec[(i, j)] - a[(i, j)]).norm());
+                }
+            }
+            assert!(
+                rec_err < 1e-8 * smax,
+                "n={n}: reconstruction error {rec_err}"
+            );
+
+            for k in 1..n {
+                assert!(
+                    s_dc[k] <= s_dc[k - 1] + 1e-9 * smax,
+                    "n={n}: singular values not descending at {k}"
+                );
+            }
+
+            // Independent reference SVD (one-sided Jacobi) for the cheaper sizes.
+            if n <= 50 {
+                let reference = ComplexSvd::compute(a.as_ref()).unwrap();
+                let s_ref = reference.singular_values();
+                for k in 0..n {
+                    assert!(
+                        (s_dc[k] - s_ref[k]).abs() < 1e-6 * smax,
+                        "n={n}: sigma[{k}] dc={} ref={}",
+                        s_dc[k],
+                        s_ref[k]
+                    );
+                }
             }
         }
     }

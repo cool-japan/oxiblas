@@ -99,12 +99,29 @@ pub fn laplacian_3d_7pt(nx: usize, ny: usize, nz: usize) -> CsrMatrix<f64> {
     builder.build().to_csr()
 }
 
+/// Fixed seed for [`random_spd_matrix`]'s pseudo-random number generator.
+///
+/// Test fixtures must be reproducible: a failure that only shows up for one
+/// random draw out of many is effectively undebuggable unless the exact
+/// matrix that triggered it can be regenerated. Using OS entropy (as
+/// `rand::rng()` does) makes every test run see a different matrix, so a
+/// fixed seed is used here instead - the generated matrix is still
+/// "random" in the sense of being unstructured/non-trivial, but it is the
+/// *same* unstructured matrix on every run, on every machine.
+const RANDOM_SPD_SEED: u64 = 0x5350445F_53454544; // "SPD_SEED" in ASCII hex
+
 /// Generates a random SPD (symmetric positive definite) matrix
 ///
 /// Uses the formula A = B^T * B + λI where B is random and λ ensures positive definiteness.
+///
+/// The underlying RNG is seeded with a fixed constant ([`RANDOM_SPD_SEED`])
+/// rather than OS entropy, so the returned matrix is identical across runs
+/// and machines - a test failure involving this matrix can always be
+/// reproduced.
 pub fn random_spd_matrix(n: usize, density: f64, lambda: f64) -> CsrMatrix<f64> {
-    use rand::RngExt;
-    let mut rng = rand::rng();
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(RANDOM_SPD_SEED);
 
     let nnz_per_row = (density * n as f64) as usize;
     let mut builder = CooMatrixBuilder::new(n, n);

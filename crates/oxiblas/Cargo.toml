@@ -23,14 +23,19 @@ bytemuck.workspace = true
 num-traits.workspace = true
 
 [features]
-default = ["sparse", "oxiblas-core/std", "oxiblas-matrix/std"]
-parallel = ["oxiblas-core/parallel", "oxiblas-blas/parallel", "oxiblas-lapack/parallel", "oxiblas-sparse?/parallel", "oxiblas-ndarray?/parallel"]
+default = ["std", "sparse"]
+# Mirrors the `std` feature gating used by `oxiblas-core`/`oxiblas-matrix`
+# (`#![cfg_attr(not(feature = "std"), no_std)]`). Enabling it activates `std`
+# support on the underlying core/matrix layers; this is the real signal the
+# `features::NO_STD` constant in `lib.rs` reads via `cfg!(feature = "std")`.
+std = ["oxiblas-core/std", "oxiblas-matrix/std"]
+parallel = ["std", "oxiblas-core/parallel", "oxiblas-blas/parallel", "oxiblas-lapack/parallel", "oxiblas-sparse?/parallel", "oxiblas-ndarray?/parallel"]
 f16 = ["oxiblas-core/f16", "dep:half"]
 f128 = ["oxiblas-core/f128"]
 ndarray = ["dep:oxiblas-ndarray"]
 sparse = ["dep:oxiblas-sparse"]
-serde = ["oxiblas-matrix/serde"]
-mmap = ["oxiblas-matrix/mmap"]
+serde = ["std", "oxiblas-matrix/serde"]
+mmap = ["std", "oxiblas-matrix/mmap"]
 nalgebra = ["oxiblas-matrix/nalgebra"]  # nalgebra type conversions
 full = ["parallel", "f16", "f128", "ndarray", "sparse", "serde", "mmap", "nalgebra"]
 
@@ -42,6 +47,13 @@ max-simd-256 = ["oxiblas-core/max-simd-256", "oxiblas-blas/max-simd-256", "oxibl
 [dev-dependencies]
 criterion.workspace = true
 num-complex.workspace = true
+# Doctest-only: the "ndarray"/"nalgebra" Integration and Migration Guide
+# sections in lib.rs write examples against these crates directly (matching
+# the optional `oxiblas-ndarray`/`oxiblas-matrix::nalgebra_compat`
+# integration surface below), which needs them as direct dependencies of
+# this crate, not just transitively through oxiblas-ndarray/oxiblas-matrix.
+ndarray.workspace = true
+nalgebra.workspace = true
 
 [[bench]]
 name = "gemm_bench"
@@ -57,3 +69,6 @@ required-features = ["sparse"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

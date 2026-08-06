@@ -11,7 +11,6 @@
 //! - `col_ptrs` has length n+1
 
 use oxiblas_core::scalar::{Field, Scalar};
-use std::ops::Index;
 
 /// Error type for CSC matrix operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,17 +450,21 @@ impl<T: Scalar + Clone> CscMatrix<T> {
     }
 }
 
-impl<T: Scalar + Clone> Index<(usize, usize)> for CscMatrix<T>
-where
-    T: Field,
-{
-    type Output = T;
-
-    fn index(&self, (row, col): (usize, usize)) -> &Self::Output {
-        self.get(row, col)
-            .expect("Index out of bounds or zero element")
-    }
-}
+// Note: `CscMatrix` deliberately does not implement `std::ops::Index`
+// (matching `CsrMatrix`).
+//
+// A sparse matrix cannot honor `Index`'s `&Self::Output` contract for a
+// structurally-absent (implicit zero) position: there is no `T` value stored at
+// that location to borrow from, so the only implementations available are
+// (a) panicking, which violates the crate's no-panic policy and is a surprising
+// trap — `let v = a[(0, 1)];` for a merely-empty position is a perfectly
+// ordinary sparse read, yet it aborted the program — or (b) manufacturing a
+// reference to a shared zero, which would require `T: 'static` plus interior
+// storage purely to satisfy the trait shape. Use the checked accessors instead:
+//   - [`CscMatrix::get`] returns `Option<&T>` (`None` for implicit zeros and
+//     out-of-bounds positions alike).
+//   - [`CscMatrix::get_or_zero`] returns an owned `T`, `T::zero()` for implicit
+//     zeros (requires `T: Field`).
 
 #[cfg(test)]
 mod tests {
@@ -608,5 +611,82 @@ mod tests {
 
         let csc = CscMatrix::new(2, 2, col_ptrs, row_indices, values).unwrap();
         assert!(csc.is_structurally_symmetric());
+    }
+
+    // --- Regression: `is_structurally_symmetric` must query the transposed
+    // position, not re-discover the entry it started from --------------------
+    //
+    // `is_structurally_symmetric` walks every stored entry (row, col) and must
+    // ask "does the mirrored entry (col, row) also exist?" via
+    // `self.get(col, row)`. A swapped call — `self.get(row, col)` — would ask
+    // "does (row, col) exist?", which is always true because that is the very
+    // entry the outer loop is currently standing on: the check degenerates
+    // into a no-op self-lookup that can never observe an asymmetry and always
+    // reports `true`. The two cases below pin the argument order: a
+    // block-diagonal matrix that is genuinely symmetric but is *not* fully
+    // dense (so a naive "count the entries" check can't accidentally pass),
+    // and a strictly upper-triangular matrix that is genuinely asymmetric and
+    // that the swapped/self-lookup form would misreport as symmetric.
+    #[test]
+    fn test_csc_structurally_symmetric_block_diagonal_non_dense() {
+        // [1 2 0]
+        // [3 4 0]
+        // [0 0 5]
+        // Symmetric *structure* (values need not match, only the zero
+        // pattern), but not a fully dense matrix, so every stored entry
+        // genuinely requires the transpose lookup to find its mirror in a
+        // different column.
+        let values = vec![1.0f64, 3.0, 2.0, 4.0, 5.0];
+        let row_indices = vec![0, 1, 0, 1, 2];
+        let col_ptrs = vec![0, 2, 4, 5];
+
+        let csc = CscMatrix::new(3, 3, col_ptrs, row_indices, values).unwrap();
+        assert!(csc.is_structurally_symmetric());
+    }
+
+    #[test]
+    fn test_csc_not_structurally_symmetric_upper_triangular() {
+        // [1 2 0]
+        // [0 3 0]
+        // [0 0 4]
+        // (0,1) is stored but its mirror (1,0) is not: not structurally
+        // symmetric. A swapped `self.get(row, col)` call would re-find (0,1)
+        // itself instead of checking for (1,0) and would wrongly report
+        // `true`.
+        let values = vec![1.0f64, 2.0, 3.0, 4.0];
+        let row_indices = vec![0, 0, 1, 2];
+        let col_ptrs = vec![0, 1, 3, 4];
+
+        let csc = CscMatrix::new(3, 3, col_ptrs, row_indices, values).unwrap();
+        assert!(!csc.is_structurally_symmetric());
+    }
+
+    // --- Regression: reading a structurally-zero element must not panic -----
+    //
+    // `CscMatrix` used to implement `Index<(usize, usize)>` as
+    // `self.get(row, col).expect("Index out of bounds or zero element")`, so
+    // `let v = a[(0, 1)];` for an implicit zero — an entirely ordinary sparse
+    // read — aborted the program. The impl is gone (matching `CsrMatrix`);
+    // `get` / `get_or_zero` are the supported accessors and never panic.
+    #[test]
+    fn test_csc_no_index_operator_use_get_instead() {
+        // [1 0 4]
+        // [0 3 0]
+        // [2 0 5]
+        let values = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
+        let row_indices = vec![0, 2, 1, 0, 2];
+        let col_ptrs = vec![0, 2, 3, 5];
+
+        let csc = CscMatrix::new(3, 3, col_ptrs, row_indices, values).expect("valid CSC");
+
+        // Structural zero: `None` / `0.0`, not a panic.
+        assert_eq!(csc.get(0, 1), None);
+        assert_eq!(csc.get_or_zero(0, 1), 0.0);
+        // Out of bounds is the same story.
+        assert_eq!(csc.get(99, 99), None);
+        assert_eq!(csc.get_or_zero(99, 99), 0.0);
+        // Stored entries still read back.
+        assert_eq!(csc.get_or_zero(0, 0), 1.0);
+        assert_eq!(csc.get_or_zero(2, 2), 5.0);
     }
 }

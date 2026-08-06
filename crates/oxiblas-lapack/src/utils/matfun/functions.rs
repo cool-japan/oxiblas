@@ -92,8 +92,8 @@ pub fn expm<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<Ma
 /// ]);
 /// let result = logm(a.as_ref()).unwrap();
 ///
-/// // Should be approximately the identity (relaxed tolerance for iterative method)
-/// assert!((result[(0, 0)] - 1.0).abs() < 1e-4);
+/// // Inverse scaling and squaring recovers the identity to near machine precision.
+/// assert!((result[(0, 0)] - 1.0).abs() < 1e-12);
 /// ```
 pub fn logm<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<Mat<T>, MatFunError> {
     let n = a.nrows();
@@ -121,9 +121,15 @@ pub fn logm<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<Ma
             work[(i, j)] = a[(i, j)];
         }
     }
-    let half = T::one() / (T::one() + T::one());
+    // Inverse scaling and squaring (Higham's algorithm): repeatedly take the
+    // matrix square root of `work` until ||work - I|| is small enough that the
+    // log(I + X) series converges to near machine precision in a handful of
+    // terms. A threshold of ~0.1 keeps the number of square roots modest while
+    // limiting the cancellation incurred when forming X = work - I to about one
+    // decimal digit, leaving the result accurate to ~10*eps.
+    let theta = from_f64::<T>(0.1);
     let mut s = 0;
-    while matrix_1_norm_minus_identity(&work) > half && s < 100 {
+    while matrix_1_norm_minus_identity(&work) > theta && s < 100 {
         work = sqrtm_newton(&work)?;
         s += 1;
     }
@@ -134,7 +140,9 @@ pub fn logm<T: Field + Real + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<Ma
         }
         x[(i, i)] = x[(i, i)] - T::one();
     }
-    let log_x = log1p_pade(&x);
+    // log(work) = log(I + X). Scaling back by 2^s recovers log(A), since each
+    // square root halves the log: log(A) = 2^s * log(A^(1/2^s)).
+    let log_x = log1p_taylor(&x);
     let two = T::one() + T::one();
     let s_t = from_f64::<T>(s as f64);
     let scale: T = Float::powf(two, s_t);
@@ -747,27 +755,59 @@ fn pade_coeff<T: Field + Real>(p: usize, k: usize) -> T {
     }
     result
 }
-/// Taylor series approximation for log(I + X) where X is small.
-/// Uses log(I + X) ≈ X - X²/2 + X³/3 - X⁴/4 + ... up to 8 terms for better accuracy.
-fn log1p_pade<T: Field + Real + bytemuck::Zeroable>(x: &Mat<T>) -> Mat<T> {
+/// Adaptive Taylor series for the matrix logarithm log(I + X), valid for a
+/// small argument X.
+///
+/// Sums the series
+///
+/// ```text
+/// log(I + X) = X - X²/2 + X³/3 - X⁴/4 + ...
+/// ```
+///
+/// accumulating terms X^k * (-1)^(k+1) / k until the incremental contribution
+/// falls below machine precision relative to the accumulated result (or a
+/// generous safety cap is reached). When the caller keeps ||X|| small via the
+/// inverse scaling-and-squaring reduction, the terms decay geometrically and
+/// the sum reaches near machine precision after only a handful of iterations —
+/// unlike a fixed low-order truncation, which leaves a ~||X||^9 residual.
+fn log1p_taylor<T: Field + Real + bytemuck::Zeroable>(x: &Mat<T>) -> Mat<T> {
     let n = x.nrows();
-    let x2 = mat_mult(x, x);
-    let x3 = mat_mult(&x2, x);
-    let x4 = mat_mult(&x3, x);
-    let x5 = mat_mult(&x4, x);
-    let x6 = mat_mult(&x5, x);
-    let x7 = mat_mult(&x6, x);
-    let x8 = mat_mult(&x7, x);
+    let eps: T = <T as Float>::epsilon();
     let mut result = Mat::zeros(n, n);
+    // First term (k = 1): + X.
+    let mut term = x.clone();
     for i in 0..n {
         for j in 0..n {
-            result[(i, j)] = x[(i, j)] - x2[(i, j)] / from_f64::<T>(2.0)
-                + x3[(i, j)] / from_f64::<T>(3.0)
-                - x4[(i, j)] / from_f64::<T>(4.0)
-                + x5[(i, j)] / from_f64::<T>(5.0)
-                - x6[(i, j)] / from_f64::<T>(6.0)
-                + x7[(i, j)] / from_f64::<T>(7.0)
-                - x8[(i, j)] / from_f64::<T>(8.0);
+            result[(i, j)] = result[(i, j)] + term[(i, j)];
+        }
+    }
+    // Safety cap: for ||X|| < 1 the series converges long before this bound;
+    // the cap only guards against a pathological (non-converging) argument.
+    let max_terms = 60usize;
+    for k in 2..=max_terms {
+        // term := X^k (previous term multiplied by X).
+        term = mat_mult(&term, x);
+        let sign = if k % 2 == 0 {
+            T::zero() - T::one()
+        } else {
+            T::one()
+        };
+        let coeff = sign / from_f64::<T>(k as f64);
+        let mut add_sq = T::zero();
+        for i in 0..n {
+            for j in 0..n {
+                let contrib = coeff * term[(i, j)];
+                result[(i, j)] = result[(i, j)] + contrib;
+                add_sq = add_sq + contrib * contrib;
+            }
+        }
+        // Stop once the newly added term is negligible relative to the sum.
+        // For ||X|| < 1 the geometric tail beyond this term is bounded by a
+        // small multiple of it, so the truncation error is ~eps * ||result||.
+        let add_norm = Real::sqrt(add_sq);
+        let res_norm = matrix_frob_norm(&result);
+        if add_norm <= eps * res_norm {
+            break;
         }
     }
     result
@@ -1646,6 +1686,100 @@ mod tests {
             frechet[(0, 0)]
         );
     }
+    /// Verifies logm accuracy via the round-trip exp(logm(A)) == A for a range
+    /// of symmetric positive-definite matrices whose deviation ||A - I|| spans
+    /// from small (0.01) up to and well beyond the previously-problematic 0.5.
+    /// With the inverse scaling-and-squaring logm the relative error is now
+    /// close to machine epsilon rather than the ~2e-4 of the old 8-term series.
+    #[test]
+    fn test_logm_accuracy_exp_of_logm() {
+        // (label, matrix). All symmetric positive-definite so the principal
+        // real logarithm is well defined.
+        let cases: Vec<(&str, Mat<f64>)> = vec![
+            // ||A - I||_1 = 0.015 (small argument regime).
+            (
+                "near_identity",
+                Mat::from_rows(&[&[1.01f64, 0.005], &[0.005, 1.01]]),
+            ),
+            // ||A - I||_1 = 0.4.
+            ("mid", Mat::from_rows(&[&[1.3f64, 0.1], &[0.1, 1.2]])),
+            // ||A - I||_1 = 0.7 (beyond the old 0.5 threshold).
+            (
+                "beyond_half",
+                Mat::from_rows(&[&[1.5f64, 0.2], &[0.2, 1.4]]),
+            ),
+            // ||A - I||_1 = 2.5 (needs several square-root reductions).
+            ("large", Mat::from_rows(&[&[2.0f64, 0.5], &[0.5, 3.0]])),
+            // Diagonal with eigenvalues far from 1 in both directions.
+            (
+                "wide_spectrum",
+                Mat::from_rows(&[&[0.25f64, 0.0], &[0.0, 5.0]]),
+            ),
+        ];
+        for (label, a) in &cases {
+            let log_a = logm(a.as_ref()).unwrap();
+            let recovered = expm(log_a.as_ref()).unwrap();
+            let mut max_abs = 0.0f64;
+            let mut a_norm = 0.0f64;
+            for i in 0..a.nrows() {
+                for j in 0..a.ncols() {
+                    max_abs = max_abs.max((recovered[(i, j)] - a[(i, j)]).abs());
+                    a_norm = a_norm.max(a[(i, j)].abs());
+                }
+            }
+            let rel = max_abs / a_norm;
+            assert!(
+                rel < 1e-12,
+                "case '{}': exp(logm(A)) relative error {} exceeds 1e-12",
+                label,
+                rel
+            );
+        }
+    }
+
+    /// Directly checks logm against known closed-form logs of diagonal matrices,
+    /// where the old truncated series was ~2e-4 off near the 0.5 boundary.
+    #[test]
+    fn test_logm_diagonal_exact() {
+        // exp(0.5) and exp(-0.5) give a matrix with ||A - I|| near the old
+        // boundary; log must recover 0.5 and -0.5 to near machine precision.
+        let a = Mat::from_rows(&[&[0.5f64.exp(), 0.0], &[0.0, (-0.5f64).exp()]]);
+        let log_a = logm(a.as_ref()).unwrap();
+        assert!(
+            (log_a[(0, 0)] - 0.5).abs() < 1e-13,
+            "log(exp(0.5)) = {}, expected 0.5",
+            log_a[(0, 0)]
+        );
+        assert!(
+            (log_a[(1, 1)] + 0.5).abs() < 1e-13,
+            "log(exp(-0.5)) = {}, expected -0.5",
+            log_a[(1, 1)]
+        );
+        assert!(log_a[(0, 1)].abs() < 1e-13);
+        assert!(log_a[(1, 0)].abs() < 1e-13);
+    }
+
+    /// Round-trip in the other direction: logm(expm(A)) == A for a non-normal A
+    /// whose exponential lands beyond the old 0.5 threshold.
+    #[test]
+    fn test_logm_of_expm_tight() {
+        let a = Mat::from_rows(&[&[0.5f64, 0.3], &[0.1, 0.4]]);
+        let exp_a = expm(a.as_ref()).unwrap();
+        let log_exp_a = logm(exp_a.as_ref()).unwrap();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (a[(i, j)] - log_exp_a[(i, j)]).abs() < 1e-12,
+                    "log(exp(A)) != A at ({}, {}): {} vs {}",
+                    i,
+                    j,
+                    a[(i, j)],
+                    log_exp_a[(i, j)]
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cond_expm_identity() {
         let eye = Mat::<f64>::eye(2);

@@ -171,13 +171,24 @@ pub struct TrlResult {
 ///
 /// # Usage
 ///
-/// ```ignore
-/// use oxiblas_sparse::linalg::eigenvalue::{ThickRestartLanczos, TrlConfig, EigenvalueTarget};
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
+/// use oxiblas_sparse::linalg::eigenvalue::{EigenvalueTarget, ThickRestartLanczos, TrlConfig};
+///
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+/// let csr_matrix = CsrMatrix::new(
+///     10,
+///     10,
+///     (0..=10).collect(),
+///     (0..10).collect(),
+///     (1..=10).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = TrlConfig {
-///     num_eigenvalues: 5,
-///     max_krylov_size: 25,
-///     num_thick: 7,
+///     num_eigenvalues: 2,
+///     max_krylov_size: 8,
+///     num_thick: 3,
 ///     tol: 1e-10,
 ///     which: EigenvalueTarget::LargestMagnitude,
 ///     ..Default::default()
@@ -186,6 +197,7 @@ pub struct TrlResult {
 /// let trl = ThickRestartLanczos::new(config).unwrap();
 /// let result = trl.compute(&csr_matrix).unwrap();
 /// println!("Eigenvalues: {:?}", result.eigenvalues);
+/// assert_eq!(result.eigenvalues.len(), 2);
 /// ```
 pub struct ThickRestartLanczos {
     config: TrlConfig,

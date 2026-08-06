@@ -391,13 +391,30 @@ impl<T: Field + Real + bytemuck::Zeroable> Balance<T> {
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let bal = Balance::compute(a.as_ref(), BalanceJob::Both).unwrap();
-    /// // Compute eigenvectors of balanced matrix
-    /// let evd = GeneralEvd::compute(bal.balanced()).unwrap();
-    /// let v_bal = evd.right_eigenvectors();
-    /// // Back-transform to original matrix eigenvectors
+    /// ```
+    /// use oxiblas_lapack::evd::balance::{Balance, BalanceJob, BalanceSide};
+    /// use oxiblas_matrix::Mat;
+    ///
+    /// let a: Mat<f64> = Mat::from_rows(&[&[1.0, 100.0], &[0.01, 2.0]]);
+    /// let bal = Balance::compute(a.as_ref(), BalanceJob::Scale).unwrap();
+    ///
+    /// // A right eigenvector of the *balanced* matrix (any vector of the
+    /// // right length works for demonstrating the transform itself).
+    /// let v_bal = vec![vec![1.0, 1.0]];
     /// let v = bal.back_transform(&v_bal, BalanceSide::Right);
+    ///
+    /// // `back_transform` is documented to multiply row `i` by `scale()[i]`
+    /// // for every row in the non-isolated block `ilo..=ihi`, and leave
+    /// // everything else unchanged -- check that against its own outputs.
+    /// let scale = bal.scale();
+    /// for i in 0..a.nrows() {
+    ///     let expected = if (bal.ilo()..=bal.ihi()).contains(&i) {
+    ///         scale[i] * v_bal[0][i]
+    ///     } else {
+    ///         v_bal[0][i]
+    ///     };
+    ///     assert_eq!(v[0][i], expected);
+    /// }
     /// ```
     pub fn back_transform(&self, v: &[Vec<T>], side: BalanceSide) -> Vec<Vec<T>> {
         let num_vectors = v.len();

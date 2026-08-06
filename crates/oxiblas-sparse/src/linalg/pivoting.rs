@@ -78,91 +78,25 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> SparseLuThreshold<T> {
             });
         }
 
+        // Left-looking (Gilbert-Peierls) sparse LU with threshold partial
+        // pivoting. The working storage scales with nnz(L) + nnz(U) plus an
+        // O(n) sparse accumulator, never n^2. Because the row permutation is
+        // built incrementally via `pinv` and L is relabelled only once at the
+        // end, the resulting factorization satisfies P*A = L*U exactly for
+        // every step (already-computed L rows are never left inconsistent with
+        // the permutation, unlike a naive swap-the-permutation scheme).
+        let factors = sparse_lu_left_looking(a, LuPivotMode::Threshold(threshold.clone()))?;
+
         let n = a.nrows();
-        let mut perm: Vec<usize> = (0..n).collect();
-
-        // Dense working storage
-        let mut l_data = vec![vec![T::zero(); n]; n];
-        let mut u_data = vec![vec![T::zero(); n]; n];
-
-        let mut work = vec![vec![T::zero(); n]; n];
-        for col in 0..n {
-            let start = a.col_ptrs()[col];
-            let end = a.col_ptrs()[col + 1];
-            for idx in start..end {
-                work[a.row_indices()[idx]][col] = a.values()[idx].clone();
-            }
-        }
-
-        for k in 0..n {
-            // Find maximum absolute value in column k, rows k..n
-            let mut max_val = T::zero();
-            let mut max_row = k;
-
-            for i in k..n {
-                let perm_i = perm[i];
-                let val = Scalar::abs(work[perm_i][k].clone());
-                if val > max_val {
-                    max_val = val;
-                    max_row = i;
-                }
-            }
-
-            if max_val <= <T as Scalar>::epsilon() {
-                return Err(SparseLUError::Singular { row: k });
-            }
-
-            // Threshold pivoting: only swap if diagonal is too small relative to max
-            let diag_val = Scalar::abs(work[perm[k]][k].clone());
-            if diag_val < threshold.clone() * max_val {
-                // Diagonal is insufficiently large; swap with the max row
-                perm.swap(k, max_row);
-            }
-            // Otherwise keep the diagonal (less fill-in)
-
-            let pivot_row = perm[k];
-            let pivot = work[pivot_row][k].clone();
-
-            if Scalar::abs(pivot.clone()) <= <T as Scalar>::epsilon() {
-                return Err(SparseLUError::Singular { row: k });
-            }
-
-            u_data[k][k] = pivot.clone();
-
-            for i in (k + 1)..n {
-                let row_i = perm[i];
-                let lik = work[row_i][k].clone() / pivot.clone();
-
-                l_data[i][k] = lik.clone();
-
-                for j in (k + 1)..n {
-                    work[row_i][j] =
-                        work[row_i][j].clone() - lik.clone() * work[pivot_row][j].clone();
-                }
-            }
-
-            for j in (k + 1)..n {
-                u_data[k][j] = work[pivot_row][j].clone();
-            }
-        }
-
-        // Set L diagonal to 1
-        for i in 0..n {
-            l_data[i][i] = T::one();
-        }
-
-        let l = dense_to_csc_lower(&l_data);
-        let u = dense_to_csc_upper(&u_data);
-
-        let mut perm_inv = vec![0; n];
-        for (i, &p) in perm.iter().enumerate() {
+        let mut perm_inv = vec![0usize; n];
+        for (i, &p) in factors.perm.iter().enumerate() {
             perm_inv[p] = i;
         }
 
         Ok(Self {
-            l,
-            u,
-            perm,
+            l: factors.l,
+            u: factors.u,
+            perm: factors.perm,
             perm_inv,
             threshold,
         })
@@ -251,63 +185,17 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> SparseLuStaticPivot<T> {
             });
         }
 
-        let n = a.nrows();
-        let mut num_perturbed = 0usize;
-
-        let mut l_data = vec![vec![T::zero(); n]; n];
-        let mut u_data = vec![vec![T::zero(); n]; n];
-
-        let mut work = vec![vec![T::zero(); n]; n];
-        for col in 0..n {
-            let start = a.col_ptrs()[col];
-            let end = a.col_ptrs()[col + 1];
-            for idx in start..end {
-                work[a.row_indices()[idx]][col] = a.values()[idx].clone();
-            }
-        }
-
-        for k in 0..n {
-            let mut pivot = work[k][k].clone();
-
-            // Static pivoting: perturb small pivots
-            if Scalar::abs(pivot.clone()) < epsilon.clone() {
-                num_perturbed += 1;
-                if pivot >= T::zero() {
-                    pivot = epsilon.clone();
-                } else {
-                    pivot = T::zero() - epsilon.clone();
-                }
-                work[k][k] = pivot.clone();
-            }
-
-            u_data[k][k] = pivot.clone();
-
-            for i in (k + 1)..n {
-                let lik = work[i][k].clone() / pivot.clone();
-                l_data[i][k] = lik.clone();
-
-                for j in (k + 1)..n {
-                    work[i][j] = work[i][j].clone() - lik.clone() * work[k][j].clone();
-                }
-            }
-
-            for j in (k + 1)..n {
-                u_data[k][j] = work[k][j].clone();
-            }
-        }
-
-        for i in 0..n {
-            l_data[i][i] = T::one();
-        }
-
-        let l = dense_to_csc_lower(&l_data);
-        let u = dense_to_csc_upper(&u_data);
+        // Left-looking (Gilbert-Peierls) sparse LU using the natural row order
+        // (no row interchanges). Any pivot with |pivot| < epsilon is replaced by
+        // sign(pivot) * epsilon (SuperLU-style perturbation). Working storage
+        // scales with nnz(L) + nnz(U) plus an O(n) sparse accumulator, not n^2.
+        let factors = sparse_lu_left_looking(a, LuPivotMode::StaticPerturb(epsilon.clone()))?;
 
         Ok(Self {
-            l,
-            u,
+            l: factors.l,
+            u: factors.u,
             epsilon,
-            num_perturbed,
+            num_perturbed: factors.num_perturbed,
         })
     }
 
@@ -553,8 +441,13 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> SparseLdlt<T> {
             // Test 3: |a_rr| >= alpha * sigma => swap r to position k, use 1x1
             let arr = work[pr][pr].clone();
             if Scalar::abs(arr.clone()) >= alpha.clone() * sigma.clone() {
-                // Swap rows/cols k and r in permutation
+                // Swap rows/cols k and r in permutation. `l_data` is indexed by
+                // position (not physical row), so the already-computed columns
+                // `0..k` of L must be swapped in lock-step with the permutation;
+                // otherwise the multipliers stored for positions k and r would
+                // become attached to the wrong physical rows and P*A*P^T != L*D*L^T.
                 perm.swap(k, r);
+                swap_l_rows(&mut l_data, k, r, k);
                 let pivot = arr.clone();
                 if Scalar::abs(pivot.clone()) <= <T as Scalar>::epsilon() {
                     return Err(SparseLUError::Singular { row: k });
@@ -565,9 +458,13 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> SparseLdlt<T> {
                 continue;
             }
 
-            // Use 2x2 pivot at (k, k+1) after swapping r to position k+1
+            // Use 2x2 pivot at (k, k+1) after swapping r to position k+1.
+            // As above, the already-computed columns `0..k` of the
+            // position-indexed L must be swapped together with the permutation
+            // so the multipliers stay attached to the correct physical rows.
             if r != k + 1 {
                 perm.swap(k + 1, r);
+                swap_l_rows(&mut l_data, k + 1, r, k);
             }
 
             let pk = perm[k];
@@ -818,51 +715,402 @@ fn self_apply_1x1_pivot<T: Scalar<Real = T> + Clone + Field + Real>(
 }
 
 // ---------------------------------------------------------------------------
-// Dense-to-CSC conversion helpers (same logic as in lu.rs, but local)
+// Symmetric-pivot L row swap (used by the Bunch-Kaufman LDL^T factorization)
 // ---------------------------------------------------------------------------
 
-/// Converts a dense lower triangular matrix to CSC format.
-fn dense_to_csc_lower<T: Scalar + Clone + Field>(data: &[Vec<T>]) -> CscMatrix<T> {
-    let n = data.len();
-    let mut col_ptrs = vec![0usize; n + 1];
-    let mut row_indices = Vec::new();
-    let mut values = Vec::new();
-
-    for j in 0..n {
-        for i in j..n {
-            let val = data[i][j].clone();
-            if Scalar::abs(val.clone()) > <T as Scalar>::epsilon() || i == j {
-                row_indices.push(i);
-                values.push(val);
-            }
-        }
-        col_ptrs[j + 1] = values.len();
+/// Swaps rows `a` and `b` of the position-indexed lower factor `l_data` over the
+/// already-computed columns `0..cols`.
+///
+/// The LDL^T factorization stores `l_data` indexed by *position* (not physical
+/// row) and drives elimination through the `perm` array. When a symmetric pivot
+/// swaps two positions, the multipliers already stored for those positions must
+/// move with them, otherwise the position-indexed L becomes inconsistent with
+/// the permutation and `P*A*P^T = L*D*L^T` no longer holds.
+fn swap_l_rows<T>(l_data: &mut [Vec<T>], a: usize, b: usize, cols: usize) {
+    if a == b || cols == 0 {
+        return;
     }
-
-    // Safety: we construct valid CSC invariants (sorted row indices per column)
-    unsafe { CscMatrix::new_unchecked(n, n, col_ptrs, row_indices, values) }
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let (left, right) = l_data.split_at_mut(hi);
+    let row_lo = &mut left[lo];
+    let row_hi = &mut right[0];
+    for c in 0..cols {
+        std::mem::swap(&mut row_lo[c], &mut row_hi[c]);
+    }
 }
 
-/// Converts a dense upper triangular matrix to CSC format.
-fn dense_to_csc_upper<T: Scalar + Clone + Field>(data: &[Vec<T>]) -> CscMatrix<T> {
-    let n = data.len();
-    let mut col_ptrs = vec![0usize; n + 1];
-    let mut row_indices = Vec::new();
-    let mut values = Vec::new();
+// ---------------------------------------------------------------------------
+// Left-looking (Gilbert-Peierls) sparse LU with pivoting
+// ---------------------------------------------------------------------------
 
-    for j in 0..n {
-        for i in 0..=j {
-            let val = data[i][j].clone();
-            if Scalar::abs(val.clone()) > <T as Scalar>::epsilon() || i == j {
-                row_indices.push(i);
-                values.push(val);
-            }
+/// Pivot strategy for the shared left-looking sparse LU driver.
+enum LuPivotMode<T> {
+    /// Threshold partial pivoting with tolerance `tol` in `[0, 1]`.
+    ///
+    /// `tol = 1` is full partial pivoting (always the largest magnitude row);
+    /// `tol = 0` keeps the natural diagonal whenever it is non-zero.
+    Threshold(T),
+    /// Static (SuperLU-style) pivoting: keep the natural row order and replace
+    /// any pivot with `|pivot| < epsilon` by `sign(pivot) * epsilon`.
+    StaticPerturb(T),
+}
+
+/// Result of a left-looking sparse LU factorization: `P*A = L*U`.
+struct SparseLuFactors<T: Scalar> {
+    /// Unit lower triangular factor (CSC, diagonal stored first in each column).
+    l: CscMatrix<T>,
+    /// Upper triangular factor (CSC).
+    u: CscMatrix<T>,
+    /// Row permutation `perm` such that row `k` of `P*A` is original row `perm[k]`.
+    perm: Vec<usize>,
+    /// Number of pivots perturbed (static pivoting only; `0` otherwise).
+    num_perturbed: usize,
+}
+
+/// O(n) sparse accumulator and depth-first-search workspace for Gilbert-Peierls.
+///
+/// This is the only workspace whose size grows with `n`; together with the CSC
+/// storage for `L` and `U` (which grows with the number of non-zeros produced)
+/// the whole factorization uses `O(n + nnz(L) + nnz(U))` memory rather than the
+/// `O(n^2)` dense working arrays used previously.
+struct LuSpa<T> {
+    /// Dense values of the current column solution (mostly zero).
+    x: Vec<T>,
+    /// Non-zero pattern of the current column, `xi[top..n]` in topological order.
+    xi: Vec<usize>,
+    /// DFS recursion stack of graph nodes (original row indices).
+    rstack: Vec<usize>,
+    /// DFS resume position within each stacked node's adjacency list.
+    pstack: Vec<usize>,
+    /// Per-node visited flag, reset after every column.
+    marked: Vec<bool>,
+}
+
+impl<T: Scalar<Real = T> + Clone + Field + Real> LuSpa<T> {
+    fn new(n: usize) -> Self {
+        Self {
+            x: vec![T::zero(); n],
+            xi: vec![0usize; n],
+            rstack: vec![0usize; n],
+            pstack: vec![0usize; n],
+            marked: vec![false; n],
         }
-        col_ptrs[j + 1] = values.len();
     }
 
-    // Safety: we construct valid CSC invariants (sorted row indices per column)
-    unsafe { CscMatrix::new_unchecked(n, n, col_ptrs, row_indices, values) }
+    /// Iterative depth-first search of the graph of `L` starting at `start`.
+    ///
+    /// Nodes reachable from `start` are pushed (in post-order) into `xi`, filling
+    /// it from index `top` downwards; the new `top` is returned.
+    fn dfs(
+        &mut self,
+        start: usize,
+        pinv: &[isize],
+        l_col_ptrs: &[usize],
+        l_rows: &[usize],
+        mut top: usize,
+    ) -> usize {
+        let mut head: isize = 0;
+        self.rstack[0] = start;
+        while head >= 0 {
+            let h = head as usize;
+            let node = self.rstack[h];
+            let node_col = pinv[node];
+            if !self.marked[node] {
+                self.marked[node] = true;
+                // Skip the (self-loop) diagonal entry stored first in the column.
+                self.pstack[h] = if node_col < 0 {
+                    0
+                } else {
+                    l_col_ptrs[node_col as usize] + 1
+                };
+            }
+            let p_end = if node_col < 0 {
+                0
+            } else {
+                l_col_ptrs[node_col as usize + 1]
+            };
+            let mut done = true;
+            let mut p = self.pstack[h];
+            while p < p_end {
+                let neighbor = l_rows[p];
+                if self.marked[neighbor] {
+                    p += 1;
+                    continue;
+                }
+                // Pause this node, descend into `neighbor`.
+                self.pstack[h] = p;
+                head += 1;
+                self.rstack[head as usize] = neighbor;
+                done = false;
+                break;
+            }
+            if done {
+                top -= 1;
+                self.xi[top] = node;
+                head -= 1;
+            }
+        }
+        top
+    }
+
+    /// Computes the non-zero pattern of `x = L \ A(:,col)` via reachability.
+    ///
+    /// Returns `top`; the pattern is `xi[top..n]` in topological order.
+    fn reach(
+        &mut self,
+        a: &CscMatrix<T>,
+        col: usize,
+        pinv: &[isize],
+        l_col_ptrs: &[usize],
+        l_rows: &[usize],
+    ) -> usize {
+        let n = self.x.len();
+        let mut top = n;
+        let start = a.col_ptrs()[col];
+        let end = a.col_ptrs()[col + 1];
+        for idx in start..end {
+            let row = a.row_indices()[idx];
+            if !self.marked[row] {
+                top = self.dfs(row, pinv, l_col_ptrs, l_rows, top);
+            }
+        }
+        // Restore the visited flags for the next column.
+        for p in top..n {
+            let node = self.xi[p];
+            self.marked[node] = false;
+        }
+        top
+    }
+
+    /// Sparse triangular solve `x = L \ A(:,col)`.
+    ///
+    /// On entry `x` must be identically zero (the driver restores this after each
+    /// column). On return `xi[top..n]` holds the pattern and `x[i]` the values.
+    fn spsolve(
+        &mut self,
+        a: &CscMatrix<T>,
+        col: usize,
+        pinv: &[isize],
+        l_col_ptrs: &[usize],
+        l_rows: &[usize],
+        l_vals: &[T],
+    ) -> usize {
+        let n = self.x.len();
+        let top = self.reach(a, col, pinv, l_col_ptrs, l_rows);
+
+        // Scatter A(:,col) into the (all-zero) accumulator.
+        let start = a.col_ptrs()[col];
+        let end = a.col_ptrs()[col + 1];
+        for idx in start..end {
+            let row = a.row_indices()[idx];
+            self.x[row] = a.values()[idx].clone();
+        }
+
+        // Forward substitution in topological order.
+        for p_idx in top..n {
+            let node = self.xi[p_idx];
+            let node_col = pinv[node];
+            if node_col < 0 {
+                // Column of L not yet formed: `node` is a pivot candidate, its
+                // value stays as-is (L has unit diagonal, so no self-division).
+                continue;
+            }
+            let jj = node_col as usize;
+            let xj = self.x[node].clone();
+            for p in (l_col_ptrs[jj] + 1)..l_col_ptrs[jj + 1] {
+                let i = l_rows[p];
+                self.x[i] = self.x[i].clone() - l_vals[p].clone() * xj.clone();
+            }
+        }
+
+        top
+    }
+}
+
+/// Sorts every column of a CSC triple in place by ascending row index.
+///
+/// This both satisfies the crate's CSC invariant (sorted row indices per column)
+/// and places the unit diagonal of `L` first / the diagonal of `U` last, matching
+/// what the sparse triangular solvers expect.
+fn sort_csc_columns<T: Clone>(col_ptrs: &[usize], rows: &mut [usize], vals: &mut [T]) {
+    let ncols = col_ptrs.len().saturating_sub(1);
+    for j in 0..ncols {
+        let start = col_ptrs[j];
+        let end = col_ptrs[j + 1];
+        if end - start <= 1 {
+            continue;
+        }
+        let mut order: Vec<usize> = (start..end).collect();
+        order.sort_unstable_by_key(|&p| rows[p]);
+        let sorted_rows: Vec<usize> = order.iter().map(|&p| rows[p]).collect();
+        let sorted_vals: Vec<T> = order.iter().map(|&p| vals[p].clone()).collect();
+        for (offset, r) in sorted_rows.into_iter().enumerate() {
+            rows[start + offset] = r;
+        }
+        for (offset, v) in sorted_vals.into_iter().enumerate() {
+            vals[start + offset] = v;
+        }
+    }
+}
+
+/// Left-looking (Gilbert-Peierls) sparse LU factorization `P*A = L*U`.
+///
+/// Each column `k` is computed by a sparse triangular solve against the columns
+/// of `L` already produced (`x = L \ A(:,k)`), followed by pivot selection and
+/// storage of `L(:,k)` and `U(:,k)`. The row permutation is built incrementally
+/// in `pinv` and `L`'s row indices are relabelled to permuted space exactly once
+/// at the end, so `P*A = L*U` holds for every intermediate step (there is no
+/// stale, half-permuted `L` as in a naive swap-the-permutation implementation).
+///
+/// Memory and work scale with `nnz(L) + nnz(U)` plus an `O(n)` accumulator.
+fn sparse_lu_left_looking<T: Scalar<Real = T> + Clone + Field + Real>(
+    a: &CscMatrix<T>,
+    mode: LuPivotMode<T>,
+) -> Result<SparseLuFactors<T>, SparseLUError> {
+    let n = a.nrows();
+    if n == 0 {
+        // Empty factorization: 0x0 L and U.
+        let l = unsafe { CscMatrix::new_unchecked(0, 0, vec![0usize], Vec::new(), Vec::new()) };
+        let u = unsafe { CscMatrix::new_unchecked(0, 0, vec![0usize], Vec::new(), Vec::new()) };
+        return Ok(SparseLuFactors {
+            l,
+            u,
+            perm: Vec::new(),
+            num_perturbed: 0,
+        });
+    }
+
+    let eps = <T as Scalar>::epsilon();
+
+    // pinv[orig] = k means original row `orig` is the k-th pivot (position k);
+    // `-1` marks a row that is not yet pivotal.
+    let mut pinv = vec![-1isize; n];
+    let mut perm = vec![0usize; n];
+    let mut spa = LuSpa::<T>::new(n);
+    let mut num_perturbed = 0usize;
+
+    let mut l_col_ptrs = vec![0usize; n + 1];
+    let mut l_rows: Vec<usize> = Vec::new();
+    let mut l_vals: Vec<T> = Vec::new();
+    let mut u_col_ptrs = vec![0usize; n + 1];
+    let mut u_rows: Vec<usize> = Vec::new();
+    let mut u_vals: Vec<T> = Vec::new();
+
+    for k in 0..n {
+        l_col_ptrs[k] = l_rows.len();
+        u_col_ptrs[k] = u_rows.len();
+
+        // No column permutation: the diagonal candidate for column k is row k.
+        let col = k;
+        let top = spa.spsolve(a, col, &pinv, &l_col_ptrs, &l_rows, &l_vals);
+
+        // --- Pivot selection --------------------------------------------------
+        let ipiv: usize;
+        let pivot: T;
+        match &mode {
+            LuPivotMode::Threshold(tol) => {
+                let mut amax = T::zero();
+                let mut best: isize = -1;
+                for p_idx in top..n {
+                    let i = spa.xi[p_idx];
+                    if pinv[i] < 0 {
+                        let t = Scalar::abs(spa.x[i].clone());
+                        if t > amax {
+                            amax = t;
+                            best = i as isize;
+                        }
+                    }
+                }
+                if best < 0 || amax <= eps {
+                    return Err(SparseLUError::Singular { row: k });
+                }
+                let mut chosen = best as usize;
+                // Threshold rule: keep the natural diagonal row if it is still
+                // available and large enough relative to the column maximum.
+                if pinv[col] < 0 {
+                    let dval = Scalar::abs(spa.x[col].clone());
+                    if dval > eps && dval >= amax * tol.clone() {
+                        chosen = col;
+                    }
+                }
+                ipiv = chosen;
+                pivot = spa.x[ipiv].clone();
+                if Scalar::abs(pivot.clone()) <= eps {
+                    return Err(SparseLUError::Singular { row: k });
+                }
+            }
+            LuPivotMode::StaticPerturb(epsilon) => {
+                let mut pv = spa.x[col].clone();
+                if Scalar::abs(pv.clone()) < epsilon.clone() {
+                    num_perturbed += 1;
+                    pv = if pv >= T::zero() {
+                        epsilon.clone()
+                    } else {
+                        T::zero() - epsilon.clone()
+                    };
+                    spa.x[col] = pv.clone();
+                }
+                ipiv = col;
+                pivot = pv;
+            }
+        }
+
+        // --- Store U(:,k): already-pivotal entries, then the diagonal ---------
+        for p_idx in top..n {
+            let i = spa.xi[p_idx];
+            let pos = pinv[i];
+            if pos >= 0 {
+                u_rows.push(pos as usize);
+                u_vals.push(spa.x[i].clone());
+            }
+        }
+        u_rows.push(k);
+        u_vals.push(pivot.clone());
+
+        // --- Store L(:,k): unit diagonal, then scaled sub-diagonal ------------
+        l_rows.push(ipiv); // original row index; relabelled after the loop
+        l_vals.push(T::one());
+        for p_idx in top..n {
+            let i = spa.xi[p_idx];
+            if pinv[i] < 0 && i != ipiv {
+                let scaled = spa.x[i].clone() / pivot.clone();
+                l_rows.push(i);
+                l_vals.push(scaled);
+            }
+        }
+
+        // Register the pivot and clear the accumulator for the next column.
+        pinv[ipiv] = k as isize;
+        perm[k] = ipiv;
+        for p_idx in top..n {
+            let i = spa.xi[p_idx];
+            spa.x[i] = T::zero();
+        }
+    }
+
+    l_col_ptrs[n] = l_rows.len();
+    u_col_ptrs[n] = u_rows.len();
+
+    // Relabel L's row indices from original rows to permuted (position) space,
+    // making L unit lower triangular with respect to P*A.
+    for r in l_rows.iter_mut() {
+        *r = pinv[*r] as usize;
+    }
+
+    sort_csc_columns(&l_col_ptrs, &mut l_rows, &mut l_vals);
+    sort_csc_columns(&u_col_ptrs, &mut u_rows, &mut u_vals);
+
+    // Safety: columns are sorted by row index with no duplicates, and both
+    // factors are square n x n, satisfying the CSC invariants.
+    let l = unsafe { CscMatrix::new_unchecked(n, n, l_col_ptrs, l_rows, l_vals) };
+    let u = unsafe { CscMatrix::new_unchecked(n, n, u_col_ptrs, u_rows, u_vals) };
+
+    Ok(SparseLuFactors {
+        l,
+        u,
+        perm,
+        num_perturbed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,5 +1569,235 @@ mod tests {
                 "Default threshold LU solve failed at index {i}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconstruction helpers and randomized factorization identity checks
+    // -----------------------------------------------------------------------
+
+    /// Expands a CSC matrix to a dense row-major matrix.
+    fn csc_to_dense(a: &CscMatrix<f64>) -> Vec<Vec<f64>> {
+        let (nr, nc) = a.shape();
+        let mut d = vec![vec![0.0f64; nc]; nr];
+        for col in 0..nc {
+            for idx in a.col_ptrs()[col]..a.col_ptrs()[col + 1] {
+                d[a.row_indices()[idx]][col] = a.values()[idx];
+            }
+        }
+        d
+    }
+
+    /// Builds a CSC matrix from a dense (row-major) square matrix.
+    fn dense_full_to_csc(m: &[Vec<f64>]) -> CscMatrix<f64> {
+        let n = m.len();
+        let mut col_ptrs = vec![0usize; n + 1];
+        let mut rows = Vec::new();
+        let mut vals = Vec::new();
+        for j in 0..n {
+            for (i, row) in m.iter().enumerate() {
+                if row[j] != 0.0 {
+                    rows.push(i);
+                    vals.push(row[j]);
+                }
+            }
+            col_ptrs[j + 1] = rows.len();
+        }
+        CscMatrix::new(n, n, col_ptrs, rows, vals).expect("valid csc from dense")
+    }
+
+    /// Dense square matrix product `a * b`.
+    fn mat_mul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let n = a.len();
+        let mut r = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for k in 0..n {
+                let aik = a[i][k];
+                if aik != 0.0 {
+                    for j in 0..n {
+                        r[i][j] += aik * b[k][j];
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    /// Small deterministic LCG returning values in `[-1, 1)`.
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 33) as f64) / ((1u64 << 31) as f64) * 2.0 - 1.0
+    }
+
+    fn max_abs(m: &[Vec<f64>]) -> f64 {
+        m.iter()
+            .flat_map(|row| row.iter())
+            .fold(0.0f64, |acc, &v| acc.max(v.abs()))
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 13: threshold sparse LU actually satisfies P*A == L*U
+    // -----------------------------------------------------------------------
+    //
+    // This is the definitive check for the "already-computed L rows are not
+    // swapped when the permutation changes" bug: if L and the permutation ever
+    // disagreed, the reconstructed L*U would not equal P*A. Randomized,
+    // non-diagonally-dominant draws force interchanges at steps k > 0.
+    #[test]
+    fn test_threshold_reconstruction_pa_eq_lu() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut factored = 0usize;
+        for trial in 0..300usize {
+            let n = 3 + trial % 5; // sizes 3..=7
+            let mut m = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    if lcg(&mut state) > -0.2 {
+                        m[i][j] = lcg(&mut state) * 5.0;
+                    }
+                }
+                if m[i][i].abs() < 0.25 {
+                    m[i][i] = 0.5; // keep a (non-dominant) diagonal present
+                }
+            }
+            let a = dense_full_to_csc(&m);
+            let ad = csc_to_dense(&a);
+            let scale = 1.0 + max_abs(&ad);
+
+            for &tol in &[1.0f64, 0.5, 0.1, 0.0] {
+                let lu = match SparseLuThreshold::with_threshold(&a, tol) {
+                    Ok(f) => f,
+                    Err(_) => continue, // structurally singular draw
+                };
+                factored += 1;
+
+                let l = csc_to_dense(lu.l());
+                let u = csc_to_dense(lu.u());
+                let prod = mat_mul(&l, &u);
+                let perm = lu.perm();
+                for i in 0..n {
+                    for j in 0..n {
+                        let pa = ad[perm[i]][j];
+                        assert!(
+                            (pa - prod[i][j]).abs() < 1e-9 * scale,
+                            "trial {trial} tol {tol}: (P A)[{i}][{j}]={pa} != (L U)={}",
+                            prod[i][j],
+                        );
+                    }
+                }
+
+                // And the solve is accurate for a known solution.
+                let x_true: Vec<f64> = (0..n).map(|i| i as f64 - 1.5).collect();
+                let b = csc_matvec(&a, &x_true);
+                let x = lu.solve(&b);
+                let ax = csc_matvec(&a, &x);
+                let resid: f64 = (0..n).map(|i| (ax[i] - b[i]).powi(2)).sum::<f64>().sqrt();
+                assert!(
+                    resid < 1e-6 * scale,
+                    "trial {trial} tol {tol}: solve residual {resid}",
+                );
+            }
+        }
+        assert!(
+            factored > 50,
+            "too few successful factorizations: {factored}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14: Bunch-Kaufman LDL^T satisfies P*A*P^T == L*D*L^T
+    // -----------------------------------------------------------------------
+    //
+    // Guards the symmetric-pivot L-row-swap fix: interchange (1x1) and 2x2
+    // pivots at steps k > 0 permute already-computed L columns, and the
+    // reconstruction would fail if those rows were not moved with the
+    // permutation. Tiny/indefinite diagonals force both pivot kinds.
+    #[test]
+    fn test_ldlt_reconstruction_papt_eq_ldlt() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut factored = 0usize;
+        let mut with_2x2 = 0usize;
+        for trial in 0..500usize {
+            let n = 4 + trial % 4; // sizes 4..=7
+            let mut m = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in i..n {
+                    if lcg(&mut state) > -0.1 {
+                        let v = lcg(&mut state) * 4.0;
+                        m[i][j] = v;
+                        m[j][i] = v;
+                    }
+                }
+            }
+            // Bias odd diagonals small/indefinite to force interchanges & 2x2 pivots.
+            for i in 0..n {
+                if i % 2 == 1 {
+                    m[i][i] = lcg(&mut state) * 0.4;
+                }
+            }
+
+            let a = dense_full_to_csc(&m);
+            let ldlt = match SparseLdlt::new(&a) {
+                Ok(f) => f,
+                Err(_) => continue, // exactly singular draw
+            };
+            factored += 1;
+            if ldlt.num_2x2_pivots() > 0 {
+                with_2x2 += 1;
+            }
+
+            let l = &ldlt.l_data;
+            let mut dmat = vec![vec![0.0f64; n]; n];
+            for p in ldlt.pivots() {
+                match p {
+                    PivotBlock::OneByOne { idx, d } => dmat[*idx][*idx] = *d,
+                    PivotBlock::TwoByTwo {
+                        idx1,
+                        idx2,
+                        d11,
+                        d21,
+                        d22,
+                    } => {
+                        dmat[*idx1][*idx1] = *d11;
+                        dmat[*idx2][*idx2] = *d22;
+                        dmat[*idx1][*idx2] = *d21;
+                        dmat[*idx2][*idx1] = *d21;
+                    }
+                }
+            }
+
+            // L * D * L^T
+            let ld = mat_mul(l, &dmat);
+            let mut lt = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    lt[j][i] = l[i][j];
+                }
+            }
+            let prod = mat_mul(&ld, &lt);
+
+            let ad = csc_to_dense(&a);
+            let perm = ldlt.perm();
+            let scale = 1.0 + max_abs(&ad);
+            for i in 0..n {
+                for j in 0..n {
+                    let pap = ad[perm[i]][perm[j]];
+                    assert!(
+                        (pap - prod[i][j]).abs() < 1e-6 * scale,
+                        "trial {trial}: (P A P^T)[{i}][{j}]={pap} != (L D L^T)={}",
+                        prod[i][j],
+                    );
+                }
+            }
+        }
+        assert!(
+            factored > 50,
+            "too few successful factorizations: {factored}"
+        );
+        assert!(
+            with_2x2 > 0,
+            "expected some 2x2 pivot blocks to be exercised"
+        );
     }
 }

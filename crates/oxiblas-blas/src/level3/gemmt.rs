@@ -21,7 +21,7 @@
 //! extracts the required triangle. For small matrices, a direct computation
 //! avoiding unnecessary work is used.
 
-use crate::level3::gemm::gemm;
+use crate::level3::gemm::gemm_transposed;
 use crate::level3::gemm_kernel::GemmKernel;
 use crate::level3::trsm::{Trans, Uplo};
 use oxiblas_core::scalar::Field;
@@ -144,7 +144,7 @@ pub fn gemmt<T: Field + GemmKernel + bytemuck::Zeroable>(
     const GEMM_THRESHOLD: usize = 32;
 
     if n >= GEMM_THRESHOLD && k >= 8 {
-        gemmt_via_gemm(uplo, trans_a, trans_b, alpha, a, b, beta, c, n, k)
+        gemmt_via_gemm(uplo, trans_a, trans_b, alpha, a, b, beta, c, n)
     } else {
         gemmt_naive(uplo, trans_a, trans_b, alpha, a, b, beta, c, n, k)
     }
@@ -161,82 +161,13 @@ fn gemmt_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     mut c: MatMut<'_, T>,
     n: usize,
-    k: usize,
 ) -> Result<(), GemmtError> {
-    // For GEMM, we need the matrices in non-transposed form
-    // We'll create temporary matrices if needed
-
-    // Create op(A) explicitly
-    let op_a: Mat<T> = match trans_a {
-        Trans::NoTrans => {
-            let mut t = Mat::zeros(n, k);
-            for i in 0..n {
-                for j in 0..k {
-                    t[(i, j)] = a[(i, j)];
-                }
-            }
-            t
-        }
-        Trans::Trans => {
-            let mut t = Mat::zeros(n, k);
-            for i in 0..n {
-                for j in 0..k {
-                    t[(i, j)] = a[(j, i)];
-                }
-            }
-            t
-        }
-        Trans::ConjTrans => {
-            let mut t = Mat::zeros(n, k);
-            for i in 0..n {
-                for j in 0..k {
-                    t[(i, j)] = a[(j, i)].conj();
-                }
-            }
-            t
-        }
-    };
-
-    // Create op(B) explicitly
-    let op_b: Mat<T> = match trans_b {
-        Trans::NoTrans => {
-            let mut t = Mat::zeros(k, n);
-            for i in 0..k {
-                for j in 0..n {
-                    t[(i, j)] = b[(i, j)];
-                }
-            }
-            t
-        }
-        Trans::Trans => {
-            let mut t = Mat::zeros(k, n);
-            for i in 0..k {
-                for j in 0..n {
-                    t[(i, j)] = b[(j, i)];
-                }
-            }
-            t
-        }
-        Trans::ConjTrans => {
-            let mut t = Mat::zeros(k, n);
-            for i in 0..k {
-                for j in 0..n {
-                    t[(i, j)] = b[(j, i)].conj();
-                }
-            }
-            t
-        }
-    };
-
-    // Compute full result using GEMM
+    // Compute the full n x n product using the transpose-aware GEMM entry
+    // point. This reads op(A)/op(B) in place while packing (zero-copy for real
+    // types), so the previous behavior of materializing two transposed copies
+    // of A and B is no longer needed.
     let mut temp: Mat<T> = Mat::zeros(n, n);
-    gemm(
-        alpha,
-        op_a.as_ref(),
-        op_b.as_ref(),
-        T::zero(),
-        temp.as_mut(),
-    );
+    gemm_transposed(trans_a, trans_b, alpha, a, b, T::zero(), temp.as_mut());
 
     // Copy triangle to C with beta scaling
     match uplo {

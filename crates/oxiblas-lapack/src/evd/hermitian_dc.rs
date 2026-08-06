@@ -6,6 +6,7 @@
 //! For Hermitian matrices (A = A^H), all eigenvalues are real and eigenvectors form
 //! a unitary matrix.
 
+use super::hermitian_tridiag::tridiagonalize_hermitian;
 use num_traits::{FromPrimitive, One, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
@@ -125,9 +126,10 @@ where
             u[(i, i)] = T::one();
         }
 
-        // Tridiagonalize: A = Q * T * Q^H
-        // For Hermitian matrices, the tridiagonal form has real diagonal and off-diagonal
-        let (diag, off_diag) = tridiagonalize(&mut work, &mut u, n);
+        // Tridiagonalize: A = (Q·D) * T * (Q·D)^H with T real symmetric tridiagonal.
+        // `u` receives Q·D (the accumulated reflectors folded with the diagonal phase
+        // correction D) so the D&C solver below yields the correct eigenvectors Q·D·V.
+        let (diag, off_diag) = tridiagonalize_hermitian(&mut work, &mut u, n);
 
         // Apply divide-and-conquer algorithm to real tridiagonal matrix
         let eigenvalues = divide_and_conquer(diag, off_diag, &mut u, n)?;
@@ -176,138 +178,6 @@ where
 
         a
     }
-}
-
-/// Tridiagonalizes a Hermitian matrix using Householder reflections.
-/// Returns (real diagonal, real off-diagonal) vectors.
-/// For Hermitian matrices, the tridiagonal form is real.
-fn tridiagonalize<T: Field + ComplexScalar>(
-    a: &mut Mat<T>,
-    u: &mut Mat<T>,
-    n: usize,
-) -> (Vec<T::Real>, Vec<T::Real>)
-where
-    T::Real: Real,
-{
-    let mut diag = vec![T::Real::zero(); n];
-    let mut off_diag = vec![T::Real::zero(); n.saturating_sub(1)];
-
-    // Working vectors
-    let mut v: Vec<T> = vec![T::zero(); n];
-
-    for k in 0..(n.saturating_sub(2)) {
-        // Compute the norm of the subdiagonal part of column k
-        let mut norm_sq = T::Real::zero();
-        for i in (k + 1)..n {
-            norm_sq = norm_sq + a[(i, k)].abs_sq();
-        }
-        let alpha = <T::Real as Real>::sqrt(norm_sq);
-
-        if alpha > T::Real::zero() {
-            // Get the first element of the subdiagonal
-            let x0 = a[(k + 1, k)];
-            let x0_norm = x0.abs();
-
-            // Compute the signed norm (similar to LAPACK's choice)
-            let beta = if x0_norm > T::Real::zero() {
-                let sign = if x0.real() >= T::Real::zero() {
-                    T::Real::one()
-                } else {
-                    -T::Real::one()
-                };
-                sign * alpha
-            } else {
-                alpha
-            };
-
-            // Construct Householder vector v
-            let v0 = if x0_norm > T::Real::zero() {
-                x0 + T::from_real(beta) * (x0 / T::from_real(x0_norm))
-            } else {
-                T::from_real(beta)
-            };
-
-            // Store the Householder vector (normalized so v[0] = 1)
-            let v0_norm = v0.abs();
-            if v0_norm > T::Real::zero() {
-                let scale = T::from_real(T::Real::one() / v0_norm);
-                v[k + 1] = T::one();
-                for i in (k + 2)..n {
-                    v[i] = a[(i, k)] * scale;
-                }
-
-                // Compute ||v||^2
-                let mut v_norm_sq = T::Real::one();
-                for i in (k + 2)..n {
-                    v_norm_sq = v_norm_sq + v[i].abs_sq();
-                }
-
-                // tau = 2 / ||v||^2
-                let two = T::Real::one() + T::Real::one();
-                let tau = T::from_real(two / v_norm_sq);
-
-                // Compute p = tau * A * v (for the submatrix A[k+1:, k+1:])
-                let mut p: Vec<T> = vec![T::zero(); n];
-                for i in (k + 1)..n {
-                    let mut sum = T::zero();
-                    for j in (k + 1)..n {
-                        sum = sum + a[(i, j)] * v[j];
-                    }
-                    p[i] = tau * sum;
-                }
-
-                // Compute w = p - (tau/2) * (v^H * p) * v
-                let mut vh_p = T::zero();
-                for i in (k + 1)..n {
-                    vh_p = vh_p + v[i].conj() * p[i];
-                }
-                let half_tau_vhp = tau * vh_p / T::from_real(two);
-
-                let mut w: Vec<T> = vec![T::zero(); n];
-                for i in (k + 1)..n {
-                    w[i] = p[i] - half_tau_vhp * v[i];
-                }
-
-                // Update A: A = A - v*w^H - w*v^H
-                for i in (k + 1)..n {
-                    for j in (k + 1)..n {
-                        a[(i, j)] = a[(i, j)] - v[i] * w[j].conj() - w[i] * v[j].conj();
-                    }
-                }
-
-                // Update U: U = U * (I - tau * v * v^H)
-                for i in 0..n {
-                    let mut uv = T::zero();
-                    for j in (k + 1)..n {
-                        uv = uv + u[(i, j)] * v[j];
-                    }
-                    let tau_uv = tau * uv;
-                    for j in (k + 1)..n {
-                        u[(i, j)] = u[(i, j)] - tau_uv * v[j].conj();
-                    }
-                }
-
-                off_diag[k] = beta;
-            }
-        }
-    }
-
-    // Extract diagonal elements (should be real for Hermitian)
-    for i in 0..n {
-        diag[i] = a[(i, i)].real();
-    }
-
-    // The last off-diagonal element
-    if n >= 2 {
-        off_diag[n - 2] = a[(n - 1, n - 2)].abs();
-    }
-
-    // Make all off_diag positive (they represent |e_k|)
-    for i in 0..off_diag.len() {
-        off_diag[i] = off_diag[i].abs();
-    }
-
-    (diag, off_diag)
 }
 
 /// Divide-and-conquer algorithm for real symmetric tridiagonal matrices.
@@ -597,7 +467,11 @@ where
             let (c, s) = givens_rotation(x, z);
 
             if k > l {
-                off_diag[k - 1] = <T::Real as Real>::hypot(x, z);
+                // Signed rotated off-diagonal r = c·x − s·z (NOT hypot(x, z)): dropping the
+                // sign leaves eigenVALUES correct but the accumulated Givens rotations
+                // inconsistent with the tridiagonal, so the eigenVECTORS come out wrong
+                // (U stays orthonormal, hiding the defect). Matches evd/symmetric.rs.
+                off_diag[k - 1] = c * x - s * z;
             }
 
             let d1 = diag[k];
@@ -830,5 +704,186 @@ mod tests {
         // Eigenvalues should be 1 and 4
         assert!((eigs[0] - 1.0).abs() < 1e-5);
         assert!((eigs[1] - 4.0).abs() < 1e-5);
+    }
+
+    /// Regression test for the missing diagonal phase-correction bug (D&C variant).
+    ///
+    /// A *genuinely* complex Hermitian matrix is used and EVERY eigenpair is verified via
+    /// `A·v = λ·v`. Before the fix the eigenvalues were right but each eigenvector was off
+    /// by a per-row unit-modulus phase, which only the residual check exposes.
+    #[test]
+    fn test_hermitian_evd_dc_complex_eigenpairs_5x5() {
+        let a: Mat<Complex64> = Mat::from_rows(&[
+            &[
+                Complex64::new(3.0, 0.0),
+                Complex64::new(1.0, 2.0),
+                Complex64::new(0.5, -1.0),
+                Complex64::new(2.0, 0.5),
+                Complex64::new(-1.0, 1.0),
+            ],
+            &[
+                Complex64::new(1.0, -2.0),
+                Complex64::new(4.0, 0.0),
+                Complex64::new(2.0, 1.0),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(1.0, 3.0),
+            ],
+            &[
+                Complex64::new(0.5, 1.0),
+                Complex64::new(2.0, -1.0),
+                Complex64::new(5.0, 0.0),
+                Complex64::new(1.0, -2.0),
+                Complex64::new(0.5, 0.5),
+            ],
+            &[
+                Complex64::new(2.0, -0.5),
+                Complex64::new(0.5, 0.5),
+                Complex64::new(1.0, 2.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(3.0, -1.0),
+            ],
+            &[
+                Complex64::new(-1.0, -1.0),
+                Complex64::new(1.0, -3.0),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(3.0, 1.0),
+                Complex64::new(6.0, 0.0),
+            ],
+        ]);
+
+        let evd = HermitianEvdDc::compute(a.as_ref()).unwrap();
+        let eigs = evd.eigenvalues();
+        let u = evd.eigenvectors();
+        let n = 5;
+
+        for k in 1..n {
+            assert!(eigs[k - 1] <= eigs[k] + 1e-12);
+        }
+
+        // A·v = λ·v for every eigenpair.
+        for k in 0..n {
+            for i in 0..n {
+                let mut av = Complex64::zero();
+                for j in 0..n {
+                    av = av + a[(i, j)] * u[(j, k)];
+                }
+                let lv = Complex64::new(eigs[k], 0.0) * u[(i, k)];
+                assert!(
+                    (av.re - lv.re).abs() < 1e-8 && (av.im - lv.im).abs() < 1e-8,
+                    "A*v != lambda*v at eigenpair {}, row {}: Av=({},{}) lv=({},{})",
+                    k,
+                    i,
+                    av.re,
+                    av.im,
+                    lv.re,
+                    lv.im
+                );
+            }
+        }
+
+        // Orthonormality: U^H·U = I.
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = Complex64::zero();
+                for kk in 0..n {
+                    s = s + u[(kk, i)].conj() * u[(kk, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (s.re - expected).abs() < 1e-8 && s.im.abs() < 1e-8,
+                    "U^H*U[{},{}] = ({},{}), expected {}",
+                    i,
+                    j,
+                    s.re,
+                    s.im,
+                    expected
+                );
+            }
+        }
+
+        // Full reconstruction A = U·D·U^H.
+        let recon = evd.reconstruct();
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    (recon[(i, j)].re - a[(i, j)].re).abs() < 1e-8
+                        && (recon[(i, j)].im - a[(i, j)].im).abs() < 1e-8,
+                    "reconstruct mismatch at [{},{}]: got ({},{}) want ({},{})",
+                    i,
+                    j,
+                    recon[(i, j)].re,
+                    recon[(i, j)].im,
+                    a[(i, j)].re,
+                    a[(i, j)].im
+                );
+            }
+        }
+    }
+
+    /// Regression test with a genuine cluster of repeated eigenvalues (D&C variant).
+    ///
+    /// `A = 2·I + w·wᴴ` (complex `w`) has eigenvalue 2 with multiplicity 3 and
+    /// `2 + ‖w‖²` once. Every eigenpair is checked against `A·v = λ·v`.
+    #[test]
+    fn test_hermitian_evd_dc_complex_clustered_eigenvalues() {
+        let w = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 1.0),
+            Complex64::new(1.0, 1.0),
+            Complex64::new(2.0, -1.0),
+        ];
+        let n = 4;
+        let mut a: Mat<Complex64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut val = w[i] * w[j].conj();
+                if i == j {
+                    val = val + Complex64::new(2.0, 0.0);
+                }
+                a[(i, j)] = val;
+            }
+        }
+
+        let evd = HermitianEvdDc::compute(a.as_ref()).unwrap();
+        let eigs = evd.eigenvalues();
+        let u = evd.eigenvectors();
+
+        // ‖w‖² = 9  =>  spectrum {2, 2, 2, 11}.
+        assert!(approx_eq(eigs[0], 2.0, 1e-8));
+        assert!(approx_eq(eigs[1], 2.0, 1e-8));
+        assert!(approx_eq(eigs[2], 2.0, 1e-8));
+        assert!(approx_eq(eigs[3], 11.0, 1e-8));
+
+        for k in 0..n {
+            for i in 0..n {
+                let mut av = Complex64::zero();
+                for j in 0..n {
+                    av = av + a[(i, j)] * u[(j, k)];
+                }
+                let lv = Complex64::new(eigs[k], 0.0) * u[(i, k)];
+                assert!(
+                    (av.re - lv.re).abs() < 1e-8 && (av.im - lv.im).abs() < 1e-8,
+                    "A*v != lambda*v at eigenpair {}, row {}",
+                    k,
+                    i
+                );
+            }
+        }
+
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = Complex64::zero();
+                for kk in 0..n {
+                    s = s + u[(kk, i)].conj() * u[(kk, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (s.re - expected).abs() < 1e-8 && s.im.abs() < 1e-8,
+                    "U^H*U[{},{}] not identity",
+                    i,
+                    j
+                );
+            }
+        }
     }
 }

@@ -5,7 +5,125 @@ All notable changes to OxiBLAS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-08-06
+
+A production-readiness hardening release. A systematic multi-agent audit swept the
+entire workspace (`oxiblas-core`, `oxiblas-matrix`, `oxiblas-blas`, `oxiblas-lapack`,
+`oxiblas-ndarray`, `oxiblas-sparse`), followed by adversarial re-verification of every
+proposed fix, resulting in a large batch of correctness, honesty, and documentation
+fixes — plus a follow-on hardening pass over that audit closure: soundness fixes for
+the sibling call sites the original audit's fixes missed, plus workspace hygiene
+(lint/dependency/CI policy, doctest and file-size compliance, fuzz coverage).
+No public API breaking changes; a handful of previously-`unsafe fn`-eligible
+constructors are now correctly marked `unsafe fn` (see Changed).
+
+### Fixed
+- Numerous numerical correctness bugs across BLAS, LAPACK, and sparse routines,
+  including Hermitian/symmetric diagonal handling, SVD and eigensolver convergence
+  and deflation, sparse factorization fill-in, incremental SVD, and IRAM restart
+  logic
+- Several fabricated or stub code paths replaced with real, verified algorithms
+  (e.g. a dead-code MRRR eigensolver path, an untested symmetric divide-and-conquer
+  EVD merge, and fake complex-routine aliases)
+- Panics on edge-case inputs (empty, singular, or near-singular matrices) converted
+  to proper `Result`-based error handling instead of `unwrap()`/`expect()`/`panic!()`
+- Assorted silent-fallback and misleading-documentation issues that could mask
+  incorrect results
+- `PackedRef::new`/`PackedMut::new` (packed.rs) and `BandedRef::new`/`BandedMut::new`
+  (banded.rs) were still safe `pub fn` over raw pointers with no validation, even
+  though the sibling `MatRef::new`/`MatMut::new` had already been hardened to
+  `unsafe fn` — safe code could construct an out-of-bounds view and read/write past
+  the backing allocation. All four are now `unsafe fn` with `# Safety` docs.
+- `wasm32.rs` SIMD `extract()`/`insert()` still reached `unreachable_unchecked()` on
+  an out-of-range lane index from safe caller code in release builds, after the
+  identical bug had been fixed for x86_64/aarch64 — ported the
+  `lane_index_out_of_range` panic helper to all six wasm32 call sites.
+- `MmapMatMut::create`'s size computation (`row_stride * ncols * size_of::<T>()`)
+  used unchecked arithmetic, so an oversized `(nrows, ncols)` could wrap to a small
+  file while the returned struct still recorded the original huge dimensions,
+  letting ordinary safe accessors write past the mapping. Now uses checked
+  arithmetic and re-validates the layout against the mapped file size.
+- The four CBLAS modules added to close the "CBLAS surface is incomplete" audit
+  finding (`hermitian.rs`, `triangular_symmetric.rs`, `complex_level2.rs`,
+  `complex_level1.rs`) shipped with zero `lda`/`ldb`/`ldc`/null-pointer validation,
+  reproducing the exact bug class `cblas/basic.rs` had already been hardened
+  against. Added a shared `cblas/validate.rs` module and wired
+  `gemv_params_valid`/`gemm_params_valid`/-family checks plus null checks into
+  every `extern "C"` entry point in the four files, no-oping (matching the
+  `xerbla`-then-return convention) on invalid input instead of indexing OOB.
+- `CscMatrix`'s `Index` impl still panicked via `expect()` on a structurally-zero
+  element after the identical `CsrMatrix` impl had been removed for the same
+  reason; removed to match.
+- `packed_len()` (`n*(n+1)/2`) and the banded `ldab*ncols` allocation-size
+  expressions were still plain, wrapping-in-release arithmetic after `mat.rs`'s
+  allocations had been routed through a checked `checked_dim_mul` helper; both now
+  use checked multiplication and panic on overflow instead of silently
+  under-allocating.
+- Matrix Market reader (`mtx.rs`) pre-allocated `Vec::with_capacity(header.nnz)`
+  directly from the untrusted size line, so a ~30-byte crafted file
+  (`3 3 18446744073709551615`) could trigger a capacity-overflow abort before any
+  data line was read. `read_header` now rejects `nnz > nrows*ncols` (coordinate
+  format, checked with `saturating_mul`) and uses checked multiplication for the
+  array-format `nrows*ncols` cell count, so malformed headers return a
+  `MtxError` instead of aborting the process.
+- 57 of 64 public-API doctests marked `` ```ignore `` (never compiled or verified)
+  across `oxiblas-core`, `oxiblas-matrix`, `oxiblas-lapack`, `oxiblas-ndarray`, and
+  `oxiblas-sparse` are now real, executed doctests with concrete inputs and
+  assertions on the results (the audit that closed this finding had only fixed 7 of
+  the 64).
+- `oxiblas-core`'s no_std test-code gating was incomplete for the x86_64 SIMD
+  modules: `simd/x86_64/functions.rs` (a `thread_local!` override plus 16
+  `is_x86_feature_detected!` call sites and a `println!`) and 4 direct-register
+  test functions in `simd/complex.rs` compiled only under `std`, but were not
+  `#[cfg(feature = "std")]`-gated — invisible to `--no-default-features` checks
+  run on an aarch64 host, since that module tree is itself
+  `#[cfg(target_arch = "x86_64")]`-gated and was never actually cross-compiled.
+  Confirmed and fixed by adding `--target x86_64-apple-darwin` to the no_std
+  verification command (see `TODO.md`); see `TODO.md` for the full file list.
+- Two pre-existing test/feature-interaction bugs surfaced by the above
+  verification pass (not caused by it): `simd::dispatch::tests::test_aarch64_neon_always_present`
+  and `simd::multiver::tests::test_aarch64_neon_always_true` both asserted NEON
+  is unconditionally present on AArch64 without accounting for `dispatch.rs`'s
+  own `limited_to()` masking, which correctly reports `has_neon = false` under
+  the `force-scalar` feature (always active under `--all-features`). Fixed by
+  checking `SimdCapabilities::simd_ceiling_bytes() >= 16` before asserting,
+  mirroring the already-correct sibling test `test_compute_respects_feature_ceiling`.
+
+### Changed
+- Dependencies updated to latest compatible versions
+- Documentation corrected in numerous places to accurately describe actual behavior
+- `PackedRef::new`, `PackedMut::new`, `BandedRef::new`, `BandedMut::new` are now
+  `unsafe fn` (see Fixed above) — existing safe call sites inside this workspace
+  were updated to `unsafe { ... }` blocks with `// SAFETY:` justifications;
+  downstream callers constructing these types directly from raw pointers will need
+  to do the same.
+- Hoisted the last four per-crate dependency version pins
+  (`oxiblas-ndarray`'s `faer`, `oxiblas-benchmarks`'s `ndarray-linalg`/`blas-src`/
+  `cblas-sys`) into `[workspace.dependencies]` so every version lives in one place.
+- `oxiblas-blas`'s crate-wide `#![allow(clippy::missing_safety_doc)]`,
+  `clippy::ptr_as_ptr`, `clippy::transmute_ptr_to_ref`, `clippy::cast_possible_wrap`,
+  `clippy::transmute_undefined_repr`, and `clippy::missing_transmute_annotations`
+  lint suppressions were removed; the 74 CBLAS entry points that were missing a
+  `# Safety` doc section now have one, and 8 NEON transmute call sites in
+  `level1/nrm2.rs` now carry explicit `transmute::<From, To>()` turbofish
+  annotations instead of relying on suppressed lints.
+- Split 4 source files that had grown past the workspace's 2000-line limit into
+  cohesive modules with the public API re-exported from the original path:
+  `oxiblas-blas/src/level2/gemv.rs`, `oxiblas-blas/src/cblas/basic.rs`,
+  `oxiblas-sparse/src/linalg/eigenvalue/tests.rs`, and
+  `oxiblas-sparse/src/linalg/eigenvalue/special.rs`.
+
+### Added
+- `[package.metadata.docs.rs]` with `all-features = true` on every publishable
+  crate so feature-gated APIs are visible on docs.rs
+- `rustfmt.toml`, `clippy.toml` (MSRV pinned to the workspace's `rust-version`),
+  `deny.toml` (COOLJAPAN dependency-ban list, `cargo deny check bans` clean),
+  `SECURITY.md`, and `CONTRIBUTING.md` at the workspace root.
+- `fuzz/` (an independent `cargo-fuzz` workspace, excluded from the main
+  workspace so `cargo build`/`clippy --workspace` never need a nightly
+  toolchain) with two real libFuzzer targets: `mtx_matrix_market` (the Matrix
+  Market parser) and `mmap_header` (the `.oxiblas` memory-mapped-matrix header
+  parser) — the two untrusted-input parsers in the workspace.
 
 ## [0.2.1] - 2026-03-16
 
@@ -259,7 +377,11 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 
 ---
 
-## Release Checklist
+## Release Checklist (v0.1.0 — historical)
+
+This checklist tracked readiness for the original v0.1.0 release (2025-12-27) and is
+complete; it is retained here for historical reference only and requires no further
+action. See the dated entries above for what shipped in each subsequent release.
 
 - [x] All tests pass
 - [x] Zero clippy warnings
@@ -268,14 +390,15 @@ OxiBLAS 0.1.0 is the first public release of a pure Rust BLAS/LAPACK implementat
 - [x] LICENSE file (Apache-2.0)
 - [x] README up to date
 - [x] CHANGELOG created
-- [ ] Version 0.1.0 in all Cargo.toml
-- [ ] Examples functional
-- [ ] cargo publish --dry-run succeeds
-- [ ] Git tags created
+- [x] Version 0.1.0 in all Cargo.toml
+- [x] Examples functional
+- [x] cargo publish --dry-run succeeds
+- [x] Git tags created
 
 ---
 
-[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/cool-japan/oxiblas/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/cool-japan/oxiblas/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/cool-japan/oxiblas/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cool-japan/oxiblas/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/cool-japan/oxiblas/compare/v0.1.1...v0.1.2

@@ -17,22 +17,34 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use oxiblas_sparse::csr::CsrMatrix;
-//! use oxiblas_sparse::linalg::eigenvalue::{ShiftInvertLanczos, ShiftInvertConfig};
+//! use oxiblas_sparse::linalg::eigenvalue::{ShiftInvertConfig, ShiftInvertLanczos};
 //!
-//! // Create a sparse symmetric matrix
-//! let a = CsrMatrix::<f64>::eye(100);
+//! // A diagonal matrix has its diagonal entries as eigenvalues: 1, 2, 3, 4, 5.
+//! let a = CsrMatrix::<f64>::new(
+//!     5,
+//!     5,
+//!     vec![0, 1, 2, 3, 4, 5],
+//!     vec![0, 1, 2, 3, 4],
+//!     vec![1.0, 2.0, 3.0, 4.0, 5.0],
+//! )
+//! .unwrap();
 //!
 //! let config = ShiftInvertConfig {
-//!     num_eigenvalues: 5,
-//!     shift: 0.5,  // Find eigenvalues near 0.5
+//!     num_eigenvalues: 2,
+//!     shift: 2.5, // Find eigenvalues near 2.5
 //!     ..Default::default()
 //! };
 //!
 //! let solver = ShiftInvertLanczos::new(config);
 //! let result = solver.compute(&a, None).unwrap();
-//! println!("Eigenvalues near 0.5: {:?}", result.eigenvalues);
+//! println!("Eigenvalues near 2.5: {:?}", result.eigenvalues);
+//! // The two eigenvalues closest to 2.5 are 2.0 and 3.0.
+//! assert_eq!(result.eigenvalues.len(), 2);
+//! for ev in &result.eigenvalues {
+//!     assert!((ev - 2.0).abs() < 1e-6 || (ev - 3.0).abs() < 1e-6);
+//! }
 //! ```
 
 use crate::csr::CsrMatrix;
@@ -129,22 +141,30 @@ pub struct ShiftInvertResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use oxiblas_sparse::csr::CsrMatrix;
-/// use oxiblas_sparse::linalg::eigenvalue::{ShiftInvertLanczos, ShiftInvertConfig};
+/// use oxiblas_sparse::linalg::eigenvalue::{ShiftInvertConfig, ShiftInvertLanczos};
 ///
-/// // Create a sparse symmetric matrix
-/// let a = CsrMatrix::<f64>::eye(100);
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1, 2, 3, 4, 5.
+/// let a = CsrMatrix::<f64>::new(
+///     5,
+///     5,
+///     vec![0, 1, 2, 3, 4, 5],
+///     vec![0, 1, 2, 3, 4],
+///     vec![1.0, 2.0, 3.0, 4.0, 5.0],
+/// )
+/// .unwrap();
 ///
 /// let config = ShiftInvertConfig {
-///     num_eigenvalues: 5,
-///     shift: 0.5,  // Find eigenvalues near 0.5
+///     num_eigenvalues: 2,
+///     shift: 2.5, // Find eigenvalues near 2.5
 ///     ..Default::default()
 /// };
 ///
 /// let solver = ShiftInvertLanczos::new(config);
 /// let result = solver.compute(&a, None).unwrap();
-/// println!("Eigenvalues near 0.5: {:?}", result.eigenvalues);
+/// println!("Eigenvalues near 2.5: {:?}", result.eigenvalues);
+/// assert_eq!(result.eigenvalues.len(), 2);
 /// ```
 pub struct ShiftInvertLanczos<T> {
     config: ShiftInvertConfig<T>,
@@ -194,7 +214,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> ShiftInvertLanc
         let shifted_csr = self.build_shifted_matrix(a)?;
 
         // Convert to CSC for factorization
-        let shifted_csc = csr_to_csc(&shifted_csr);
+        let shifted_csc = csr_to_csc(&shifted_csr)?;
 
         // Factorize the shifted matrix
         let (solve_fn, _use_cholesky) = if self.config.symmetric {

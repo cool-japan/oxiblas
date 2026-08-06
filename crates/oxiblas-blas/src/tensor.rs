@@ -157,12 +157,19 @@ pub fn contract_2d<T: Field + GemmKernel + bytemuck::Zeroable>(
         // So gemm(B^T, A^T) -> C^T gives us C in row-major!
 
         // Create views: B^T (k×n) and A^T (n×m)
-        let b_t = MatRef::new(b.as_ptr(), k, n, k);
-        let a_t = MatRef::new(a.as_ptr(), n, m, n);
+        // SAFETY: `b`/`a` are slices of exactly the required length for these
+        // dimensions (checked by the caller's shape validation above), and the
+        // views do not outlive them.
+        let b_t = unsafe { MatRef::new(b.as_ptr(), k, n, k) };
+        let a_t = unsafe { MatRef::new(a.as_ptr(), n, m, n) };
 
         // Result: C^T (k×m)
         let mut c = vec![T::zero(); m * k];
-        let c_t = MatMut::new(c.as_mut_ptr(), k, m, k);
+        // SAFETY: `c` was just allocated with exactly `m * k` initialized
+        // elements, which is the full range a `k x m` view with leading
+        // dimension `k` addresses; `c` outlives the view and is not otherwise
+        // borrowed while it is alive.
+        let c_t = unsafe { MatMut::new(c.as_mut_ptr(), k, m, k) };
 
         // Compute C^T = B^T * A^T
         gemm(T::one(), b_t, a_t, T::zero(), c_t);
@@ -289,11 +296,18 @@ pub fn batched_matmul<T: Field + GemmKernel + bytemuck::Zeroable>(
             let c_offset = b_idx * m * n;
 
             // Create views: B^T (n×k) and A^T (k×m)
-            let b_t = MatRef::new(unsafe { b.data().as_ptr().add(b_offset) }, n, k, n);
-            let a_t = MatRef::new(unsafe { a.data().as_ptr().add(a_offset) }, k, m, k);
+            // SAFETY: `b_offset`/`a_offset` are batch-index-scaled offsets that stay
+            // within `b`/`a`'s allocation (each batch slot is exactly n*k / k*m
+            // elements), and the resulting views do not outlive the tensors.
+            let b_t = unsafe { MatRef::new(b.data().as_ptr().add(b_offset), n, k, n) };
+            let a_t = unsafe { MatRef::new(a.data().as_ptr().add(a_offset), k, m, k) };
 
             // Result: C^T (n×m)
-            let c_t = MatMut::new(unsafe { c.data_mut().as_mut_ptr().add(c_offset) }, n, m, n);
+            // SAFETY: `c_offset` is a batch-index-scaled offset and each batch
+            // slot holds exactly `n * m` initialized elements, which is the
+            // full range an `n x m` view with leading dimension `n` addresses;
+            // the view does not outlive the tensor.
+            let c_t = unsafe { MatMut::new(c.data_mut().as_mut_ptr().add(c_offset), n, m, n) };
 
             // Compute C^T = B^T * A^T
             gemm(T::one(), b_t, a_t, T::zero(), c_t);

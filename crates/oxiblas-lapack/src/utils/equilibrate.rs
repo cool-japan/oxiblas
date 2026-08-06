@@ -66,9 +66,15 @@ pub struct EquilibrationInfo<T: Scalar> {
     pub row_scale: Vec<T>,
     /// Column scaling factors `C[j]` such that A*diag(C) has equal column norms.
     pub col_scale: Vec<T>,
-    /// Row condition number: max(R)/min(R).
+    /// Row condition number `ROWCND = min(R)/max(R)`, matching LAPACK DGEEQU.
+    ///
+    /// Lies in `(0, 1]` for a nonzero matrix. A value close to `1` means the
+    /// rows are already well scaled; a value close to `0` means they are not.
     pub row_cond: T,
-    /// Column condition number: max(C)/min(C).
+    /// Column condition number `COLCND = min(C)/max(C)`, matching LAPACK DGEEQU.
+    ///
+    /// Lies in `(0, 1]` for a nonzero matrix. A value close to `1` means the
+    /// columns are already well scaled; a value close to `0` means they are not.
     pub col_cond: T,
     /// Maximum absolute element of the scaled matrix.
     pub amax: T,
@@ -144,7 +150,9 @@ pub fn geequ<T: Field + Real + bytemuck::Zeroable>(
         }
     }
 
-    let row_cond = row_max / row_min;
+    // LAPACK DGEEQU convention: ROWCND = min(R) / max(R), which lies in (0, 1].
+    // Because R[i] = 1/max_j|A[i,j]|, this equals min_i(row_norm) / max_i(row_norm).
+    let row_cond = row_min / row_max;
 
     // Compute column scaling: `C[j] = 1/max_i |A[i,j]|`
     let mut col_min = T::one() / <T as Scalar>::epsilon();
@@ -173,7 +181,8 @@ pub fn geequ<T: Field + Real + bytemuck::Zeroable>(
         }
     }
 
-    let col_cond = col_max / col_min;
+    // LAPACK DGEEQU convention: COLCND = min(C) / max(C), which lies in (0, 1].
+    let col_cond = col_min / col_max;
 
     // Compute amax (maximum absolute element)
     let mut amax = T::zero();
@@ -257,10 +266,11 @@ pub fn geequb<T: Field + Real + bytemuck::Zeroable + FromPrimitive>(
         }
     }
 
-    let row_cond = if row_min > T::zero() {
-        row_max / row_min
+    // LAPACK DGEEQUB convention: ROWCND = min(R) / max(R), lying in (0, 1].
+    let row_cond = if row_max > T::zero() {
+        row_min / row_max
     } else {
-        big
+        T::zero()
     };
 
     // Compute column scaling on the row-scaled matrix
@@ -291,10 +301,11 @@ pub fn geequb<T: Field + Real + bytemuck::Zeroable + FromPrimitive>(
         }
     }
 
-    let col_cond = if col_min > T::zero() {
-        col_max / col_min
+    // LAPACK DGEEQUB convention: COLCND = min(C) / max(C), lying in (0, 1].
+    let col_cond = if col_max > T::zero() {
+        col_min / col_max
     } else {
-        big
+        T::zero()
     };
 
     // Compute amax
@@ -360,7 +371,12 @@ pub fn syequ<T: Field + Real + bytemuck::Zeroable>(
         }
     }
 
-    let cond = scale_max / scale_min;
+    // LAPACK DSYEQU convention: SCOND = min(S) / max(S), lying in (0, 1].
+    let cond = if scale_max > T::zero() {
+        scale_min / scale_max
+    } else {
+        T::zero()
+    };
 
     // Compute amax
     let mut amax = T::zero();
@@ -540,9 +556,33 @@ mod tests {
 
         let info = geequ(a.as_ref()).unwrap();
 
-        // Should have large condition numbers
-        assert!(info.row_cond > 1e5);
-        assert!(info.col_cond > 1e5);
+        // DGEEQU convention: ROWCND/COLCND = min(scale)/max(scale) in (0, 1].
+        // A badly scaled matrix has a condition number close to 0 (here 1e-6),
+        // not a large value. Rows 1e-6..1 and 1..1e6 give ROWCND = 1e-6.
+        assert!(info.row_cond > 0.0 && info.row_cond < 1e-5);
+        assert!(info.col_cond > 0.0 && info.col_cond < 1e-5);
+    }
+
+    #[test]
+    fn test_geequ_rowcond_hand_checked() {
+        // Hand-checked against the LAPACK DGEEQU definition
+        // ROWCND = min(R)/max(R), R[i] = 1/max_j|A[i,j]|.
+        //   row 0: max|.| = 100 -> R0 = 0.01
+        //   row 1: max|.| = 1   -> R1 = 1.0
+        //   ROWCND = min(0.01, 1.0) / max(0.01, 1.0) = 0.01
+        //   col 0: max|.| = 100 -> C0 = 0.01
+        //   col 1: max|.| = 1   -> C1 = 1.0
+        //   COLCND = 0.01
+        let a = Mat::from_rows(&[&[100.0f64, 1.0], &[1.0, 0.01]]);
+        let info = geequ(a.as_ref()).unwrap();
+        assert!(approx_eq(info.row_cond, 0.01, 1e-12));
+        assert!(approx_eq(info.col_cond, 0.01, 1e-12));
+
+        // A matrix whose rows are already equally scaled must report ROWCND == 1.
+        let balanced = Mat::from_rows(&[&[3.0f64, 1.0], &[1.0, 3.0]]);
+        let info_bal = geequ(balanced.as_ref()).unwrap();
+        assert!(approx_eq(info_bal.row_cond, 1.0, 1e-12));
+        assert!(approx_eq(info_bal.col_cond, 1.0, 1e-12));
     }
 
     #[test]

@@ -233,7 +233,14 @@ impl<T: Scalar> MatBuilder<T> {
     where
         F: FnMut(usize, usize) -> T,
     {
-        let mut m = Mat::filled(nrows, ncols, f(0, 0));
+        // Allocate with a neutral placeholder value (`T::zero()`, guaranteed
+        // by the `Scalar: Zero` bound) rather than pre-invoking the
+        // user-supplied closure. Pre-invoking `f(0, 0)` here would panic for
+        // 0-sized builders (no valid (0, 0) cell exists) and would call a
+        // stateful closure one extra time for non-empty builders. The loop
+        // below already handles the 0-sized case correctly: it simply
+        // performs zero iterations, so `f` is never invoked at all.
+        let mut m = Mat::filled(nrows, ncols, T::zero());
         for j in 0..ncols {
             for i in 0..nrows {
                 m[(i, j)] = f(i, j);
@@ -1101,6 +1108,60 @@ mod tests {
         assert_eq!(m[(0, 0)], 0.0);
         assert_eq!(m[(1, 2)], 12.0);
         assert_eq!(m[(2, 1)], 21.0);
+    }
+
+    #[test]
+    fn test_from_fn_zero_rows_does_not_panic_or_invoke_closure() {
+        let mut calls = 0usize;
+        let m = MatBuilder::<f64>::from_fn(0, 5, |i, j| {
+            calls += 1;
+            (i + j) as f64
+        });
+        assert_eq!(m.nrows(), 0);
+        assert_eq!(m.ncols(), 5);
+        assert_eq!(calls, 0, "closure must not be called for a 0-row builder");
+    }
+
+    #[test]
+    fn test_from_fn_zero_cols_does_not_panic_or_invoke_closure() {
+        let mut calls = 0usize;
+        let m = MatBuilder::<f64>::from_fn(5, 0, |i, j| {
+            calls += 1;
+            (i + j) as f64
+        });
+        assert_eq!(m.nrows(), 5);
+        assert_eq!(m.ncols(), 0);
+        assert_eq!(
+            calls, 0,
+            "closure must not be called for a 0-column builder"
+        );
+    }
+
+    #[test]
+    fn test_from_fn_zero_by_zero_does_not_panic_or_invoke_closure() {
+        let mut calls = 0usize;
+        let m = MatBuilder::<f64>::from_fn(0, 0, |i, j| {
+            calls += 1;
+            (i + j) as f64
+        });
+        assert_eq!(m.nrows(), 0);
+        assert_eq!(m.ncols(), 0);
+        assert_eq!(calls, 0, "closure must not be called for a 0x0 builder");
+    }
+
+    #[test]
+    fn test_from_fn_invokes_closure_exactly_once_per_cell() {
+        // Regression test: the closure must be invoked exactly nrows*ncols
+        // times, not nrows*ncols + 1 (the old code called f(0, 0) an extra
+        // time as a "type inference" trick before the fill loop).
+        let mut calls = 0usize;
+        let m = MatBuilder::<f64>::from_fn(4, 3, |i, j| {
+            calls += 1;
+            (i + j) as f64
+        });
+        assert_eq!(calls, 4 * 3);
+        assert_eq!(m[(0, 0)], 0.0);
+        assert_eq!(m[(3, 2)], 5.0);
     }
 
     #[test]

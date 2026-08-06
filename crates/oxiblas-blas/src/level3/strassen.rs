@@ -27,6 +27,24 @@
 //! - C21 = M2 + M4
 //! - C22 = M1 - M2 + M3 + M6
 //!
+//! ## Non-square and non-power-of-two shapes: dynamic peeling
+//!
+//! The classic 2×2 partition above requires every dimension to be even. Rather than
+//! padding `m`, `k`, and `n` up to a single shared power of two of the *largest*
+//! dimension (which can inflate the effective work by up to ~8x for rectangular
+//! matrices, e.g. padding a 1000×8 by 8×1000 multiply to 1024×1024×1024), this
+//! implementation uses *dynamic peeling*: whichever of `m`, `k`, or `n` is odd has a
+//! single row/column/inner-slice shaved off and settled with a direct GEMM call, and
+//! the remaining even-sized bulk recurses normally. Each dimension is therefore only
+//! ever "padded" by at most one element per recursion level, so the overhead scales
+//! with that dimension individually instead of with the cube of the largest one.
+//!
+//! Very rectangular shapes still are not good candidates for Strassen (the recursion
+//! and allocation bookkeeping cost is not amortized by a mostly-tiny dimension), so
+//! [`should_use_strassen`] additionally rejects shapes whose largest dimension is more
+//! than `STRASSEN_MAX_ASPECT_RATIO` times the smallest one, falling back to the
+//! standard blocked GEMM instead.
+//!
 //! ## Usage
 //!
 //! Strassen's algorithm is beneficial for very large matrices (typically > 512×512).
@@ -48,6 +66,16 @@ const STRASSEN_LEAF_SIZE: usize = 64;
 
 /// Maximum recursion depth to prevent stack overflow and manage memory.
 const MAX_STRASSEN_DEPTH: usize = 4;
+
+/// Maximum tolerated ratio between the largest and smallest dimension for
+/// Strassen recursion to be considered worthwhile.
+///
+/// Beyond this ratio the matrices are rectangular enough (e.g. a GEMV-like
+/// `k = 8` multiplied against `m = n = 1000`) that Strassen's `O(n^2.807)`
+/// scaling -- which only kicks in once *all three* dimensions shrink
+/// together -- gains little while still paying recursion and allocation
+/// overhead, so the standard blocked GEMM is expected to win outright.
+const STRASSEN_MAX_ASPECT_RATIO: usize = 8;
 
 /// Performs matrix multiplication using Strassen's algorithm for large matrices.
 ///
@@ -119,90 +147,44 @@ pub fn gemm_strassen_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
         return;
     }
 
-    // Check if Strassen is beneficial
-    let min_dim = m.min(k).min(n);
-    if min_dim < STRASSEN_THRESHOLD {
-        // Use standard GEMM for smaller matrices
-        let shape = T::micro_kernel_shape();
-        let blocking = GemmBlocking::for_kernel::<T>(&shape);
-        gemm_with_blocking(alpha, a, b, beta, c.rb_mut(), par, &blocking);
+    if !should_use_strassen(m, k, n) {
+        // Too small to amortize Strassen's bookkeeping, or too rectangular
+        // for its recursive halving to pay off: use the standard blocked GEMM.
+        strassen_direct_gemm(alpha, a, b, beta, c, par);
         return;
     }
 
-    // For non-square or non-power-of-2 matrices, pad to the nearest power of 2
-    let max_dim = m.max(k).max(n);
-    let padded_dim = next_power_of_two(max_dim);
-
-    // Create padded matrices if needed
-    if m == padded_dim && k == padded_dim && n == padded_dim {
-        // Already square and power of 2
-        strassen_recursive(alpha, a, b, beta, c.rb_mut(), 0, par);
-    } else {
-        // Need to pad
-        strassen_with_padding(alpha, a, b, beta, c.rb_mut(), padded_dim, par);
-    }
+    // Strassen's recursion with dynamic peeling: each dimension is only
+    // ever shaved down by one row/column per level as needed (see the
+    // module documentation), so the overhead scales with each dimension
+    // individually rather than with a shared power-of-two of the largest
+    // one. No upfront padded copy of the whole matrix is required.
+    strassen_recursive(alpha, a, b, beta, c, 0, par);
 }
 
-/// Strassen with padding for non-square matrices.
-fn strassen_with_padding<T: Field + GemmKernel + bytemuck::Zeroable>(
+/// Invokes the standard blocked GEMM kernel directly, bypassing Strassen's
+/// recursion. Used both as the recursion's base case and to settle the
+/// leftover row/column/inner-slice produced by dynamic peeling.
+#[inline]
+fn strassen_direct_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
     beta: T,
-    mut c: MatMut<'_, T>,
-    padded_dim: usize,
+    c: MatMut<'_, T>,
     par: Par,
 ) {
-    let m = a.nrows();
-    let k = a.ncols();
-    let n = b.ncols();
-
-    // Create padded matrices
-    let mut a_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
-    let mut b_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
-    let mut c_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
-
-    // Copy A to padded matrix
-    for i in 0..m {
-        for j in 0..k {
-            a_padded[(i, j)] = a[(i, j)];
-        }
-    }
-
-    // Copy B to padded matrix
-    for i in 0..k {
-        for j in 0..n {
-            b_padded[(i, j)] = b[(i, j)];
-        }
-    }
-
-    // Copy C to padded matrix and scale if needed
-    for i in 0..m {
-        for j in 0..n {
-            c_padded[(i, j)] = c[(i, j)];
-        }
-    }
-
-    // Perform Strassen on padded matrices
-    strassen_recursive(
-        alpha,
-        a_padded.as_ref(),
-        b_padded.as_ref(),
-        beta,
-        c_padded.as_mut(),
-        0,
-        par,
-    );
-
-    // Copy result back
-    for i in 0..m {
-        for j in 0..n {
-            c.set(i, j, c_padded[(i, j)]);
-        }
-    }
+    let shape = T::micro_kernel_shape();
+    let blocking = GemmBlocking::for_kernel::<T>(&shape);
+    gemm_with_blocking(alpha, a, b, beta, c, par, &blocking);
 }
 
-/// Recursive Strassen implementation.
+/// Recursive Strassen implementation with dynamic peeling.
+///
+/// Handles arbitrary (non-square, odd-sized) `m x k` by `k x n` shapes directly:
+/// odd dimensions are peeled one row/column at a time (see the module
+/// documentation) until `m`, `k`, and `n` are all even, at which point the
+/// standard 2x2 Strassen partition is applied.
 fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     alpha: T,
     a: MatRef<'_, T>,
@@ -212,54 +194,78 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     depth: usize,
     par: Par,
 ) {
-    let n = a.nrows();
-    debug_assert_eq!(n, a.ncols());
-    debug_assert_eq!(n, b.nrows());
-    debug_assert_eq!(n, b.ncols());
-    debug_assert_eq!(n, c.nrows());
+    let m = a.nrows();
+    let k = a.ncols();
+    let n = b.ncols();
+    debug_assert_eq!(k, b.nrows());
+    debug_assert_eq!(m, c.nrows());
     debug_assert_eq!(n, c.ncols());
 
-    // Base case: use standard GEMM
-    if n <= STRASSEN_LEAF_SIZE || depth >= MAX_STRASSEN_DEPTH {
-        let shape = T::micro_kernel_shape();
-        let blocking = GemmBlocking::for_kernel::<T>(&shape);
-        gemm_with_blocking(alpha, a, b, beta, c.rb_mut(), par, &blocking);
+    // Base case: fall back to the blocked GEMM kernel once any dimension is
+    // small enough to no longer be worth splitting, or the recursion budget
+    // is exhausted. `gemm_with_blocking` handles arbitrary (non-square,
+    // odd-sized) shapes directly.
+    if m.min(k).min(n) <= STRASSEN_LEAF_SIZE || depth >= MAX_STRASSEN_DEPTH {
+        strassen_direct_gemm(alpha, a, b, beta, c, par);
         return;
     }
 
-    let half = n / 2;
+    // Dynamic peeling: shave a single row/column off odd dimensions instead
+    // of padding every dimension up to a shared power of two. Each peeled
+    // slice is settled with one direct GEMM call, so the padding overhead
+    // stays proportional to that dimension alone (at most +1 per level).
+    if m % 2 == 1 {
+        strassen_peel_row(alpha, a, b, beta, c, depth, par);
+        return;
+    }
+    if k % 2 == 1 {
+        strassen_peel_inner(alpha, a, b, beta, c, depth, par);
+        return;
+    }
+    if n % 2 == 1 {
+        strassen_peel_col(alpha, a, b, beta, c, depth, par);
+        return;
+    }
 
-    // Partition matrices into quadrants
-    let a11 = a.submatrix(0, 0, half, half);
-    let a12 = a.submatrix(0, half, half, half);
-    let a21 = a.submatrix(half, 0, half, half);
-    let a22 = a.submatrix(half, half, half, half);
+    // All dimensions are even: apply the standard 2x2 Strassen partition.
+    // A is m x k, B is k x n, C is m x n; the halves are independent per
+    // matrix (half_m/half_k from A, half_k/half_n from B), so this works
+    // directly for rectangular (non-square) shapes.
+    let half_m = m / 2;
+    let half_k = k / 2;
+    let half_n = n / 2;
 
-    let b11 = b.submatrix(0, 0, half, half);
-    let b12 = b.submatrix(0, half, half, half);
-    let b21 = b.submatrix(half, 0, half, half);
-    let b22 = b.submatrix(half, half, half, half);
+    let a11 = a.submatrix(0, 0, half_m, half_k);
+    let a12 = a.submatrix(0, half_k, half_m, half_k);
+    let a21 = a.submatrix(half_m, 0, half_m, half_k);
+    let a22 = a.submatrix(half_m, half_k, half_m, half_k);
 
-    // Allocate intermediate matrices for M1-M7
-    let mut m1: Mat<T> = Mat::zeros(half, half);
-    let mut m2: Mat<T> = Mat::zeros(half, half);
-    let mut m3: Mat<T> = Mat::zeros(half, half);
-    let mut m4: Mat<T> = Mat::zeros(half, half);
-    let mut m5: Mat<T> = Mat::zeros(half, half);
-    let mut m6: Mat<T> = Mat::zeros(half, half);
-    let mut m7: Mat<T> = Mat::zeros(half, half);
+    let b11 = b.submatrix(0, 0, half_k, half_n);
+    let b12 = b.submatrix(0, half_n, half_k, half_n);
+    let b21 = b.submatrix(half_k, 0, half_k, half_n);
+    let b22 = b.submatrix(half_k, half_n, half_k, half_n);
 
-    // Temporary matrices for sums
-    let mut temp1: Mat<T> = Mat::zeros(half, half);
-    let mut temp2: Mat<T> = Mat::zeros(half, half);
+    // Allocate intermediate matrices for M1-M7 (each half_m x half_n).
+    let mut m1: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m2: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m3: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m4: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m5: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m6: Mat<T> = Mat::zeros(half_m, half_n);
+    let mut m7: Mat<T> = Mat::zeros(half_m, half_n);
+
+    // Temporary matrices for sums: temp_a mirrors an A quadrant
+    // (half_m x half_k), temp_b mirrors a B quadrant (half_k x half_n).
+    let mut temp_a: Mat<T> = Mat::zeros(half_m, half_k);
+    let mut temp_b: Mat<T> = Mat::zeros(half_k, half_n);
 
     // M1 = (A11 + A22)(B11 + B22)
-    matrix_add(&a11, &a22, &mut temp1);
-    matrix_add(&b11, &b22, &mut temp2);
+    matrix_add(&a11, &a22, &mut temp_a);
+    matrix_add(&b11, &b22, &mut temp_b);
     strassen_recursive(
         T::one(),
-        temp1.as_ref(),
-        temp2.as_ref(),
+        temp_a.as_ref(),
+        temp_b.as_ref(),
         T::zero(),
         m1.as_mut(),
         depth + 1,
@@ -267,10 +273,10 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M2 = (A21 + A22)B11
-    matrix_add(&a21, &a22, &mut temp1);
+    matrix_add(&a21, &a22, &mut temp_a);
     strassen_recursive(
         T::one(),
-        temp1.as_ref(),
+        temp_a.as_ref(),
         b11,
         T::zero(),
         m2.as_mut(),
@@ -279,11 +285,11 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M3 = A11(B12 - B22)
-    matrix_sub(&b12, &b22, &mut temp2);
+    matrix_sub(&b12, &b22, &mut temp_b);
     strassen_recursive(
         T::one(),
         a11,
-        temp2.as_ref(),
+        temp_b.as_ref(),
         T::zero(),
         m3.as_mut(),
         depth + 1,
@@ -291,11 +297,11 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M4 = A22(B21 - B11)
-    matrix_sub(&b21, &b11, &mut temp2);
+    matrix_sub(&b21, &b11, &mut temp_b);
     strassen_recursive(
         T::one(),
         a22,
-        temp2.as_ref(),
+        temp_b.as_ref(),
         T::zero(),
         m4.as_mut(),
         depth + 1,
@@ -303,10 +309,10 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M5 = (A11 + A12)B22
-    matrix_add(&a11, &a12, &mut temp1);
+    matrix_add(&a11, &a12, &mut temp_a);
     strassen_recursive(
         T::one(),
-        temp1.as_ref(),
+        temp_a.as_ref(),
         b22,
         T::zero(),
         m5.as_mut(),
@@ -315,12 +321,12 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M6 = (A21 - A11)(B11 + B12)
-    matrix_sub(&a21, &a11, &mut temp1);
-    matrix_add(&b11, &b12, &mut temp2);
+    matrix_sub(&a21, &a11, &mut temp_a);
+    matrix_add(&b11, &b12, &mut temp_b);
     strassen_recursive(
         T::one(),
-        temp1.as_ref(),
-        temp2.as_ref(),
+        temp_a.as_ref(),
+        temp_b.as_ref(),
         T::zero(),
         m6.as_mut(),
         depth + 1,
@@ -328,12 +334,12 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
     );
 
     // M7 = (A12 - A22)(B21 + B22)
-    matrix_sub(&a12, &a22, &mut temp1);
-    matrix_add(&b21, &b22, &mut temp2);
+    matrix_sub(&a12, &a22, &mut temp_a);
+    matrix_add(&b21, &b22, &mut temp_b);
     strassen_recursive(
         T::one(),
-        temp1.as_ref(),
-        temp2.as_ref(),
+        temp_a.as_ref(),
+        temp_b.as_ref(),
         T::zero(),
         m7.as_mut(),
         depth + 1,
@@ -351,58 +357,111 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
         c.scale(beta);
     }
 
-    // Get mutable quadrants of C
-    for i in 0..half {
-        for j in 0..half {
-            // C11 = alpha * (M1 + M4 - M5 + M7) + beta * C11
+    for i in 0..half_m {
+        for j in 0..half_n {
             let c11_contrib = m1[(i, j)] + m4[(i, j)] - m5[(i, j)] + m7[(i, j)];
+            let c12_contrib = m3[(i, j)] + m5[(i, j)];
+            let c21_contrib = m2[(i, j)] + m4[(i, j)];
+            let c22_contrib = m1[(i, j)] - m2[(i, j)] + m3[(i, j)] + m6[(i, j)];
+
             if beta == T::zero() {
                 c.set(i, j, alpha * c11_contrib);
-            } else if beta == T::one() {
-                c.set(i, j, c[(i, j)] + alpha * c11_contrib);
+                c.set(i, j + half_n, alpha * c12_contrib);
+                c.set(i + half_m, j, alpha * c21_contrib);
+                c.set(i + half_m, j + half_n, alpha * c22_contrib);
             } else {
                 c.set(i, j, c[(i, j)] + alpha * c11_contrib);
-            }
-
-            // C12 = alpha * (M3 + M5) + beta * C12
-            let c12_contrib = m3[(i, j)] + m5[(i, j)];
-            if beta == T::zero() {
-                c.set(i, j + half, alpha * c12_contrib);
-            } else if beta == T::one() {
-                c.set(i, j + half, c[(i, j + half)] + alpha * c12_contrib);
-            } else {
-                c.set(i, j + half, c[(i, j + half)] + alpha * c12_contrib);
-            }
-
-            // C21 = alpha * (M2 + M4) + beta * C21
-            let c21_contrib = m2[(i, j)] + m4[(i, j)];
-            if beta == T::zero() {
-                c.set(i + half, j, alpha * c21_contrib);
-            } else if beta == T::one() {
-                c.set(i + half, j, c[(i + half, j)] + alpha * c21_contrib);
-            } else {
-                c.set(i + half, j, c[(i + half, j)] + alpha * c21_contrib);
-            }
-
-            // C22 = alpha * (M1 - M2 + M3 + M6) + beta * C22
-            let c22_contrib = m1[(i, j)] - m2[(i, j)] + m3[(i, j)] + m6[(i, j)];
-            if beta == T::zero() {
-                c.set(i + half, j + half, alpha * c22_contrib);
-            } else if beta == T::one() {
+                c.set(i, j + half_n, c[(i, j + half_n)] + alpha * c12_contrib);
+                c.set(i + half_m, j, c[(i + half_m, j)] + alpha * c21_contrib);
                 c.set(
-                    i + half,
-                    j + half,
-                    c[(i + half, j + half)] + alpha * c22_contrib,
-                );
-            } else {
-                c.set(
-                    i + half,
-                    j + half,
-                    c[(i + half, j + half)] + alpha * c22_contrib,
+                    i + half_m,
+                    j + half_n,
+                    c[(i + half_m, j + half_n)] + alpha * c22_contrib,
                 );
             }
         }
     }
+}
+
+/// Peels the last row off `A`/`C` when `m` is odd, so the remaining
+/// `m - 1` rows can be split evenly for the 2x2 Strassen recursion.
+///
+/// `C_top = alpha * A_top * B + beta * C_top` is computed recursively, and
+/// the single leftover row `C_last = alpha * A_last * B + beta * C_last` is
+/// settled directly -- an O(k * n) correction, negligible next to the
+/// O(m * k * n) bulk of the multiply.
+fn strassen_peel_row<T: Field + GemmKernel + bytemuck::Zeroable>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    depth: usize,
+    par: Par,
+) {
+    let m = a.nrows();
+    debug_assert!(m % 2 == 1, "strassen_peel_row requires an odd m");
+    let bulk = m - 1;
+
+    let (a_top, a_last) = a.split_rows(bulk);
+    let (c_top, c_last) = c.split_rows(bulk);
+
+    strassen_recursive(alpha, a_top, b, beta, c_top, depth, par);
+    strassen_direct_gemm(alpha, a_last, b, beta, c_last, par);
+}
+
+/// Peels the last column off `A` and last row off `B` when `k` (the shared
+/// inner/contraction dimension) is odd, so the remaining `k - 1` columns/rows
+/// can be split evenly for the 2x2 Strassen recursion.
+///
+/// `A * B = A_left * B_top + A_right * B_bottom` splits exactly along the
+/// contraction dimension, so both contributions are accumulated into the
+/// same `C`: the bulk product is computed first (applying `beta` to the
+/// existing `C`), then the leftover rank-1-style outer product
+/// `A_right * B_bottom` (A_right is `m x 1`, B_bottom is `1 x k`) is added
+/// on top with `beta = 1`.
+fn strassen_peel_inner<T: Field + GemmKernel + bytemuck::Zeroable>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    mut c: MatMut<'_, T>,
+    depth: usize,
+    par: Par,
+) {
+    let k = a.ncols();
+    debug_assert!(k % 2 == 1, "strassen_peel_inner requires an odd k");
+    let bulk = k - 1;
+
+    let (a_left, a_right) = a.split_cols(bulk);
+    let (b_top, b_bottom) = b.split_rows(bulk);
+
+    strassen_recursive(alpha, a_left, b_top, beta, c.rb_mut(), depth, par);
+    strassen_direct_gemm(alpha, a_right, b_bottom, T::one(), c, par);
+}
+
+/// Peels the last column off `B`/`C` when `n` is odd, so the remaining
+/// `n - 1` columns can be split evenly for the 2x2 Strassen recursion.
+///
+/// Mirrors [`strassen_peel_row`] along the column dimension.
+fn strassen_peel_col<T: Field + GemmKernel + bytemuck::Zeroable>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    depth: usize,
+    par: Par,
+) {
+    let n = b.ncols();
+    debug_assert!(n % 2 == 1, "strassen_peel_col requires an odd n");
+    let bulk = n - 1;
+
+    let (b_left, b_right) = b.split_cols(bulk);
+    let (c_left, c_right) = c.split_cols(bulk);
+
+    strassen_recursive(alpha, a, b_left, beta, c_left, depth, par);
+    strassen_direct_gemm(alpha, a, b_right, beta, c_right, par);
 }
 
 /// Matrix addition: C = A + B
@@ -459,29 +518,20 @@ fn matrix_sub<T: Field>(a: &MatRef<'_, T>, b: &MatRef<'_, T>, c: &mut Mat<T>) {
     }
 }
 
-/// Returns the next power of two >= n.
-#[inline]
-const fn next_power_of_two(n: usize) -> usize {
-    if n == 0 {
-        return 1;
-    }
-    let mut v = n - 1;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    v + 1
-}
-
 /// Checks if Strassen's algorithm would be beneficial for the given dimensions.
 ///
-/// Returns true if at least one dimension exceeds the Strassen threshold.
+/// Returns `true` only when every dimension clears [`STRASSEN_THRESHOLD`] *and*
+/// the matrices are not too rectangular: the largest dimension must be no
+/// more than `STRASSEN_MAX_ASPECT_RATIO` times the smallest one. Very
+/// rectangular shapes (e.g. `1000 x 8` times `8 x 1000`) gain little from
+/// Strassen's asymptotic scaling -- which only kicks in once *all three*
+/// dimensions shrink together via recursion -- while still paying its
+/// recursion and allocation overhead, so plain GEMM is used instead.
 #[must_use]
 pub fn should_use_strassen(m: usize, k: usize, n: usize) -> bool {
     let min_dim = m.min(k).min(n);
-    min_dim >= STRASSEN_THRESHOLD
+    let max_dim = m.max(k).max(n);
+    min_dim >= STRASSEN_THRESHOLD && max_dim <= min_dim * STRASSEN_MAX_ASPECT_RATIO
 }
 
 /// Parallel Strassen for very large matrices.
@@ -516,79 +566,92 @@ pub fn gemm_strassen_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send 
         return;
     }
 
-    let min_dim = m.min(k).min(n);
-    if min_dim < STRASSEN_THRESHOLD {
-        let shape = T::micro_kernel_shape();
-        let blocking = GemmBlocking::for_kernel::<T>(&shape);
-        gemm_with_blocking(alpha, a, b, beta, c.rb_mut(), Par::Rayon, &blocking);
+    if !should_use_strassen(m, k, n) {
+        strassen_direct_gemm(alpha, a, b, beta, c, Par::Rayon);
         return;
     }
 
-    let max_dim = m.max(k).max(n);
-    let padded_dim = next_power_of_two(max_dim);
-
-    if m == padded_dim && k == padded_dim && n == padded_dim {
-        strassen_recursive_parallel(alpha, a, b, beta, c.rb_mut(), 0);
-    } else {
-        strassen_with_padding_parallel(alpha, a, b, beta, c.rb_mut(), padded_dim);
-    }
+    strassen_recursive_parallel(alpha, a, b, beta, c, 0);
 }
 
-/// Parallel version of strassen_with_padding.
+/// Peels the last row off `A`/`C` when `m` is odd (parallel variant).
+///
+/// See [`strassen_peel_row`] for the sequential version this mirrors.
 #[cfg(feature = "parallel")]
-fn strassen_with_padding_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync>(
+fn strassen_peel_row_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    depth: usize,
+) where
+    Mat<T>: Send + Sync,
+{
+    let m = a.nrows();
+    debug_assert!(m % 2 == 1, "strassen_peel_row_parallel requires an odd m");
+    let bulk = m - 1;
+
+    let (a_top, a_last) = a.split_rows(bulk);
+    let (c_top, c_last) = c.split_rows(bulk);
+
+    strassen_recursive_parallel(alpha, a_top, b, beta, c_top, depth);
+    strassen_direct_gemm(alpha, a_last, b, beta, c_last, Par::Rayon);
+}
+
+/// Peels the last column of `A` / last row of `B` when `k` is odd (parallel variant).
+///
+/// See [`strassen_peel_inner`] for the sequential version this mirrors.
+#[cfg(feature = "parallel")]
+fn strassen_peel_inner_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync>(
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
     beta: T,
     mut c: MatMut<'_, T>,
-    padded_dim: usize,
+    depth: usize,
 ) where
     Mat<T>: Send + Sync,
 {
-    let m = a.nrows();
     let k = a.ncols();
-    let n = b.ncols();
+    debug_assert!(k % 2 == 1, "strassen_peel_inner_parallel requires an odd k");
+    let bulk = k - 1;
 
-    let mut a_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
-    let mut b_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
-    let mut c_padded: Mat<T> = Mat::zeros(padded_dim, padded_dim);
+    let (a_left, a_right) = a.split_cols(bulk);
+    let (b_top, b_bottom) = b.split_rows(bulk);
 
-    for i in 0..m {
-        for j in 0..k {
-            a_padded[(i, j)] = a[(i, j)];
-        }
-    }
-
-    for i in 0..k {
-        for j in 0..n {
-            b_padded[(i, j)] = b[(i, j)];
-        }
-    }
-
-    for i in 0..m {
-        for j in 0..n {
-            c_padded[(i, j)] = c[(i, j)];
-        }
-    }
-
-    strassen_recursive_parallel(
-        alpha,
-        a_padded.as_ref(),
-        b_padded.as_ref(),
-        beta,
-        c_padded.as_mut(),
-        0,
-    );
-
-    for i in 0..m {
-        for j in 0..n {
-            c.set(i, j, c_padded[(i, j)]);
-        }
-    }
+    strassen_recursive_parallel(alpha, a_left, b_top, beta, c.rb_mut(), depth);
+    strassen_direct_gemm(alpha, a_right, b_bottom, T::one(), c, Par::Rayon);
 }
 
-/// Parallel recursive Strassen.
+/// Peels the last column off `B`/`C` when `n` is odd (parallel variant).
+///
+/// See [`strassen_peel_col`] for the sequential version this mirrors.
+#[cfg(feature = "parallel")]
+fn strassen_peel_col_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    c: MatMut<'_, T>,
+    depth: usize,
+) where
+    Mat<T>: Send + Sync,
+{
+    let n = b.ncols();
+    debug_assert!(n % 2 == 1, "strassen_peel_col_parallel requires an odd n");
+    let bulk = n - 1;
+
+    let (b_left, b_right) = b.split_cols(bulk);
+    let (c_left, c_right) = c.split_cols(bulk);
+
+    strassen_recursive_parallel(alpha, a, b_left, beta, c_left, depth);
+    strassen_direct_gemm(alpha, a, b_right, beta, c_right, Par::Rayon);
+}
+
+/// Parallel recursive Strassen with dynamic peeling.
+///
+/// See [`strassen_recursive`] for the sequential version this mirrors.
 #[cfg(feature = "parallel")]
 fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync>(
     alpha: T,
@@ -602,27 +665,42 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
 {
     use rayon::prelude::*;
 
-    let n = a.nrows();
+    let m = a.nrows();
+    let k = a.ncols();
+    let n = b.ncols();
 
-    if n <= STRASSEN_LEAF_SIZE || depth >= MAX_STRASSEN_DEPTH {
-        let shape = T::micro_kernel_shape();
-        let blocking = GemmBlocking::for_kernel::<T>(&shape);
-        gemm_with_blocking(alpha, a, b, beta, c.rb_mut(), Par::Rayon, &blocking);
+    if m.min(k).min(n) <= STRASSEN_LEAF_SIZE || depth >= MAX_STRASSEN_DEPTH {
+        strassen_direct_gemm(alpha, a, b, beta, c, Par::Rayon);
         return;
     }
 
-    let half = n / 2;
+    if m % 2 == 1 {
+        strassen_peel_row_parallel(alpha, a, b, beta, c, depth);
+        return;
+    }
+    if k % 2 == 1 {
+        strassen_peel_inner_parallel(alpha, a, b, beta, c, depth);
+        return;
+    }
+    if n % 2 == 1 {
+        strassen_peel_col_parallel(alpha, a, b, beta, c, depth);
+        return;
+    }
+
+    let half_m = m / 2;
+    let half_k = k / 2;
+    let half_n = n / 2;
 
     // Partition matrices
-    let a11 = a.submatrix(0, 0, half, half);
-    let a12 = a.submatrix(0, half, half, half);
-    let a21 = a.submatrix(half, 0, half, half);
-    let a22 = a.submatrix(half, half, half, half);
+    let a11 = a.submatrix(0, 0, half_m, half_k);
+    let a12 = a.submatrix(0, half_k, half_m, half_k);
+    let a21 = a.submatrix(half_m, 0, half_m, half_k);
+    let a22 = a.submatrix(half_m, half_k, half_m, half_k);
 
-    let b11 = b.submatrix(0, 0, half, half);
-    let b12 = b.submatrix(0, half, half, half);
-    let b21 = b.submatrix(half, 0, half, half);
-    let b22 = b.submatrix(half, half, half, half);
+    let b11 = b.submatrix(0, 0, half_k, half_n);
+    let b12 = b.submatrix(0, half_n, half_k, half_n);
+    let b21 = b.submatrix(half_k, 0, half_k, half_n);
+    let b22 = b.submatrix(half_k, half_n, half_k, half_n);
 
     // Create owned copies for parallel computation
     let a11_owned = copy_to_mat(&a11);
@@ -640,19 +718,19 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
         let results: Vec<Mat<T>> = (0..7)
             .into_par_iter()
             .map(|idx| {
-                let mut temp1: Mat<T> = Mat::zeros(half, half);
-                let mut temp2: Mat<T> = Mat::zeros(half, half);
-                let mut result: Mat<T> = Mat::zeros(half, half);
+                let mut temp_a: Mat<T> = Mat::zeros(half_m, half_k);
+                let mut temp_b: Mat<T> = Mat::zeros(half_k, half_n);
+                let mut result: Mat<T> = Mat::zeros(half_m, half_n);
 
                 match idx {
                     0 => {
                         // M1 = (A11 + A22)(B11 + B22)
-                        matrix_add(&a11_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
-                        matrix_add(&b11_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+                        matrix_add(&a11_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
+                        matrix_add(&b11_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
                             T::one(),
-                            temp1.as_ref(),
-                            temp2.as_ref(),
+                            temp_a.as_ref(),
+                            temp_b.as_ref(),
                             T::zero(),
                             result.as_mut(),
                             depth + 1,
@@ -660,10 +738,10 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     1 => {
                         // M2 = (A21 + A22)B11
-                        matrix_add(&a21_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
+                        matrix_add(&a21_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
                         strassen_recursive_parallel(
                             T::one(),
-                            temp1.as_ref(),
+                            temp_a.as_ref(),
                             b11_owned.as_ref(),
                             T::zero(),
                             result.as_mut(),
@@ -672,11 +750,11 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     2 => {
                         // M3 = A11(B12 - B22)
-                        matrix_sub(&b12_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+                        matrix_sub(&b12_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
                             T::one(),
                             a11_owned.as_ref(),
-                            temp2.as_ref(),
+                            temp_b.as_ref(),
                             T::zero(),
                             result.as_mut(),
                             depth + 1,
@@ -684,11 +762,11 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     3 => {
                         // M4 = A22(B21 - B11)
-                        matrix_sub(&b21_owned.as_ref(), &b11_owned.as_ref(), &mut temp2);
+                        matrix_sub(&b21_owned.as_ref(), &b11_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
                             T::one(),
                             a22_owned.as_ref(),
-                            temp2.as_ref(),
+                            temp_b.as_ref(),
                             T::zero(),
                             result.as_mut(),
                             depth + 1,
@@ -696,10 +774,10 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     4 => {
                         // M5 = (A11 + A12)B22
-                        matrix_add(&a11_owned.as_ref(), &a12_owned.as_ref(), &mut temp1);
+                        matrix_add(&a11_owned.as_ref(), &a12_owned.as_ref(), &mut temp_a);
                         strassen_recursive_parallel(
                             T::one(),
-                            temp1.as_ref(),
+                            temp_a.as_ref(),
                             b22_owned.as_ref(),
                             T::zero(),
                             result.as_mut(),
@@ -708,12 +786,12 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     5 => {
                         // M6 = (A21 - A11)(B11 + B12)
-                        matrix_sub(&a21_owned.as_ref(), &a11_owned.as_ref(), &mut temp1);
-                        matrix_add(&b11_owned.as_ref(), &b12_owned.as_ref(), &mut temp2);
+                        matrix_sub(&a21_owned.as_ref(), &a11_owned.as_ref(), &mut temp_a);
+                        matrix_add(&b11_owned.as_ref(), &b12_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
                             T::one(),
-                            temp1.as_ref(),
-                            temp2.as_ref(),
+                            temp_a.as_ref(),
+                            temp_b.as_ref(),
                             T::zero(),
                             result.as_mut(),
                             depth + 1,
@@ -721,12 +799,12 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                     }
                     6 => {
                         // M7 = (A12 - A22)(B21 + B22)
-                        matrix_sub(&a12_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
-                        matrix_add(&b21_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+                        matrix_sub(&a12_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
+                        matrix_add(&b21_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
                             T::one(),
-                            temp1.as_ref(),
-                            temp2.as_ref(),
+                            temp_a.as_ref(),
+                            temp_b.as_ref(),
                             T::zero(),
                             result.as_mut(),
                             depth + 1,
@@ -749,84 +827,84 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
         )
     } else {
         // Sequential computation for deeper recursion levels
-        let mut m1: Mat<T> = Mat::zeros(half, half);
-        let mut m2: Mat<T> = Mat::zeros(half, half);
-        let mut m3: Mat<T> = Mat::zeros(half, half);
-        let mut m4: Mat<T> = Mat::zeros(half, half);
-        let mut m5: Mat<T> = Mat::zeros(half, half);
-        let mut m6: Mat<T> = Mat::zeros(half, half);
-        let mut m7: Mat<T> = Mat::zeros(half, half);
-        let mut temp1: Mat<T> = Mat::zeros(half, half);
-        let mut temp2: Mat<T> = Mat::zeros(half, half);
+        let mut m1: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m2: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m3: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m4: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m5: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m6: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut m7: Mat<T> = Mat::zeros(half_m, half_n);
+        let mut temp_a: Mat<T> = Mat::zeros(half_m, half_k);
+        let mut temp_b: Mat<T> = Mat::zeros(half_k, half_n);
 
-        matrix_add(&a11_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
-        matrix_add(&b11_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+        matrix_add(&a11_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
+        matrix_add(&b11_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
         strassen_recursive_parallel(
             T::one(),
-            temp1.as_ref(),
-            temp2.as_ref(),
+            temp_a.as_ref(),
+            temp_b.as_ref(),
             T::zero(),
             m1.as_mut(),
             depth + 1,
         );
 
-        matrix_add(&a21_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
+        matrix_add(&a21_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
         strassen_recursive_parallel(
             T::one(),
-            temp1.as_ref(),
+            temp_a.as_ref(),
             b11_owned.as_ref(),
             T::zero(),
             m2.as_mut(),
             depth + 1,
         );
 
-        matrix_sub(&b12_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+        matrix_sub(&b12_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
         strassen_recursive_parallel(
             T::one(),
             a11_owned.as_ref(),
-            temp2.as_ref(),
+            temp_b.as_ref(),
             T::zero(),
             m3.as_mut(),
             depth + 1,
         );
 
-        matrix_sub(&b21_owned.as_ref(), &b11_owned.as_ref(), &mut temp2);
+        matrix_sub(&b21_owned.as_ref(), &b11_owned.as_ref(), &mut temp_b);
         strassen_recursive_parallel(
             T::one(),
             a22_owned.as_ref(),
-            temp2.as_ref(),
+            temp_b.as_ref(),
             T::zero(),
             m4.as_mut(),
             depth + 1,
         );
 
-        matrix_add(&a11_owned.as_ref(), &a12_owned.as_ref(), &mut temp1);
+        matrix_add(&a11_owned.as_ref(), &a12_owned.as_ref(), &mut temp_a);
         strassen_recursive_parallel(
             T::one(),
-            temp1.as_ref(),
+            temp_a.as_ref(),
             b22_owned.as_ref(),
             T::zero(),
             m5.as_mut(),
             depth + 1,
         );
 
-        matrix_sub(&a21_owned.as_ref(), &a11_owned.as_ref(), &mut temp1);
-        matrix_add(&b11_owned.as_ref(), &b12_owned.as_ref(), &mut temp2);
+        matrix_sub(&a21_owned.as_ref(), &a11_owned.as_ref(), &mut temp_a);
+        matrix_add(&b11_owned.as_ref(), &b12_owned.as_ref(), &mut temp_b);
         strassen_recursive_parallel(
             T::one(),
-            temp1.as_ref(),
-            temp2.as_ref(),
+            temp_a.as_ref(),
+            temp_b.as_ref(),
             T::zero(),
             m6.as_mut(),
             depth + 1,
         );
 
-        matrix_sub(&a12_owned.as_ref(), &a22_owned.as_ref(), &mut temp1);
-        matrix_add(&b21_owned.as_ref(), &b22_owned.as_ref(), &mut temp2);
+        matrix_sub(&a12_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
+        matrix_add(&b21_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
         strassen_recursive_parallel(
             T::one(),
-            temp1.as_ref(),
-            temp2.as_ref(),
+            temp_a.as_ref(),
+            temp_b.as_ref(),
             T::zero(),
             m7.as_mut(),
             depth + 1,
@@ -840,8 +918,8 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
         c.scale(beta);
     }
 
-    for i in 0..half {
-        for j in 0..half {
+    for i in 0..half_m {
+        for j in 0..half_n {
             let c11_contrib = m1[(i, j)] + m4[(i, j)] - m5[(i, j)] + m7[(i, j)];
             let c12_contrib = m3[(i, j)] + m5[(i, j)];
             let c21_contrib = m2[(i, j)] + m4[(i, j)];
@@ -849,17 +927,17 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
 
             if beta == T::zero() {
                 c.set(i, j, alpha * c11_contrib);
-                c.set(i, j + half, alpha * c12_contrib);
-                c.set(i + half, j, alpha * c21_contrib);
-                c.set(i + half, j + half, alpha * c22_contrib);
+                c.set(i, j + half_n, alpha * c12_contrib);
+                c.set(i + half_m, j, alpha * c21_contrib);
+                c.set(i + half_m, j + half_n, alpha * c22_contrib);
             } else {
                 c.set(i, j, c[(i, j)] + alpha * c11_contrib);
-                c.set(i, j + half, c[(i, j + half)] + alpha * c12_contrib);
-                c.set(i + half, j, c[(i + half, j)] + alpha * c21_contrib);
+                c.set(i, j + half_n, c[(i, j + half_n)] + alpha * c12_contrib);
+                c.set(i + half_m, j, c[(i + half_m, j)] + alpha * c21_contrib);
                 c.set(
-                    i + half,
-                    j + half,
-                    c[(i + half, j + half)] + alpha * c22_contrib,
+                    i + half_m,
+                    j + half_n,
+                    c[(i + half_m, j + half_n)] + alpha * c22_contrib,
                 );
             }
         }
@@ -955,7 +1033,8 @@ mod tests {
 
     #[test]
     fn test_strassen_non_square() {
-        // Non-square matrices should be handled correctly with padding
+        // Non-square, below-threshold matrices exercise the standard GEMM
+        // fallback path in `gemm_strassen_with_par`.
         let m = 50;
         let k = 40;
         let n = 60;
@@ -976,6 +1055,125 @@ mod tests {
                     j,
                     c[(i, j)],
                     expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_strassen_non_square_non_power_of_two_large() {
+        // Deliberately non-square, non-power-of-two, and with all three
+        // dimensions distinct from one another -- while still clearing
+        // STRASSEN_THRESHOLD so the real Strassen recursion with dynamic
+        // peeling is exercised end to end through the public
+        // `gemm_strassen` entry point (m, k, and n are all odd, so every
+        // peeling branch -- row, inner, and column -- gets triggered at
+        // least once). The result is checked against `gemm_with_blocking`,
+        // an independent (non-recursive) GEMM implementation.
+        let m = 513;
+        let k = 515;
+        let n = 517;
+        assert!(should_use_strassen(m, k, n), "shape should use Strassen");
+
+        let mut a: Mat<f64> = Mat::zeros(m, k);
+        for i in 0..m {
+            for j in 0..k {
+                a[(i, j)] = ((i * 7 + j * 3 + 1) % 11) as f64;
+            }
+        }
+
+        let mut b: Mat<f64> = Mat::zeros(k, n);
+        for i in 0..k {
+            for j in 0..n {
+                b[(i, j)] = ((i * 5 + j * 2 + 3) % 13) as f64;
+            }
+        }
+
+        let mut c_strassen: Mat<f64> = Mat::zeros(m, n);
+        gemm_strassen(1.0, a.as_ref(), b.as_ref(), 0.0, c_strassen.as_mut());
+
+        let mut c_reference: Mat<f64> = Mat::zeros(m, n);
+        let shape = <f64 as GemmKernel>::micro_kernel_shape();
+        let blocking = GemmBlocking::for_kernel::<f64>(&shape);
+        gemm_with_blocking(
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c_reference.as_mut(),
+            Par::Seq,
+            &blocking,
+        );
+
+        for i in 0..m {
+            for j in 0..n {
+                let strassen_val = c_strassen[(i, j)];
+                let reference_val = c_reference[(i, j)];
+                assert!(
+                    (strassen_val - reference_val).abs() < 1e-6,
+                    "mismatch at ({i}, {j}): strassen={strassen_val}, reference={reference_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_strassen_recursive_peeling_arbitrary_shape() {
+        // Exercises the private dynamic-peeling recursion directly
+        // (bypassing the STRASSEN_THRESHOLD/aspect-ratio gate that the
+        // public entry points use) with a non-square, non-power-of-two,
+        // wildly rectangular shape in the spirit of the audited example
+        // (100x37 times 37x250), scaled just past STRASSEN_LEAF_SIZE so at
+        // least one real 2x2 split (in addition to peeling) occurs.
+        let m = 101;
+        let k = 79;
+        let n = 251;
+
+        let mut a: Mat<f64> = Mat::zeros(m, k);
+        for i in 0..m {
+            for j in 0..k {
+                a[(i, j)] = ((i * 3 + j * 7 + 2) % 9) as f64;
+            }
+        }
+
+        let mut b: Mat<f64> = Mat::zeros(k, n);
+        for i in 0..k {
+            for j in 0..n {
+                b[(i, j)] = ((i * 2 + j * 5 + 1) % 7) as f64;
+            }
+        }
+
+        let mut c_strassen: Mat<f64> = Mat::zeros(m, n);
+        strassen_recursive(
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c_strassen.as_mut(),
+            0,
+            Par::Seq,
+        );
+
+        let mut c_reference: Mat<f64> = Mat::zeros(m, n);
+        let shape = <f64 as GemmKernel>::micro_kernel_shape();
+        let blocking = GemmBlocking::for_kernel::<f64>(&shape);
+        gemm_with_blocking(
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c_reference.as_mut(),
+            Par::Seq,
+            &blocking,
+        );
+
+        for i in 0..m {
+            for j in 0..n {
+                let strassen_val = c_strassen[(i, j)];
+                let reference_val = c_reference[(i, j)];
+                assert!(
+                    (strassen_val - reference_val).abs() < 1e-6,
+                    "mismatch at ({i}, {j}): strassen={strassen_val}, reference={reference_val}"
                 );
             }
         }
@@ -1050,25 +1248,169 @@ mod tests {
     }
 
     #[test]
-    fn test_next_power_of_two() {
-        assert_eq!(next_power_of_two(1), 1);
-        assert_eq!(next_power_of_two(2), 2);
-        assert_eq!(next_power_of_two(3), 4);
-        assert_eq!(next_power_of_two(4), 4);
-        assert_eq!(next_power_of_two(5), 8);
-        assert_eq!(next_power_of_two(100), 128);
-        assert_eq!(next_power_of_two(512), 512);
-        assert_eq!(next_power_of_two(513), 1024);
-    }
-
-    #[test]
     fn test_should_use_strassen() {
         assert!(!should_use_strassen(100, 100, 100));
         assert!(!should_use_strassen(511, 511, 511));
         assert!(should_use_strassen(512, 512, 512));
         assert!(should_use_strassen(1000, 1000, 1000));
-        // Only the minimum dimension matters
+        // The minimum dimension gates eligibility on its own...
         assert!(!should_use_strassen(1000, 100, 1000));
+        // ...but a small-enough aspect ratio is also required even once
+        // every dimension clears the threshold (see
+        // `test_should_use_strassen_rejects_extreme_aspect_ratio`).
+    }
+
+    #[test]
+    fn test_should_use_strassen_rejects_extreme_aspect_ratio() {
+        // All dimensions individually clear STRASSEN_THRESHOLD, but the
+        // shape is far too rectangular (ratio >> STRASSEN_MAX_ASPECT_RATIO)
+        // for Strassen's recursive halving to pay off versus a single flat
+        // GEMM call.
+        assert!(!should_use_strassen(8192, 512, 8192));
+        // Right at the aspect-ratio boundary: still allowed.
+        assert!(should_use_strassen(4096, 512, 4096));
+        // Just past the boundary: rejected.
+        assert!(!should_use_strassen(4104, 512, 4104));
+    }
+
+    /// Minimal per-thread allocation tracker used only by
+    /// [`test_strassen_padding_does_not_blow_up_allocations`] to verify
+    /// that dynamic peeling keeps Strassen's scratch-memory footprint
+    /// proportional to the actual matrix sizes instead of a shared
+    /// power-of-two cube of the largest dimension.
+    mod alloc_tracking {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static CURRENT: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// A `GlobalAlloc` wrapper around the system allocator that tracks
+        /// the current and peak number of live bytes allocated *on the
+        /// calling thread* since the last [`reset`].
+        pub struct TrackingAllocator;
+
+        // SAFETY: every call is forwarded unchanged to `System`, which is a
+        // valid `GlobalAlloc`; the extra bookkeeping only touches
+        // thread-local counters and never affects the returned pointers or
+        // their validity.
+        unsafe impl GlobalAlloc for TrackingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    CURRENT.with(|current| {
+                        let updated = current.get() + layout.size();
+                        current.set(updated);
+                        PEAK.with(|peak| {
+                            if updated > peak.get() {
+                                peak.set(updated);
+                            }
+                        });
+                    });
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) };
+                CURRENT.with(|current| {
+                    current.set(current.get().saturating_sub(layout.size()));
+                });
+            }
+        }
+
+        /// Resets this thread's current/peak counters to zero.
+        pub fn reset() {
+            CURRENT.with(|c| c.set(0));
+            PEAK.with(|p| p.set(0));
+        }
+
+        /// Returns the peak number of bytes concurrently allocated on this
+        /// thread since the last [`reset`].
+        pub fn peak_bytes() -> usize {
+            PEAK.with(Cell::get)
+        }
+    }
+
+    #[global_allocator]
+    static TRACKING_ALLOCATOR: alloc_tracking::TrackingAllocator =
+        alloc_tracking::TrackingAllocator;
+
+    #[test]
+    fn test_strassen_padding_does_not_blow_up_allocations() {
+        // Shape chosen so the OLD implementation (padding every dimension
+        // to `next_power_of_two(max(m, k, n))`) would have padded all
+        // three dimensions from ~513-517 up to 1024, allocating a
+        // 1024x1024 A/B/C triple (~24 MB of f64 scratch) for a multiply
+        // whose actual data is only ~6 MB. All three dimensions clear
+        // STRASSEN_THRESHOLD (so the Strassen path, not the small-matrix
+        // fallback, is what gets measured), and all three are odd (so
+        // dynamic peeling is exercised, not just a clean 2x2 split).
+        let m = 513usize;
+        let k = 515usize;
+        let n = 517usize;
+        assert!(should_use_strassen(m, k, n), "shape should use Strassen");
+
+        let a: Mat<f64> = Mat::filled(m, k, 1.5);
+        let b: Mat<f64> = Mat::filled(k, n, 0.5);
+        let mut c: Mat<f64> = Mat::zeros(m, n);
+
+        let elem = std::mem::size_of::<f64>();
+        let raw_input_bytes = (m * k + k * n + m * n) * elem;
+
+        // Mirrors the old `next_power_of_two(max(m, k, n))` global padding
+        // scheme this fix removes, to quantify how bad the historical
+        // blow-up was for this exact shape.
+        let old_padded_dim = {
+            let max_dim = m.max(k).max(n);
+            let mut v = max_dim - 1;
+            v |= v >> 1;
+            v |= v >> 2;
+            v |= v >> 4;
+            v |= v >> 8;
+            v |= v >> 16;
+            v |= v >> 32;
+            v + 1
+        };
+        let old_padded_bytes = 3 * old_padded_dim * old_padded_dim * elem;
+
+        // Sanity check: confirm this shape really would have triggered a
+        // large blow-up under the old scheme (old padded scratch is
+        // several times larger than the matrices' actual raw data).
+        assert!(
+            old_padded_bytes > 3 * raw_input_bytes,
+            "test shape does not exercise the old blow-up: old={old_padded_bytes}, raw={raw_input_bytes}"
+        );
+
+        alloc_tracking::reset();
+        gemm_strassen(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut());
+        let peak = alloc_tracking::peak_bytes();
+
+        // The new dynamic-peeling implementation never materializes a
+        // padded copy of the whole matrix: the M1..M7/temp scratch buffers
+        // it does allocate form a geometric series proportional to the
+        // *actual* matrix sizes, well under half of what the old global
+        // power-of-two-cube padding would have required.
+        assert!(
+            peak < old_padded_bytes / 2,
+            "peak scratch allocation {peak} bytes is not meaningfully smaller than the old \
+             padded-cube scratch of {old_padded_bytes} bytes -- padding overhead is no longer \
+             supposed to scale with the max dimension cubed"
+        );
+
+        // Correctness: each output element is k * 1.5 * 0.5 = k * 0.75.
+        let expected = k as f64 * 0.75;
+        for i in 0..m {
+            for j in 0..n {
+                assert!(
+                    (c[(i, j)] - expected).abs() < 1e-6,
+                    "c[{i},{j}] = {}, expected {expected}",
+                    c[(i, j)]
+                );
+            }
+        }
     }
 
     #[cfg(feature = "parallel")]

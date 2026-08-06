@@ -38,6 +38,13 @@ pub enum MultifrontalError {
         /// Description of the error.
         message: String,
     },
+    /// Right-hand side vector length does not match the matrix dimension.
+    DimensionMismatch {
+        /// Expected length (matrix dimension).
+        expected: usize,
+        /// Actual length of the provided right-hand side.
+        actual: usize,
+    },
 }
 
 impl core::fmt::Display for MultifrontalError {
@@ -54,6 +61,9 @@ impl core::fmt::Display for MultifrontalError {
             }
             Self::AssemblyError { message } => {
                 write!(f, "Assembly error: {message}")
+            }
+            Self::DimensionMismatch { expected, actual } => {
+                write!(f, "RHS length mismatch: expected {expected}, got {actual}")
             }
         }
     }
@@ -315,10 +325,24 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> FrontalMatrix<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csc::CscMatrix;
 /// use oxiblas_sparse::linalg::MultifrontalCholesky;
+///
+/// // Symmetric positive definite tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let a = CscMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let chol = MultifrontalCholesky::new(&a)?;
-/// let x = chol.solve(&b);
+/// let x = chol.solve(&[1.0, 1.0, 1.0])?;
+/// assert_eq!(x.len(), 3);
+/// # Ok::<(), oxiblas_sparse::linalg::multifrontal_cholesky::MultifrontalError>(())
 /// ```
 #[derive(Debug, Clone)]
 pub struct MultifrontalCholesky<T: Scalar> {
@@ -524,9 +548,19 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
     ///
     /// Performs forward substitution (L * y = P * b) then
     /// backward substitution (L^T * z = y), then applies P^T.
-    pub fn solve(&self, b: &[T]) -> Vec<T> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultifrontalError::DimensionMismatch`] if `b.len()` does not
+    /// match the matrix dimension.
+    pub fn solve(&self, b: &[T]) -> Result<Vec<T>, MultifrontalError> {
         let n = self.n;
-        assert_eq!(b.len(), n, "RHS length must match matrix dimension");
+        if b.len() != n {
+            return Err(MultifrontalError::DimensionMismatch {
+                expected: n,
+                actual: b.len(),
+            });
+        }
 
         // Apply permutation: b_perm = P * b
         let mut x = vec![T::zero(); n];
@@ -546,7 +580,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
             result[self.perm[i]] = x[i].clone();
         }
 
-        result
+        Ok(result)
     }
 
     /// Forward substitution: L * y = b.
@@ -669,36 +703,49 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> MultifrontalCholesky<T> {
     }
 }
 
-/// Builds the elimination tree from a symmetric matrix (lower triangle).
+/// Builds the elimination tree of a symmetric matrix from its (full symmetric)
+/// pattern.
+///
+/// This is the classic path-compressing `cs_etree` algorithm for Cholesky.
+/// `ancestor[v]` tracks the highest ancestor of `v` discovered so far (`None`
+/// marks a root). For each column `k`, every earlier neighbour `i < k` walks
+/// toward its current root, path-compressing the traversed pointers directly to
+/// `k`; the root of that walk gets `k` as its parent.
+///
+/// Every traversed node — including the eventual root — has its `ancestor`
+/// updated to `k`, so a later column that touches the same node routes through
+/// `k` instead of re-rooting it. Omitting that update (as a naive variant does)
+/// lets a node with several parent-candidate edges have its parent overwritten,
+/// yielding a wrong tree for fill-generating matrices such as 2D grids.
 fn build_elimination_tree<T: Scalar>(a: &CscMatrix<T>) -> Vec<Option<usize>> {
     let n = a.nrows();
     let mut parent: Vec<Option<usize>> = vec![None; n];
-    let mut ancestor = vec![0usize; n];
+    let mut ancestor: Vec<Option<usize>> = vec![None; n];
 
     for k in 0..n {
-        ancestor[k] = k;
         let col_start = a.col_ptrs()[k];
         let col_end = a.col_ptrs()[k + 1];
 
         for idx in col_start..col_end {
             let i = a.row_indices()[idx];
             if i < k {
-                // Walk up the tree, path-compressing
-                let mut r = i;
-                while ancestor[r] != r && ancestor[r] != k {
-                    let next = ancestor[r];
-                    ancestor[r] = k;
-                    r = next;
-                }
-                if ancestor[r] == r {
-                    parent[r] = Some(k);
-                }
-                // Path compression for i
-                let mut j = i;
-                while ancestor[j] != k {
-                    let next = ancestor[j];
-                    ancestor[j] = k;
-                    j = next;
+                // Walk from `i` toward the current root, compressing to `k`.
+                let mut node = i;
+                loop {
+                    let next = ancestor[node];
+                    ancestor[node] = Some(k);
+                    match next {
+                        None => {
+                            parent[node] = Some(k);
+                            break;
+                        }
+                        Some(nx) => {
+                            if nx >= k {
+                                break;
+                            }
+                            node = nx;
+                        }
+                    }
                 }
             }
         }
@@ -738,68 +785,125 @@ fn compute_postorder(_parent: &[Option<usize>], children: &[Vec<usize>], n: usiz
     order
 }
 
-/// Symbolic factorization: determine the sparsity structure of each column of L.
+/// Symbolic factorization: determine the fill-aware sparsity structure of each
+/// column of `L`.
 ///
-/// For each column j, l_struct[j] contains the sorted row indices of L below the diagonal.
+/// For each column `j`, `l_struct[j]` contains the sorted row indices of `L`
+/// strictly below the diagonal. The structure is computed with the exact
+/// symbolic-Cholesky recursion over the elimination tree:
+///
+/// ```text
+/// struct(L[:,j]) = { i > j : A[i,j] != 0 }
+///                  ∪ ( ∪_{child c of j in etree} struct(L[:,c]) \ {c} )
+/// ```
+///
+/// The child union is what captures *fill-in* — nonzeros created during
+/// factorization that are absent from the pattern of `A`. A bare walk over the
+/// direct neighbours of `A` (or up the tree from those neighbours) misses fill
+/// for anything beyond the immediate sparsity pattern, which is exactly what a
+/// 2D-grid Laplacian produces.
+///
+/// Because every child index is strictly smaller than its parent, processing
+/// columns in increasing order guarantees each child's structure is already
+/// available when its parent is reached. `a` here is the fill-reducing-permuted
+/// matrix stored with its full symmetric pattern, so column `j` already exposes
+/// every neighbour of `j`; keeping rows `> j` selects the strictly-below-diagonal
+/// entries. Since each child `c` has parent `j`, the value `j` is the minimum of
+/// `struct(L[:,c])`, so restricting the propagated rows to `> j` drops exactly
+/// the shared parent entry (the `\ {c}` in the recursion is realised because `c`
+/// itself never appears in its own below-diagonal structure).
 fn symbolic_factorization<T: Scalar>(
     a: &CscMatrix<T>,
     parent: &[Option<usize>],
 ) -> Vec<Vec<usize>> {
     let n = a.nrows();
-    let mut l_struct: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-    // For each column j, the structure of L[:,j] below diagonal is the
-    // union of:
-    // 1. Row indices from A[:,j] that are > j
-    // 2. For each child c of j in etree, the row indices of L[:,c] that are > j
+    // Build the elimination-tree child lists from the parent pointers.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (c, p) in parent.iter().enumerate() {
+        if let Some(pp) = p {
+            children[*pp].push(c);
+        }
+    }
 
-    // Process in natural order (0..n)
+    let mut structs: Vec<std::collections::BTreeSet<usize>> =
+        vec![std::collections::BTreeSet::new(); n];
+
     for j in 0..n {
-        let mut row_set = std::collections::BTreeSet::new();
+        let mut set = std::collections::BTreeSet::new();
 
-        // Add entries from A
+        // Direct contributions from the (symmetric) pattern of A.
         let col_start = a.col_ptrs()[j];
         let col_end = a.col_ptrs()[j + 1];
         for idx in col_start..col_end {
             let row = a.row_indices()[idx];
             if row > j {
-                row_set.insert(row);
+                set.insert(row);
             }
         }
 
-        // Propagate structure from children via elimination tree
-        // For each row r in l_struct[j], if parent[r] exists and > j, add it
-        // This is a simplified column count / reachability
-        let rows: Vec<usize> = row_set.iter().copied().collect();
-        for &r in &rows {
-            // Walk up the elimination tree from r
-            let mut current = r;
-            while let Some(p) = parent[current] {
-                if p <= j {
-                    break;
+        // Fill contributions propagated from children in the elimination tree.
+        for &c in &children[j] {
+            for &row in &structs[c] {
+                if row > j {
+                    set.insert(row);
                 }
-                if !row_set.contains(&p) {
-                    row_set.insert(p);
-                }
-                current = p;
             }
         }
 
-        l_struct[j] = row_set.into_iter().collect();
+        structs[j] = set;
     }
 
-    l_struct
+    structs
+        .into_iter()
+        .map(|s| s.into_iter().collect())
+        .collect()
 }
 
 /// Permutes a symmetric matrix: returns P * A * P^T.
 ///
 /// Stores the full symmetric matrix (both triangles) in the result.
+///
+/// `a` may store either the full symmetric matrix or just one triangle;
+/// entries that live in another column but reference the current row are
+/// recovered via a precomputed row index (built once in a single O(nnz)
+/// pass over the CSC structure) rather than by rescanning every column of
+/// `a` for each output column, which would degrade to O(n^2) work overall.
 fn permute_symmetric_csc<T: Scalar + Clone + Field>(
     a: &CscMatrix<T>,
     perm: &[usize],
     perm_inv: &[usize],
 ) -> CscMatrix<T> {
     let n = a.nrows();
+    let nnz = a.row_indices().len();
+
+    // Build a row-major view of A's nonzeros: for each row `r`, the list of
+    // (col, value) pairs whose row index is `r`. This is the transpose's
+    // CSC structure, computed via a standard counting-sort pass over the
+    // existing CSC column pointers (O(n + nnz)), so that later we can find
+    // "which other columns reference row `old_j`" in O(deg(old_j)) instead
+    // of scanning all n columns of `a`.
+    let mut row_ptr = vec![0usize; n + 1];
+    for &row in a.row_indices() {
+        row_ptr[row + 1] += 1;
+    }
+    for r in 0..n {
+        row_ptr[r + 1] += row_ptr[r];
+    }
+    let mut row_col = vec![0usize; nnz];
+    let mut row_val: Vec<T> = vec![T::zero(); nnz];
+    let mut cursor = row_ptr.clone();
+    for old_k in 0..n {
+        let k_start = a.col_ptrs()[old_k];
+        let k_end = a.col_ptrs()[old_k + 1];
+        for idx in k_start..k_end {
+            let row = a.row_indices()[idx];
+            let pos = cursor[row];
+            row_col[pos] = old_k;
+            row_val[pos] = a.values()[idx].clone();
+            cursor[row] += 1;
+        }
+    }
 
     let mut col_ptrs = vec![0usize; n + 1];
     let mut row_indices = Vec::new();
@@ -810,7 +914,7 @@ fn permute_symmetric_csc<T: Scalar + Clone + Field>(
 
         let mut entries: Vec<(usize, T)> = Vec::new();
 
-        // Get entries from column old_j of A
+        // Get entries from column old_j of A (its actual nonzeros only).
         let start = a.col_ptrs()[old_j];
         let end = a.col_ptrs()[old_j + 1];
 
@@ -821,21 +925,17 @@ fn permute_symmetric_csc<T: Scalar + Clone + Field>(
         }
 
         // Also pick up entries from other columns that have row = old_j
-        // (to handle the upper triangle mapping to lower)
-        for old_k in 0..n {
+        // (to handle the upper triangle mapping to lower), using the
+        // precomputed row index instead of scanning every column.
+        let r_start = row_ptr[old_j];
+        let r_end = row_ptr[old_j + 1];
+        for ridx in r_start..r_end {
+            let old_k = row_col[ridx];
             if old_k == old_j {
                 continue;
             }
             let new_k = perm_inv[old_k];
-            let k_start = a.col_ptrs()[old_k];
-            let k_end = a.col_ptrs()[old_k + 1];
-
-            for idx in k_start..k_end {
-                if a.row_indices()[idx] == old_j {
-                    entries.push((new_k, a.values()[idx].clone()));
-                    break;
-                }
-            }
+            entries.push((new_k, row_val[ridx].clone()));
         }
 
         // Sort by row index and deduplicate
@@ -970,7 +1070,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 1x1 SPD matrix should succeed");
 
         let b = vec![10.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("1x1 solve should succeed");
 
         assert!(
             (x[0] - 2.0).abs() < 1e-10,
@@ -986,7 +1086,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 2x2 SPD matrix should succeed");
 
         let b = vec![5.0, 5.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("2x2 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..2 {
@@ -1007,7 +1107,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 3x3 SPD matrix should succeed");
 
         let b = vec![1.0, 2.0, 3.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("3x3 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..3 {
@@ -1028,7 +1128,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 5x5 SPD matrix should succeed");
 
         let b = vec![1.0, 2.0, 3.0, 2.0, 1.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("5x5 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         for i in 0..5 {
@@ -1049,7 +1149,7 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("factorization of 8x8 Laplacian should succeed");
 
         let b = vec![1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("8x8 solve should succeed");
 
         let ax = csc_matvec(&a, &x);
         let residual: f64 = (0..8).map(|i| (ax[i] - b[i]).powi(2)).sum::<f64>().sqrt();
@@ -1068,7 +1168,7 @@ mod tests {
         let chol = MultifrontalCholesky::new(&a).expect("factorization of identity should succeed");
 
         let b = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let x = chol.solve(&b);
+        let x = chol.solve(&b).expect("identity solve should succeed");
 
         for i in 0..5 {
             assert!(
@@ -1103,6 +1203,34 @@ mod tests {
             .expect("matrix construction should succeed");
         let result = MultifrontalCholesky::new(&a);
         assert!(matches!(result, Err(MultifrontalError::NotSquare { .. })));
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_solve_rhs_length_mismatch() {
+        let a = make_spd_3x3();
+        let chol = MultifrontalCholesky::new(&a).expect("factorization should succeed");
+
+        // RHS too short.
+        let b_short = vec![1.0, 2.0];
+        let result = chol.solve(&b_short);
+        assert!(matches!(
+            result,
+            Err(MultifrontalError::DimensionMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+
+        // RHS too long.
+        let b_long = vec![1.0, 2.0, 3.0, 4.0];
+        let result = chol.solve(&b_long);
+        assert!(matches!(
+            result,
+            Err(MultifrontalError::DimensionMismatch {
+                expected: 3,
+                actual: 4
+            })
+        ));
     }
 
     #[test]
@@ -1206,7 +1334,9 @@ mod tests {
 
         let b = vec![2.0, -1.0, 3.0, -2.0, 1.0];
 
-        let x_mf = mf_chol.solve(&b);
+        let x_mf = mf_chol
+            .solve(&b)
+            .expect("multifrontal solve should succeed");
         let x_direct = direct_chol.solve(&b);
 
         for i in 0..5 {
@@ -1228,5 +1358,238 @@ mod tests {
             MultifrontalCholesky::new(&a).expect("empty matrix factorization should succeed");
         assert_eq!(chol.n(), 0);
         assert_eq!(chol.nnz_l(), 0);
+    }
+
+    /// Densifies a CSC matrix into a row-major dense matrix for test comparisons.
+    fn densify(a: &CscMatrix<f64>) -> Vec<Vec<f64>> {
+        let n = a.nrows();
+        let mut dense = vec![vec![0.0; n]; n];
+        for col in 0..n {
+            let start = a.col_ptrs()[col];
+            let end = a.col_ptrs()[col + 1];
+            for idx in start..end {
+                let row = a.row_indices()[idx];
+                dense[row][col] = a.values()[idx];
+            }
+        }
+        dense
+    }
+
+    #[test]
+    fn test_permute_symmetric_csc_identity_lower_triangle_only() {
+        // A = [4 1 0 0]
+        //     [1 4 1 0]
+        //     [0 1 4 1]
+        //     [0 0 1 4]
+        // Stored with only the lower triangle (row >= col) present, to
+        // exercise the "recover entries from other columns" path.
+        let values = vec![4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 4.0];
+        let row_indices = vec![0, 1, 1, 2, 2, 3, 3];
+        let col_ptrs = vec![0, 2, 4, 6, 7];
+        let a = CscMatrix::new(4, 4, col_ptrs, row_indices, values)
+            .expect("lower-triangular matrix construction should succeed");
+
+        let perm: Vec<usize> = vec![0, 1, 2, 3];
+        let perm_inv: Vec<usize> = vec![0, 1, 2, 3];
+        let ap = permute_symmetric_csc(&a, &perm, &perm_inv);
+
+        let dense = densify(&ap);
+        let expected = vec![
+            vec![4.0, 1.0, 0.0, 0.0],
+            vec![1.0, 4.0, 1.0, 0.0],
+            vec![0.0, 1.0, 4.0, 1.0],
+            vec![0.0, 0.0, 1.0, 4.0],
+        ];
+        assert_eq!(
+            dense, expected,
+            "identity permutation should fully symmetrize the lower-triangular input"
+        );
+    }
+
+    #[test]
+    fn test_permute_symmetric_csc_nontrivial_permutation() {
+        // Same lower-triangular-only tridiagonal 4x4 matrix as above.
+        let values = vec![4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 4.0];
+        let row_indices = vec![0, 1, 1, 2, 2, 3, 3];
+        let col_ptrs = vec![0, 2, 4, 6, 7];
+        let a = CscMatrix::new(4, 4, col_ptrs, row_indices, values)
+            .expect("lower-triangular matrix construction should succeed");
+        let a_dense = densify(&a);
+        // Full symmetric dense reference (both triangles).
+        let mut a_full = vec![vec![0.0; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                a_full[i][j] = if a_dense[i][j] != 0.0 {
+                    a_dense[i][j]
+                } else {
+                    a_dense[j][i]
+                };
+            }
+        }
+
+        // Reverse permutation: new index i <- old index perm[i].
+        let perm: Vec<usize> = vec![3, 2, 1, 0];
+        let mut perm_inv = vec![0usize; 4];
+        for (i, &p) in perm.iter().enumerate() {
+            perm_inv[p] = i;
+        }
+
+        let ap = permute_symmetric_csc(&a, &perm, &perm_inv);
+        let dense = densify(&ap);
+
+        // Expected: (P*A*P^T)[i][j] = A_full[perm[i]][perm[j]]
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (dense[i][j] - a_full[perm[i]][perm[j]]).abs() < 1e-12,
+                    "P*A*P^T mismatch at ({i},{j}): {} vs {}",
+                    dense[i][j],
+                    a_full[perm[i]][perm[j]]
+                );
+            }
+        }
+    }
+
+    /// Builds a `k x k` 2D grid 5-point Laplacian as a full symmetric SPD matrix.
+    ///
+    /// Diagonal `4`, nearest-neighbour coupling `-1`. Under any elimination
+    /// ordering these matrices generate genuine fill-in (nonzeros in `L` absent
+    /// from `A`), which is precisely what exercises the fill-aware symbolic
+    /// factorization.
+    fn make_grid_laplacian(k: usize) -> CscMatrix<f64> {
+        let n = k * k;
+        let idx = |r: usize, c: usize| r * k + c;
+
+        let mut col_ptrs = vec![0usize];
+        let mut row_indices = Vec::new();
+        let mut values = Vec::new();
+
+        for lin in 0..n {
+            let r = lin / k;
+            let c = lin % k;
+            let mut entries: Vec<(usize, f64)> = Vec::new();
+
+            if r > 0 {
+                entries.push((idx(r - 1, c), -1.0));
+            }
+            if c > 0 {
+                entries.push((idx(r, c - 1), -1.0));
+            }
+            entries.push((lin, 4.0));
+            if c + 1 < k {
+                entries.push((idx(r, c + 1), -1.0));
+            }
+            if r + 1 < k {
+                entries.push((idx(r + 1, c), -1.0));
+            }
+
+            entries.sort_by_key(|(row, _)| *row);
+            for (row, val) in entries {
+                row_indices.push(row);
+                values.push(val);
+            }
+            col_ptrs.push(values.len());
+        }
+
+        CscMatrix::new(n, n, col_ptrs, row_indices, values)
+            .expect("valid grid Laplacian construction")
+    }
+
+    /// Relative residual `||A x - b|| / ||b||` for a solved system.
+    fn relative_residual(a: &CscMatrix<f64>, x: &[f64], b: &[f64]) -> f64 {
+        let ax = csc_matvec(a, x);
+        let residual: f64 = (0..b.len())
+            .map(|i| (ax[i] - b[i]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if b_norm > 0.0 {
+            residual / b_norm
+        } else {
+            residual
+        }
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_3x3() {
+        // The exact reproduction from the bug report: a 3x3 2D-grid Laplacian
+        // (5-point stencil, n = 9). Before the fill-aware symbolic factorization
+        // this produced residual ~10.5; it must now be near machine epsilon.
+        let a = make_grid_laplacian(3);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("3x3 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64)).collect();
+        let x = chol
+            .solve(&b)
+            .expect("3x3 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-12,
+            "3x3 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_5x5() {
+        // Larger fill-generating case (5x5 grid, n = 25).
+        let a = make_grid_laplacian(5);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("5x5 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.5) - 3.0).collect();
+        let x = chol
+            .solve(&b)
+            .expect("5x5 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-11,
+            "5x5 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_grid_laplacian_10x10() {
+        // Substantial fill-generating case (10x10 grid, n = 100).
+        let a = make_grid_laplacian(10);
+        let n = a.nrows();
+        let chol = MultifrontalCholesky::new(&a).expect("10x10 grid Laplacian is SPD");
+
+        let b: Vec<f64> = (0..n).map(|i| (((i * 7 + 3) % 11) as f64) - 5.0).collect();
+        let x = chol
+            .solve(&b)
+            .expect("10x10 grid Laplacian solve should succeed");
+
+        let rel = relative_residual(&a, &x, &b);
+        assert!(
+            rel < 1e-10,
+            "10x10 grid Laplacian relative residual too large: {rel}"
+        );
+    }
+
+    #[test]
+    fn test_multifrontal_cholesky_fill_matches_direct() {
+        // Cross-check the fill-generating factor against the reference direct
+        // sparse Cholesky on the same grid Laplacian.
+        let a = make_grid_laplacian(4);
+        let n = a.nrows();
+        let mf = MultifrontalCholesky::new(&a).expect("multifrontal factorization should succeed");
+        let direct = super::super::SparseCholesky::new(&a).expect("direct cholesky should succeed");
+
+        let b: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
+        let x_mf = mf.solve(&b).expect("multifrontal solve should succeed");
+        let x_direct = direct.solve(&b);
+
+        for i in 0..n {
+            assert!(
+                (x_mf[i] - x_direct[i]).abs() < 1e-9,
+                "multifrontal vs direct differ at {}: {} vs {}",
+                i,
+                x_mf[i],
+                x_direct[i]
+            );
+        }
     }
 }

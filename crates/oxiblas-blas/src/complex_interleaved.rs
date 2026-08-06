@@ -27,10 +27,10 @@
 //! let real = [1.0, 2.0, 3.0];
 //! let imag = [4.0, 5.0, 6.0];
 //!
-//! let interleaved = split_to_interleaved(&real, &imag);
+//! let interleaved = split_to_interleaved(&real, &imag).expect("real and imag have equal length");
 //! assert_eq!(interleaved, [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 //!
-//! let (re, im) = interleaved_to_split(&interleaved);
+//! let (re, im) = interleaved_to_split(&interleaved).expect("interleaved length is even");
 //! assert_eq!(re, real);
 //! assert_eq!(im, imag);
 //! ```
@@ -38,6 +38,62 @@
 use num_complex::{Complex32, Complex64};
 use num_traits::Float;
 use oxiblas_core::scalar::Field;
+
+// =============================================================================
+// Error Type
+// =============================================================================
+
+/// Errors that can occur when working with interleaved complex data.
+///
+/// All of the fallible functions in this module take caller-supplied slice
+/// lengths, so violations are reported as a typed [`Result`] error instead of
+/// panicking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterleavedComplexError {
+    /// An interleaved array does not have an even number of elements, so it
+    /// cannot be decomposed into `(re, im)` pairs.
+    OddLength {
+        /// The actual (odd) length that was supplied.
+        len: usize,
+    },
+    /// The real-part and imaginary-part arrays passed to a split/interleave
+    /// conversion do not have the same length.
+    SplitLengthMismatch {
+        /// Length of the real-part array.
+        real_len: usize,
+        /// Length of the imaginary-part array.
+        imag_len: usize,
+    },
+    /// Two interleaved vectors passed to a binary vector operation (dotc,
+    /// axpy, ...) do not have the same length.
+    VectorLengthMismatch {
+        /// Length of the first vector.
+        x_len: usize,
+        /// Length of the second vector.
+        y_len: usize,
+    },
+}
+
+impl core::fmt::Display for InterleavedComplexError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OddLength { len } => write!(
+                f,
+                "interleaved complex array must have an even length, got {len}"
+            ),
+            Self::SplitLengthMismatch { real_len, imag_len } => write!(
+                f,
+                "real and imaginary arrays must have the same length (real: {real_len}, imag: {imag_len})"
+            ),
+            Self::VectorLengthMismatch { x_len, y_len } => write!(
+                f,
+                "interleaved vectors must have the same length (x: {x_len}, y: {y_len})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InterleavedComplexError {}
 
 // =============================================================================
 // Type Definitions
@@ -98,12 +154,21 @@ impl InterleavedComplex for f64 {
 ///
 /// Interleaved array of size 2*n.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if arrays have different lengths.
+/// Returns [`InterleavedComplexError::SplitLengthMismatch`] if `real` and
+/// `imag` have different lengths.
 #[inline]
-pub fn split_to_interleaved<T: InterleavedComplex>(real: &[T], imag: &[T]) -> Vec<T> {
-    assert_eq!(real.len(), imag.len(), "Arrays must have same length");
+pub fn split_to_interleaved<T: InterleavedComplex>(
+    real: &[T],
+    imag: &[T],
+) -> Result<Vec<T>, InterleavedComplexError> {
+    if real.len() != imag.len() {
+        return Err(InterleavedComplexError::SplitLengthMismatch {
+            real_len: real.len(),
+            imag_len: imag.len(),
+        });
+    }
 
     let n = real.len();
     let mut result = Vec::with_capacity(2 * n);
@@ -130,7 +195,7 @@ pub fn split_to_interleaved<T: InterleavedComplex>(real: &[T], imag: &[T]) -> Ve
         result.push(imag[i]);
     }
 
-    result
+    Ok(result)
 }
 
 /// Convert interleaved complex array to split format.
@@ -143,15 +208,18 @@ pub fn split_to_interleaved<T: InterleavedComplex>(real: &[T], imag: &[T]) -> Ve
 ///
 /// Tuple of (real array, imaginary array).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if array length is not even.
+/// Returns [`InterleavedComplexError::OddLength`] if `interleaved.len()` is odd.
 #[inline]
-pub fn interleaved_to_split<T: InterleavedComplex>(interleaved: &[T]) -> (Vec<T>, Vec<T>) {
-    assert!(
-        interleaved.len() % 2 == 0,
-        "Interleaved array must have even length"
-    );
+pub fn interleaved_to_split<T: InterleavedComplex>(
+    interleaved: &[T],
+) -> Result<(Vec<T>, Vec<T>), InterleavedComplexError> {
+    if interleaved.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength {
+            len: interleaved.len(),
+        });
+    }
 
     let n = interleaved.len() / 2;
     let mut real = Vec::with_capacity(n);
@@ -180,7 +248,7 @@ pub fn interleaved_to_split<T: InterleavedComplex>(interleaved: &[T]) -> (Vec<T>
         imag.push(interleaved[base + 1]);
     }
 
-    (real, imag)
+    Ok((real, imag))
 }
 
 /// Convert `num_complex` slice to interleaved format.
@@ -262,16 +330,18 @@ pub fn complex_to_interleaved_f32(complex: &[Complex32]) -> Vec<f32> {
 ///
 /// Vector of complex numbers.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if array length is not even.
+/// Returns [`InterleavedComplexError::OddLength`] if `interleaved.len()` is odd.
 #[inline]
-#[must_use]
-pub fn interleaved_to_complex_f64(interleaved: &[f64]) -> Vec<Complex64> {
-    assert!(
-        interleaved.len() % 2 == 0,
-        "Interleaved array must have even length"
-    );
+pub fn interleaved_to_complex_f64(
+    interleaved: &[f64],
+) -> Result<Vec<Complex64>, InterleavedComplexError> {
+    if interleaved.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength {
+            len: interleaved.len(),
+        });
+    }
 
     let n = interleaved.len() / 2;
     let mut result = Vec::with_capacity(n);
@@ -292,17 +362,23 @@ pub fn interleaved_to_complex_f64(interleaved: &[f64]) -> Vec<Complex64> {
         result.push(Complex64::new(interleaved[base], interleaved[base + 1]));
     }
 
-    result
+    Ok(result)
 }
 
 /// Convert interleaved format to `num_complex` slice (f32).
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `interleaved.len()` is odd.
 #[inline]
-#[must_use]
-pub fn interleaved_to_complex_f32(interleaved: &[f32]) -> Vec<Complex32> {
-    assert!(
-        interleaved.len() % 2 == 0,
-        "Interleaved array must have even length"
-    );
+pub fn interleaved_to_complex_f32(
+    interleaved: &[f32],
+) -> Result<Vec<Complex32>, InterleavedComplexError> {
+    if interleaved.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength {
+            len: interleaved.len(),
+        });
+    }
 
     let n = interleaved.len() / 2;
     let mut result = Vec::with_capacity(n);
@@ -323,91 +399,141 @@ pub fn interleaved_to_complex_f32(interleaved: &[f32]) -> Vec<Complex32> {
         result.push(Complex32::new(interleaved[base], interleaved[base + 1]));
     }
 
-    result
+    Ok(result)
 }
 
 // =============================================================================
 // In-place Conversion Functions
 // =============================================================================
 
+/// Minimal fixed-size bit-vector used only for cycle-visitation bookkeeping by
+/// [`permute_in_place`]. This keeps the auxiliary memory used by the
+/// "genuinely in-place" conversions below at `O(n)` *bits* (`n / 64` `u64`
+/// words), rather than an `O(n)`-element buffer of `T` values.
+struct VisitedBits {
+    words: Vec<u64>,
+}
+
+impl VisitedBits {
+    #[inline]
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+        }
+    }
+
+    #[inline]
+    fn is_set(&self, index: usize) -> bool {
+        (self.words[index / 64] >> (index % 64)) & 1 != 0
+    }
+
+    #[inline]
+    fn set(&mut self, index: usize) {
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+}
+
+/// Applies the permutation described by `dest` to `data` in place by
+/// following permutation cycles: every element is moved directly to its
+/// final resting place exactly once, so no full-size auxiliary buffer of `T`
+/// is required (only the small [`VisitedBits`] bitmap above).
+///
+/// `dest(i)` must describe a bijection of `0..data.len()` onto itself: the
+/// element currently stored at index `i` belongs at index `dest(i)` in the
+/// final layout.
+fn permute_in_place<T: Copy>(data: &mut [T], dest: impl Fn(usize) -> usize) {
+    let total = data.len();
+    let mut visited = VisitedBits::new(total);
+
+    for start in 0..total {
+        if visited.is_set(start) {
+            continue;
+        }
+
+        let mut cur = start;
+        let mut carry = data[start];
+        loop {
+            visited.set(cur);
+            let d = dest(cur);
+            if d == start {
+                data[start] = carry;
+                break;
+            }
+            carry = core::mem::replace(&mut data[d], carry);
+            cur = d;
+        }
+    }
+}
+
 /// Convert interleaved data to split format in place.
 ///
-/// This is more efficient than allocating new buffers when the data is already
-/// contiguous and can be rearranged.
+/// Real/imaginary de-interleaving is equivalent to transposing a conceptual
+/// `n x 2` matrix (rows = complex elements, columns = `[re, im]`) into a
+/// `2 x n` matrix (rows = `[all re, all im]`). This is performed with a
+/// genuine in-place cycle-following permutation (`permute_in_place`):
+/// every element is written to its final position exactly once, and the
+/// only auxiliary memory used is a small bit-vector for cycle-visitation
+/// bookkeeping -- not a full `O(n)`-element buffer of `T`.
 ///
 /// # Arguments
 ///
 /// * `data` - Mutable slice containing interleaved data. Will be rearranged to
 ///   contain all real parts in the first half and all imaginary parts in the second half.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if array length is not even.
-pub fn interleaved_to_split_inplace<T: InterleavedComplex>(data: &mut [T]) {
-    assert!(
-        data.len() % 2 == 0,
-        "Interleaved array must have even length"
-    );
+/// Returns [`InterleavedComplexError::OddLength`] if `data.len()` is odd.
+pub fn interleaved_to_split_inplace<T: InterleavedComplex>(
+    data: &mut [T],
+) -> Result<(), InterleavedComplexError> {
+    if data.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: data.len() });
+    }
 
     let n = data.len() / 2;
     if n <= 1 {
-        return;
+        return Ok(());
     }
 
-    // Use auxiliary buffer for efficient in-place conversion
-    // This is O(n) time and O(n) space, but more cache-friendly than the
-    // O(1) space algorithm which has poor locality
-    let mut temp = Vec::with_capacity(n);
-
-    // Extract imaginary parts to temp
-    for i in 0..n {
-        temp.push(data[i * 2 + 1]);
-    }
-
-    // Move real parts to first half
-    for i in 0..n {
-        data[i] = data[i * 2];
-    }
-
-    // Copy imaginary parts to second half
-    for i in 0..n {
-        data[n + i] = temp[i];
-    }
+    // Source index `i` holds `re_{i/2}` when `i` is even, or `im_{i/2}` when
+    // `i` is odd. In the split layout, `re_k` belongs at index `k` and
+    // `im_k` belongs at index `n + k`.
+    permute_in_place(data, |i| (i % 2) * n + i / 2);
+    Ok(())
 }
 
 /// Convert split data to interleaved format in place.
+///
+/// This is the inverse permutation of [`interleaved_to_split_inplace`]
+/// (transposing the conceptual `2 x n` matrix back into `n x 2`), performed
+/// with the same in-place cycle-following algorithm and the same `O(n)`-bit
+/// (not `O(n)`-element) auxiliary memory footprint.
 ///
 /// # Arguments
 ///
 /// * `data` - Mutable slice containing split data (real parts in first half,
 ///   imaginary parts in second half). Will be rearranged to interleaved format.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if array length is not even.
-pub fn split_to_interleaved_inplace<T: InterleavedComplex>(data: &mut [T]) {
-    assert!(data.len() % 2 == 0, "Array must have even length");
+/// Returns [`InterleavedComplexError::OddLength`] if `data.len()` is odd.
+pub fn split_to_interleaved_inplace<T: InterleavedComplex>(
+    data: &mut [T],
+) -> Result<(), InterleavedComplexError> {
+    if data.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: data.len() });
+    }
 
     let n = data.len() / 2;
     if n <= 1 {
-        return;
+        return Ok(());
     }
 
-    // Use auxiliary buffers for efficient in-place conversion
-    let mut real = Vec::with_capacity(n);
-    let mut imag = Vec::with_capacity(n);
-
-    // Copy real and imaginary parts
-    for i in 0..n {
-        real.push(data[i]);
-        imag.push(data[n + i]);
-    }
-
-    // Interleave
-    for i in 0..n {
-        data[i * 2] = real[i];
-        data[i * 2 + 1] = imag[i];
-    }
+    // Source index `k` holds `re_k` when `k < n`, or `im_{k-n}` when `k >= n`.
+    // In interleaved layout, `re_k` belongs at index `2k` and `im_k` belongs
+    // at index `2k + 1`.
+    permute_in_place(data, |k| (k % n) * 2 + k / n);
+    Ok(())
 }
 
 // =============================================================================
@@ -426,15 +552,27 @@ pub fn split_to_interleaved_inplace<T: InterleavedComplex>(data: &mut [T]) {
 /// # Returns
 ///
 /// Complex dot product as (real, imaginary) tuple.
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd, or
+/// [`InterleavedComplexError::VectorLengthMismatch`] if `x` and `y` have
+/// different lengths.
 #[inline]
-#[must_use]
-pub fn dotc_interleaved_f64(x: &[f64], y: &[f64]) -> (f64, f64) {
-    assert!(x.len() % 2 == 0, "x must have even length");
-    assert_eq!(x.len(), y.len(), "Vectors must have same length");
+pub fn dotc_interleaved_f64(x: &[f64], y: &[f64]) -> Result<(f64, f64), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+    if x.len() != y.len() {
+        return Err(InterleavedComplexError::VectorLengthMismatch {
+            x_len: x.len(),
+            y_len: y.len(),
+        });
+    }
 
     let n = x.len() / 2;
     if n == 0 {
-        return (0.0, 0.0);
+        return Ok((0.0, 0.0));
     }
 
     // Use 4-way accumulation for better numerical stability and performance
@@ -496,19 +634,31 @@ pub fn dotc_interleaved_f64(x: &[f64], y: &[f64]) -> (f64, f64) {
         im0 += x_re.mul_add(y_im, -(x_im * y_re));
     }
 
-    ((re0 + re1) + (re2 + re3), (im0 + im1) + (im2 + im3))
+    Ok(((re0 + re1) + (re2 + re3), (im0 + im1) + (im2 + im3)))
 }
 
 /// Dot product of two interleaved complex vectors (f32).
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd, or
+/// [`InterleavedComplexError::VectorLengthMismatch`] if `x` and `y` have
+/// different lengths.
 #[inline]
-#[must_use]
-pub fn dotc_interleaved_f32(x: &[f32], y: &[f32]) -> (f32, f32) {
-    assert!(x.len() % 2 == 0, "x must have even length");
-    assert_eq!(x.len(), y.len(), "Vectors must have same length");
+pub fn dotc_interleaved_f32(x: &[f32], y: &[f32]) -> Result<(f32, f32), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+    if x.len() != y.len() {
+        return Err(InterleavedComplexError::VectorLengthMismatch {
+            x_len: x.len(),
+            y_len: y.len(),
+        });
+    }
 
     let n = x.len() / 2;
     if n == 0 {
-        return (0.0, 0.0);
+        return Ok((0.0, 0.0));
     }
 
     let mut re0 = 0.0_f32;
@@ -565,7 +715,7 @@ pub fn dotc_interleaved_f32(x: &[f32], y: &[f32]) -> (f32, f32) {
         im0 += x_re.mul_add(y_im, -(x_im * y_re));
     }
 
-    ((re0 + re1) + (re2 + re3), (im0 + im1) + (im2 + im3))
+    Ok(((re0 + re1) + (re2 + re3), (im0 + im1) + (im2 + im3)))
 }
 
 /// AXPY operation on interleaved complex vectors: y = alpha * x + y
@@ -576,14 +726,32 @@ pub fn dotc_interleaved_f32(x: &[f32], y: &[f32]) -> (f32, f32) {
 /// * `alpha_im` - Imaginary part of scalar
 /// * `x` - Source interleaved complex vector
 /// * `y` - Destination interleaved complex vector (modified in place)
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd, or
+/// [`InterleavedComplexError::VectorLengthMismatch`] if `x` and `y` have
+/// different lengths.
 #[inline]
-pub fn axpy_interleaved_f64(alpha_re: f64, alpha_im: f64, x: &[f64], y: &mut [f64]) {
-    assert!(x.len() % 2 == 0, "x must have even length");
-    assert_eq!(x.len(), y.len(), "Vectors must have same length");
+pub fn axpy_interleaved_f64(
+    alpha_re: f64,
+    alpha_im: f64,
+    x: &[f64],
+    y: &mut [f64],
+) -> Result<(), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+    if x.len() != y.len() {
+        return Err(InterleavedComplexError::VectorLengthMismatch {
+            x_len: x.len(),
+            y_len: y.len(),
+        });
+    }
 
     let n = x.len() / 2;
     if n == 0 {
-        return;
+        return Ok(());
     }
 
     let chunks = n / 4;
@@ -623,6 +791,82 @@ pub fn axpy_interleaved_f64(alpha_re: f64, alpha_im: f64, x: &[f64], y: &mut [f6
         y[base] += alpha_re.mul_add(x_re, -(alpha_im * x_im));
         y[base + 1] += alpha_re.mul_add(x_im, alpha_im * x_re);
     }
+
+    Ok(())
+}
+
+/// AXPY operation on interleaved complex vectors (f32): y = alpha * x + y
+///
+/// # Arguments
+///
+/// * `alpha_re` - Real part of scalar
+/// * `alpha_im` - Imaginary part of scalar
+/// * `x` - Source interleaved complex vector
+/// * `y` - Destination interleaved complex vector (modified in place)
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd, or
+/// [`InterleavedComplexError::VectorLengthMismatch`] if `x` and `y` have
+/// different lengths.
+#[inline]
+pub fn axpy_interleaved_f32(
+    alpha_re: f32,
+    alpha_im: f32,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+    if x.len() != y.len() {
+        return Err(InterleavedComplexError::VectorLengthMismatch {
+            x_len: x.len(),
+            y_len: y.len(),
+        });
+    }
+
+    let n = x.len() / 2;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let chunks = n / 4;
+    let remainder = n % 4;
+
+    for i in 0..chunks {
+        let base = i * 8;
+
+        let x_re0 = x[base];
+        let x_im0 = x[base + 1];
+        y[base] += alpha_re.mul_add(x_re0, -(alpha_im * x_im0));
+        y[base + 1] += alpha_re.mul_add(x_im0, alpha_im * x_re0);
+
+        let x_re1 = x[base + 2];
+        let x_im1 = x[base + 3];
+        y[base + 2] += alpha_re.mul_add(x_re1, -(alpha_im * x_im1));
+        y[base + 3] += alpha_re.mul_add(x_im1, alpha_im * x_re1);
+
+        let x_re2 = x[base + 4];
+        let x_im2 = x[base + 5];
+        y[base + 4] += alpha_re.mul_add(x_re2, -(alpha_im * x_im2));
+        y[base + 5] += alpha_re.mul_add(x_im2, alpha_im * x_re2);
+
+        let x_re3 = x[base + 6];
+        let x_im3 = x[base + 7];
+        y[base + 6] += alpha_re.mul_add(x_re3, -(alpha_im * x_im3));
+        y[base + 7] += alpha_re.mul_add(x_im3, alpha_im * x_re3);
+    }
+
+    for i in (n - remainder)..n {
+        let base = i * 2;
+        let x_re = x[base];
+        let x_im = x[base + 1];
+        y[base] += alpha_re.mul_add(x_re, -(alpha_im * x_im));
+        y[base + 1] += alpha_re.mul_add(x_im, alpha_im * x_re);
+    }
+
+    Ok(())
 }
 
 /// SCAL operation on interleaved complex vector: x = alpha * x
@@ -632,13 +876,23 @@ pub fn axpy_interleaved_f64(alpha_re: f64, alpha_im: f64, x: &[f64], y: &mut [f6
 /// * `alpha_re` - Real part of scalar
 /// * `alpha_im` - Imaginary part of scalar
 /// * `x` - Interleaved complex vector (modified in place)
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
 #[inline]
-pub fn scal_interleaved_f64(alpha_re: f64, alpha_im: f64, x: &mut [f64]) {
-    assert!(x.len() % 2 == 0, "x must have even length");
+pub fn scal_interleaved_f64(
+    alpha_re: f64,
+    alpha_im: f64,
+    x: &mut [f64],
+) -> Result<(), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
 
     let n = x.len() / 2;
     if n == 0 {
-        return;
+        return Ok(());
     }
 
     let chunks = n / 4;
@@ -675,26 +929,35 @@ pub fn scal_interleaved_f64(alpha_re: f64, alpha_im: f64, x: &mut [f64]) {
         x[base] = alpha_re.mul_add(x_re, -(alpha_im * x_im));
         x[base + 1] = alpha_re.mul_add(x_im, alpha_im * x_re);
     }
+
+    Ok(())
 }
 
-/// Compute the Euclidean norm of an interleaved complex vector.
+/// SCAL operation on interleaved complex vector (f32): x = alpha * x
 ///
-/// ||x|| = sqrt(Σ |`x_i|^2`) = sqrt(Σ (`re_i^2` + `im_i^2`))
+/// # Arguments
+///
+/// * `alpha_re` - Real part of scalar
+/// * `alpha_im` - Imaginary part of scalar
+/// * `x` - Interleaved complex vector (modified in place)
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
 #[inline]
-#[must_use]
-pub fn nrm2_interleaved_f64(x: &[f64]) -> f64 {
-    assert!(x.len() % 2 == 0, "x must have even length");
+pub fn scal_interleaved_f32(
+    alpha_re: f32,
+    alpha_im: f32,
+    x: &mut [f32],
+) -> Result<(), InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
 
     let n = x.len() / 2;
     if n == 0 {
-        return 0.0;
+        return Ok(());
     }
-
-    // Use 4-way accumulation
-    let mut sum0 = 0.0;
-    let mut sum1 = 0.0;
-    let mut sum2 = 0.0;
-    let mut sum3 = 0.0;
 
     let chunks = n / 4;
     let remainder = n % 4;
@@ -702,31 +965,77 @@ pub fn nrm2_interleaved_f64(x: &[f64]) -> f64 {
     for i in 0..chunks {
         let base = i * 8;
 
-        let re0 = x[base];
-        let im0 = x[base + 1];
-        sum0 += re0.mul_add(re0, im0 * im0);
+        let x_re0 = x[base];
+        let x_im0 = x[base + 1];
+        x[base] = alpha_re.mul_add(x_re0, -(alpha_im * x_im0));
+        x[base + 1] = alpha_re.mul_add(x_im0, alpha_im * x_re0);
 
-        let re1 = x[base + 2];
-        let im1 = x[base + 3];
-        sum1 += re1.mul_add(re1, im1 * im1);
+        let x_re1 = x[base + 2];
+        let x_im1 = x[base + 3];
+        x[base + 2] = alpha_re.mul_add(x_re1, -(alpha_im * x_im1));
+        x[base + 3] = alpha_re.mul_add(x_im1, alpha_im * x_re1);
 
-        let re2 = x[base + 4];
-        let im2 = x[base + 5];
-        sum2 += re2.mul_add(re2, im2 * im2);
+        let x_re2 = x[base + 4];
+        let x_im2 = x[base + 5];
+        x[base + 4] = alpha_re.mul_add(x_re2, -(alpha_im * x_im2));
+        x[base + 5] = alpha_re.mul_add(x_im2, alpha_im * x_re2);
 
-        let re3 = x[base + 6];
-        let im3 = x[base + 7];
-        sum3 += re3.mul_add(re3, im3 * im3);
+        let x_re3 = x[base + 6];
+        let x_im3 = x[base + 7];
+        x[base + 6] = alpha_re.mul_add(x_re3, -(alpha_im * x_im3));
+        x[base + 7] = alpha_re.mul_add(x_im3, alpha_im * x_re3);
     }
 
     for i in (n - remainder)..n {
         let base = i * 2;
-        let re = x[base];
-        let im = x[base + 1];
-        sum0 += re.mul_add(re, im * im);
+        let x_re = x[base];
+        let x_im = x[base + 1];
+        x[base] = alpha_re.mul_add(x_re, -(alpha_im * x_im));
+        x[base + 1] = alpha_re.mul_add(x_im, alpha_im * x_re);
     }
 
-    ((sum0 + sum1) + (sum2 + sum3)).sqrt()
+    Ok(())
+}
+
+/// Compute the Euclidean norm of an interleaved complex vector.
+///
+/// ||x|| = sqrt(Σ |`x_i|^2`) = sqrt(Σ (`re_i^2` + `im_i^2`))
+///
+/// `Σ (re_i^2 + im_i^2)` over all complex elements is exactly the sum of
+/// squares of every individual real/imaginary component stored in the flat
+/// interleaved buffer, so this reuses the crate's numerically stable,
+/// scaled-accumulation (Blue's-algorithm-style) real `nrm2` kernel
+/// ([`crate::level1::nrm2_f64`]) directly on `x`. This gives interleaved
+/// complex vectors with very large or very small magnitude components the
+/// same overflow/underflow protection as the real `nrm2` kernels.
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
+#[inline]
+pub fn nrm2_interleaved_f64(x: &[f64]) -> Result<f64, InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+
+    Ok(crate::level1::nrm2_f64(x))
+}
+
+/// Compute the Euclidean norm of an interleaved complex vector (f32).
+///
+/// See [`nrm2_interleaved_f64`] for the numerical-stability rationale; this
+/// delegates to [`crate::level1::nrm2_f32`] the same way.
+///
+/// # Errors
+///
+/// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
+#[inline]
+pub fn nrm2_interleaved_f32(x: &[f32]) -> Result<f32, InterleavedComplexError> {
+    if x.len() % 2 != 0 {
+        return Err(InterleavedComplexError::OddLength { len: x.len() });
+    }
+
+    Ok(crate::level1::nrm2_f32(x))
 }
 
 #[cfg(test)]
@@ -738,17 +1047,40 @@ mod tests {
         let real = [1.0, 2.0, 3.0, 4.0];
         let imag = [5.0, 6.0, 7.0, 8.0];
 
-        let interleaved = split_to_interleaved(&real, &imag);
+        let interleaved =
+            split_to_interleaved(&real, &imag).expect("real and imag have equal length");
         assert_eq!(interleaved, [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]);
+    }
+
+    #[test]
+    fn test_split_to_interleaved_length_mismatch() {
+        let real = [1.0, 2.0, 3.0];
+        let imag = [5.0, 6.0];
+
+        let err = split_to_interleaved(&real, &imag).expect_err("lengths differ");
+        assert_eq!(
+            err,
+            InterleavedComplexError::SplitLengthMismatch {
+                real_len: 3,
+                imag_len: 2
+            }
+        );
     }
 
     #[test]
     fn test_interleaved_to_split() {
         let interleaved = [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0];
 
-        let (real, imag) = interleaved_to_split(&interleaved);
+        let (real, imag) = interleaved_to_split(&interleaved).expect("interleaved length is even");
         assert_eq!(real, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(imag, [5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_interleaved_to_split_odd_length() {
+        let interleaved = [1.0, 5.0, 2.0];
+        let err = interleaved_to_split(&interleaved).expect_err("odd length");
+        assert_eq!(err, InterleavedComplexError::OddLength { len: 3 });
     }
 
     #[test]
@@ -767,10 +1099,17 @@ mod tests {
     fn test_interleaved_to_complex_f64() {
         let interleaved = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 
-        let complex = interleaved_to_complex_f64(&interleaved);
+        let complex = interleaved_to_complex_f64(&interleaved).expect("interleaved length is even");
         assert_eq!(complex[0], Complex64::new(1.0, 2.0));
         assert_eq!(complex[1], Complex64::new(3.0, 4.0));
         assert_eq!(complex[2], Complex64::new(5.0, 6.0));
+    }
+
+    #[test]
+    fn test_interleaved_to_complex_f64_odd_length() {
+        let interleaved = [1.0, 2.0, 3.0];
+        let err = interleaved_to_complex_f64(&interleaved).expect_err("odd length");
+        assert_eq!(err, InterleavedComplexError::OddLength { len: 3 });
     }
 
     #[test]
@@ -784,7 +1123,8 @@ mod tests {
         ];
 
         let interleaved = complex_to_interleaved_f64(&original);
-        let recovered = interleaved_to_complex_f64(&interleaved);
+        let recovered =
+            interleaved_to_complex_f64(&interleaved).expect("interleaved length is even");
 
         for (o, r) in original.iter().zip(recovered.iter()) {
             assert!((o.re - r.re).abs() < 1e-10);
@@ -797,12 +1137,67 @@ mod tests {
         let mut data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
         // Convert interleaved to split
-        interleaved_to_split_inplace(&mut data);
+        interleaved_to_split_inplace(&mut data).expect("even length");
         assert_eq!(data, [1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]);
 
         // Convert back to interleaved
-        split_to_interleaved_inplace(&mut data);
+        split_to_interleaved_inplace(&mut data).expect("even length");
         assert_eq!(data, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_inplace_conversion_odd_length_error() {
+        let mut data = [1.0, 2.0, 3.0];
+        let err = interleaved_to_split_inplace(&mut data).expect_err("odd length");
+        assert_eq!(err, InterleavedComplexError::OddLength { len: 3 });
+
+        let mut data2 = [1.0, 2.0, 3.0];
+        let err2 = split_to_interleaved_inplace(&mut data2).expect_err("odd length");
+        assert_eq!(err2, InterleavedComplexError::OddLength { len: 3 });
+    }
+
+    /// The cycle-following in-place algorithm's correctness depends on the
+    /// permutation formula holding for every `n`, not just powers of two.
+    /// This regression test sweeps a range of sizes -- including odd `n`
+    /// and `n` with various small prime factors -- verifying the round trip
+    /// `interleaved -> split -> interleaved` reproduces the original data
+    /// exactly. This is exactly the kind of bug a subtly-wrong cycle
+    /// formula (e.g. one that only works for power-of-two sizes) would have
+    /// been caught by.
+    #[test]
+    fn test_inplace_conversion_many_sizes() {
+        for n in 0..=64usize {
+            let original: Vec<f64> = (0..2 * n).map(|i| i as f64).collect();
+            let mut data = original.clone();
+
+            interleaved_to_split_inplace(&mut data).expect("even length");
+            if n > 0 {
+                let expected_real: Vec<f64> = (0..n).map(|k| (2 * k) as f64).collect();
+                let expected_imag: Vec<f64> = (0..n).map(|k| (2 * k + 1) as f64).collect();
+                assert_eq!(&data[..n], expected_real.as_slice(), "n={n}");
+                assert_eq!(&data[n..], expected_imag.as_slice(), "n={n}");
+            }
+
+            split_to_interleaved_inplace(&mut data).expect("even length");
+            assert_eq!(data, original, "round trip failed for n={n}");
+        }
+    }
+
+    /// Confirms the split->interleaved direction independently (not just as
+    /// the second half of a round trip), across a range of sizes.
+    #[test]
+    fn test_split_to_interleaved_inplace_matches_out_of_place() {
+        for n in 0..=40usize {
+            let real: Vec<f64> = (0..n).map(|k| k as f64).collect();
+            let imag: Vec<f64> = (0..n).map(|k| (k as f64) + 1000.0).collect();
+
+            let mut data = real.clone();
+            data.extend_from_slice(&imag);
+            split_to_interleaved_inplace(&mut data).expect("even length");
+
+            let expected = split_to_interleaved(&real, &imag).expect("equal length");
+            assert_eq!(data, expected, "n={n}");
+        }
     }
 
     #[test]
@@ -815,9 +1210,20 @@ mod tests {
         let x = [1.0, 2.0, 3.0, 4.0];
         let y = [5.0, 6.0, 7.0, 8.0];
 
-        let (re, im) = dotc_interleaved_f64(&x, &y);
+        let (re, im) = dotc_interleaved_f64(&x, &y).expect("even, matching lengths");
         assert!((re - 70.0).abs() < 1e-10);
         assert!((im - (-8.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dotc_interleaved_f64_length_mismatch() {
+        let x = [1.0, 2.0, 3.0, 4.0];
+        let y = [5.0, 6.0];
+        let err = dotc_interleaved_f64(&x, &y).expect_err("length mismatch");
+        assert_eq!(
+            err,
+            InterleavedComplexError::VectorLengthMismatch { x_len: 4, y_len: 2 }
+        );
     }
 
     #[test]
@@ -829,7 +1235,7 @@ mod tests {
         let x = [1.0, 2.0, 3.0, 4.0];
         let mut y = [0.0, 0.0, 0.0, 0.0];
 
-        axpy_interleaved_f64(2.0, 1.0, &x, &mut y);
+        axpy_interleaved_f64(2.0, 1.0, &x, &mut y).expect("even, matching lengths");
 
         assert!((y[0] - 0.0).abs() < 1e-10); // re of (2+i)(1+2i)
         assert!((y[1] - 5.0).abs() < 1e-10); // im of (2+i)(1+2i)
@@ -838,12 +1244,38 @@ mod tests {
     }
 
     #[test]
+    fn test_axpy_interleaved_f32() {
+        // Same hand-computed case as the f64 test, in f32.
+        // alpha = 2+1i, x = [1+2i, 3+4i], y = [0, 0]
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let mut y = [0.0f32, 0.0, 0.0, 0.0];
+
+        axpy_interleaved_f32(2.0, 1.0, &x, &mut y).expect("even, matching lengths");
+
+        assert!((y[0] - 0.0).abs() < 1e-5);
+        assert!((y[1] - 5.0).abs() < 1e-5);
+        assert!((y[2] - 2.0).abs() < 1e-5);
+        assert!((y[3] - 11.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_axpy_interleaved_f64_length_mismatch() {
+        let x = [1.0, 2.0, 3.0, 4.0];
+        let mut y = [0.0, 0.0];
+        let err = axpy_interleaved_f64(1.0, 0.0, &x, &mut y).expect_err("length mismatch");
+        assert_eq!(
+            err,
+            InterleavedComplexError::VectorLengthMismatch { x_len: 4, y_len: 2 }
+        );
+    }
+
+    #[test]
     fn test_scal_interleaved_f64() {
         // x = alpha * x
         // alpha = 2+1i, x = [1+2i, 3+4i]
         let mut x = [1.0, 2.0, 3.0, 4.0];
 
-        scal_interleaved_f64(2.0, 1.0, &mut x);
+        scal_interleaved_f64(2.0, 1.0, &mut x).expect("even length");
 
         assert!((x[0] - 0.0).abs() < 1e-10); // re of (2+i)(1+2i)
         assert!((x[1] - 5.0).abs() < 1e-10); // im of (2+i)(1+2i)
@@ -852,31 +1284,105 @@ mod tests {
     }
 
     #[test]
+    fn test_scal_interleaved_f32() {
+        // Same hand-computed case as the f64 test, in f32.
+        let mut x = [1.0f32, 2.0, 3.0, 4.0];
+
+        scal_interleaved_f32(2.0, 1.0, &mut x).expect("even length");
+
+        assert!((x[0] - 0.0).abs() < 1e-5);
+        assert!((x[1] - 5.0).abs() < 1e-5);
+        assert!((x[2] - 2.0).abs() < 1e-5);
+        assert!((x[3] - 11.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_scal_interleaved_f64_odd_length() {
+        let mut x = [1.0, 2.0, 3.0];
+        let err = scal_interleaved_f64(1.0, 0.0, &mut x).expect_err("odd length");
+        assert_eq!(err, InterleavedComplexError::OddLength { len: 3 });
+    }
+
+    #[test]
     fn test_nrm2_interleaved_f64() {
         // x = [3+4i] => ||x|| = sqrt(9+16) = 5
         let x = [3.0, 4.0];
-        let norm = nrm2_interleaved_f64(&x);
+        let norm = nrm2_interleaved_f64(&x).expect("even length");
         assert!((norm - 5.0).abs() < 1e-10);
 
         // x = [1+0i, 0+1i] => ||x|| = sqrt(1+1) = sqrt(2)
         let x2 = [1.0, 0.0, 0.0, 1.0];
-        let norm2 = nrm2_interleaved_f64(&x2);
+        let norm2 = nrm2_interleaved_f64(&x2).expect("even length");
         assert!((norm2 - 2.0_f64.sqrt()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_nrm2_interleaved_f32() {
+        // Same hand-computed cases as the f64 test, in f32.
+        let x = [3.0f32, 4.0];
+        let norm = nrm2_interleaved_f32(&x).expect("even length");
+        assert!((norm - 5.0).abs() < 1e-5);
+
+        let x2 = [1.0f32, 0.0, 0.0, 1.0];
+        let norm2 = nrm2_interleaved_f32(&x2).expect("even length");
+        assert!((norm2 - 2.0_f32.sqrt()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_nrm2_interleaved_f64_odd_length() {
+        let x = [1.0, 2.0, 3.0];
+        let err = nrm2_interleaved_f64(&x).expect_err("odd length");
+        assert_eq!(err, InterleavedComplexError::OddLength { len: 3 });
+    }
+
+    /// Mirrors `level1::nrm2`'s `test_nrm2_overflow_prevention_f64`: values
+    /// large enough that naive `re*re + im*im` accumulation would overflow
+    /// `f64::MAX` (~1.8e308), which the scaled-accumulation kernel must
+    /// avoid.
+    #[test]
+    fn test_nrm2_interleaved_f64_overflow_prevention() {
+        // Two complex elements, each (1e160 + 1e160i).
+        // Naive sum of squares: 4 * (1e160)^2 = 4e320, which overflows f64.
+        let large_val = 1e160_f64;
+        let x = vec![large_val; 4];
+        let norm = nrm2_interleaved_f64(&x).expect("even length");
+        let expected = 2.0 * large_val; // sqrt(4) * large_val
+        assert!(norm.is_finite(), "norm should be finite, got {norm}");
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {expected}, got {norm}"
+        );
+    }
+
+    /// Mirrors `level1::nrm2`'s underflow-prevention test: values near
+    /// `f64::MIN_POSITIVE` should not silently underflow to zero when
+    /// squared.
+    #[test]
+    fn test_nrm2_interleaved_f64_underflow_prevention() {
+        let small_val = 1e-308_f64;
+        let x = vec![small_val; 4];
+        let norm = nrm2_interleaved_f64(&x).expect("even length");
+        let expected = 2.0 * small_val;
+        assert!(norm > 0.0, "norm should be positive, got {norm}");
+        assert!(
+            (norm - expected).abs() / expected < 1e-10,
+            "expected {expected}, got {norm}"
+        );
     }
 
     #[test]
     fn test_empty_vectors() {
         let empty: [f64; 0] = [];
 
-        let (re, im) = dotc_interleaved_f64(&empty, &empty);
+        let (re, im) = dotc_interleaved_f64(&empty, &empty).expect("empty is valid");
         assert_eq!(re, 0.0);
         assert_eq!(im, 0.0);
 
-        assert_eq!(nrm2_interleaved_f64(&empty), 0.0);
+        assert_eq!(nrm2_interleaved_f64(&empty).expect("empty is valid"), 0.0);
 
         let mut empty_mut: [f64; 0] = [];
-        axpy_interleaved_f64(1.0, 0.0, &empty, &mut empty_mut);
-        scal_interleaved_f64(2.0, 0.0, &mut empty_mut);
+        axpy_interleaved_f64(1.0, 0.0, &empty, &mut empty_mut).expect("empty is valid");
+        scal_interleaved_f64(2.0, 0.0, &mut empty_mut).expect("empty is valid");
     }
 
     #[test]
@@ -886,23 +1392,47 @@ mod tests {
         let y: Vec<f64> = (0..2 * n).map(|i| ((i + 1) % 100) as f64 * 0.01).collect();
 
         // Just verify it runs without panicking
-        let (_re, _im) = dotc_interleaved_f64(&x, &y);
-        let _norm = nrm2_interleaved_f64(&x);
+        let (_re, _im) = dotc_interleaved_f64(&x, &y).expect("even, matching lengths");
+        let _norm = nrm2_interleaved_f64(&x).expect("even length");
 
         let mut y_copy = y.clone();
-        axpy_interleaved_f64(1.0, 1.0, &x, &mut y_copy);
+        axpy_interleaved_f64(1.0, 1.0, &x, &mut y_copy).expect("even, matching lengths");
 
         let mut x_copy = x.clone();
-        scal_interleaved_f64(2.0, 0.0, &mut x_copy);
+        scal_interleaved_f64(2.0, 0.0, &mut x_copy).expect("even length");
     }
 
     #[test]
-    fn test_odd_element_count() {
-        // Test with odd number of complex elements (5 elements = 10 reals)
-        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
-        let y: Vec<f64> = (0..10).map(|i| (i + 1) as f64).collect();
+    fn test_odd_element_count_error() {
+        // Odd total length (not a multiple of 2) must now be a typed error,
+        // not a silently-truncated computation or a panic.
+        let x: Vec<f64> = (0..9).map(|i| i as f64).collect();
+        let y: Vec<f64> = (0..9).map(|i| (i + 1) as f64).collect();
 
-        let (_re, _im) = dotc_interleaved_f64(&x, &y);
-        let _norm = nrm2_interleaved_f64(&x);
+        assert_eq!(
+            dotc_interleaved_f64(&x, &y).expect_err("odd length"),
+            InterleavedComplexError::OddLength { len: 9 }
+        );
+        assert_eq!(
+            nrm2_interleaved_f64(&x).expect_err("odd length"),
+            InterleavedComplexError::OddLength { len: 9 }
+        );
+    }
+
+    #[test]
+    fn test_error_display() {
+        let odd = InterleavedComplexError::OddLength { len: 3 };
+        assert!(odd.to_string().contains('3'));
+
+        let split_mismatch = InterleavedComplexError::SplitLengthMismatch {
+            real_len: 2,
+            imag_len: 5,
+        };
+        assert!(split_mismatch.to_string().contains('2'));
+        assert!(split_mismatch.to_string().contains('5'));
+
+        let vec_mismatch = InterleavedComplexError::VectorLengthMismatch { x_len: 4, y_len: 6 };
+        assert!(vec_mismatch.to_string().contains('4'));
+        assert!(vec_mismatch.to_string().contains('6'));
     }
 }

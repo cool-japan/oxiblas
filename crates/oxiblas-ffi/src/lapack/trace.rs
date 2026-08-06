@@ -56,8 +56,13 @@ pub unsafe extern "C" fn oblas_strace(
         }
     }
 
-    *result = trace(mat.as_ref());
-    OblasReturn::Success as c_int
+    match trace(mat.as_ref()) {
+        Ok(t) => {
+            *result = t;
+            OblasReturn::Success as c_int
+        }
+        Err(_) => OblasReturn::InvalidArg as c_int,
+    }
 }
 
 // =============================================================================
@@ -100,8 +105,13 @@ pub unsafe extern "C" fn oblas_dtrace(
         }
     }
 
-    *result = trace(mat.as_ref());
-    OblasReturn::Success as c_int
+    match trace(mat.as_ref()) {
+        Ok(t) => {
+            *result = t;
+            OblasReturn::Success as c_int
+        }
+        Err(_) => OblasReturn::InvalidArg as c_int,
+    }
 }
 
 // =============================================================================

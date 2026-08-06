@@ -194,24 +194,72 @@ pub fn nrm2_par<T: Real + Send + Sync>(x: &[T], par: Par) -> T {
     super::nrm2(x)
 }
 
+/// Combines two Blue's-scaling `(scale, ssq)` accumulators, each satisfying
+/// `Σ|x|² == scale² · ssq`, into one covering both partial sums.
+///
+/// This is the cross-chunk reduction step the parallel nrm2 needs: without it
+/// each chunk's sum of squares would be summed naively, which overflows the
+/// moment a single chunk holds a large value (e.g. `1e200² == 1e400`) and loses
+/// precision when chunk magnitudes differ widely.
+///
+/// Correctness on non-finite / degenerate scales:
+/// - Two equal scales (both `0` for all-zero chunks, or both `+Inf`) form ratios
+///   `0/0` and `Inf/Inf` (= NaN); the `scale_a == scale_b` branch adds the
+///   `ssq`s directly, so all-zero chunks stay `0` and all-infinite chunks stay
+///   `+Inf` instead of collapsing to NaN.
+/// - A NaN `ssq` (produced by a NaN input in `nrm2_fold`) always survives: it is
+///   added in every branch, and even when scaled by `t·t` the product
+///   `NaN · anything == NaN`, so a NaN input propagates to the final norm.
+#[cfg(feature = "parallel")]
+fn nrm2_combine<T: Real>(a: (T, T), b: (T, T)) -> (T, T) {
+    let (scale_a, ssq_a) = a;
+    let (scale_b, ssq_b) = b;
+
+    if scale_a == scale_b {
+        if scale_a == T::zero() {
+            // Both chunks contributed nothing; keep the neutral accumulator.
+            return (T::zero(), T::one());
+        }
+        // Equal (finite or infinite) scales: no rescaling ratio is needed.
+        return (scale_a, ssq_a + ssq_b);
+    }
+
+    if scale_a > scale_b {
+        // `scale_a` is the common scale; `scale_b / scale_a` is finite (and `0`
+        // when `scale_a` is `+Inf`), so no spurious NaN is introduced.
+        let t = scale_b / scale_a;
+        (scale_a, ssq_a + ssq_b * t * t)
+    } else {
+        let t = scale_a / scale_b;
+        (scale_b, ssq_b + ssq_a * t * t)
+    }
+}
+
 /// Internal parallel nrm2 implementation.
+///
+/// Each chunk folds its elements into a Blue's-scaling `(scale, ssq)` pair; the
+/// pairs are then reduced with [`nrm2_combine`], which rescales across chunk
+/// boundaries. This keeps the whole computation overflow/underflow-safe and
+/// consistent with the scalar and SIMD paths — a naive per-chunk sum of squares
+/// would overflow or lose precision.
 #[cfg(feature = "parallel")]
 fn nrm2_parallel<T: Real + Send + Sync>(x: &[T]) -> T {
+    use super::nrm2::{nrm2_finalize, nrm2_fold};
+
     const CHUNK_SIZE: usize = 4096;
 
-    // Compute sum of squares in parallel
-    let sum_sq: T = x
+    let state = x
         .par_chunks(CHUNK_SIZE)
         .map(|chunk| {
-            let mut sum = T::zero();
-            for xi in chunk {
-                sum = sum + *xi * *xi;
+            let mut local = (T::zero(), T::one());
+            for &xi in chunk {
+                local = nrm2_fold(local, xi);
             }
-            sum
+            local
         })
-        .reduce(T::zero, |a, b| a + b);
+        .reduce(|| (T::zero(), T::one()), nrm2_combine);
 
-    Real::sqrt(sum_sq)
+    nrm2_finalize(state)
 }
 
 /// Parallel asum: ||x||_1 with parallelization control.
@@ -462,6 +510,131 @@ mod tests {
             result_seq,
             result_par,
             rel_err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_overflow_cross_chunk() {
+        // A value large enough that squaring it overflows f64 lives in one chunk
+        // and a tiny value in another (chunks are 4096 elements wide, so indices
+        // 0 and 80_000 fall in different chunks). A naive per-chunk sum of
+        // squares computes 1e200² == 1e400 == +Inf and returns +Inf; the scaled
+        // cross-chunk combine must instead return the correct finite norm.
+        let n = 100_000;
+        let mut x = vec![0.0f64; n];
+        x[0] = 1e200;
+        x[80_000] = 1e-200;
+
+        let result = nrm2_par(&x, Par::Rayon);
+        assert!(
+            result.is_finite(),
+            "cross-chunk norm must be finite, got {}",
+            result
+        );
+        // The 1e-200 term is ~800 orders of magnitude below 1e200, so the norm
+        // rounds to exactly 1e200 in f64.
+        assert!(
+            (result - 1e200).abs() / 1e200 < 1e-10,
+            "expected ≈1e200, got {}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_two_large_cross_chunk() {
+        // Two overflow-prone values in distinct chunks: correct norm is
+        // sqrt(2) * 1e200. Naive per-chunk sums would overflow to +Inf.
+        let n = 100_000;
+        let mut x = vec![0.0f64; n];
+        x[10] = 1e200;
+        x[90_000] = 1e200;
+
+        let result = nrm2_par(&x, Par::Rayon);
+        let expected = (2.0f64).sqrt() * 1e200;
+        assert!(
+            result.is_finite(),
+            "cross-chunk norm must be finite, got {}",
+            result
+        );
+        assert!(
+            (result - expected).abs() / expected < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_matches_scalar_wide_range() {
+        // Parallel scaled reduction must match the scalar reference norm even
+        // when magnitudes span a wide dynamic range across many chunks.
+        let n = 100_000;
+        let x: Vec<f64> = (0..n)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (1e-50 + (i as f64) * 1e-40)
+            })
+            .collect();
+
+        let par = nrm2_par(&x, Par::Rayon);
+        let seq = super::super::nrm2(&x);
+        assert!(
+            (par - seq).abs() / seq < 1e-12,
+            "parallel {} vs scalar {}",
+            par,
+            seq
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_nan_propagates() {
+        // A single NaN anywhere in a large (multi-chunk) vector must make the
+        // whole parallel norm NaN.
+        let n = 100_000;
+        let mut x = vec![1.0f64; n];
+        x[50_000] = f64::NAN;
+        assert!(
+            nrm2_par(&x, Par::Rayon).is_nan(),
+            "parallel nrm2 must propagate NaN"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_inf_yields_positive_infinity() {
+        // A single infinity in a large vector yields +Inf, not NaN.
+        let n = 100_000;
+        let mut x = vec![1.0f64; n];
+        x[70_000] = f64::INFINITY;
+        let result = nrm2_par(&x, Par::Rayon);
+        assert!(
+            result.is_infinite() && result > 0.0,
+            "parallel nrm2 of Inf must be +Inf, got {}",
+            result
+        );
+
+        // Infinities in two different chunks must still give +Inf (not Inf/Inf).
+        let mut x2 = vec![1.0f64; n];
+        x2[1_000] = f64::INFINITY;
+        x2[90_000] = f64::NEG_INFINITY;
+        let result2 = nrm2_par(&x2, Par::Rayon);
+        assert!(
+            result2.is_infinite() && result2 > 0.0,
+            "parallel nrm2 of two infinities must be +Inf, got {}",
+            result2
+        );
+
+        // Inf together with NaN: NaN wins.
+        let mut x3 = vec![1.0f64; n];
+        x3[2_000] = f64::INFINITY;
+        x3[95_000] = f64::NAN;
+        assert!(
+            nrm2_par(&x3, Par::Rayon).is_nan(),
+            "parallel nrm2 of Inf+NaN must be NaN"
         );
     }
 }

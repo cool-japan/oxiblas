@@ -112,12 +112,11 @@ impl Field for Complex32 {
 
     #[inline]
     fn powi(self, n: i32) -> Self {
-        self.powu(n.unsigned_abs())
-            * if n < 0 {
-                self.recip().powu(n.unsigned_abs())
-            } else {
-                Complex32::new(1.0, 0.0)
-            }
+        if n >= 0 {
+            self.powu(n as u32)
+        } else {
+            self.recip().powu(n.unsigned_abs())
+        }
     }
 }
 

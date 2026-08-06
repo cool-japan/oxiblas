@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.toml') }}
+
+      # `oxiblas-benchmarks` is excluded from every `--all-features` invocation:
+      # its opt-in `compare-openblas` feature pulls openblas-src/blas-src/
+      # cblas-sys/ndarray-linalg, which need a system OpenBLAS that no runner
+      # installs (and that has no plausible presence on Windows). The crate is
+      # `publish = false` and never part of the shipped Pure-Rust product, so
+      # excluding it from CI leaves full coverage of every publishable crate.
+      - name: Run tests
+        run: cargo test --all-features --workspace --exclude oxiblas-benchmarks
+
+      - name: Run tests (no default features)
+        run: cargo test --no-default-features --workspace
+
+      # Workspace feature unification enables `oxiblas-core/std` (sibling crates
+      # depend on it with `std`), so the workspace run above never exercises the
+      # crate in true `no_std` mode. This targeted step is the only job that
+      # actually compiles and runs oxiblas-core with `alloc`-only support.
+      - name: Run no_std tests (oxiblas-core)
+        run: cargo test -p oxiblas-core --no-default-features
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace --exclude oxiblas-benchmarks
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        run: cargo clippy --all-features --workspace --exclude oxiblas-benchmarks -- -D warnings
+
+      - name: Run clippy (no default features, oxiblas-core no_std)
+        run: cargo clippy -p oxiblas-core --no-default-features --all-targets -- -D warnings
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build documentation
+        run: cargo doc --all-features --no-deps --workspace --exclude oxiblas-benchmarks
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Check for broken links
+        run: cargo doc --all-features --workspace --exclude oxiblas-benchmarks 2>&1 | grep -i "warning.*broken" && exit 1 || exit 0
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage
+        run: cargo tarpaulin --all-features --workspace --exclude oxiblas-benchmarks --timeout 300 --out xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./cobertura.xml
+          fail_ci_if_error: false
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit

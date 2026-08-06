@@ -105,6 +105,12 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Err(Her2kError::InvalidTrans);
     }
 
+    // Reference (Z/C)HER2K declare β as a REAL scalar (unlike α, which MAY be
+    // complex). The update C = α·A·Bᴴ + conj(α)·B·Aᴴ + β·C is Hermitian only when β
+    // is real, so discard any imaginary component of β up front, reproducing the
+    // reference contract exactly. This is a no-op for real element types.
+    let beta = T::from_real(beta.real());
+
     // Validate C is square
     let n = c.nrows();
     if c.ncols() != n {
@@ -149,6 +155,47 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 }
 
+/// Writes `temp`'s `uplo` triangle into `c` as `β·C + temp`, enforcing the two
+/// invariants the reference (Z/C)HER2K guarantee:
+///
+/// * **`β == 0` must not read `C`.** The result is `temp` alone; reading the old
+///   `C` and forming `0·C` would let NaN/garbage in an uninitialised `C` buffer
+///   poison the output (`0·NaN == NaN`).
+/// * **The diagonal is real.** `α·A·Bᴴ + conj(α)·B·Aᴴ` is Hermitian and thus has a
+///   real diagonal in exact arithmetic, but the two-GEMM accumulation can leave
+///   rounding noise in the imaginary part, so every `i == j` entry is projected
+///   back onto the reals (matching the module invariant "the diagonal of C is
+///   always real").
+fn write_her2k_triangle<T: Field>(
+    uplo: Uplo,
+    beta: T,
+    temp: &Mat<T>,
+    c: &mut MatMut<'_, T>,
+    n: usize,
+) {
+    let beta_is_zero = beta == T::zero();
+    for j in 0..n {
+        // Row range covers only the requested triangle (including the diagonal).
+        let i_range = match uplo {
+            Uplo::Lower => j..n,
+            Uplo::Upper => 0..(j + 1),
+        };
+        for i in i_range {
+            let combined = if beta_is_zero {
+                temp[(i, j)]
+            } else {
+                temp[(i, j)] + beta * c[(i, j)]
+            };
+            let val = if i == j {
+                T::from_real(combined.real())
+            } else {
+                combined
+            };
+            c.set(i, j, val);
+        }
+    }
+}
+
 /// GEMM-based HER2K for larger matrices.
 ///
 /// For real types (f32, f64), HER2K is equivalent to SYR2K since conjugation
@@ -166,12 +213,11 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 ) -> Result<(), Her2kError> {
     let alpha_conj = alpha.conj();
 
+    // Compute `temp = α·A·Bᴴ + conj(α)·B·Aᴴ` (or the ConjTrans variant) via two GEMMs.
+    let mut temp: Mat<T> = Mat::zeros(n, n);
     match trans {
         Trans::NoTrans => {
-            // A is n×k, B is n×k
-            // Compute A·B^H + conj(α)/α · B·A^H
-            // For real: A·B^T + B·A^T (same as SYR2K)
-            // Create B^H (k×n) and A^H (k×n)
+            // A is n×k, B is n×k. Build B^H (k×n) and A^H (k×n).
             let mut b_h: Mat<T> = Mat::zeros(k, n);
             for i in 0..n {
                 for j in 0..k {
@@ -184,34 +230,11 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
                     a_h[(j, i)] = a[(i, j)].conj();
                 }
             }
-
-            // Compute temp = α·A·B^H + conj(α)·B·A^H using two GEMMs
-            let mut temp: Mat<T> = Mat::zeros(n, n);
             gemm(alpha, a, b_h.as_ref(), T::zero(), temp.as_mut()); // temp = α·A·B^H
             gemm(alpha_conj, b, a_h.as_ref(), T::one(), temp.as_mut()); // temp += conj(α)·B·A^H
-
-            // Copy triangle with beta scaling
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for i in j..n {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for i in 0..=j {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-            }
         }
         Trans::ConjTrans => {
-            // A is k×n, B is k×n
-            // Compute A^H·B + conj(α)/α · B^H·A
-            // Create A^H (n×k) and B^H (n×k)
+            // A is k×n, B is k×n. Build A^H (n×k) and B^H (n×k).
             let mut a_h: Mat<T> = Mat::zeros(n, k);
             for i in 0..k {
                 for j in 0..n {
@@ -224,32 +247,14 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
                     b_h[(j, i)] = b[(i, j)].conj();
                 }
             }
-
-            // Compute temp = α·A^H·B + conj(α)·B^H·A using two GEMMs
-            let mut temp: Mat<T> = Mat::zeros(n, n);
             gemm(alpha, a_h.as_ref(), b, T::zero(), temp.as_mut()); // temp = α·A^H·B
             gemm(alpha_conj, b_h.as_ref(), a, T::one(), temp.as_mut()); // temp += conj(α)·B^H·A
-
-            // Copy triangle with beta scaling
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for i in j..n {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for i in 0..=j {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-            }
         }
         Trans::Trans => unreachable!(),
     }
+
+    // Copy triangle with beta scaling, honouring the β==0 / real-diagonal invariants.
+    write_her2k_triangle(uplo, beta, &temp, &mut c, n);
 
     Ok(())
 }
@@ -303,81 +308,86 @@ fn her2k_naive<T: Field>(
         }
     }
 
-    // Early return if alpha is zero
-    if alpha == T::zero() {
-        return Ok(());
+    // Compute C += alpha * A * B^H + conj(alpha) * B * A^H
+    // or C += alpha * A^H * B + conj(alpha) * B^H * A (skipped when alpha == 0).
+    if alpha != T::zero() {
+        let alpha_conj = alpha.conj();
+
+        match trans {
+            Trans::NoTrans => {
+                // C += alpha * A * B^H + conj(alpha) * B * A^H
+                // C[i,j] += alpha * sum_l A[i,l] * conj(B[j,l]) + conj(alpha) * sum_l B[i,l] * conj(A[j,l])
+                match uplo {
+                    Uplo::Lower => {
+                        for j in 0..n {
+                            for l in 0..k {
+                                let temp1 = alpha * b[(j, l)].conj();
+                                let temp2 = alpha_conj * a[(j, l)].conj();
+                                for i in j..n {
+                                    let val = c[(i, j)] + a[(i, l)] * temp1 + b[(i, l)] * temp2;
+                                    c.set(i, j, val);
+                                }
+                            }
+                        }
+                    }
+                    Uplo::Upper => {
+                        for j in 0..n {
+                            for l in 0..k {
+                                let temp1 = alpha * b[(j, l)].conj();
+                                let temp2 = alpha_conj * a[(j, l)].conj();
+                                for i in 0..=j {
+                                    let val = c[(i, j)] + a[(i, l)] * temp1 + b[(i, l)] * temp2;
+                                    c.set(i, j, val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Trans::ConjTrans => {
+                // C += alpha * A^H * B + conj(alpha) * B^H * A
+                // C[i,j] += alpha * sum_l conj(A[l,i]) * B[l,j] + conj(alpha) * sum_l conj(B[l,i]) * A[l,j]
+                match uplo {
+                    Uplo::Lower => {
+                        for j in 0..n {
+                            for i in j..n {
+                                let mut temp = T::zero();
+                                for l in 0..k {
+                                    temp = temp
+                                        + alpha * a[(l, i)].conj() * b[(l, j)]
+                                        + alpha_conj * b[(l, i)].conj() * a[(l, j)];
+                                }
+                                let val = c[(i, j)] + temp;
+                                c.set(i, j, val);
+                            }
+                        }
+                    }
+                    Uplo::Upper => {
+                        for j in 0..n {
+                            for i in 0..=j {
+                                let mut temp = T::zero();
+                                for l in 0..k {
+                                    temp = temp
+                                        + alpha * a[(l, i)].conj() * b[(l, j)]
+                                        + alpha_conj * b[(l, i)].conj() * a[(l, j)];
+                                }
+                                let val = c[(i, j)] + temp;
+                                c.set(i, j, val);
+                            }
+                        }
+                    }
+                }
+            }
+            Trans::Trans => unreachable!(),
+        }
     }
 
-    // Compute C += alpha * A * B^H + conj(alpha) * B * A^H
-    // or C += alpha * A^H * B + conj(alpha) * B^H * A
-    let alpha_conj = alpha.conj();
-
-    match trans {
-        Trans::NoTrans => {
-            // C += alpha * A * B^H + conj(alpha) * B * A^H
-            // C[i,j] += alpha * sum_l A[i,l] * conj(B[j,l]) + conj(alpha) * sum_l B[i,l] * conj(A[j,l])
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for l in 0..k {
-                            let temp1 = alpha * b[(j, l)].conj();
-                            let temp2 = alpha_conj * a[(j, l)].conj();
-                            for i in j..n {
-                                let val = c[(i, j)] + a[(i, l)] * temp1 + b[(i, l)] * temp2;
-                                c.set(i, j, val);
-                            }
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for l in 0..k {
-                            let temp1 = alpha * b[(j, l)].conj();
-                            let temp2 = alpha_conj * a[(j, l)].conj();
-                            for i in 0..=j {
-                                let val = c[(i, j)] + a[(i, l)] * temp1 + b[(i, l)] * temp2;
-                                c.set(i, j, val);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Trans::ConjTrans => {
-            // C += alpha * A^H * B + conj(alpha) * B^H * A
-            // C[i,j] += alpha * sum_l conj(A[l,i]) * B[l,j] + conj(alpha) * sum_l conj(B[l,i]) * A[l,j]
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for i in j..n {
-                            let mut temp = T::zero();
-                            for l in 0..k {
-                                temp = temp
-                                    + alpha * a[(l, i)].conj() * b[(l, j)]
-                                    + alpha_conj * b[(l, i)].conj() * a[(l, j)];
-                            }
-                            let val = c[(i, j)] + temp;
-                            c.set(i, j, val);
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for i in 0..=j {
-                            let mut temp = T::zero();
-                            for l in 0..k {
-                                temp = temp
-                                    + alpha * a[(l, i)].conj() * b[(l, j)]
-                                    + alpha_conj * b[(l, i)].conj() * a[(l, j)];
-                            }
-                            let val = c[(i, j)] + temp;
-                            c.set(i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        Trans::Trans => unreachable!(),
+    // The diagonal of a Hermitian matrix is real (see module docs). β-scaling of a
+    // noisy input and the rank-2k accumulation can both leave rounding residue in the
+    // imaginary part, so project every diagonal entry back onto the reals. No-op for
+    // real element types.
+    for i in 0..n {
+        c.set(i, i, T::from_real(c[(i, i)].real()));
     }
 
     Ok(())
@@ -685,6 +695,77 @@ mod tests {
         assert!((c[(1, 1)] - 106.0).abs() < 1e-5);
     }
 
-    // Test with Complex numbers would go here when Complex is fully implemented
-    // For now, we test that real types work correctly with HER2K
+    /// Regression: `beta == 0` must not read C. Uses n>=32, k>=8 so the GEMM path
+    /// (`her2k_via_gemm`) is exercised — that path previously always evaluated
+    /// `beta * c[(i,j)] + temp`, poisoning the result when C held NaN.
+    #[test]
+    fn test_her2k_beta_zero_ignores_nan_c() {
+        let n = 32usize;
+        let k = 8usize;
+        let mut a = Mat::<f64>::zeros(n, k);
+        let mut b = Mat::<f64>::zeros(n, k);
+        for i in 0..n {
+            for j in 0..k {
+                a[(i, j)] = (i as f64) * 0.25 - (j as f64) + 1.0;
+                b[(i, j)] = (j as f64) * 0.5 - (i as f64) * 0.1 + 2.0;
+            }
+        }
+
+        let mut c = Mat::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                c[(i, j)] = f64::NAN;
+            }
+        }
+
+        her2k(
+            Uplo::Lower,
+            Trans::NoTrans,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+        )
+        .unwrap();
+
+        // Reference result: C = A·Bᵀ + B·Aᵀ, entirely NaN-free.
+        for j in 0..n {
+            for i in j..n {
+                assert!(
+                    c[(i, j)].is_finite(),
+                    "NaN leaked into C[{i},{j}] with beta==0"
+                );
+                let mut expected = 0.0;
+                for l in 0..k {
+                    expected += a[(i, l)] * b[(j, l)] + b[(i, l)] * a[(j, l)];
+                }
+                assert!((c[(i, j)] - expected).abs() < 1e-8);
+            }
+        }
+    }
+
+    /// Regression: the same β==0 guard on the small/naive path.
+    #[test]
+    fn test_her2k_naive_beta_zero_ignores_nan_c() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]);
+        let b = Mat::from_rows(&[&[5.0f64, 6.0], &[7.0, 8.0]]);
+        let mut c = Mat::from_rows(&[&[f64::NAN, f64::NAN], &[f64::NAN, f64::NAN]]);
+
+        her2k(
+            Uplo::Lower,
+            Trans::NoTrans,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+        )
+        .unwrap();
+
+        // Same as test_her2k_real_lower_no_trans, proving no NaN leaked.
+        assert!((c[(0, 0)] - 34.0).abs() < 1e-10);
+        assert!((c[(1, 0)] - 62.0).abs() < 1e-10);
+        assert!((c[(1, 1)] - 106.0).abs() < 1e-10);
+    }
 }

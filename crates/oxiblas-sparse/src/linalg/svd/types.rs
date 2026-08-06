@@ -96,20 +96,27 @@ pub struct TruncatedSVDResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{RandomizedSparseSvd, RandomizedSparseSvdConfig};
 ///
+/// // Diagonal matrix so the top singular values are known exactly.
+/// let matrix = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![5.0, 3.0, 1.0]).unwrap();
+///
 /// let config = RandomizedSparseSvdConfig {
-///     num_singular_values: 10,
-///     oversampling: 5,
+///     num_singular_values: 2,
+///     oversampling: 1, // k + oversampling must be <= min(m, n) = 3
 ///     power_iterations: 2,
-///     ..Default::default()
+///     seed: Some(42),
+///     compute_vectors: false,
 /// };
 ///
 /// let rsvd = RandomizedSparseSvd::new(config);
 /// let result = rsvd.compute(&matrix)?;
 ///
 /// println!("Top singular values: {:?}", result.singular_values);
+/// assert_eq!(result.singular_values.len(), 2);
+/// # Ok::<(), oxiblas_sparse::linalg::svd::SVDError>(())
 /// ```
 pub struct RandomizedSparseSvd {
     config: RandomizedSparseSvdConfig,
@@ -417,18 +424,28 @@ impl RandomizedSparseSvd {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{TruncatedSVD, TruncatedSVDConfig};
 ///
+/// // Diagonal matrix so the singular values are known exactly.
+/// let matrix = CsrMatrix::new(3, 3, vec![0, 1, 2, 3], vec![0, 1, 2], vec![5.0, 3.0, 1.0]).unwrap();
+///
 /// let config = TruncatedSVDConfig {
-///     num_singular_values: 5,
-///     ..Default::default()
+///     num_singular_values: 2,
+///     max_iterations: 100,
+///     tolerance: 1e-10,
+///     compute_vectors: false,
+///     krylov_dimension: 3,
+///     full_reorthogonalization: true,
 /// };
 ///
 /// let svd_solver = TruncatedSVD::new(config);
 /// let result = svd_solver.compute(&matrix)?;
 ///
 /// println!("Singular values: {:?}", result.singular_values);
+/// assert_eq!(result.singular_values.len(), 2);
+/// # Ok::<(), oxiblas_sparse::linalg::svd::SVDError>(())
 /// ```
 pub struct TruncatedSVD<T> {
     config: TruncatedSVDConfig<T>,
@@ -603,20 +620,31 @@ pub struct RandomizedSparseSvdResult<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::svd::{IncrementalSVD, IncrementalSVDConfig};
 ///
-/// let config = IncrementalSVDConfig::default();
+/// let config = IncrementalSVDConfig {
+///     max_rank: 2,
+///     tolerance: 1e-10,
+///     reorthogonalize: true,
+/// };
 /// let mut isvd = IncrementalSVD::new(config);
 ///
-/// // Initialize with matrix
-/// isvd.initialize(&initial_matrix, 5).unwrap();
+/// // Initialize with a 2x2 matrix
+/// let initial_matrix =
+///     CsrMatrix::new(2, 2, vec![0, 1, 2], vec![0, 1], vec![5.0, 3.0]).unwrap();
+/// isvd.initialize(&initial_matrix, 1).unwrap();
 ///
-/// // Add new rows
+/// // Add a new row (must have the same column count as `initial_matrix`, 2)
+/// let new_rows = vec![vec![1.0, 0.0]];
 /// isvd.add_rows(&new_rows).unwrap();
 ///
 /// // Get current SVD
 /// let (u, s, vt) = isvd.get_svd();
+/// assert_eq!(u.len(), 3); // 2 initial rows + 1 added row
+/// assert!(!s.is_empty());
+/// assert!(!vt.is_empty());
 /// ```
 #[derive(Debug, Clone)]
 pub struct IncrementalSVD<T> {
@@ -728,6 +756,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
                 "SVD not initialized".to_string(),
             ));
         }
+        let tol = T::from_f64(1e-14).unwrap_or_else(T::zero);
+        // Project the new rows onto the current right singular subspace:
+        // M = B V (p × k), where row i of M holds the coordinates of new row i
+        // in the basis of the k right singular vectors.
         let mut m_matrix = vec![vec![T::zero(); self.k]; p];
         for i in 0..p {
             for j in 0..self.k {
@@ -738,23 +770,31 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
                 m_matrix[i][j] = sum;
             }
         }
-        let mut r = new_rows.to_vec();
+        // Residual rows orthogonal to the current row space: R = B - M Vᵀ (p × n).
+        let mut residual = new_rows.to_vec();
         for i in 0..p {
             for l in 0..self.n {
                 for j in 0..self.k {
-                    r[i][l] = r[i][l].clone() - m_matrix[i][j].clone() * self.vt[j][l].clone();
+                    residual[i][l] =
+                        residual[i][l].clone() - m_matrix[i][j].clone() * self.vt[j][l].clone();
                 }
             }
         }
-        let r_transpose = transpose_dense(&r);
-        let (q_r, n_matrix) = qr_decompose_dense(&r_transpose);
-        let p_prime = q_r[0].len();
+        // Rank-revealing orthonormal basis Q_R (p' vectors of length n) of the
+        // residual directions, plus the coefficients that reconstruct each
+        // residual row from that basis. `p_prime` is the numerical rank of the
+        // residual block, so linearly dependent residuals add fewer new
+        // directions than their raw row count.
+        let (basis, coeffs) = orthonormal_basis_with_coeffs(&residual, self.n);
+        let p_prime = basis.len();
         if p_prime == 0 {
-            for i in 0..p {
+            // The new rows lie entirely in the existing row space: the rank is
+            // unchanged and only the left singular vectors gain new rows.
+            for row in m_matrix.iter().take(p) {
                 let mut u_row = vec![T::zero(); self.k];
                 for j in 0..self.k {
-                    if Scalar::abs(self.s[j].clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
-                        u_row[j] = m_matrix[i][j].clone() / self.s[j].clone();
+                    if Scalar::abs(self.s[j].clone()) > tol {
+                        u_row[j] = row[j].clone() / self.s[j].clone();
                     }
                 }
                 self.u.push(u_row);
@@ -762,29 +802,33 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
             self.m += p;
             return Ok(());
         }
+        // Assemble the coupling matrix K = [[S, 0], [M, coeffsᵀ]] of shape
+        // (k + p) × (k + p'). The augmented factorization is
+        // A' = [[U, 0], [0, I_p]] · K · [V | Q_R]ᵀ.
         let new_k = self.k + p_prime;
-        let mut k_matrix = vec![vec![T::zero(); new_k]; new_k];
+        let rows_k = self.k + p;
+        let mut k_matrix = vec![vec![T::zero(); new_k]; rows_k];
         for i in 0..self.k {
             k_matrix[i][i] = self.s[i].clone();
         }
-        for i in 0..self.k {
-            for j in 0..p {
-                k_matrix[i][self.k + j] = m_matrix[j][i].clone();
+        for i in 0..p {
+            for j in 0..self.k {
+                k_matrix[self.k + i][j] = m_matrix[i][j].clone();
             }
-        }
-        for i in 0..p_prime {
-            for j in 0..p {
-                if i < n_matrix.len() && j < n_matrix[0].len() {
-                    k_matrix[self.k + j][self.k + i] = n_matrix[i][j].clone();
-                }
+            for l in 0..p_prime {
+                k_matrix[self.k + i][self.k + l] = coeffs[l][i].clone();
             }
         }
         let k_svd_result = dense_svd_full(&k_matrix)?;
         let u_k = k_svd_result.u.ok_or_else(|| {
             SVDError::ComputationError("Failed to compute U in K SVD".to_string())
         })?;
+        let v_k = k_svd_result.v.ok_or_else(|| {
+            SVDError::ComputationError("Failed to compute V in K SVD".to_string())
+        })?;
         let s_new = k_svd_result.singular_values;
         let k_new = s_new.len().min(self.config.max_rank);
+        // U_new = [[U, 0], [0, I_p]] · U_k, of shape (m + p) × k_new.
         let mut u_new = vec![vec![T::zero(); k_new]; self.m + p];
         for i in 0..self.m {
             for j in 0..k_new {
@@ -800,11 +844,23 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
                 u_new[self.m + i][j] = u_k[self.k + i][j].clone();
             }
         }
-        self.u = u_new;
-        self.s = s_new.into_iter().take(k_new).collect();
-        while self.vt.len() < k_new {
-            self.vt.push(vec![T::zero(); self.n]);
+        // V_new = [V | Q_R] · V_k, stored transposed as vt_new (k_new × n).
+        let mut vt_new = vec![vec![T::zero(); self.n]; k_new];
+        for j in 0..k_new {
+            for i in 0..self.n {
+                let mut sum = T::zero();
+                for l in 0..self.k {
+                    sum = sum + self.vt[l][i].clone() * v_k[l][j].clone();
+                }
+                for l in 0..p_prime {
+                    sum = sum + basis[l][i].clone() * v_k[self.k + l][j].clone();
+                }
+                vt_new[j][i] = sum;
+            }
         }
+        self.u = u_new;
+        self.vt = vt_new;
+        self.s = s_new.into_iter().take(k_new).collect();
         self.k = k_new;
         self.m += p;
         Ok(())
@@ -840,6 +896,9 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
                 "SVD not initialized".to_string(),
             ));
         }
+        let tol = T::from_f64(1e-14).unwrap_or_else(T::zero);
+        // Project the new columns onto the current left singular subspace:
+        // P = Uᵀ C (k × q).
         let mut p_matrix = vec![vec![T::zero(); q]; self.k];
         for i in 0..self.k {
             for j in 0..q {
@@ -850,26 +909,28 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
                 p_matrix[i][j] = sum;
             }
         }
-        let mut q_c = new_cols.to_vec();
+        // Residual columns orthogonal to the current column space: C - U P
+        // (q columns, each of length m).
+        let mut residual = new_cols.to_vec();
         for j in 0..q {
             for l in 0..self.m {
                 for i in 0..self.k {
-                    q_c[j][l] = q_c[j][l].clone() - self.u[l][i].clone() * p_matrix[i][j].clone();
+                    residual[j][l] =
+                        residual[j][l].clone() - self.u[l][i].clone() * p_matrix[i][j].clone();
                 }
             }
         }
-        let mut q_c_matrix = vec![vec![T::zero(); q]; self.m];
-        for i in 0..self.m {
-            for j in 0..q {
-                q_c_matrix[i][j] = q_c[j][i].clone();
-            }
-        }
-        let (q_q, n_matrix) = qr_decompose_dense(&q_c_matrix);
-        let q_prime = if q_q.is_empty() { 0 } else { q_q[0].len() };
+        // Rank-revealing orthonormal basis Q_c (q' vectors of length m) of the
+        // residual columns plus their coefficients. `q_prime` is the numerical
+        // rank of the residual block.
+        let (basis, coeffs) = orthonormal_basis_with_coeffs(&residual, self.m);
+        let q_prime = basis.len();
         if q_prime == 0 {
+            // The new columns lie entirely in the existing column space: the
+            // rank is unchanged and each right singular vector gains new entries.
             for i in 0..self.k {
                 for j in 0..q {
-                    if Scalar::abs(self.s[i].clone()) > T::from_f64(1e-14).unwrap_or_else(T::zero) {
+                    if Scalar::abs(self.s[i].clone()) > tol {
                         self.vt[i].push(p_matrix[i][j].clone() / self.s[i].clone());
                     } else {
                         self.vt[i].push(T::zero());
@@ -879,8 +940,12 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
             self.n += q;
             return Ok(());
         }
+        // Assemble the coupling matrix L = [[S, P], [0, coeffs]] of shape
+        // (k + q') × (k + q). The augmented factorization is
+        // A' = [U | Q_c] · L · [[V, 0], [0, I_q]]ᵀ.
         let new_k = self.k + q_prime;
-        let mut l_matrix = vec![vec![T::zero(); new_k]; new_k];
+        let cols_l = self.k + q;
+        let mut l_matrix = vec![vec![T::zero(); cols_l]; new_k];
         for i in 0..self.k {
             l_matrix[i][i] = self.s[i].clone();
         }
@@ -891,32 +956,48 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
         }
         for i in 0..q_prime {
             for j in 0..q {
-                if i < n_matrix.len() && j < n_matrix[0].len() {
-                    l_matrix[self.k + j][self.k + i] = n_matrix[i][j].clone();
-                }
+                l_matrix[self.k + i][self.k + j] = coeffs[i][j].clone();
             }
         }
         let l_svd_result = dense_svd_full(&l_matrix)?;
+        let u_l = l_svd_result.u.ok_or_else(|| {
+            SVDError::ComputationError("Failed to compute U in L SVD".to_string())
+        })?;
         let v_l = l_svd_result.v.ok_or_else(|| {
             SVDError::ComputationError("Failed to compute V in L SVD".to_string())
         })?;
         let s_new = l_svd_result.singular_values;
         let k_new = s_new.len().min(self.config.max_rank);
-        let mut vt_new = vec![vec![T::zero(); self.n + q]; k_new];
-        for i in 0..k_new {
-            for j in 0..self.n {
+        // U_new = [U | Q_c] · U_l, of shape m × k_new.
+        let mut u_new = vec![vec![T::zero(); k_new]; self.m];
+        for i in 0..self.m {
+            for j in 0..k_new {
                 let mut sum = T::zero();
                 for l in 0..self.k {
-                    sum = sum + v_l[l][i].clone() * self.vt[l][j].clone();
+                    sum = sum + self.u[i][l].clone() * u_l[l][j].clone();
                 }
-                vt_new[i][j] = sum;
+                for l in 0..q_prime {
+                    sum = sum + basis[l][i].clone() * u_l[self.k + l][j].clone();
+                }
+                u_new[i][j] = sum;
             }
         }
-        for i in 0..k_new {
-            for j in 0..q {
-                vt_new[i][self.n + j] = v_l[self.k + j][i].clone();
+        // V_new = [[V, 0], [0, I_q]] · V_l, stored transposed as vt_new
+        // (k_new × (n + q)).
+        let mut vt_new = vec![vec![T::zero(); self.n + q]; k_new];
+        for j in 0..k_new {
+            for i in 0..self.n {
+                let mut sum = T::zero();
+                for l in 0..self.k {
+                    sum = sum + self.vt[l][i].clone() * v_l[l][j].clone();
+                }
+                vt_new[j][i] = sum;
+            }
+            for i in 0..q {
+                vt_new[j][self.n + i] = v_l[self.k + i][j].clone();
             }
         }
+        self.u = u_new;
         self.vt = vt_new;
         self.s = s_new.into_iter().take(k_new).collect();
         self.k = k_new;
@@ -938,5 +1019,269 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> IncrementalSVD<
     /// Get current dimensions.
     pub fn dimensions(&self) -> (usize, usize) {
         (self.m, self.n)
+    }
+}
+
+#[cfg(test)]
+mod incremental_exact_tests {
+    //! Regression tests that seed the incremental SVD with an *exact* initial
+    //! factorization (bypassing the randomized `initialize`) so that the update
+    //! math can be checked at machine-epsilon accuracy. These are placed in
+    //! `types.rs` because they construct [`IncrementalSVD`] from its private
+    //! fields, which is only permitted inside the defining module.
+
+    use super::*;
+
+    fn reconstruct(u: &[Vec<f64>], s: &[f64], vt: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let m = u.len();
+        let n = if vt.is_empty() { 0 } else { vt[0].len() };
+        let r = s.len();
+        let mut out = vec![vec![0.0; n]; m];
+        for (i, out_row) in out.iter_mut().enumerate() {
+            for (j, out_val) in out_row.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for l in 0..r {
+                    sum += u[i][l] * s[l] * vt[l][j];
+                }
+                *out_val = sum;
+            }
+        }
+        out
+    }
+
+    fn frobenius_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+        let mut sum = 0.0;
+        for (row_a, row_b) in a.iter().zip(b.iter()) {
+            for (va, vb) in row_a.iter().zip(row_b.iter()) {
+                let d = va - vb;
+                sum += d * d;
+            }
+        }
+        sum.sqrt()
+    }
+
+    fn seed(
+        u: Vec<Vec<f64>>,
+        s: Vec<f64>,
+        vt: Vec<Vec<f64>>,
+        max_rank: usize,
+    ) -> IncrementalSVD<f64> {
+        let m = u.len();
+        let n = vt[0].len();
+        let k = s.len();
+        IncrementalSVD {
+            config: IncrementalSVDConfig {
+                max_rank,
+                tolerance: 1e-12,
+                reorthogonalize: true,
+            },
+            u,
+            s,
+            vt,
+            m,
+            n,
+            k,
+        }
+    }
+
+    #[test]
+    fn test_sequential_single_row_adds_repeated_singular_value() {
+        // Exact SVD of the 2×4 matrix diag(4, 3) [padded with zero columns].
+        let mut isvd = seed(
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![4.0, 3.0],
+            vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+            8,
+        );
+        // Append e2 then e3. The second update's coupling matrix is
+        // diag(4, 3, 1, 1) with a repeated singular value 1.
+        isvd.add_rows(&[vec![0.0, 0.0, 1.0, 0.0]]).unwrap();
+        isvd.add_rows(&[vec![0.0, 0.0, 0.0, 1.0]]).unwrap();
+        assert_eq!(isvd.dimensions(), (4, 4));
+        assert_eq!(isvd.rank(), 4);
+        let expected = vec![
+            vec![4.0, 0.0, 0.0, 0.0],
+            vec![0.0, 3.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let err = frobenius_diff(&expected, &reconstruct(u, s, vt));
+        assert!(
+            err < 1e-10,
+            "reconstruction error {} (was ~1.0 before fix)",
+            err
+        );
+        let mut sorted = s.to_vec();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert!((sorted[2] - 1.0).abs() < 1e-10, "s2 = {}", sorted[2]);
+        assert!(
+            (sorted[3] - 1.0).abs() < 1e-10,
+            "repeated singular value not resolved: s3 = {}",
+            sorted[3]
+        );
+    }
+
+    #[test]
+    fn test_rank_deficient_multi_row_add() {
+        // Exact SVD of the 2×3 matrix diag(3, 2) [padded with a zero column].
+        let mut isvd = seed(
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![3.0, 2.0],
+            vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]],
+            8,
+        );
+        // Both appended rows have residuals along e2 only, so the residual block
+        // is rank 1: the update must add exactly one new direction (rank 3), not
+        // two (rank 4).
+        isvd.add_rows(&[vec![1.0, 1.0, 1.0], vec![2.0, 0.0, 5.0]])
+            .unwrap();
+        assert_eq!(isvd.dimensions(), (4, 3));
+        assert_eq!(
+            isvd.rank(),
+            3,
+            "rank-deficient residual over-counted: rank = {}",
+            isvd.rank()
+        );
+        let expected = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 0.0, 5.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let err = frobenius_diff(&expected, &reconstruct(u, s, vt));
+        assert!(
+            err < 1e-10,
+            "reconstruction error {} (was ~2.74 before fix)",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rank_deficient_multi_column_add() {
+        // Symmetric column-side check: two appended columns whose residuals both
+        // lie along e2 form a rank-1 residual block; rank must grow by one.
+        let mut isvd = seed(
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.0, 0.0]],
+            vec![3.0, 2.0],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            8,
+        );
+        isvd.add_columns(&[vec![1.0, 1.0, 1.0], vec![0.0, 2.0, 5.0]])
+            .unwrap();
+        assert_eq!(isvd.dimensions(), (3, 4));
+        assert_eq!(
+            isvd.rank(),
+            3,
+            "rank-deficient residual over-counted: rank = {}",
+            isvd.rank()
+        );
+        let expected = vec![
+            vec![3.0, 0.0, 1.0, 0.0],
+            vec![0.0, 2.0, 1.0, 2.0],
+            vec![0.0, 0.0, 1.0, 5.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let err = frobenius_diff(&expected, &reconstruct(u, s, vt));
+        assert!(err < 1e-10, "reconstruction error {}", err);
+    }
+}
+#[cfg(test)]
+mod incremental_reconstruction_tests {
+    use super::*;
+
+    /// Reconstruct entry (i, j) of A from the maintained factors: (U Σ V^T)[i][j].
+    fn reconstruct_entry(u: &[Vec<f64>], s: &[f64], vt: &[Vec<f64>], i: usize, j: usize) -> f64 {
+        let mut sum = 0.0;
+        for (l, sigma) in s.iter().enumerate() {
+            sum += u[i][l] * sigma * vt[l][j];
+        }
+        sum
+    }
+
+    /// Frobenius norm of (U Σ V^T - expected).
+    fn frobenius_reconstruction_error(
+        u: &[Vec<f64>],
+        s: &[f64],
+        vt: &[Vec<f64>],
+        expected: &[Vec<f64>],
+    ) -> f64 {
+        let m = expected.len();
+        let n = expected[0].len();
+        let mut acc = 0.0;
+        for i in 0..m {
+            for j in 0..n {
+                let diff = reconstruct_entry(u, s, vt, i, j) - expected[i][j];
+                acc += diff * diff;
+            }
+        }
+        acc.sqrt()
+    }
+
+    #[test]
+    fn test_add_rows_reconstruction_with_rank_growth() {
+        // A = diag(3, 2) padded to 3x3 is exactly rank 2, so the truncated
+        // rank-2 SVD is exact. The appended row (0, 0, 1) lies entirely outside
+        // the current row space span{e1, e2}, forcing the rank to grow to 3.
+        let values = vec![3.0, 2.0];
+        let col_indices = vec![0, 1];
+        let row_ptrs = vec![0, 1, 2, 2];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+        let config = IncrementalSVDConfig {
+            max_rank: 5,
+            tolerance: 1e-10,
+            reorthogonalize: true,
+        };
+        let mut isvd = IncrementalSVD::new(config);
+        isvd.initialize(&a, 2).unwrap();
+        isvd.add_rows(&[vec![0.0, 0.0, 1.0]]).unwrap();
+
+        assert_eq!(isvd.dimensions(), (4, 3));
+        assert_eq!(isvd.rank(), 3, "rank must grow from 2 to 3");
+
+        let expected = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let err = frobenius_reconstruction_error(u, s, vt, &expected);
+        assert!(err < 1e-6, "add_rows reconstruction error too large: {err}");
+    }
+
+    #[test]
+    fn test_add_columns_reconstruction_with_rank_growth() {
+        // A = diag(3, 2) as a 3x2 matrix is exactly rank 2. The appended column
+        // (0, 0, 1) lies entirely outside the current column space span{e1, e2}
+        // in R^3, forcing the rank to grow to 3.
+        let values = vec![3.0, 2.0];
+        let col_indices = vec![0, 1];
+        let row_ptrs = vec![0, 1, 2, 2];
+        let a = CsrMatrix::new(3, 2, row_ptrs, col_indices, values).unwrap();
+        let config = IncrementalSVDConfig {
+            max_rank: 5,
+            tolerance: 1e-10,
+            reorthogonalize: true,
+        };
+        let mut isvd = IncrementalSVD::new(config);
+        isvd.initialize(&a, 2).unwrap();
+        isvd.add_columns(&[vec![0.0, 0.0, 1.0]]).unwrap();
+
+        assert_eq!(isvd.dimensions(), (3, 3));
+        assert_eq!(isvd.rank(), 3, "rank must grow from 2 to 3");
+
+        let expected = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let (u, s, vt) = isvd.get_svd();
+        let err = frobenius_reconstruction_error(u, s, vt, &expected);
+        assert!(
+            err < 1e-6,
+            "add_columns reconstruction error too large: {err}"
+        );
     }
 }

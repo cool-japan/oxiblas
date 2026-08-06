@@ -71,18 +71,22 @@ pub use memory::{
 #[cfg(feature = "std")]
 pub use memory::{
     MatNuma, NumaAllocHint, NumaAllocator, NumaInterleavingStrategy, NumaTopology, NumaVec,
-    NumaWorkHint, get_huge_page_size, get_page_size, numa_alloc, numa_alloc_zeroed,
-    numa_distribute_work,
+    NumaWorkHint, bind_memory_policy, get_huge_page_size, get_page_size, numa_alloc,
+    numa_alloc_zeroed, numa_dealloc, numa_distribute_work,
 };
 #[cfg(feature = "std")]
 pub use parallel::global_num_threads;
+// `OxiblasThreadConfig` owns a `String` and queries `std::thread`, so it only
+// exists on `std` builds (see its definition in `parallel`).
+#[cfg(feature = "std")]
+pub use parallel::OxiblasThreadConfig;
 #[cfg(all(feature = "std", feature = "parallel"))]
 pub use parallel::set_global_thread_pool;
 #[cfg(feature = "parallel")]
 pub use parallel::{CustomRayonPool, RayonGlobalPool};
 pub use parallel::{
-    OxiblasThreadConfig, Par, ParThreshold, PoolScope, SequentialPool, ThreadPool, WorkRange,
-    default_pool, for_each_indexed, for_each_range, map_reduce, partition_work, with_default_pool,
+    Par, ParThreshold, PoolScope, SequentialPool, ThreadPool, WorkRange, default_pool,
+    for_each_indexed, for_each_range, map_reduce, partition_work, with_default_pool,
     with_thread_count,
 };
 #[cfg(feature = "f128")]
@@ -115,8 +119,10 @@ pub mod prelude {
         MatNuma, NumaAllocHint, NumaAllocator, NumaTopology, NumaVec, numa_distribute_work,
     };
     #[cfg(feature = "std")]
+    pub use crate::parallel::OxiblasThreadConfig;
+    #[cfg(feature = "std")]
     pub use crate::parallel::global_num_threads;
-    pub use crate::parallel::{OxiblasThreadConfig, Par, ParThreshold, with_thread_count};
+    pub use crate::parallel::{Par, ParThreshold, with_thread_count};
     pub use crate::scalar::{
         C32, C64, ComplexExt, ComplexScalar, ExtendedPrecision, Field, HasFastFma, I32, I64,
         KBKSum, KahanSum, Real, Scalar, ScalarBatch, ScalarClass, ScalarClassify, SimdCompatible,
@@ -133,6 +139,7 @@ mod tests {
     #[test]
     fn test_simd_detection() {
         let level = detect_simd_level();
+        #[cfg(feature = "std")]
         println!("Detected SIMD level: {:?}", level);
 
         // When force-scalar is enabled, should be Scalar

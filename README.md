@@ -123,20 +123,24 @@ OxiBLAS includes comprehensive examples demonstrating all major features:
 
 ```bash
 # Basic BLAS operations (Level 1/2/3)
-cargo run --example basic_blas
+cargo run -p oxiblas --example basic_blas
 
 # LAPACK decompositions (LU, QR, Cholesky, SVD, EVD)
-cargo run --example lapack_decompositions
+cargo run -p oxiblas --example lapack_decompositions
 
 # Extended precision (f128, Kahan, pairwise summation)
-cargo run --example extended_precision --features f128
+cargo run -p oxiblas --example extended_precision --features f128
 
 # Tensor operations & Einstein summation (24 patterns)
-cargo run --example tensor_operations
+cargo run -p oxiblas --example tensor_operations
 
 # Sparse matrices (CSR, CSC, COO, iterative solvers, preconditioners)
-cargo run --example sparse_matrices --features parallel
+cargo run -p oxiblas --example sparse_matrices --features parallel
 ```
+
+The workspace root is a virtual manifest (no `[package]`), so `-p oxiblas` (or
+running from `crates/oxiblas/`) is required — plain `cargo run --example NAME`
+from the repo root will fail with "no such example".
 
 See [crates/oxiblas/examples/](crates/oxiblas/examples/) for complete source code.
 
@@ -439,7 +443,7 @@ OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD
 - **Fine-tuned blocking parameters:** KC=192, MC=128 (optimized for 256KB L2 cache)
 - **Increased prefetch distance:** 12 iterations (optimized for Intel Xeon E5-2600 memory latency)
 - **Platform-aware cache detection:** Linux sysfs, macOS sysctl, x86_64 CPUID fallback
-- **All 2,922 tests passing** with zero warnings
+- **All tests passing** with zero warnings (see [Project Status](#project-status) below for the current test count)
 
 ### macOS AArch64 Performance (Apple M3)
 
@@ -645,13 +649,15 @@ let chol = Cholesky::compute_blocked_par(a.as_ref())?;
 For applications requiring double-precision accuracy with single-precision speed:
 
 ```rust
-use oxiblas_lapack::refine::{mixed_precision_solve, mixed_precision_solve_cholesky};
+use oxiblas_lapack::solve::{mixed_precision_solve, mixed_precision_solve_cholesky};
 
 // LU-based: factorize in f32, refine residuals in f64
-let x = mixed_precision_solve(a.as_ref(), b.as_ref())?;
+let result = mixed_precision_solve(a.as_ref(), b.as_ref())?;
+let x = result.solution;
 
 // Cholesky-based (symmetric positive definite systems)
-let x = mixed_precision_solve_cholesky(a.as_ref(), b.as_ref())?;
+let result = mixed_precision_solve_cholesky(a.as_ref(), b.as_ref())?;
+let x = result.solution;
 ```
 
 ### Batched BLAS Operations
@@ -659,13 +665,23 @@ let x = mixed_precision_solve_cholesky(a.as_ref(), b.as_ref())?;
 For batches of independent small matrix operations (e.g., neural network layers):
 
 ```rust
-use oxiblas_blas::batched::{gemm_batched, gemm_strided_batched, axpy_batched};
+use oxiblas_blas::level3::batched::{Transpose, gemm_batched};
+use oxiblas_matrix::{Mat, MatMut, MatRef};
 
-// Batch of independent GEMMs: C[i] = A[i] * B[i]
-gemm_batched(1.0, &a_slices, &b_slices, 0.0, &mut c_slices)?;
+// Batch of independent GEMMs: C[i] = alpha * A[i] * B[i] + beta * C[i]
+let a_refs: Vec<MatRef<'_, f64>> = a_mats.iter().map(Mat::as_ref).collect();
+let b_refs: Vec<MatRef<'_, f64>> = b_mats.iter().map(Mat::as_ref).collect();
+let mut c_muts: Vec<MatMut<'_, f64>> = c_mats.iter_mut().map(Mat::as_mut).collect();
 
-// Strided batched GEMM (contiguous memory layout)
-gemm_strided_batched(1.0, &a, stride_a, &b, stride_b, 0.0, &mut c, stride_c, batch)?;
+gemm_batched(
+    Transpose::NoTrans,
+    Transpose::NoTrans,
+    1.0,
+    &a_refs,
+    &b_refs,
+    0.0,
+    &mut c_muts,
+)?;
 ```
 
 ## Feature Flags
@@ -691,11 +707,11 @@ gemm_strided_batched(1.0, &a, stride_a, &b, stride_b, 0.0, &mut c, stride_c, bat
 
 ## Project Status
 
-**Version:** 0.2.1 (2026-03-16)
+**Version:** 0.2.2 (2026-08-06)
 
-- **Lines of Code:** ~223,935 Rust (371 files)
-- **Documentation:** ~16,163 lines of comments, 12 comprehensive examples
-- **Tests:** 2,922 passing lib tests + 287 doctests (100% success rate)
+- **Lines of Code:** ~220,400 Rust (365 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
+- **Documentation:** 12 comprehensive examples
+- **Tests:** 3,431 passing lib/integration tests (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 373 passing doctests (100% success rate)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ Extensive LAPACK (LU, Cholesky, QR, SVD, EVD, Schur, Hessenberg)

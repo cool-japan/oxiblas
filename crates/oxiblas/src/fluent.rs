@@ -55,7 +55,7 @@ use oxiblas_blas::level1;
 use oxiblas_blas::level3::{self, GemmKernel};
 use oxiblas_core::{Field, Real, Scalar};
 use oxiblas_lapack::{cholesky::Cholesky, lu::Lu, qr::Qr, solve, svd::Svd};
-use oxiblas_matrix::{Mat, MatMut, MatRef, TransposeRef};
+use oxiblas_matrix::{Mat, MatMut, MatRef};
 
 /// Extension trait for fluent matrix operations on immutable references.
 ///
@@ -82,7 +82,7 @@ pub trait MatrixOps<'a, T: Scalar> {
     /// assert_eq!(t.nrows(), 3);
     /// assert_eq!(t.ncols(), 2);
     /// ```
-    fn transpose(&self) -> TransposeRef<'a, T>;
+    fn transpose(&self) -> MatRef<'a, T>;
 
     /// Computes the matrix product C = A * B.
     ///
@@ -197,7 +197,7 @@ pub trait MatrixOps<'a, T: Scalar> {
 }
 
 impl<'a, T: Scalar> MatrixOps<'a, T> for MatRef<'a, T> {
-    fn transpose(&self) -> TransposeRef<'a, T> {
+    fn transpose(&self) -> MatRef<'a, T> {
         MatRef::transpose(self)
     }
 

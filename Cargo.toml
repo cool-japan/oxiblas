@@ -10,9 +10,18 @@ members = [
     "crates/oxiblas-sparse",
     "crates/oxiblas-benchmarks",
 ]
+# oxiblas-ffi is retired (v0.2.0 Pure Rust pivot): unbuilt, untested by CI,
+# not part of the shipped product. Structurally excluded so it can never be
+# accidentally pulled in by --workspace / --all or a future members-list edit.
+#
+# fuzz/ is its own independent `[workspace]` (see fuzz/Cargo.toml) and needs
+# libfuzzer-sys + a nightly toolchain; excluding it here too means a plain
+# `cargo build`/`cargo clippy --workspace` from the root never touches it.
+# Build/run fuzz targets explicitly: `cd fuzz && cargo +nightly fuzz run <target>`.
+exclude = ["crates/oxiblas-ffi", "fuzz"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -21,13 +30,13 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.1", default-features = false }
-oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.1", default-features = false }
-oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.1" }
-oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.1" }
-oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.1" }
-oxiblas = { path = "crates/oxiblas", version = "0.2.1" }
-oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.1" }
+oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.2", default-features = false }
+oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.2", default-features = false }
+oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.2" }
+oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.2" }
+oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.2" }
+oxiblas = { path = "crates/oxiblas", version = "0.2.2" }
+oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.2" }
 # oxiblas-ffi has been retired as of v0.2.0 (Pure Rust ecosystem)
 
 # Essential dependencies
@@ -36,19 +45,30 @@ num-traits = "0.2"
 bytemuck = { version = "1.25", features = ["derive"] }
 
 # Optional dependencies
-rayon = "1.11"
+rayon = "1.12"
 ndarray = "0.17"
-nalgebra = "0.34"
+nalgebra = "0.35"
 twofloat = "0.8"
 half = { version = "2.7", features = ["num-traits", "bytemuck"] }
 serde = { version = "1.0", features = ["std", "derive"] }
 serde_json = "1.0"
 memmap2 = "0.9"
+libc = "0.2"
 
 # Dev dependencies
 criterion = "0.8"
 rand = "0.10"
 approx = "0.5"
+quickcheck = "1.1"
+quickcheck_macros = "1.2"
+faer = "0.24"
+
+# oxiblas-benchmarks' opt-in `compare-openblas` feature only (see that
+# crate's Cargo.toml comment) — never reached by any default or
+# non-default feature of a publishable crate.
+ndarray-linalg = "0.18"
+blas-src = "0.14"
+cblas-sys = "0.3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"  # Rust 2024 defaults to requiring unsafe blocks; we allow for now

@@ -131,8 +131,11 @@ pub fn hemv<T: Field>(
                 let mut temp1 = T::zero();
                 let alpha_xi = alpha * x[i];
 
-                // Diagonal element (must be real for Hermitian, but we use it as-is)
-                y[i] += alpha * a[(i, i)] * x[i];
+                // Diagonal element. The Hermitian contract fixes A[i,i] real; the
+                // imaginary part of the stored value is not part of the matrix, so we
+                // take only the real part (matching reference BLAS, which never touches
+                // the diagonal's imaginary part). Callers may leave garbage there.
+                y[i] += alpha * T::from_real(a[(i, i)].real()) * x[i];
 
                 // Off-diagonal elements (j > i)
                 for j in (i + 1)..n {
@@ -152,8 +155,9 @@ pub fn hemv<T: Field>(
                 let mut temp1 = T::zero();
                 let alpha_xi = alpha * x[i];
 
-                // Diagonal element
-                y[i] += alpha * a[(i, i)] * x[i];
+                // Diagonal element. Real part only: the Hermitian contract fixes
+                // A[i,i] real and reference BLAS ignores any stored imaginary part.
+                y[i] += alpha * T::from_real(a[(i, i)].real()) * x[i];
 
                 // Off-diagonal elements (j < i)
                 for j in 0..i {
@@ -400,5 +404,44 @@ mod tests {
         assert!(approx_eq_c(y[0], c(1.0, 0.0)));
         assert!(approx_eq_c(y[1], c(2.0, -1.0)));
         assert!(approx_eq_c(y[2], c(3.0, 2.0)));
+    }
+
+    #[test]
+    fn test_hemv_ignores_diagonal_imaginary_part() {
+        // Regression: a Hermitian matrix has real diagonal, but callers are NOT
+        // required to zero the imaginary part of the stored diagonal. Reference BLAS
+        // uses only the real part; the imaginary garbage must not leak into y.
+        let x = [c(1.0, 0.0), c(1.0, 0.0)];
+
+        // Upper: diagonal carries garbage imaginary parts (7i and -5i).
+        let a_upper = Mat::from_rows(&[&[c(2.0, 7.0), c(1.0, 1.0)], &[c(0.0, 0.0), c(3.0, -5.0)]]);
+        let mut y_upper = [c(0.0, 0.0); 2];
+        hemv(
+            HemvUplo::Upper,
+            c(1.0, 0.0),
+            a_upper.as_ref(),
+            &x,
+            c(0.0, 0.0),
+            &mut y_upper,
+        )
+        .unwrap();
+        // Same result as if the diagonal were exactly [2, 3]: [3+i, 4-i].
+        assert!(approx_eq_c(y_upper[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_upper[1], c(4.0, -1.0)));
+
+        // Lower: same garbage on the diagonal, lower off-diagonal is conj of upper's.
+        let a_lower = Mat::from_rows(&[&[c(2.0, 7.0), c(0.0, 0.0)], &[c(1.0, -1.0), c(3.0, -5.0)]]);
+        let mut y_lower = [c(0.0, 0.0); 2];
+        hemv(
+            HemvUplo::Lower,
+            c(1.0, 0.0),
+            a_lower.as_ref(),
+            &x,
+            c(0.0, 0.0),
+            &mut y_lower,
+        )
+        .unwrap();
+        assert!(approx_eq_c(y_lower[0], c(3.0, 1.0)));
+        assert!(approx_eq_c(y_lower[1], c(4.0, -1.0)));
     }
 }

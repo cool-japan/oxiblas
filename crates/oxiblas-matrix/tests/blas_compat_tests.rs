@@ -7,8 +7,9 @@
 //! - Packed storage formats match BLAS expectations
 
 use oxiblas_matrix::{
-    Mat,
+    Expr, LazyExt, Mat,
     banded::BandedMat,
+    gemm,
     packed::{PackedMat, TriangularKind},
 };
 
@@ -128,12 +129,12 @@ fn test_packed_upper_blas_format() {
     let mut p: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Upper);
 
     // Set elements
-    p.set(0, 0, 1.0); // a
-    p.set(0, 1, 2.0); // b
-    p.set(1, 1, 3.0); // c
-    p.set(0, 2, 4.0); // d
-    p.set(1, 2, 5.0); // e
-    p.set(2, 2, 6.0); // f
+    p.set(0, 0, 1.0).unwrap(); // a
+    p.set(0, 1, 2.0).unwrap(); // b
+    p.set(1, 1, 3.0).unwrap(); // c
+    p.set(0, 2, 4.0).unwrap(); // d
+    p.set(1, 2, 5.0).unwrap(); // e
+    p.set(2, 2, 6.0).unwrap(); // f
 
     // Verify packed storage follows BLAS convention
     let storage = p.as_slice();
@@ -156,12 +157,12 @@ fn test_packed_lower_blas_format() {
     let mut p: PackedMat<f64> = PackedMat::zeros(3, TriangularKind::Lower);
 
     // Set elements
-    p.set(0, 0, 1.0); // a
-    p.set(1, 0, 2.0); // b
-    p.set(2, 0, 3.0); // c
-    p.set(1, 1, 4.0); // d
-    p.set(2, 1, 5.0); // e
-    p.set(2, 2, 6.0); // f
+    p.set(0, 0, 1.0).unwrap(); // a
+    p.set(1, 0, 2.0).unwrap(); // b
+    p.set(2, 0, 3.0).unwrap(); // c
+    p.set(1, 1, 4.0).unwrap(); // d
+    p.set(2, 1, 5.0).unwrap(); // e
+    p.set(2, 2, 6.0).unwrap(); // f
 
     // Verify packed storage follows BLAS convention
     let storage = p.as_slice();
@@ -280,24 +281,82 @@ fn test_banded_diagonal_access() {
 #[test]
 fn test_gemm_layout_requirements() {
     // GEMM requires: C := alpha*A*B + beta*C
-    // All matrices should be column-major with proper leading dimensions
+    // All matrices must be column-major with proper leading dimensions
+    // (lda/ldb/ldc >= the respective logical extents).
+    //
+    // This test exercises the crate's real GEMM entry point (the lazy
+    // `Expr`-based `gemm()` builder, re-exported from `oxiblas_matrix`)
+    // rather than only checking leading-dimension arithmetic on freshly
+    // allocated (and therefore trivially contiguous) matrices. Each
+    // operand is carved out as a *submatrix* of a larger backing matrix so
+    // its leading dimension genuinely exceeds its logical row count,
+    // and the numerical result is checked against a naive triple-loop
+    // reference product computed independently in this test.
 
     let m = 4;
     let n = 3;
     let k = 5;
 
-    let a: Mat<f64> = Mat::zeros(m, k);
-    let b: Mat<f64> = Mat::zeros(k, n);
-    let c: Mat<f64> = Mat::zeros(m, n);
+    // Back each operand with extra rows/cols so `submatrix` produces a
+    // view whose row_stride (lda) strictly exceeds its own row count.
+    let mut a_storage: Mat<f64> = Mat::zeros(m + 2, k + 2);
+    for i in 0..m {
+        for j in 0..k {
+            a_storage[(i, j)] = ((i + 1) * 10 + (j + 1)) as f64;
+        }
+    }
+    let a = a_storage.as_ref().submatrix(0, 0, m, k);
 
-    // Verify leading dimensions
+    let mut b_storage: Mat<f64> = Mat::zeros(k + 3, n + 1);
+    for i in 0..k {
+        for j in 0..n {
+            b_storage[(i, j)] = ((i + 1) as f64) - 2.0 * ((j + 1) as f64);
+        }
+    }
+    let b = b_storage.as_ref().submatrix(0, 0, k, n);
+
+    let mut c_storage: Mat<f64> = Mat::zeros(m + 1, n + 1);
+    for i in 0..m {
+        for j in 0..n {
+            c_storage[(i, j)] = 100.0 + (i * n + j) as f64;
+        }
+    }
+    let c = c_storage.as_ref().submatrix(0, 0, m, n);
+
+    // Confirm this test setup is not accidentally degenerate: the whole
+    // point is to exercise lda/ldb/ldc that are strictly larger than the
+    // logical extents.
     let lda = a.row_stride();
     let ldb = b.row_stride();
     let ldc = c.row_stride();
+    assert!(lda > m, "lda must exceed m for this test to be meaningful");
+    assert!(ldb > k, "ldb must exceed k for this test to be meaningful");
+    assert!(ldc > m, "ldc must exceed m for this test to be meaningful");
 
-    assert!(lda >= m, "lda must be >= m");
-    assert!(ldb >= k, "ldb must be >= k");
-    assert!(ldc >= m, "ldc must be >= m");
+    let alpha = 2.0;
+    let beta = 0.5;
+
+    let result = gemm(alpha, a.lazy(), b.lazy(), beta, c.lazy()).eval();
+
+    assert_eq!(result.shape(), (m, n));
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut dot = 0.0;
+            for kk in 0..k {
+                dot += a_storage[(i, kk)] * b_storage[(kk, j)];
+            }
+            let expected = alpha * dot + beta * c_storage[(i, j)];
+            assert!(
+                (result[(i, j)] - expected).abs() < 1e-10,
+                "gemm mismatch at ({}, {}): got {}, expected {}",
+                i,
+                j,
+                result[(i, j)],
+                expected
+            );
+        }
+    }
 }
 
 #[test]

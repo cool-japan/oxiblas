@@ -124,8 +124,11 @@ pub mod prelude {
         band_lu_workspace, bidiag_workspace, cholesky_solve_workspace, cholesky_workspace,
         general_evd_workspace, generalized_evd_workspace, hermitian_evd_workspace,
         hessenberg_workspace, ldlt_workspace, least_squares_workspace, lu_solve_workspace,
-        lu_workspace, orgqr_workspace, ormqr_workspace, qr_pivot_workspace, qr_workspace,
-        qz_workspace, schur_workspace, svd_dc_workspace, svd_workspace, symmetric_evd_dc_workspace,
-        symmetric_evd_workspace, triangular_solve_workspace, tridiagonal_solve_workspace,
+        lu_workspace, optimal_block_size_bidiag, optimal_block_size_cholesky,
+        optimal_block_size_evd, optimal_block_size_hessenberg, optimal_block_size_lu,
+        optimal_block_size_qr, optimal_block_size_trsm, orgqr_workspace, ormqr_workspace,
+        qr_pivot_workspace, qr_workspace, qz_workspace, schur_workspace, svd_dc_workspace,
+        svd_workspace, symmetric_evd_dc_workspace, symmetric_evd_workspace,
+        triangular_solve_workspace, tridiagonal_solve_workspace,
     };
 }

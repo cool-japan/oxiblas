@@ -105,31 +105,38 @@
 //!
 //! With the `ndarray` feature enabled, you can use OxiBLAS with ndarray types:
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "ndarray")] {
+//! use ndarray::array;
 //! use oxiblas::ndarray::prelude::*;
-//! use ndarray::Array2;
 //!
-//! let a = Array2::<f64>::from_shape_fn((100, 100), |idx| (idx.0 + idx.1) as f64);
-//! let b = Array2::<f64>::from_shape_fn((100, 100), |idx| (idx.0 * idx.1) as f64);
+//! let a = array![[1.0f64, 2.0], [3.0, 4.0]];
+//! let b = array![[5.0f64, 6.0], [7.0, 8.0]];
 //! let c = matmul(&a, &b);
+//! assert_eq!(c, array![[19.0, 22.0], [43.0, 50.0]]);
+//! # }
 //! ```
 //!
 //! ## nalgebra Integration
 //!
 //! With the `nalgebra` feature enabled, you can convert between OxiBLAS and nalgebra types:
 //!
-//! ```ignore
+//! ```
+//! # #[cfg(feature = "nalgebra")] {
 //! use oxiblas::prelude::*;
-//! use oxiblas::{mat_to_dmatrix, dmatrix_to_mat, MatNalgebraExt, DMatrixOxiblasExt};
+//! use oxiblas::{DMatrixOxiblasExt, MatNalgebraExt};
 //! use nalgebra::DMatrix;
 //!
 //! // Convert from nalgebra to OxiBLAS
 //! let na_mat = DMatrix::from_fn(3, 3, |row, col| (row + col) as f64);
 //! let oxi_mat: Mat<f64> = na_mat.to_mat();
+//! assert_eq!(oxi_mat[(1, 2)], 3.0);
 //!
 //! // Convert from OxiBLAS to nalgebra
 //! let mat: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
 //! let dm: DMatrix<f64> = mat.to_dmatrix();
+//! assert_eq!(dm[(1, 0)], 3.0);
+//! # }
 //! ```
 //!
 //! ## Lazy Evaluation
@@ -191,15 +198,23 @@
 //!
 //! Enable the `parallel` feature and use `Par::Rayon` for large matrices:
 //!
-//! ```ignore
-//! use oxiblas::prelude::*;
+//! ```
+//! # #[cfg(feature = "parallel")] {
 //! use oxiblas::core::Par;
+//! use oxiblas::prelude::*;
+//!
+//! let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
+//! let b: Mat<f64> = Mat::from_rows(&[&[5.0, 6.0], &[7.0, 8.0]]);
+//! let mut c: Mat<f64> = Mat::zeros(2, 2);
 //!
 //! // Sequential (default)
 //! gemm(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut());
+//! assert_eq!(c[(0, 0)], 19.0);
 //!
-//! // Parallel - recommended for n >= 256
+//! // Parallel - recommended for n >= 256 (small sizes fall back internally)
 //! gemm_with_par(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut(), Par::Rayon);
+//! assert_eq!(c[(0, 0)], 19.0);
+//! # }
 //! ```
 //!
 //! ## Cache Optimization Tips
@@ -217,37 +232,64 @@
 //!
 //! ## From ndarray-linalg
 //!
-//! ```ignore
+//! `ndarray-linalg` is not a dependency of this crate (it links a system
+//! BLAS/LAPACK), so the "before" snippet below is illustrative only and is
+//! not compiled as part of this crate's tests; the "OxiBLAS equivalent"
+//! that follows it is a real, executed example.
+//!
+//! ```text
 //! // ndarray-linalg
 //! use ndarray::Array2;
 //! use ndarray_linalg::Solve;
 //! let a = Array2::<f64>::eye(3);
 //! let b = Array2::<f64>::ones((3, 1));
 //! let x = a.solve(&b).unwrap();
+//! ```
 //!
+//! ```
 //! // OxiBLAS equivalent
 //! use oxiblas::prelude::*;
+//!
 //! let a = MatBuilder::<f64>::identity(3);
 //! let b = MatBuilder::<f64>::ones(3, 1);
 //! let x = solve(a.as_ref(), b.as_ref()).unwrap();
+//! assert_eq!(x.nrows(), 3);
+//! // A is the identity, so x must equal b exactly.
+//! for i in 0..3 {
+//!     assert!((x[(i, 0)] - b[(i, 0)]).abs() < 1e-12);
+//! }
 //! ```
 //!
 //! ## From nalgebra
 //!
-//! ```ignore
+//! ```
 //! // nalgebra
 //! use nalgebra::{DMatrix, DVector};
-//! let a = DMatrix::from_fn(3, 3, |i, j| (i + j) as f64);
+//!
+//! // Diagonally dominant, so `lu()` is guaranteed non-singular.
+//! let a = DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 4.0]);
 //! let b = DVector::from_element(3, 1.0);
 //! let lu = a.lu();
 //! let x = lu.solve(&b).unwrap();
+//! # let _ = &x;
+//! ```
 //!
+//! ```
+//! # #[cfg(feature = "nalgebra")] {
 //! // OxiBLAS equivalent (with nalgebra feature)
+//! use nalgebra::DMatrix;
 //! use oxiblas::prelude::*;
+//! use oxiblas::{DMatrixOxiblasExt, MatNalgebraExt};
+//!
+//! let na_matrix = DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 4.0]);
+//! let na_vector = DMatrix::from_element(3, 1, 1.0);
+//!
 //! let a: Mat<f64> = na_matrix.to_mat(); // Convert from nalgebra
 //! let b: Mat<f64> = na_vector.to_mat();
 //! let x = solve(a.as_ref(), b.as_ref()).unwrap();
 //! let result = x.to_dmatrix(); // Convert back if needed
+//! assert_eq!(result.nrows(), 3);
+//! # }
 //! ```
 //!
 //! ## From NumPy (via Rust)
@@ -354,7 +396,7 @@ pub use oxiblas_core::{
 pub use oxiblas_core::{C32, C64, ComplexExt, I32, I64, ToComplex, c32, c64};
 
 // Re-export matrix types
-pub use oxiblas_matrix::{DiagRef, Mat, MatMut, MatRef, TransposeRef};
+pub use oxiblas_matrix::{DiagRef, Mat, MatMut, MatRef};
 
 // Re-export memory-mapped matrix types (requires `mmap` feature)
 #[cfg(feature = "mmap")]
@@ -428,10 +470,17 @@ pub mod features {
     pub const HAS_F128: bool = cfg!(feature = "f128");
     /// `true` when the `ndarray` feature (ndarray interop) is compiled in.
     pub const HAS_NDARRAY: bool = cfg!(feature = "ndarray");
-    /// `true` when the `oxiblas-core` std feature is absent (no-std mode for the core layer).
+    /// `true` when this crate is actually built without the standard library
+    /// support that it forwards to the `oxiblas-core`/`oxiblas-matrix` layers
+    /// (no-std mode for the core layer).
     ///
-    /// Note: check `oxiblas_core` feature flags directly for precise no-std detection.
-    pub const NO_STD: bool = !cfg!(feature = "default");
+    /// This mirrors the `#![cfg_attr(not(feature = "std"), no_std)]` gating
+    /// that `oxiblas-core` and `oxiblas-matrix` use internally: this crate's
+    /// own `std` feature (enabled by default) forwards to `oxiblas-core/std`
+    /// and `oxiblas-matrix/std`, so `NO_STD` reflects the real build
+    /// configuration rather than merely whether the unrelated `default`
+    /// feature happens to be active.
+    pub const NO_STD: bool = !cfg!(feature = "std");
 }
 
 /// Prelude module - import everything commonly needed.

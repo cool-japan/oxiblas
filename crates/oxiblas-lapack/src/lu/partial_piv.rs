@@ -502,8 +502,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// Returns `LuError::Singular` if the matrix is singular.
     #[inline]
     pub fn compute_blocked(a: MatRef<'_, T>) -> Result<Self, LuError> {
-        const BLOCK_SIZE: usize = 64;
-        Self::compute_with_block_size(a, BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_lu(a.nrows(), a.ncols());
+        Self::compute_with_block_size(a, nb)
     }
 
     /// Computes LU decomposition with a specified block size.
@@ -1047,8 +1047,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
     /// Returns `LuError::Singular` if the matrix is singular.
     #[inline]
     pub fn compute_blocked_par(a: MatRef<'_, T>) -> Result<Self, LuError> {
-        const BLOCK_SIZE: usize = 64;
-        Self::compute_blocked_par_with_block_size(a, BLOCK_SIZE)
+        let nb = crate::workspace::optimal_block_size_lu(a.nrows(), a.ncols());
+        Self::compute_blocked_par_with_block_size(a, nb)
     }
 
     /// Computes parallel blocked LU decomposition with a specified block size.

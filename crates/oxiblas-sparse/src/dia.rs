@@ -6,7 +6,15 @@
 //!
 //! For an m×n matrix with `ndiag` diagonals:
 //! - `offsets` has length `ndiag`
-//! - `data[k]` has length `min(m, n)` (padded with zeros where diagonal is shorter)
+//! - `data[k]` has length `max(m, n)`, indexed by the *column* position of each
+//!   element (i.e. `data[k][col]` holds the value at `(row, col)` where
+//!   `col = row + offsets[k]`). Positions outside the actual diagonal extent
+//!   are padding zeros. Using `max(m, n)` (rather than `min(m, n)`) is required
+//!   because for a wide matrix (n > m) a super-diagonal near the far edge has
+//!   `col` values approaching `n - 1`, and for a tall matrix (m > n) the
+//!   analogous situation arises for sub-diagonals; sizing by `min(m, n)` would
+//!   under-allocate and either panic on out-of-bounds indexing or silently
+//!   drop entries near the far edge.
 //!
 //! # When to Use DIA
 //!
@@ -192,8 +200,15 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
             }
         }
 
-        // Validate diagonal lengths
-        let diag_len = nrows.min(ncols);
+        // Validate diagonal lengths.
+        //
+        // Each diagonal is stored padded to `max(nrows, ncols)`, indexed by the
+        // column position of each element (see module docs). Sizing by
+        // `min(nrows, ncols)` instead would under-allocate for non-square
+        // matrices: a super-diagonal near the far edge of a wide matrix (or a
+        // sub-diagonal near the far edge of a tall matrix) needs an index up to
+        // `max(nrows, ncols) - 1`.
+        let diag_len = nrows.max(ncols);
         for (k, diag) in data.iter().enumerate() {
             if diag.len() != diag_len {
                 return Err(DiaError::InvalidDiagonalLength {
@@ -409,7 +424,7 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                 let col = start_col + i;
                 if row < self.nrows && col < self.ncols {
                     let idx = Self::data_index(*offset, row, self.nrows);
-                    if Scalar::abs(self.data[k][idx].clone()) > eps {
+                    if idx < self.data[k].len() && Scalar::abs(self.data[k][idx].clone()) > eps {
                         count += 1;
                     }
                 }
@@ -463,16 +478,21 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
         }
     }
 
-    /// Compute the index into data array for a given row.
+    /// Compute the index into the data array for a given row on diagonal `offset`.
     ///
-    /// For diagonals with offset k:
-    /// - Super-diagonals (k > 0): data has k padding elements at start, so index = row + k
-    /// - Main diagonal (k = 0): index = row
-    /// - Sub-diagonals (k < 0): data has |k| padding elements at end, so index = row + k = row - |k|
+    /// The storage convention indexes each diagonal by the *column* of the
+    /// element: `index = row + offset = col`. This is well-defined and stays
+    /// within `[0, ncols)` (and therefore within `[0, max(nrows, ncols))`,
+    /// the allocated diagonal length) for any `(row, col)` pair that is
+    /// actually on the matrix, regardless of whether the matrix is wide or
+    /// tall. Callers must only invoke this with a `row` that is known to be
+    /// on the diagonal within matrix bounds (e.g. from [`Self::diag_length`]),
+    /// and should still bounds-check `idx` against `data[k].len()` before
+    /// indexing, since a `DiaMatrix` built via [`Self::new_unchecked`] is not
+    /// guaranteed to honor the sizing invariant.
     #[inline]
     fn data_index(offset: isize, row: usize, _nrows: usize) -> usize {
-        // For all cases: index = row + offset (as signed arithmetic)
-        // This accounts for padding at start (super) or end (sub)
+        // index = row + offset (signed arithmetic) = col
         (row as isize + offset) as usize
     }
 
@@ -488,7 +508,7 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
         match self.offsets.binary_search(&offset) {
             Ok(k) => {
                 let idx = Self::data_index(offset, row, self.nrows);
-                Some(&self.data[k][idx])
+                self.data[k].get(idx)
             }
             Err(_) => None,
         }
@@ -516,7 +536,7 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                     let col = start_col + i;
                     if row < self.nrows && col < self.ncols {
                         let idx = Self::data_index(offset, row, self.nrows);
-                        Some((row, col, &self.data[k][idx]))
+                        self.data[k].get(idx).map(|val| (row, col, val))
                     } else {
                         None
                     }
@@ -547,7 +567,9 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                 let col = start_col + i;
                 if row < self.nrows && col < self.ncols {
                     let idx = Self::data_index(offset, row, self.nrows);
-                    y[row] = y[row].clone() + self.data[k][idx].clone() * x[col].clone();
+                    if let Some(val) = self.data[k].get(idx) {
+                        y[row] = y[row].clone() + val.clone() * x[col].clone();
+                    }
                 }
             }
         }
@@ -628,7 +650,9 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                 let col = start_col + i;
                 if row < self.nrows && col < self.ncols {
                     let idx = Self::data_index(offset, row, self.nrows);
-                    dense[(row, col)] = self.data[k][idx].clone();
+                    if let Some(val) = self.data[k].get(idx) {
+                        dense[(row, col)] = val.clone();
+                    }
                 }
             }
         }
@@ -666,7 +690,7 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
             offsets
         });
 
-        let diag_len = nrows.min(ncols);
+        let diag_len = nrows.max(ncols);
         let mut data = Vec::with_capacity(offsets.len());
 
         for &offset in &offsets {
@@ -679,7 +703,9 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                 let col = start_col + i;
                 if row < nrows && col < ncols {
                     let idx = Self::data_index(offset, row, nrows);
-                    diag[idx] = dense[(row, col)].clone();
+                    if let Some(slot) = diag.get_mut(idx) {
+                        *slot = dense[(row, col)].clone();
+                    }
                 }
             }
 
@@ -722,7 +748,7 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
 
         let new_nrows = self.ncols;
         let new_ncols = self.nrows;
-        let diag_len = new_nrows.min(new_ncols);
+        let diag_len = new_nrows.max(new_ncols);
 
         // Negate and re-sort offsets
         let mut offset_pairs: Vec<_> = self
@@ -750,14 +776,14 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
 
                 if row < self.nrows && col < self.ncols {
                     let old_idx = Self::data_index(old_offset, row, self.nrows);
-                    let val = self.data[*old_k][old_idx].clone();
-
-                    // In transpose: this becomes A^T[col, row]
-                    // new_offset = row - col = -old_offset
-                    // new_row = col, new_col = row
-                    let new_idx = Self::data_index(*new_offset, col, new_nrows);
-                    if new_idx < diag_len {
-                        new_diag[new_idx] = val;
+                    if let Some(val) = self.data[*old_k].get(old_idx).cloned() {
+                        // In transpose: this becomes A^T[col, row]
+                        // new_offset = row - col = -old_offset
+                        // new_row = col, new_col = row
+                        let new_idx = Self::data_index(*new_offset, col, new_nrows);
+                        if let Some(slot) = new_diag.get_mut(new_idx) {
+                            *slot = val;
+                        }
                     }
                 }
             }
@@ -962,11 +988,12 @@ mod tests {
 
     #[test]
     fn test_dia_rectangular() {
-        // 4x3 matrix with 2 diagonals
+        // 4x3 matrix with 2 diagonals. Storage is padded to
+        // max(nrows, ncols) = 4 and indexed by column position.
         let offsets = vec![0, 1];
         let data = vec![
-            vec![1.0, 2.0, 3.0], // main diagonal
-            vec![0.0, 4.0, 5.0], // super diagonal
+            vec![1.0, 2.0, 3.0, 0.0], // main diagonal
+            vec![0.0, 4.0, 5.0, 0.0], // super diagonal
         ];
 
         let dia = DiaMatrix::new(4, 3, offsets, data).unwrap();
@@ -1001,5 +1028,131 @@ mod tests {
         let dia = DiaMatrix::new(3, 3, offsets, data).unwrap();
         // Actual non-zeros: 2,3 on sub, 4,5,6 on main, 1,1 on super = 7
         assert_eq!(dia.nnz(), 7);
+    }
+
+    /// Regression test for a wide-matrix (ncols > nrows) bug: diagonals were
+    /// stored padded to `min(nrows, ncols)` instead of `max(nrows, ncols)`,
+    /// so super-diagonals near the far edge of a wide matrix would index past
+    /// the end of their storage — panicking in `get`/`matvec`/`to_dense`/`nnz`
+    /// and silently dropping entries in `to_csr` (which had a bounds check).
+    #[test]
+    fn test_dia_wide_matrix_far_super_diagonal() {
+        // 3x8 matrix:
+        // row0: col0=1.0            col6=9.0   col7=7.5
+        // row1:          col1=2.0              col7=8.0
+        // row2:                    col2=3.0
+        let nrows = 3;
+        let ncols = 8;
+        let offsets = vec![0, 6, 7];
+
+        // Each diagonal is stored padded to max(nrows, ncols) = 8, indexed by
+        // column position.
+        let main_diag = vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let diag6 = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 8.0];
+        let diag7 = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.5];
+
+        let dia = DiaMatrix::new(nrows, ncols, offsets, vec![main_diag, diag6, diag7]).unwrap();
+
+        assert_eq!(dia.nrows(), 3);
+        assert_eq!(dia.ncols(), 8);
+        assert_eq!(dia.ndiag(), 3);
+
+        // get() must not panic and must return the far-edge values correctly.
+        assert_eq!(dia.get(0, 0), Some(&1.0));
+        assert_eq!(dia.get(0, 6), Some(&9.0));
+        assert_eq!(dia.get(0, 7), Some(&7.5));
+        assert_eq!(dia.get(1, 1), Some(&2.0));
+        assert_eq!(dia.get(1, 7), Some(&8.0));
+        assert_eq!(dia.get(2, 2), Some(&3.0));
+        assert_eq!(dia.get(2, 7), None); // offset 5 not stored
+        assert_eq!(dia.get(0, 5), None); // offset 5 not stored
+
+        // nnz() must not panic and must count only the real (non-padding) entries.
+        assert_eq!(dia.nnz(), 6);
+
+        // matvec() must not panic and must include the far-edge contributions.
+        let x = vec![1.0; ncols];
+        let y = dia.mul_vec(&x);
+        assert!((y[0] - 17.5).abs() < 1e-10); // 1.0 + 9.0 + 7.5
+        assert!((y[1] - 10.0).abs() < 1e-10); // 2.0 + 8.0
+        assert!((y[2] - 3.0).abs() < 1e-10); // 3.0
+
+        // to_dense() must not panic and must place far-edge entries correctly.
+        let dense = dia.to_dense();
+        assert!((dense[(0, 0)] - 1.0).abs() < 1e-10);
+        assert!((dense[(0, 6)] - 9.0).abs() < 1e-10);
+        assert!((dense[(0, 7)] - 7.5).abs() < 1e-10);
+        assert!((dense[(1, 1)] - 2.0).abs() < 1e-10);
+        assert!((dense[(1, 7)] - 8.0).abs() < 1e-10);
+        assert!((dense[(2, 2)] - 3.0).abs() < 1e-10);
+        assert!((dense[(0, 1)]).abs() < 1e-10);
+
+        // to_csr() must not silently drop the far-edge entries.
+        let csr = dia.to_csr();
+        assert_eq!(csr.get(0, 6), Some(&9.0));
+        assert_eq!(csr.get(0, 7), Some(&7.5));
+        assert_eq!(csr.get(1, 7), Some(&8.0));
+
+        // from_dense() round trip must not panic and must recover the same
+        // far-edge diagonals when auto-detecting offsets.
+        let dia2 = DiaMatrix::from_dense(&dense.as_ref(), None);
+        assert_eq!(dia2.get(0, 6), Some(&9.0));
+        assert_eq!(dia2.get(0, 7), Some(&7.5));
+        assert_eq!(dia2.get(1, 7), Some(&8.0));
+        assert_eq!(dia2.get(1, 1), Some(&2.0));
+
+        // transpose() (8x3) must not panic and must match the dense transpose.
+        let dia_t = dia.transpose();
+        assert_eq!(dia_t.nrows(), 8);
+        assert_eq!(dia_t.ncols(), 3);
+        let dense_t = dia_t.to_dense();
+        for i in 0..nrows {
+            for j in 0..ncols {
+                assert!((dense[(i, j)] - dense_t[(j, i)]).abs() < 1e-10);
+            }
+        }
+    }
+
+    /// Mirror-image regression test for a tall matrix (nrows > ncols): a
+    /// sub-diagonal near the far edge previously suffered the same
+    /// under-allocation bug as the wide-matrix case.
+    #[test]
+    fn test_dia_tall_matrix_far_sub_diagonal() {
+        // 8x3 matrix (transpose-shaped counterpart of the wide test above):
+        // row6: col0=9.0
+        // row7: col0=7.5   col1=8.0
+        let nrows = 8;
+        let ncols = 3;
+        let offsets = vec![-7, -6, 0];
+
+        // Storage is padded to max(nrows, ncols) = 8, indexed by column.
+        let mut diag_neg7_full = vec![0.0; 8];
+        diag_neg7_full[0] = 7.5; // (row=7, col=0)
+        let mut diag_neg6_full = vec![0.0; 8];
+        diag_neg6_full[0] = 9.0; // (row=6, col=0)
+        diag_neg6_full[1] = 8.0; // (row=7, col=1)
+        let main_full = vec![0.0; 8];
+
+        let dia = DiaMatrix::new(
+            nrows,
+            ncols,
+            offsets,
+            vec![diag_neg7_full, diag_neg6_full, main_full],
+        )
+        .unwrap();
+
+        assert_eq!(dia.get(6, 0), Some(&9.0));
+        assert_eq!(dia.get(7, 0), Some(&7.5));
+        assert_eq!(dia.get(7, 1), Some(&8.0));
+
+        let x = vec![1.0; ncols];
+        let y = dia.mul_vec(&x);
+        assert!((y[6] - 9.0).abs() < 1e-10);
+        assert!((y[7] - 15.5).abs() < 1e-10); // 7.5 + 8.0
+
+        let dense = dia.to_dense();
+        assert!((dense[(6, 0)] - 9.0).abs() < 1e-10);
+        assert!((dense[(7, 0)] - 7.5).abs() < 1e-10);
+        assert!((dense[(7, 1)] - 8.0).abs() < 1e-10);
     }
 }

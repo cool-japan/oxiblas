@@ -1,11 +1,30 @@
 //! Workspace size query functions (LAPACK-style lwork queries).
 //!
 //! This module provides workspace size queries for LAPACK operations,
-//! allowing users to pre-allocate workspace buffers for repeated operations.
+//! allowing users to pre-allocate workspace buffers for repeated operations,
+//! plus the block-size heuristics (this crate's ILAENV equivalent) that the
+//! blocked LU/Cholesky/QR/Hessenberg/bidiagonal drivers in this crate use
+//! internally to size their per-panel scratch matrices.
 //!
 //! In LAPACK, workspace queries are performed by calling routines with `lwork = -1`,
 //! which returns the optimal workspace size without performing the computation.
 //! This module provides equivalent functionality through dedicated query functions.
+//!
+//! # Two Families of Query
+//!
+//! - **[`WorkspaceQuery`]-returning functions** (e.g. [`qr_workspace`], [`lu_workspace`],
+//!   [`cholesky_workspace`]) report the `optimal`/`minimum` element count of the
+//!   scratch buffer a LAPACK-style `xGEQRF`/`xGETRF`/`xPOTRF` work array would need,
+//!   for capacity planning by callers that pre-allocate their own buffers.
+//! - **Block-size functions** (e.g. [`optimal_block_size_qr`], [`optimal_block_size_lu`],
+//!   [`optimal_block_size_cholesky`]) report the panel width `nb` that determines the
+//!   size of the [`WorkspaceQuery::optimal`] figure above. These are not just advisory:
+//!   they are the same functions this crate's own blocked drivers
+//!   ([`crate::lu::Lu::compute_blocked`], [`crate::cholesky::Cholesky::compute_blocked`],
+//!   [`crate::qr::Qr::compute_auto`], [`crate::evd::Hessenberg::compute_blocked`],
+//!   [`crate::svd::BidiagFactors::compute_blocked`]) call to size their block-local
+//!   temporaries, so the numbers this module computes directly drive the size of the
+//!   real allocations those routines make on every call.
 //!
 //! # Benefits of Pre-allocation
 //!
@@ -13,20 +32,60 @@
 //! - **Memory Control**: Use custom allocators or stack-allocated buffers
 //! - **Predictability**: Know memory requirements before computation
 //!
-//! # Usage Pattern
+//! # Usage Pattern: Sizing Your Own Workspace Buffer
 //!
-//! ```ignore
+//! ```
 //! use oxiblas_lapack::workspace::{WorkspaceQuery, qr_workspace};
 //!
 //! // Query workspace size
-//! let ws = qr_workspace(100, 50);
-//! println!("Optimal workspace: {} elements", ws.optimal);
-//! println!("Minimum workspace: {} elements", ws.minimum);
+//! let ws: WorkspaceQuery = qr_workspace(100, 50);
+//! assert!(ws.optimal >= ws.minimum);
+//! assert!(ws.minimum >= 1);
 //!
-//! // Pre-allocate workspace (for repeated operations)
-//! let mut work: Vec<f64> = vec![0.0; ws.optimal];
+//! // Pre-allocate a buffer sized for repeated operations, e.g. to feed a
+//! // custom allocator or a stack/arena allocator instead of the crate's
+//! // default per-call `Vec` allocations.
+//! let work: Vec<f64> = vec![0.0; ws.optimal];
+//! assert_eq!(work.len(), ws.optimal);
+//! ```
 //!
-//! // Use the workspace in computations (when workspace-accepting APIs are available)
+//! # Usage Pattern: Picking a Block Size For a Blocked Driver
+//!
+//! The blocked decomposition drivers in this crate expose a
+//! `compute_with_block_size` / `compute_blocked_with_block_size` entry point
+//! that takes an explicit panel width `nb`. The block-size functions in this
+//! module compute the exact same recommendation those drivers' `compute_blocked`
+//! convenience wrappers use by default, so callers who want the adaptive,
+//! dimension-aware default (rather than a hand-picked `nb`) can query it
+//! directly:
+//!
+//! ```
+//! use oxiblas_lapack::lu::Lu;
+//! use oxiblas_lapack::workspace::optimal_block_size_lu;
+//! use oxiblas_matrix::Mat;
+//!
+//! let n = 80;
+//! let mut a = Mat::zeros(n, n);
+//! for i in 0..n {
+//!     a[(i, i)] = (i + 1) as f64;
+//!     if i + 1 < n {
+//!         a[(i, i + 1)] = 0.5;
+//!     }
+//! }
+//!
+//! // Pre-size the panel width the same way `Lu::compute_blocked` would.
+//! let nb = optimal_block_size_lu(n, n);
+//! assert!(nb >= 1);
+//!
+//! let lu = Lu::compute_with_block_size(a.as_ref(), nb).unwrap();
+//! let lu_default = Lu::compute_blocked(a.as_ref()).unwrap();
+//!
+//! // Same block size, same factorization.
+//! for i in 0..n {
+//!     for j in 0..n {
+//!         assert!((lu.l_factor()[(i, j)] - lu_default.l_factor()[(i, j)]).abs() < 1e-9);
+//!     }
+//! }
 //! ```
 //!
 //! # Workspace Size Structures
@@ -689,16 +748,61 @@ pub fn tridiagonal_solve_workspace(n: usize, _nrhs: usize) -> WorkspaceQuery {
 
 // ============================================================================
 // Optimal Block Size Estimation
+//
+// These functions are the ILAENV-equivalent of this crate: they recommend a
+// panel/block width (`nb`) for the blocked factorization drivers in
+// `crate::lu`, `crate::cholesky`, `crate::qr`, `crate::evd`, and `crate::svd`.
+// Each blocked driver's `compute_blocked` convenience entry point calls the
+// corresponding function here to size its panel width instead of hard-coding
+// a fixed constant, so every temporary matrix that driver allocates per
+// panel/iteration (sized in terms of `nb`) is ultimately sized by this
+// module. See e.g. `crate::lu::Lu::compute_blocked`,
+// `crate::cholesky::Cholesky::compute_blocked`, `crate::qr::Qr::compute_auto`,
+// `crate::evd::Hessenberg::compute_blocked`, and
+// `crate::svd::BidiagFactors::compute_blocked`.
 // ============================================================================
 
-/// Get optimal block size for LU factorization.
+/// Recommends a panel/block width for blocked LU factorization (GETRF).
 ///
-/// Block sizes are tuned for typical cache hierarchies.
+/// The returned block size `nb` is tuned for typical cache hierarchies: small
+/// matrices get a single all-encompassing block (degenerating to the
+/// unblocked algorithm), while larger matrices get progressively wider
+/// panels to better amortize Level-3 BLAS (GEMM) call overhead.
+///
+/// This is the function [`crate::lu::Lu::compute_blocked`] and
+/// [`crate::lu::Lu::compute_blocked_par`] use internally to pick their block
+/// size; callers of [`crate::lu::Lu::compute_with_block_size`] /
+/// [`crate::lu::Lu::compute_blocked_par_with_block_size`] can call it
+/// directly to reproduce (or tune around) that default.
+///
+/// # Arguments
+///
+/// * `m` - Number of rows of the matrix to factor.
+/// * `n` - Number of columns of the matrix to factor.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_lu;
+///
+/// // Small matrices use one block equal to their own size.
+/// assert_eq!(optimal_block_size_lu(10, 10), 10);
+///
+/// // Larger matrices settle on a fixed cache-friendly panel width.
+/// assert_eq!(optimal_block_size_lu(2000, 2000), 128);
+///
+/// // The recommendation is always at least 1, even for a 0x0 matrix.
+/// assert!(optimal_block_size_lu(0, 0) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_lu(m: usize, n: usize) -> usize {
+pub fn optimal_block_size_lu(m: usize, n: usize) -> usize {
     let k = m.min(n);
     if k < 64 {
-        k
+        k.max(1)
     } else if k < 256 {
         32
     } else if k < 1024 {
@@ -708,11 +812,33 @@ fn optimal_block_size_lu(m: usize, n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for Cholesky factorization.
+/// Recommends a panel/block width for blocked Cholesky factorization (POTRF).
+///
+/// This is the function [`crate::cholesky::Cholesky::compute_blocked`] and
+/// [`crate::cholesky::Cholesky::compute_blocked_par`] use internally to pick
+/// their block size.
+///
+/// # Arguments
+///
+/// * `n` - Matrix dimension (n×n positive definite matrix).
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_cholesky;
+///
+/// assert_eq!(optimal_block_size_cholesky(10), 10);
+/// assert_eq!(optimal_block_size_cholesky(2000), 128);
+/// assert!(optimal_block_size_cholesky(0) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_cholesky(n: usize) -> usize {
+pub fn optimal_block_size_cholesky(n: usize) -> usize {
     if n < 64 {
-        n
+        n.max(1)
     } else if n < 256 {
         32
     } else if n < 1024 {
@@ -722,9 +848,31 @@ fn optimal_block_size_cholesky(n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for QR factorization.
+/// Recommends a panel/block width for blocked QR factorization (GEQRF).
+///
+/// This is the function [`crate::qr::Qr::compute_auto`] uses internally to
+/// pick the block size passed to [`crate::qr::Qr::compute_blocked`] once the
+/// matrix is large enough to benefit from blocking.
+///
+/// # Arguments
+///
+/// * `m` - Number of rows.
+/// * `n` - Number of columns.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_qr;
+///
+/// assert_eq!(optimal_block_size_qr(100, 50), 32);
+/// assert!(optimal_block_size_qr(1, 1) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_qr(m: usize, n: usize) -> usize {
+pub fn optimal_block_size_qr(m: usize, n: usize) -> usize {
     let k = m.min(n);
     if k < 32 {
         k.max(1)
@@ -737,9 +885,31 @@ fn optimal_block_size_qr(m: usize, n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for bidiagonal reduction.
+/// Recommends a panel/block width for blocked bidiagonal reduction (GEBRD).
+///
+/// This is the function [`crate::svd::BidiagFactors::compute_blocked`] uses
+/// internally to pick the block size passed to
+/// [`crate::svd::BidiagFactors::compute_blocked_with_block_size`].
+///
+/// # Arguments
+///
+/// * `m` - Number of rows.
+/// * `n` - Number of columns.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_bidiag;
+///
+/// assert!(optimal_block_size_bidiag(100, 50) >= 1);
+/// assert!(optimal_block_size_bidiag(1, 1) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_bidiag(m: usize, n: usize) -> usize {
+pub fn optimal_block_size_bidiag(m: usize, n: usize) -> usize {
     let k = m.min(n);
     if k < 32 {
         k.max(1)
@@ -750,9 +920,27 @@ fn optimal_block_size_bidiag(m: usize, n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for eigenvalue decomposition.
+/// Recommends a panel/block width for blocked eigenvalue decomposition
+/// (SYEV/HEEV-family reductions).
+///
+/// # Arguments
+///
+/// * `n` - Matrix dimension.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_evd;
+///
+/// assert!(optimal_block_size_evd(100) >= 1);
+/// assert!(optimal_block_size_evd(0) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_evd(n: usize) -> usize {
+pub fn optimal_block_size_evd(n: usize) -> usize {
     if n < 32 {
         n.max(1)
     } else if n < 256 {
@@ -764,9 +952,30 @@ fn optimal_block_size_evd(n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for Hessenberg reduction.
+/// Recommends a panel/block width for blocked Hessenberg reduction (GEHRD).
+///
+/// This is the function [`crate::evd::Hessenberg::compute_blocked`] uses
+/// internally to pick the block size passed to
+/// [`crate::evd::Hessenberg::compute_blocked_with_block_size`].
+///
+/// # Arguments
+///
+/// * `n` - Matrix dimension.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_hessenberg;
+///
+/// assert!(optimal_block_size_hessenberg(100) >= 1);
+/// assert!(optimal_block_size_hessenberg(0) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_hessenberg(n: usize) -> usize {
+pub fn optimal_block_size_hessenberg(n: usize) -> usize {
     if n < 32 {
         n.max(1)
     } else if n < 256 {
@@ -776,9 +985,27 @@ fn optimal_block_size_hessenberg(n: usize) -> usize {
     }
 }
 
-/// Get optimal block size for triangular solve.
+/// Recommends a panel/block width for blocked triangular solve (TRSM).
+///
+/// # Arguments
+///
+/// * `n` - Matrix dimension.
+/// * `nrhs` - Number of right-hand sides.
+///
+/// # Returns
+///
+/// A block size of at least 1.
+///
+/// # Examples
+///
+/// ```
+/// use oxiblas_lapack::workspace::optimal_block_size_trsm;
+///
+/// assert!(optimal_block_size_trsm(100, 10) >= 1);
+/// assert!(optimal_block_size_trsm(0, 0) >= 1);
+/// ```
 #[inline]
-fn optimal_block_size_trsm(n: usize, nrhs: usize) -> usize {
+pub fn optimal_block_size_trsm(n: usize, nrhs: usize) -> usize {
     let k = n.min(nrhs);
     if k < 32 {
         k.max(1)

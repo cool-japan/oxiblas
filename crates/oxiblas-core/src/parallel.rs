@@ -211,9 +211,9 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let ranges = partition_work(total, par.num_threads());
-        ranges.into_par_iter().for_each(|range| {
-            f(range);
+        let ranges = partition_work(total, dispatch_thread_count(par));
+        run_in_pool(par, move || {
+            ranges.into_par_iter().for_each(f);
         });
     }
 
@@ -246,11 +246,13 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        let ranges = partition_work(total, par.num_threads());
-        ranges
-            .into_par_iter()
-            .map(map)
-            .reduce(|| identity.clone(), reduce)
+        let ranges = partition_work(total, dispatch_thread_count(par));
+        run_in_pool(par, move || {
+            ranges
+                .into_par_iter()
+                .map(map)
+                .reduce(|| identity.clone(), reduce)
+        })
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -273,7 +275,9 @@ where
 
     #[cfg(feature = "parallel")]
     {
-        (0..total).into_par_iter().for_each(f);
+        run_in_pool(par, move || {
+            (0..total).into_par_iter().for_each(f);
+        });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -604,10 +608,15 @@ impl<'a, P: ThreadPool> PoolScope<'a, P> {
         if total < self.threshold.min_elements || self.pool.num_threads() <= 1 {
             f(WorkRange::new(0, total));
         } else {
+            // Genuinely dispatch the ranges across the pool's workers. Each
+            // range is addressed by index and driven through
+            // `ThreadPool::for_each`, which every concrete pool implements in
+            // parallel (rayon `into_par_iter`). The previous `for range in
+            // ranges` loop executed every range on the *caller* thread, so the
+            // "parallel" branch silently ran sequentially.
             let ranges = partition_work(total, self.pool.num_threads());
-            for range in ranges {
-                f(range);
-            }
+            let num_ranges = ranges.len();
+            self.pool.for_each(0..num_ranges, |idx| f(ranges[idx]));
         }
     }
 
@@ -691,6 +700,12 @@ where
 ///     .stack_size(2 * 1024 * 1024);
 /// println!("threads: {}", cfg.num_threads);
 /// ```
+///
+/// This type is only available with the `std` feature: it owns a `String`
+/// thread-name and its [`effective_threads`](OxiblasThreadConfig::effective_threads)
+/// query relies on `std::thread::available_parallelism`, neither of which
+/// exist in a `no_std` build (where there are no OS threads to configure).
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Default)]
 pub struct OxiblasThreadConfig {
     /// Number of worker threads.  `0` means "use all logical CPUs".
@@ -701,6 +716,7 @@ pub struct OxiblasThreadConfig {
     pub thread_name: Option<String>,
 }
 
+#[cfg(feature = "std")]
 impl OxiblasThreadConfig {
     /// Creates a new configuration with all defaults.
     pub fn new() -> Self {
@@ -759,29 +775,109 @@ impl OxiblasThreadConfig {
 // Global pool registry
 // ---------------------------------------------------------------------------
 
-/// A type-erased, `Send + Sync` trait object for thread pools stored
-/// in the global registry.
-#[cfg(feature = "std")]
-trait AnyPool: Send + Sync {
-    fn num_threads_dyn(&self) -> usize;
-}
+/// The process-wide thread-pool registry.
+///
+/// The pool is stored as a **concrete** type rather than a `dyn` trait object.
+/// A trait object cannot expose a generic `install<R, Op>()` (generic methods
+/// are not object-safe), which is exactly the operation needed to make a
+/// registered pool *actually execute* work. Storing the concrete
+/// [`CustomRayonPool`] lets [`run_in_pool`] call its properly `Send`-bounded
+/// `install`, so `Par::Rayon` work runs on the registered pool instead of the
+/// registry being an inert store (the pre-fix behaviour).
+#[cfg(feature = "parallel")]
+static GLOBAL_POOL: std::sync::OnceLock<CustomRayonPool> = std::sync::OnceLock::new();
 
-#[cfg(all(feature = "std", feature = "parallel"))]
-impl AnyPool for CustomRayonPool {
-    fn num_threads_dyn(&self) -> usize {
-        self.num_threads()
+/// Sequential registry used on `std` builds without the `parallel` feature,
+/// where there is nothing to install onto.
+#[cfg(all(feature = "std", not(feature = "parallel")))]
+static GLOBAL_POOL: std::sync::OnceLock<SequentialPool> = std::sync::OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Pool dispatch helpers (parallel feature only)
+// ---------------------------------------------------------------------------
+
+/// Number of worker threads a given [`Par`] mode will actually dispatch across.
+///
+/// For [`Par::Rayon`] this honours a pool registered via
+/// [`set_global_thread_pool`], falling back to rayon's ambient global pool; for
+/// [`Par::RayonWith`] it is the requested count. Feeding this (rather than the
+/// ambient count) to [`partition_work`] keeps the number of chunks aligned with
+/// the pool that will run them.
+#[cfg(feature = "parallel")]
+fn dispatch_thread_count(par: Par) -> usize {
+    if !is_parallelism_enabled() {
+        return 1;
+    }
+    match par {
+        Par::Seq => 1,
+        Par::RayonWith(n) => n.max(1),
+        Par::Rayon => GLOBAL_POOL
+            .get()
+            .map(|p| p.num_threads())
+            .unwrap_or_else(rayon::current_num_threads),
     }
 }
 
-#[cfg(feature = "std")]
-impl AnyPool for SequentialPool {
-    fn num_threads_dyn(&self) -> usize {
-        1
+/// Returns (building on first use) a memoised rayon pool of exactly `n` threads.
+///
+/// [`Par::RayonWith(n)`] must run on a pool of *exactly* `n` threads. Building a
+/// fresh pool per call would spawn `n` OS threads every invocation, so one pool
+/// per distinct `n` is cached behind an `Arc` and reused. Returns `None` if the
+/// pool cannot be built, so the caller can fall back rather than fail the whole
+/// computation.
+#[cfg(feature = "parallel")]
+fn cached_pool(n: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Poisoning only means a *previous* builder panicked; the map itself stays
+    // structurally consistent, so recover the guard instead of propagating a
+    // panic into an unrelated caller.
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pool) = guard.get(&n) {
+        return Some(Arc::clone(pool));
+    }
+    match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+        Ok(pool) => {
+            let pool = Arc::new(pool);
+            guard.insert(n, Arc::clone(&pool));
+            Some(pool)
+        }
+        Err(_) => None,
     }
 }
 
-#[cfg(feature = "std")]
-static GLOBAL_POOL: std::sync::OnceLock<Box<dyn AnyPool>> = std::sync::OnceLock::new();
+/// Runs `op` on the thread pool selected by `par`, so that any rayon parallel
+/// iterator constructed *inside* `op` executes on that pool's worker threads.
+///
+/// * [`Par::RayonWith(n)`] installs the cached `n`-thread pool.
+/// * Otherwise a pool registered via [`set_global_thread_pool`] is installed if
+///   present; failing that, `op` runs on rayon's ambient global pool.
+///
+/// If a fixed-size pool cannot be built, `op` is run directly rather than
+/// failing the caller's computation (correctness is preserved; only the
+/// requested thread count is not honoured in that degraded case).
+#[cfg(feature = "parallel")]
+fn run_in_pool<R, Op>(par: Par, op: Op) -> R
+where
+    Op: FnOnce() -> R + Send,
+    R: Send,
+{
+    match par {
+        Par::RayonWith(n) => match cached_pool(n) {
+            Some(pool) => pool.install(op),
+            None => op(),
+        },
+        _ => match GLOBAL_POOL.get() {
+            Some(pool) => pool.install(op),
+            None => op(),
+        },
+    }
+}
 
 /// Sets the global OxiBLAS thread pool.
 ///
@@ -807,21 +903,29 @@ static GLOBAL_POOL: std::sync::OnceLock<Box<dyn AnyPool>> = std::sync::OnceLock:
 /// ```
 #[cfg(all(feature = "std", feature = "parallel"))]
 pub fn set_global_thread_pool(pool: CustomRayonPool) {
-    let _ = GLOBAL_POOL.set(Box::new(pool));
+    let _ = GLOBAL_POOL.set(pool);
 }
 
 /// Sets the global OxiBLAS thread pool to a sequential (single-threaded)
 /// pool (available without the `parallel` feature).
 #[cfg(all(feature = "std", not(feature = "parallel")))]
 pub fn set_global_thread_pool(pool: SequentialPool) {
-    let _ = GLOBAL_POOL.set(Box::new(pool));
+    let _ = GLOBAL_POOL.set(pool);
 }
 
 /// Returns the number of threads in the global pool, or `1` if no pool has
 /// been registered.
-#[cfg(feature = "std")]
+#[cfg(feature = "parallel")]
 pub fn global_num_threads() -> usize {
-    GLOBAL_POOL.get().map(|p| p.num_threads_dyn()).unwrap_or(1)
+    GLOBAL_POOL.get().map(|p| p.num_threads()).unwrap_or(1)
+}
+
+/// Returns the number of threads in the global pool, or `1` if no pool has
+/// been registered (always `1` on `std` builds without the `parallel`
+/// feature, where the registry can only hold a sequential pool).
+#[cfg(all(feature = "std", not(feature = "parallel")))]
+pub fn global_num_threads() -> usize {
+    GLOBAL_POOL.get().map_or(1, |p| p.num_threads())
 }
 
 /// Executes `f` inside a temporary rayon pool with exactly `n` threads.
@@ -859,12 +963,24 @@ pub fn with_thread_count(_n: usize, f: impl FnOnce()) {
 // Thread-local accumulation
 // =============================================================================
 
-/// Thread-local accumulator for parallel reduction.
+/// Sharded accumulator for parallel reduction.
 ///
-/// This is useful for operations like parallel summation where each thread
-/// maintains its own accumulator to avoid synchronization.
+/// Despite the historical "thread-local" framing, this is a **sharded**
+/// accumulator, not a strictly one-slot-per-thread one. It allocates one
+/// mutex-guarded shard per rayon worker ([`rayon::current_num_threads`] at
+/// construction) and routes each caller to a shard via its
+/// [`rayon::current_thread_index`]. Callers with no rayon index (the invoking
+/// thread, or a thread belonging to a *different* pool) — and any index `>=`
+/// the shard count — fold onto an existing shard via modulo. That aliasing only
+/// ever adds mutex contention: because every shard is mutex-guarded it can
+/// never cause a data race or a lost update, so the final [`reduce`] is always
+/// correct; it simply is not lock-free in the aliased case. Prefer it for
+/// per-worker accumulation on the pool that created it, and rely on the
+/// mutexes for correctness everywhere else.
 ///
 /// Requires the `parallel` feature (which implies `std`).
+///
+/// [`reduce`]: ThreadLocalAccum::reduce
 #[cfg(feature = "parallel")]
 pub struct ThreadLocalAccum<T> {
     values: Vec<std::sync::Mutex<T>>,
@@ -872,9 +988,13 @@ pub struct ThreadLocalAccum<T> {
 
 #[cfg(feature = "parallel")]
 impl<T: Clone + Send> ThreadLocalAccum<T> {
-    /// Creates a new thread-local accumulator.
+    /// Creates a new sharded accumulator with one shard per rayon worker.
     pub fn new(identity: T) -> Self {
-        let num_threads = rayon::current_num_threads();
+        // At least one shard is always allocated. `rayon::current_num_threads`
+        // is documented to return `>= 1`, but the explicit `.max(1)` makes the
+        // non-empty invariant that `reduce` relies on hold *by construction*,
+        // independent of that external guarantee.
+        let num_threads = rayon::current_num_threads().max(1);
         let values = (0..num_threads)
             .map(|_| std::sync::Mutex::new(identity.clone()))
             .collect();
@@ -889,19 +1009,30 @@ impl<T: Clone + Send> ThreadLocalAccum<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Reduces all thread-local values into a single result.
+    /// Folds every shard into a single result using `f`.
+    ///
+    /// `f` must be an associative combiner over the accumulated values (the
+    /// same monoid whose identity was passed to [`new`](Self::new)); the shards
+    /// are combined left-to-right in shard order.
     pub fn reduce<F>(self, f: F) -> T
     where
         F: Fn(T, T) -> T,
     {
-        self.values
-            .into_iter()
-            .map(|m| {
-                m.into_inner()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
-            .reduce(f)
-            .expect("ThreadLocalAccum should have at least one value")
+        let mut acc: Option<T> = None;
+        for shard in self.values {
+            let value = shard
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            acc = Some(match acc {
+                Some(previous) => f(previous, value),
+                None => value,
+            });
+        }
+        // Infallible by construction: `new` allocates `num_threads.max(1) >= 1`
+        // shards, so the loop above runs at least once and `acc` is always
+        // `Some` here. This `.expect` therefore cannot panic; it documents the
+        // invariant rather than guarding a reachable failure.
+        acc.expect("ThreadLocalAccum always holds at least one shard")
     }
 }
 
@@ -1000,11 +1131,11 @@ mod tests {
         assert_eq!(b, 4);
 
         // Test for_each
-        let sum = std::sync::atomic::AtomicUsize::new(0);
+        let sum = core::sync::atomic::AtomicUsize::new(0);
         pool.for_each(0..10, |i| {
-            sum.fetch_add(i, std::sync::atomic::Ordering::SeqCst);
+            sum.fetch_add(i, core::sync::atomic::Ordering::SeqCst);
         });
-        assert_eq!(sum.load(std::sync::atomic::Ordering::SeqCst), 45);
+        assert_eq!(sum.load(core::sync::atomic::Ordering::SeqCst), 45);
 
         // Test map_reduce
         let result = pool.map_reduce(0..10, 0, |i| i, |a, b| a + b);
@@ -1023,11 +1154,11 @@ mod tests {
         assert_eq!(result, (0..100).sum::<usize>());
 
         // Test for_each
-        let sum = std::sync::atomic::AtomicUsize::new(0);
+        let sum = core::sync::atomic::AtomicUsize::new(0);
         scope.for_each(10, |i| {
-            sum.fetch_add(i, std::sync::atomic::Ordering::SeqCst);
+            sum.fetch_add(i, core::sync::atomic::Ordering::SeqCst);
         });
-        assert_eq!(sum.load(std::sync::atomic::Ordering::SeqCst), 45);
+        assert_eq!(sum.load(core::sync::atomic::Ordering::SeqCst), 45);
     }
 
     #[test]
@@ -1090,6 +1221,7 @@ mod tests {
 
     // ---- OxiblasThreadConfig tests ------------------------------------------
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_default() {
         let cfg = OxiblasThreadConfig::default();
@@ -1098,6 +1230,7 @@ mod tests {
         assert!(cfg.thread_name.is_none());
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_builder() {
         let cfg = OxiblasThreadConfig::new()
@@ -1109,6 +1242,7 @@ mod tests {
         assert_eq!(cfg.thread_name.as_deref(), Some("oxiblas-worker"));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_effective_threads_zero() {
         let cfg = OxiblasThreadConfig::new().num_threads(0);
@@ -1116,6 +1250,7 @@ mod tests {
         assert!(cfg.effective_threads() >= 1);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_thread_config_effective_threads_explicit() {
         let cfg = OxiblasThreadConfig::new().num_threads(3);
@@ -1165,5 +1300,152 @@ mod tests {
         // Before any pool is registered the answer must be at least 1.
         // (May be > 1 if a sibling test already set the global pool.)
         assert!(global_num_threads() >= 1);
+    }
+
+    // ---- Real-parallelism regression tests ----------------------------------
+    //
+    // These deliberately do NOT rely on numeric results (those were already
+    // correct while parallelism was silently absent). Instead they observe
+    // *where* work runs — the installed pool's thread count or its distinctive
+    // thread-name prefix — which is what actually regressed.
+
+    /// Finding 4: `Par::RayonWith(n)` must install a pool of exactly `n`
+    /// threads. Inside that pool `rayon::current_num_threads()` reports `n`;
+    /// the pre-fix code ran on the ambient global pool and reported its size.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_rayon_with_installs_n_thread_pool() {
+        let observed3 = run_in_pool(Par::RayonWith(3), rayon::current_num_threads);
+        assert_eq!(observed3, 3, "RayonWith(3) did not install a 3-thread pool");
+        let observed5 = run_in_pool(Par::RayonWith(5), rayon::current_num_threads);
+        assert_eq!(observed5, 5, "RayonWith(5) did not install a 5-thread pool");
+        // Cached: a second request for 3 threads reuses the same-sized pool.
+        let again = run_in_pool(Par::RayonWith(3), rayon::current_num_threads);
+        assert_eq!(again, 3, "cached RayonWith(3) pool changed size");
+    }
+
+    /// Finding 4 (public path): `for_each_range` with `RayonWith` must tile the
+    /// whole domain exactly once regardless of how the ranges are dispatched.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_for_each_range_rayon_with_covers_domain() {
+        enable_global_parallelism();
+        let covered = core::sync::atomic::AtomicUsize::new(0);
+        let low = ParThreshold::new(1, 1);
+        for_each_range(4_096, Par::RayonWith(4), &low, |range| {
+            covered.fetch_add(range.len(), core::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            covered.load(core::sync::atomic::Ordering::SeqCst),
+            4_096,
+            "RayonWith ranges did not tile the domain"
+        );
+    }
+
+    /// Finding 3: `set_global_thread_pool` must make `Par::Rayon` actually run
+    /// on the registered pool (pre-fix it was stored but never used). This is
+    /// the ONLY test that registers a global pool, so its `set` always wins the
+    /// process-wide `OnceLock` regardless of test ordering. The registered pool
+    /// carries a distinctive thread-name prefix; the ambient rayon pool's
+    /// threads are unnamed, so a name match proves the work ran on our pool.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_global_pool_executes_on_registered_pool() {
+        let pool = OxiblasThreadConfig::new()
+            .num_threads(3)
+            .thread_name("oxiblas-global-test")
+            .build_pool()
+            .expect("build named global pool");
+        assert_eq!(pool.num_threads(), 3);
+        set_global_thread_pool(pool);
+        assert_eq!(
+            global_num_threads(),
+            3,
+            "registered pool size not reflected"
+        );
+
+        let names = std::sync::Mutex::new(std::collections::HashSet::new());
+        run_in_pool(Par::Rayon, || {
+            (0..4_096usize).into_par_iter().for_each(|_| {
+                if let Some(name) = std::thread::current().name() {
+                    names
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(name.to_string());
+                }
+            });
+        });
+        let names = names
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !names.is_empty(),
+            "no named worker observed; work did not run on the registered pool"
+        );
+        assert!(
+            names.iter().all(|n| n.starts_with("oxiblas-global-test")),
+            "Par::Rayon ran on unexpected threads: {names:?}"
+        );
+    }
+
+    /// Finding 5: `PoolScope::for_each_range`'s parallel branch must dispatch
+    /// across the pool, not loop on the caller thread. The pool's workers carry
+    /// a distinctive name prefix; the calling (test) thread does not, so an
+    /// all-prefixed observation proves off-caller execution.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_pool_scope_for_each_range_runs_on_pool() {
+        let pool = OxiblasThreadConfig::new()
+            .num_threads(3)
+            .thread_name("oxiblas-scope-test")
+            .build_pool()
+            .expect("build named scope pool");
+        let scope = PoolScope::with_threshold(&pool, ParThreshold::new(1, 1));
+
+        let names = std::sync::Mutex::new(std::collections::HashSet::new());
+        let covered = core::sync::atomic::AtomicUsize::new(0);
+        let total = 96usize;
+        scope.for_each_range(total, |range| {
+            covered.fetch_add(range.len(), core::sync::atomic::Ordering::SeqCst);
+            let name = std::thread::current().name().map(str::to_string);
+            names
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(name);
+        });
+        let names = names
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            names.iter().all(|n| n
+                .as_deref()
+                .is_some_and(|n| n.starts_with("oxiblas-scope-test"))),
+            "ranges executed off-pool (likely on the caller thread): {names:?}"
+        );
+        assert_eq!(
+            covered.load(core::sync::atomic::Ordering::SeqCst),
+            total,
+            "PoolScope ranges did not tile the domain"
+        );
+    }
+
+    /// Finding 6: `ThreadLocalAccum::reduce` must be infallible by construction
+    /// (never the pre-fix `.expect` on a possibly-empty iterator) and must
+    /// recombine the per-worker shards correctly.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_thread_local_accum_reduce_infallible() {
+        // Identity 0, no contributions: reduce over >= 1 shard yields 0 and
+        // never panics.
+        let empty = ThreadLocalAccum::new(0i64);
+        assert_eq!(empty.reduce(|a, b| a + b), 0);
+
+        // Parallel accumulation via per-worker shards recombines to the total.
+        let accum = ThreadLocalAccum::new(0i64);
+        (0..1_000i64).into_par_iter().for_each(|x| {
+            let mut shard = accum.get();
+            *shard += x;
+        });
+        assert_eq!(accum.reduce(|a, b| a + b), (0..1_000i64).sum::<i64>());
     }
 }

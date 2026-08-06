@@ -1,0 +1,10 @@
+# OxiBLAS rustfmt configuration.
+#
+# Intentionally minimal: the existing codebase already conforms to rustfmt's
+# stable defaults (verified via `cargo fmt --all -- --check` prior to adding
+# this file — only a handful of lines in files touched by concurrent hygiene
+# fixes needed rewrapping, not a repo-wide reformat). `edition` is pinned
+# explicitly as a safety net so formatting stays edition-2024-aware even if
+# rustfmt is ever invoked outside `cargo fmt` (which otherwise infers it from
+# Cargo.toml).
+edition = "2024"

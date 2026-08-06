@@ -5,7 +5,7 @@ This directory contains GitHub Actions workflows for automated testing, benchmar
 ## Workflows
 
 ### CI (`ci.yml`)
-Runs on every push and pull request to `main` and `develop` branches.
+Runs on every push and pull request to `master`, `main`, and `develop` branches.
 
 **Jobs:**
 - **test**: Runs test suite on Ubuntu, macOS, and Windows with stable and nightly Rust
@@ -22,8 +22,8 @@ Runs on every push and pull request to `main` and `develop` branches.
 Performance tracking and regression detection.
 
 **Triggers:**
-- Push to `main`
-- Pull requests to `main`
+- Push to `master`/`main`
+- Pull requests to `master`/`main`
 - Weekly schedule (Sunday 00:00 UTC)
 - Manual dispatch
 
@@ -38,7 +38,7 @@ Performance tracking and regression detection.
   - Runs baseline on base branch
   - Compares PR performance
   - Reports significant regressions
-- **performance-tracking**: Long-term performance data (main branch only)
+- **performance-tracking**: Long-term performance data (master/main branch only)
   - Stores results for 90 days
   - Tracks GEMM and BLAS3 performance over time
 - **benchmark-matrix**: Comprehensive benchmarking (weekly/manual)
@@ -67,7 +67,7 @@ Automated release process triggered by version tags (`v*`).
 Pull requests automatically compare performance against the base branch for critical operations (BLAS Level 3, GEMM). Significant regressions are flagged in the PR.
 
 ### Historical Data
-Main branch benchmarks are stored with commit SHA for long-term performance analysis. Data includes:
+Master/main branch benchmarks are stored with commit SHA for long-term performance analysis. Data includes:
 - GEMM performance (f32/f64/c32/c64)
 - BLAS Level 3 operations (SYRK, TRSM, etc.)
 - Sparse operations
@@ -81,8 +81,8 @@ gh workflow run benchmarks.yml
 
 ### Triggering a Release
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 ### Viewing Benchmark Results
@@ -129,5 +129,5 @@ The benchmark-compare job automatically detects performance regressions in PRs b
 
 - **Caching**: All workflows cache cargo registry, index, and build artifacts
 - **Matrix strategy**: Tests run in parallel across OS/Rust versions
-- **Conditional execution**: Performance tracking only on main branch
+- **Conditional execution**: Performance tracking only on master/main branch
 - **Artifact cleanup**: Automatic cleanup via retention policies

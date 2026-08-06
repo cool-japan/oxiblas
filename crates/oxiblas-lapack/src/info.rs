@@ -11,15 +11,24 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use oxiblas_lapack::info::{LuInfo, compute_lu_info};
-//! use oxiblas_lapack::lu::Lu;
+//! ```
+//! use oxiblas_lapack::info::compute_lu_info;
+//! use oxiblas_matrix::Mat;
 //!
-//! let lu = Lu::compute(a.as_ref()).unwrap();
-//! let info = compute_lu_info(&lu);
+//! // An already-upper-triangular matrix needs no pivoting, so its combined
+//! // LU storage is the matrix itself (L's sub-diagonal is all zero).
+//! let a: Mat<f64> = Mat::from_rows(&[&[4.0, 1.0], &[0.0, 3.0]]);
+//! let lu_matrix = a.clone();
+//! let pivot = [0usize, 1];
+//! let num_swaps = 0; // no row interchanges were needed
+//!
+//! // `a.as_ref()` (the original matrix) is required alongside the
+//! // factors: pivot growth and rcond are both computed against it.
+//! let info = compute_lu_info(a.as_ref(), lu_matrix.as_ref(), &pivot, num_swaps);
 //!
 //! println!("Pivot growth factor: {}", info.pivot_growth);
 //! println!("Estimated condition: {}", info.rcond_estimate);
+//! assert_eq!(info.pivot_growth, 1.0); // no growth: already triangular
 //! if info.is_nearly_singular(1e-12) {
 //!     println!("Warning: Matrix is nearly singular");
 //! }
@@ -640,13 +649,37 @@ use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::MatRef;
 
 /// Compute LU factorization info from the LU factors.
-pub fn compute_lu_info<T>(lu_matrix: MatRef<'_, T>, _pivot: &[usize], num_swaps: usize) -> LuInfo<T>
+///
+/// # Arguments
+///
+/// * `a_matrix` - The original, unfactored matrix `A` (before pivoting/
+///   factorization). Required to compute the real LAPACK-style pivot
+///   growth factor and reciprocal condition number below; the in-place
+///   combined LU storage alone cannot provide either (its below-diagonal
+///   part holds `L`'s multipliers, not `A`).
+/// * `lu_matrix` - The combined `L`/`U` factors as produced by the
+///   factorization (unit-lower-triangular `L` below the diagonal, `U` on
+///   and above it).
+/// * `_pivot` - Row-pivot indices. Not needed for either diagnostic below:
+///   the pivot growth factor is a max over all entries of `A` and `U`
+///   regardless of row order, and `rcond_estimate` is computed directly
+///   from `a_matrix`.
+/// * `num_swaps` - Number of row interchanges (used for determinant sign).
+pub fn compute_lu_info<T>(
+    a_matrix: MatRef<'_, T>,
+    lu_matrix: MatRef<'_, T>,
+    _pivot: &[usize],
+    num_swaps: usize,
+) -> LuInfo<T>
 where
-    T: Field + Real + Float,
+    T: Field + Real + Float + bytemuck::Zeroable,
 {
     let n = lu_matrix.nrows();
 
-    // Compute pivot growth factor
+    // Real LAPACK-style pivot growth factor: max|U(i,j)| / max|A(i,j)|
+    // (see LAPACK's DLA_GERPVGRW, the xGECON-family companion diagnostic).
+    // U occupies the on-and-above-diagonal portion of the combined LU
+    // storage.
     let mut max_u = T::zero();
     for i in 0..n {
         for j in i..n {
@@ -657,11 +690,12 @@ where
         }
     }
 
-    // Estimate original matrix max (approximate)
-    let mut max_a = max_u;
-    for i in 0..n {
-        for j in 0..i {
-            let val = Scalar::abs(lu_matrix[(i, j)]);
+    // max|A(i,j)| over the real, original (unfactored) matrix -- not the
+    // LU storage's lower triangle, which holds L's multipliers.
+    let mut max_a = T::zero();
+    for i in 0..a_matrix.nrows() {
+        for j in 0..a_matrix.ncols() {
+            let val = Scalar::abs(a_matrix[(i, j)]);
             if val > max_a {
                 max_a = val;
             }
@@ -671,6 +705,7 @@ where
     let pivot_growth = if max_a > T::zero() {
         max_u / max_a
     } else {
+        // A is the zero matrix: no growth to report.
         T::one()
     };
 
@@ -692,11 +727,18 @@ where
         }
     }
 
-    // Estimate reciprocal condition number
-    let rcond = if max_diag > T::zero() && min_diag > T::zero() {
-        min_diag / max_diag
+    // Real reciprocal condition number estimate: delegate to the crate's
+    // Hager-Higham one-norm estimator (`utils::condition::rcond_estimate`),
+    // run on the real original matrix, instead of a diagonal-ratio proxy.
+    // The only failure mode of `rcond_estimate` for a square input is the
+    // n == 0 case, which is handled explicitly and honestly below (there is
+    // no ill-conditioning to report for an empty matrix); any other error
+    // is structurally unreachable here because `a_matrix` is guaranteed
+    // square (it is the same matrix that produced `lu_matrix`).
+    let rcond = if n == 0 {
+        T::one()
     } else {
-        T::zero()
+        crate::utils::rcond_estimate(a_matrix).unwrap_or_else(|_| T::zero())
     };
 
     // Determine sign of determinant
@@ -736,14 +778,19 @@ where
         let diag = l_matrix[(i, i)];
         let diag_abs = Scalar::abs(diag);
 
-        if diag <= T::zero() {
+        // `<=`/`>` are always false for NaN, so a NaN diagonal would
+        // otherwise silently skip both the failure flag and the min/max
+        // tracking below instead of correctly signaling a broken
+        // factorization (`diag.is_nan()` catches what `diag <= T::zero()`
+        // misses).
+        if diag.is_nan() || diag <= T::zero() {
             failure_index = Some(i);
         }
 
-        if diag_abs > max_diag {
+        if diag_abs.is_nan() || diag_abs > max_diag {
             max_diag = diag_abs;
         }
-        if diag_abs < min_diag && diag_abs > T::zero() {
+        if diag_abs.is_nan() || (diag_abs > T::zero() && diag_abs < min_diag) {
             min_diag = diag_abs;
         }
         if diag > T::zero() {
@@ -1122,17 +1169,88 @@ mod tests {
 
     #[test]
     fn test_lu_info() {
-        // Simple LU factors
-        let lu: Mat<f64> = Mat::from_rows(&[
-            &[4.0, 3.0],
-            &[0.5, 1.5], // L21 = 0.5, U22 = 3 - 0.5*2 = 1.5... wait, let me redo
-        ]);
+        // Simple LU factors: L = [[1,0],[0.5,1]], U = [[4,3],[0,1.5]],
+        // so A = L*U = [[4,3],[2,3]] (L21 = 0.5, U22 = 3 - 0.5*3 = 1.5).
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 3.0], &[2.0, 3.0]]);
+        let lu: Mat<f64> = Mat::from_rows(&[&[4.0, 3.0], &[0.5, 1.5]]);
 
-        let info = compute_lu_info(lu.as_ref(), &[0, 1], 0);
+        let info = compute_lu_info(a.as_ref(), lu.as_ref(), &[0, 1], 0);
 
         assert_eq!(info.n, 2);
         assert!(info.pivot_growth >= 0.0);
         assert!(info.det_sign == 1 || info.det_sign == -1);
+        // max|U| = 4 (U = [[4,3],[0,1.5]]), max|A| = 4 -> pivot growth = 1.
+        assert!((info.pivot_growth - 1.0).abs() < 1e-10);
+        // A = [[4,3],[2,3]] is well-conditioned; rcond should be sane.
+        assert!(info.rcond_estimate > 0.0);
+        assert!(info.rcond_estimate <= 1.0);
+    }
+
+    #[test]
+    fn test_lu_info_pivot_growth_not_polluted_by_l_multipliers() {
+        // Regression test for the pivot-growth fabrication: a large L
+        // multiplier below the diagonal must NOT be mistaken for a large
+        // |A(i,j)| entry. Here L21 = 100 (a large multiplier) but the
+        // original matrix A has max|A| = 5, and U has max|U| = 5, so the
+        // real pivot growth factor is 5/5 = 1, not inflated by L21=100.
+        //
+        // L = [[1,0],[100,1]], U = [[5,0],[0,2]]
+        // A = L*U = [[5,0],[500,2]]
+        let a: Mat<f64> = Mat::from_rows(&[&[5.0, 0.0], &[500.0, 2.0]]);
+        let lu: Mat<f64> = Mat::from_rows(&[&[5.0, 0.0], &[100.0, 2.0]]);
+
+        let info = compute_lu_info(a.as_ref(), lu.as_ref(), &[0, 1], 0);
+
+        // max|U| = 5, max|A| = 500 -> real pivot growth = 5/500 = 0.01.
+        // The old (buggy) formula used max_a = max(max_u, |L21|) = max(5, 100)
+        // = 100, giving a fabricated pivot_growth of 5/100 = 0.05.
+        assert!((info.pivot_growth - 0.01).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_lu_info_end_to_end_with_real_lu_factorization() {
+        use crate::lu::Lu;
+
+        let a: Mat<f64> = Mat::from_rows(&[&[2.0, 1.0], &[1.0, 3.0]]);
+        let lu = Lu::compute(a.as_ref()).expect("matrix is non-singular");
+
+        let info = compute_lu_info(a.as_ref(), lu.lu_matrix(), lu.pivot(), 0);
+
+        assert_eq!(info.n, 2);
+        assert!(info.pivot_growth > 0.0);
+        // rcond_estimate must genuinely reflect conditioning: compare against
+        // the crate's own condition-number estimator on the same matrix.
+        let expected_rcond = crate::utils::rcond_estimate(a.as_ref()).unwrap();
+        assert!((info.rcond_estimate - expected_rcond).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_lu_info_rcond_reflects_ill_conditioning() {
+        use crate::lu::Lu;
+
+        // Hilbert(5) is a classic, badly ill-conditioned matrix
+        // (true kappa_1 is on the order of 10^6). The now-removed
+        // diagonal-ratio proxy (min_diag_U / max_diag_U) would report a
+        // deceptively tame value here; the real Hager-Higham estimator
+        // must report something genuinely tiny.
+        let n = 5;
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                a[(i, j)] = 1.0 / ((i + j + 1) as f64);
+            }
+        }
+        let lu = Lu::compute(a.as_ref()).expect("Hilbert matrix is non-singular");
+
+        let info = compute_lu_info(a.as_ref(), lu.lu_matrix(), lu.pivot(), 0);
+
+        // Must match the crate's real estimator exactly (genuine wiring).
+        let expected_rcond = crate::utils::rcond_estimate(a.as_ref()).unwrap();
+        assert!((info.rcond_estimate - expected_rcond).abs() < 1e-12);
+
+        // And that real estimate must actually reflect the severe
+        // ill-conditioning of a 5x5 Hilbert matrix.
+        assert!(info.rcond_estimate < 1e-4);
     }
 
     #[test]
@@ -1205,8 +1323,9 @@ mod tests {
 
     #[test]
     fn test_lu_info_display() {
+        let a: Mat<f64> = Mat::from_rows(&[&[4.0, 3.0], &[2.0, 3.0]]);
         let lu: Mat<f64> = Mat::from_rows(&[&[4.0, 3.0], &[0.5, 1.5]]);
-        let info = compute_lu_info(lu.as_ref(), &[0, 1], 0);
+        let info = compute_lu_info(a.as_ref(), lu.as_ref(), &[0, 1], 0);
         let display = format!("{}", info);
         assert!(display.contains("LU Factorization Info"));
         assert!(display.contains("Matrix size: 2×2"));

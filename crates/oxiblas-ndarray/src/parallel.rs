@@ -5,15 +5,18 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use oxiblas_ndarray::parallel::{gemm_par_ndarray, matmul_par};
-//! use ndarray::Array2;
+//! ```
+//! # #[cfg(feature = "parallel")] {
+//! use ndarray::array;
+//! use oxiblas_ndarray::parallel::matmul_par;
 //!
-//! let a = Array2::from_shape_fn((100, 100), |(i, j)| (i + j) as f64);
-//! let b = Array2::from_shape_fn((100, 100), |(i, j)| (i * j) as f64);
+//! // A (2x3) * B (3x2) = C (2x2)
+//! let a = array![[1.0f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+//! let b = array![[7.0f64, 8.0], [9.0, 10.0], [11.0, 12.0]];
 //!
-//! // Parallel matrix multiply
 //! let c = matmul_par(&a, &b);
+//! assert_eq!(c, array![[58.0, 64.0], [139.0, 154.0]]);
+//! # }
 //! ```
 
 use crate::conversions::array2_to_mat;

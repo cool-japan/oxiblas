@@ -176,123 +176,100 @@ impl<T: Field + Real> BandLu<T> {
             });
         }
 
-        // Copy to work array
+        // Copy to work array.
         let mut ab_work = ab.to_vec();
+
+        // Zero the fill-in region.
+        //
+        // As partial pivoting interchanges rows, the factor U acquires up to `kl`
+        // extra super-diagonals beyond the original `ku` (LAPACK calls the total
+        // KV = KU + KL). Those extra super-diagonals occupy band rows `0..kl` of
+        // the storage, which the *input* matrix never uses (`dense_to_band` leaves
+        // them zero). LAPACK's DGBTF2 zeroes this region defensively before the
+        // sweep so that any stale data a caller left in the fill rows cannot leak
+        // into the factorization; we mirror that to match reference behaviour.
+        for j in 0..n {
+            for r in 0..kl {
+                ab_work[r + j * ldab] = T::zero();
+            }
+        }
+
         let mut pivot = vec![0usize; n];
 
-        // Perform band LU factorization with partial pivoting
-        // Algorithm based on LAPACK's DGBTRF
-
-        // ju tracks the maximum column affected by fill-in
+        // `ju` is the index of the right-most column reached so far by fill-in.
+        // It is monotonically non-decreasing and bounds every trailing update.
         let mut ju = 0usize;
 
+        // Gaussian elimination with partial pivoting, one column at a time
+        // (LAPACK DGBTF2, the unblocked band factorization).
         for j in 0..n {
-            // Find pivot in column j
-            // Search from row j to min(j + kl, n-1)
+            // Number of sub-diagonal candidates below the diagonal of column j.
             let km = kl.min(n - 1 - j);
-            let mut pivot_row = 0; // relative to j
-            let mut pivot_val = scalar_abs(ab_work[band_idx(ldab, kl, ku, j, j)]);
 
+            // Find the pivot: the row in j..=j+km whose entry has largest magnitude.
+            // `jp_rel` is the pivot row's offset relative to j (0 == the diagonal).
+            let mut jp_rel = 0usize;
+            let mut pivot_val = scalar_abs(ab_work[band_idx(ldab, kl, ku, j, j)]);
             for i in 1..=km {
                 let val = scalar_abs(ab_work[band_idx(ldab, kl, ku, j + i, j)]);
                 if val > pivot_val {
                     pivot_val = val;
-                    pivot_row = i;
+                    jp_rel = i;
                 }
             }
 
-            pivot[j] = j + pivot_row;
+            // Record the absolute pivot row index (0-based) for `solve`.
+            pivot[j] = j + jp_rel;
 
-            // Check for singularity
+            // Singularity test. LAPACK reports an *exactly* zero pivot; we keep the
+            // slightly stronger near-zero guard used across this crate so a solve
+            // against a numerically singular band matrix fails loudly instead of
+            // dividing by an (almost) zero pivot. A NaN pivot fails the `> tol`
+            // comparison and is therefore reported/propagated, never clamped.
             let tol = scalar_epsilon::<T>()
                 * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
             if pivot_val <= tol {
                 return Err(BandLuError::Singular { index: j });
             }
 
-            // Swap rows if needed
-            if pivot_row != 0 {
-                // Update ju to track fill-in extent
-                ju = ju.max((j + ku + pivot_row).min(n - 1));
+            // Extend the fill-in frontier. Pulling up row `j+jp_rel` reaches
+            // `ku + jp_rel` super-diagonals to the right of column j.
+            ju = ju.max((j + ku + jp_rel).min(n - 1));
 
-                // Swap elements in columns max(j - ku - kl, 0) to min(j + ku + kl, n-1)
-                let jfirst = j.saturating_sub(ku + kl);
-                let jlast = (j + ku + kl).min(n - 1);
-
-                for jj in jfirst..=jlast {
-                    // Only swap if both rows have elements in this column
-                    let row1 = j;
-                    let row2 = j + pivot_row;
-
-                    // Check if row1 has element in column jj
-                    let row1_has = jj.saturating_sub(ku) <= row1 && row1 <= jj + kl;
-                    // Check if row2 has element in column jj
-                    let row2_has = jj.saturating_sub(ku) <= row2 && row2 <= jj + kl;
-
-                    if row1_has && row2_has {
-                        let idx1 = band_idx(ldab, kl, ku, row1, jj);
-                        let idx2 = band_idx(ldab, kl, ku, row2, jj);
-                        ab_work.swap(idx1, idx2);
-                    } else if row2_has && !row1_has {
-                        // row2 has element but row1 is outside band - need fill-in
-                        let idx2 = band_idx(ldab, kl, ku, row2, jj);
-                        // Fill-in goes to extended band storage
-                        if jj >= j && jj <= j + ku + kl {
-                            let idx1 = band_idx_extended(ldab, kl, ku, row1, jj);
-                            ab_work.swap(idx1, idx2);
-                        }
-                    }
+            // Apply the interchange ONLY to columns j..=ju (the current column and
+            // the trailing sub-matrix). We deliberately do NOT permute the already
+            // computed multipliers stored in columns < j: L's column k holds the
+            // multipliers relative to the row order in effect immediately after
+            // step k, and the outstanding permutation is replayed, interleaved,
+            // at solve time. Retroactively swapping earlier L columns (the previous
+            // implementation's bug) corrupts the factorization the moment any real
+            // row swap occurs. This is the exact convention of LAPACK DGBTF2/DGBTRS.
+            if jp_rel != 0 {
+                for c in j..=ju {
+                    let idx_j = band_idx(ldab, kl, ku, j, c);
+                    let idx_p = band_idx(ldab, kl, ku, j + jp_rel, c);
+                    ab_work.swap(idx_j, idx_p);
                 }
             }
 
-            // Compute multipliers
-            let pivot_inv = T::one() / ab_work[band_idx(ldab, kl, ku, j, j)];
-
-            for i in 1..=km {
-                let idx = band_idx(ldab, kl, ku, j + i, j);
-                ab_work[idx] = ab_work[idx] * pivot_inv;
-            }
-
-            // Update the trailing matrix
-            // U row j affects columns j+1 to min(j + ku + kl, n-1)
-            let ju_local = (j + ku).min(n - 1);
-
-            for jj in (j + 1)..=ju.max(ju_local) {
-                // Check if U[j, jj] exists
-                if jj > j + ku + kl {
-                    break;
-                }
-
-                // Get U[j, jj]
-                let u_jjj = if jj <= j + ku {
-                    ab_work[band_idx(ldab, kl, ku, j, jj)]
-                } else {
-                    // Fill-in element
-                    ab_work[band_idx_extended(ldab, kl, ku, j, jj)]
-                };
-
-                if u_jjj == T::zero() {
-                    continue;
-                }
-
-                // Update A[j+1:j+km, jj] -= L[j+1:j+km, j] * U[j, jj]
+            if km > 0 {
+                // Scale column j's sub-diagonal entries to form L's multipliers.
+                let pivot_inv = T::one() / ab_work[band_idx(ldab, kl, ku, j, j)];
                 for i in 1..=km {
-                    // Check if A[j+i, jj] exists in band
-                    let row = j + i;
-                    let col = jj;
+                    let idx = band_idx(ldab, kl, ku, j + i, j);
+                    ab_work[idx] = ab_work[idx] * pivot_inv;
+                }
 
-                    // Distance from main diagonal
-                    let diag_dist = col as isize - row as isize;
-
-                    // Check if within band (including fill-in region)
-                    if diag_dist >= -(kl as isize) && diag_dist <= (ku as isize + kl as isize) {
-                        let l_elem = ab_work[band_idx(ldab, kl, ku, row, j)];
-                        let idx = if diag_dist <= ku as isize {
-                            band_idx(ldab, kl, ku, row, col)
-                        } else {
-                            band_idx_extended(ldab, kl, ku, row, col)
-                        };
-                        ab_work[idx] = ab_work[idx] - l_elem * u_jjj;
+                // Rank-1 update of the trailing sub-matrix inside the band:
+                // A[j+1..=j+km, c] -= L[j+1..=j+km, j] * U[j, c] for c in j+1..=ju.
+                for c in (j + 1)..=ju {
+                    let u_jc = ab_work[band_idx(ldab, kl, ku, j, c)];
+                    if u_jc != T::zero() {
+                        for i in 1..=km {
+                            let l_ij = ab_work[band_idx(ldab, kl, ku, j + i, j)];
+                            let idx = band_idx(ldab, kl, ku, j + i, c);
+                            ab_work[idx] = ab_work[idx] - l_ij * u_jc;
+                        }
                     }
                 }
             }
@@ -364,46 +341,45 @@ impl<T: Field + Real> BandLu<T> {
 
         let mut x = b.to_vec();
 
-        // Apply row permutations (forward)
-        for k in 0..self.n {
-            let pk = self.pivot[k];
-            if k != pk {
-                x.swap(k, pk);
+        // Forward sweep: solve L y = P b (LAPACK DGBTRS, TRANS = 'N').
+        //
+        // The permutation is *interleaved* with the elimination, not applied up
+        // front: the stored L factors as P(0) L(0) P(1) L(1) ... where each L(j) is
+        // the rank-one multiplier column produced at step j and each P(j) is the
+        // step-j interchange. Applying every interchange first and then doing a
+        // single L sweep (the previous, buggy approach) reorders the unknowns
+        // inconsistently with how the multipliers were recorded, giving silently
+        // wrong results the moment a real row swap occurs. We therefore
+        // swap-then-eliminate at each step, exactly mirroring `compute`.
+        //
+        // `LNOTI` in DGBTRS: the whole forward stage is skipped when kl == 0, since
+        // an upper-triangular band matrix never pivots (pivot[j] == j for all j).
+        if self.kl > 0 {
+            for j in 0..self.n {
+                let lm = self.kl.min(self.n - 1 - j);
+                let p = self.pivot[j];
+                if p != j {
+                    x.swap(j, p);
+                }
+                let xj = x[j];
+                for i in 1..=lm {
+                    let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
+                    x[j + i] = x[j + i] - l_elem * xj;
+                }
             }
         }
 
-        // Forward substitution: Ly = Pb
-        // L has unit diagonal and bandwidth kl
-        for j in 0..self.n {
-            let km = self.kl.min(self.n - 1 - j);
-            for i in 1..=km {
-                let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
-                x[j + i] = x[j + i] - l_elem * x[j];
-            }
-        }
-
-        // Back substitution: Ux = y
-        // U has bandwidth ku + kl (due to fill-in during pivoting)
+        // Back substitution: solve U x = y. U is upper triangular with kl+ku
+        // super-diagonals (the pivoting fill-in), so column j reaches back to
+        // row j-(kl+ku).
+        let kmax = self.ku + self.kl;
         for j in (0..self.n).rev() {
-            // Divide by diagonal
             let diag = self.ab[band_idx(self.ldab, self.kl, self.ku, j, j)];
             x[j] = x[j] / diag;
-
-            // Update x[i] for i < j where U[i, j] != 0
-            let kmax = self.ku + self.kl;
+            let xj = x[j];
             for i in j.saturating_sub(kmax)..j {
-                // Distance from diagonal
-                let diag_dist = j as isize - i as isize;
-
-                // Get U[i, j]
-                let u_elem = if diag_dist <= self.ku as isize {
-                    self.ab[band_idx(self.ldab, self.kl, self.ku, i, j)]
-                } else {
-                    // Fill-in element
-                    self.ab[band_idx_extended(self.ldab, self.kl, self.ku, i, j)]
-                };
-
-                x[i] = x[i] - u_elem * x[j];
+                let u_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, i, j)];
+                x[i] = x[i] - u_elem * xj;
             }
         }
 
@@ -435,44 +411,35 @@ impl<T: Field + Real> BandLu<T> {
         let mut x = b.to_vec();
         let ldb = nrhs;
 
-        // Apply row permutations (forward)
-        for k in 0..self.n {
-            let pk = self.pivot[k];
-            if k != pk {
-                // Swap rows k and pk
-                for col in 0..nrhs {
-                    x.swap(k * ldb + col, pk * ldb + col);
+        // Forward sweep: solve L Y = P B, interchanges interleaved with the
+        // elimination (see `solve` for why an up-front permutation is incorrect).
+        if self.kl > 0 {
+            for j in 0..self.n {
+                let lm = self.kl.min(self.n - 1 - j);
+                let p = self.pivot[j];
+                if p != j {
+                    for col in 0..nrhs {
+                        x.swap(j * ldb + col, p * ldb + col);
+                    }
+                }
+                for i in 1..=lm {
+                    let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
+                    for col in 0..nrhs {
+                        x[(j + i) * ldb + col] = x[(j + i) * ldb + col] - l_elem * x[j * ldb + col];
+                    }
                 }
             }
         }
 
-        // Forward substitution: Ly = Pb
-        for j in 0..self.n {
-            let km = self.kl.min(self.n - 1 - j);
-            for i in 1..=km {
-                let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
-                for col in 0..nrhs {
-                    x[(j + i) * ldb + col] = x[(j + i) * ldb + col] - l_elem * x[j * ldb + col];
-                }
-            }
-        }
-
-        // Back substitution: Ux = y
+        // Back substitution: solve U X = Y, one band-limited column sweep per RHS.
+        let kmax = self.ku + self.kl;
         for j in (0..self.n).rev() {
             let diag = self.ab[band_idx(self.ldab, self.kl, self.ku, j, j)];
             for col in 0..nrhs {
                 x[j * ldb + col] = x[j * ldb + col] / diag;
             }
-
-            let kmax = self.ku + self.kl;
             for i in j.saturating_sub(kmax)..j {
-                let diag_dist = j as isize - i as isize;
-                let u_elem = if diag_dist <= self.ku as isize {
-                    self.ab[band_idx(self.ldab, self.kl, self.ku, i, j)]
-                } else {
-                    self.ab[band_idx_extended(self.ldab, self.kl, self.ku, i, j)]
-                };
-
+                let u_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, i, j)];
                 for col in 0..nrhs {
                     x[i * ldb + col] = x[i * ldb + col] - u_elem * x[j * ldb + col];
                 }
@@ -510,45 +477,45 @@ impl<T: Field + Real> BandLu<T> {
 
         let mut x = b.to_vec();
 
-        // Forward substitution with U^T: U^T y = b
-        // U^T has bandwidth ku + kl (due to fill-in)
+        // Solve A^T x = b. Since P A = L U we have A^T = U^T L^T P, hence
+        // x = P^T L^-T U^-T b (LAPACK DGBTRS, TRANS = 'T').
+
+        // Step 1: forward solve U^T w = b. U^T is lower triangular with kl+ku
+        // sub-diagonals; row j of U^T (column j of U) reaches down to row j+kl+ku.
+        let kmax = self.ku + self.kl;
         for j in 0..self.n {
-            // Divide by diagonal (U[j,j])
             let diag = self.ab[band_idx(self.ldab, self.kl, self.ku, j, j)];
             x[j] = x[j] / diag;
-
-            // Update x[i] for i > j where U[j, i] != 0 (which is U^T[i, j])
-            let kmax = self.ku + self.kl;
-            for i in (j + 1)..=((j + kmax).min(self.n - 1)) {
-                // Get U[j, i] (transpose of what we're solving)
-                let diag_dist = i as isize - j as isize;
-                let u_elem = if diag_dist <= self.ku as isize {
-                    self.ab[band_idx(self.ldab, self.kl, self.ku, j, i)]
-                } else {
-                    self.ab[band_idx_extended(self.ldab, self.kl, self.ku, j, i)]
-                };
-
-                x[i] = x[i] - u_elem * x[j];
+            let xj = x[j];
+            let i_end = (j + kmax).min(self.n - 1);
+            for i in (j + 1)..=i_end {
+                // U^T[i, j] == U[j, i].
+                let u_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j, i)];
+                x[i] = x[i] - u_elem * xj;
             }
         }
 
-        // Back substitution with L^T: L^T z = y
-        // L has unit diagonal and bandwidth kl
-        for j in (0..self.n).rev() {
-            let km = self.kl.min(j);
-            for i in (j.saturating_sub(km))..j {
-                // L[j, i] = self.ab[...] but L is lower triangular, so we need L[j, i]
-                // which is stored where L[j, i] for j > i
-                let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j, i)];
-                x[i] = x[i] - l_elem * x[j];
-            }
-        }
-
-        // Apply inverse permutation (backward)
-        for k in (0..self.n).rev() {
-            let pk = self.pivot[k];
-            if k != pk {
-                x.swap(k, pk);
+        // Step 2: back solve L^T z = w with the interchanges interleaved in
+        // reverse. At each step we first apply L(j)^T (a rank-one update folding
+        // column j's multipliers back into x[j]) and THEN undo interchange P(j).
+        // This mirrors, in reverse, the forward sweep of `solve`; deferring all
+        // interchanges to a single pass at the end (the previous approach) is
+        // inconsistent with the deferred-permutation storage and silently wrong
+        // under pivoting. Skipped entirely when kl == 0 (no sub-diagonals, so L is
+        // the identity and no interchanges were recorded).
+        if self.kl > 0 {
+            for j in (0..self.n).rev() {
+                let lm = self.kl.min(self.n - 1 - j);
+                let mut acc = x[j];
+                for i in 1..=lm {
+                    let l_elem = self.ab[band_idx(self.ldab, self.kl, self.ku, j + i, j)];
+                    acc = acc - l_elem * x[j + i];
+                }
+                x[j] = acc;
+                let p = self.pivot[j];
+                if p != j {
+                    x.swap(j, p);
+                }
             }
         }
 
@@ -798,14 +765,6 @@ pub fn band_norm_inf<T: Field + Real>(ab: &[T], n: usize, kl: usize, ku: usize) 
 /// Index = row_in_band + j * ldab
 #[inline]
 fn band_idx(ldab: usize, kl: usize, ku: usize, i: usize, j: usize) -> usize {
-    let row_in_band = kl + ku + i - j;
-    row_in_band + j * ldab
-}
-
-/// Index for extended band storage (fill-in elements).
-#[inline]
-fn band_idx_extended(ldab: usize, kl: usize, ku: usize, i: usize, j: usize) -> usize {
-    // Fill-in elements go in the top kl rows
     let row_in_band = kl + ku + i - j;
     row_in_band + j * ldab
 }
@@ -1304,6 +1263,240 @@ mod tests {
                 (atx_i - b[i]).abs() < 1e-10,
                 "A^T*x[{i}] = {atx_i}, expected {}",
                 b[i]
+            );
+        }
+    }
+
+    /// Reconstructs the dense matrix `A` from a factored `BandLu` as `A = P L U`.
+    ///
+    /// The banded LAPACK factorization stores `L = P(0) L(0) P(1) L(1) ...`, i.e.
+    /// the interchanges are *deferred* rather than applied to the earlier L columns,
+    /// so `A = [P(0)(I + l_0 e_0^T)] [P(1)(I + l_1 e_1^T)] ... U`. We replay that
+    /// product right-to-left: starting from dense `U`, then for `j = n-2 .. 0` apply
+    /// the rank-one `L(j)` (a row-add) followed by the interchange `P(j)` (a
+    /// row-swap). This is the exact algebraic inverse of the elimination and equals
+    /// the original `A` only when `compute` stored the multipliers WITHOUT
+    /// retroactively permuting earlier columns — precisely the invariant guarded here.
+    fn reconstruct_plu(lu: &BandLu<f64>) -> Vec<f64> {
+        let n = lu.size();
+        let kl = lu.kl();
+        let ku = lu.ku();
+        let ldab = 2 * kl + ku + 1;
+        let ab = lu.ab();
+        let pivot = lu.pivot();
+
+        // Dense U (row-major): U[i,j] for i <= j and j-i <= kl+ku.
+        let mut x = vec![0.0f64; n * n];
+        for j in 0..n {
+            let i_start = j.saturating_sub(kl + ku);
+            for i in i_start..=j {
+                x[i * n + j] = ab[band_idx(ldab, kl, ku, i, j)];
+            }
+        }
+
+        // Apply F_j = P_j (I + l_j e_j^T) for j = n-2 down to 0.
+        for j in (0..n.saturating_sub(1)).rev() {
+            let km = kl.min(n - 1 - j);
+            // (I + l_j e_j^T): row (j+i) += L[j+i, j] * row j.
+            for i in 1..=km {
+                let l = ab[band_idx(ldab, kl, ku, j + i, j)];
+                for c in 0..n {
+                    x[(j + i) * n + c] += l * x[j * n + c];
+                }
+            }
+            // P_j: swap rows j and pivot[j].
+            let p = pivot[j];
+            if p != j {
+                for c in 0..n {
+                    x.swap(j * n + c, p * n + c);
+                }
+            }
+        }
+        x
+    }
+
+    #[test]
+    fn test_band_lu_pivot_swap_tridiagonal() {
+        // Tridiagonal matrix DELIBERATELY built so partial pivoting MUST swap:
+        // in column 0 the sub-diagonal |3| dominates the diagonal |1|, and every
+        // subsequent column likewise has a dominant sub-diagonal, forcing a genuine
+        // interchange at essentially every step (pivot ends up [1, 2, 3, 4, 4]).
+        //   [1 2 0 0 0]
+        //   [3 1 2 0 0]
+        //   [0 4 1 2 0]
+        //   [0 0 5 1 2]
+        //   [0 0 0 6 1]
+        // A random banded matrix usually would NOT need a swap, so this hand-picked
+        // matrix is what makes the regression actually exercise the pivot path.
+        let n = 5;
+        let kl = 1;
+        let ku = 1;
+        #[rustfmt::skip]
+        let a: Vec<f64> = vec![
+            1.0, 2.0, 0.0, 0.0, 0.0,
+            3.0, 1.0, 2.0, 0.0, 0.0,
+            0.0, 4.0, 1.0, 2.0, 0.0,
+            0.0, 0.0, 5.0, 1.0, 2.0,
+            0.0, 0.0, 0.0, 6.0, 1.0,
+        ];
+
+        let ab = dense_to_band(&a, n, kl, ku);
+        let lu = BandLu::compute(n, kl, ku, &ab).expect("nonsingular");
+
+        // The whole point: at least one genuine row interchange must have happened,
+        // otherwise this test would not exercise the previously-buggy code path.
+        assert!(
+            lu.pivot().iter().enumerate().any(|(j, &p)| p != j),
+            "expected a real pivot swap, got pivot = {:?}",
+            lu.pivot()
+        );
+
+        // (1) A = P L U reconstruction must match the original matrix.
+        let a_rec = reconstruct_plu(&lu);
+        for i in 0..n * n {
+            assert!(
+                (a_rec[i] - a[i]).abs() < 1e-12,
+                "reconstruction mismatch at {i}: got {}, expected {}",
+                a_rec[i],
+                a[i]
+            );
+        }
+
+        // (2) solve() must return the exact solution for this pivoting matrix.
+        let x_true = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut b = vec![0.0f64; n];
+        for i in 0..n {
+            for j in 0..n {
+                b[i] += a[i * n + j] * x_true[j];
+            }
+        }
+        let x = lu.solve(&b).expect("solve");
+        for i in 0..n {
+            assert!(
+                (x[i] - x_true[i]).abs() < 1e-10,
+                "solve x[{i}] = {}, expected {}",
+                x[i],
+                x_true[i]
+            );
+        }
+
+        // (3) solve_transpose() must also be correct under pivoting.
+        let mut bt = vec![0.0f64; n];
+        for i in 0..n {
+            for j in 0..n {
+                bt[i] += a[j * n + i] * x_true[j]; // (A^T x_true)_i = sum_j A[j,i] x_j
+            }
+        }
+        let xt = lu.solve_transpose(&bt).expect("solve_transpose");
+        for i in 0..n {
+            assert!(
+                (xt[i] - x_true[i]).abs() < 1e-10,
+                "solve_transpose x[{i}] = {}, expected {}",
+                xt[i],
+                x_true[i]
+            );
+        }
+
+        // (4) solve_multiple() must agree with solve() column-by-column.
+        let nrhs = 2;
+        let mut bm = vec![0.0f64; n * nrhs];
+        for i in 0..n {
+            bm[i * nrhs] = b[i];
+            bm[i * nrhs + 1] = 2.0 * b[i];
+        }
+        let xm = lu.solve_multiple(&bm, nrhs).expect("solve_multiple");
+        for i in 0..n {
+            assert!(
+                (xm[i * nrhs] - x_true[i]).abs() < 1e-10,
+                "solve_multiple rhs0 x[{i}] = {}, expected {}",
+                xm[i * nrhs],
+                x_true[i]
+            );
+            assert!(
+                (xm[i * nrhs + 1] - 2.0 * x_true[i]).abs() < 1e-10,
+                "solve_multiple rhs1 x[{i}] = {}, expected {}",
+                xm[i * nrhs + 1],
+                2.0 * x_true[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_band_lu_pivot_swap_wide_band() {
+        // kl=2, ku=1. In column 0 the candidate magnitudes are |1|, |3|, |6|, so the
+        // pivot lands TWO rows below the diagonal (jp_rel = 2 = kl): this exercises
+        // the maximum-distance interchange AND the resulting super-diagonal fill-in
+        // in U (kv = kl+ku = 3), the widest path through the band factorization.
+        //   [1 2 0 0 0]
+        //   [3 1 2 0 0]
+        //   [6 4 1 2 0]
+        //   [0 7 5 1 2]
+        //   [0 0 8 6 1]
+        let n = 5;
+        let kl = 2;
+        let ku = 1;
+        #[rustfmt::skip]
+        let a: Vec<f64> = vec![
+            1.0, 2.0, 0.0, 0.0, 0.0,
+            3.0, 1.0, 2.0, 0.0, 0.0,
+            6.0, 4.0, 1.0, 2.0, 0.0,
+            0.0, 7.0, 5.0, 1.0, 2.0,
+            0.0, 0.0, 8.0, 6.0, 1.0,
+        ];
+
+        let ab = dense_to_band(&a, n, kl, ku);
+        let lu = BandLu::compute(n, kl, ku, &ab).expect("nonsingular");
+
+        assert_eq!(lu.pivot()[0], 2, "column 0 must pivot two rows down");
+        assert!(
+            lu.pivot().iter().enumerate().any(|(j, &p)| p != j),
+            "expected a real pivot swap, got pivot = {:?}",
+            lu.pivot()
+        );
+
+        // A = P L U reconstruction over the wider band (with fill-in) must match.
+        let a_rec = reconstruct_plu(&lu);
+        for i in 0..n * n {
+            assert!(
+                (a_rec[i] - a[i]).abs() < 1e-12,
+                "reconstruction mismatch at {i}: got {}, expected {}",
+                a_rec[i],
+                a[i]
+            );
+        }
+
+        // solve() with a non-trivial (mixed-sign, fractional) exact solution.
+        let x_true = [2.0, -1.0, 3.0, 0.5, -4.0];
+        let mut b = vec![0.0f64; n];
+        for i in 0..n {
+            for j in 0..n {
+                b[i] += a[i * n + j] * x_true[j];
+            }
+        }
+        let x = lu.solve(&b).expect("solve");
+        for i in 0..n {
+            assert!(
+                (x[i] - x_true[i]).abs() < 1e-10,
+                "solve x[{i}] = {}, expected {}",
+                x[i],
+                x_true[i]
+            );
+        }
+
+        // Transpose consistency under the wide-band pivoting as well.
+        let mut bt = vec![0.0f64; n];
+        for i in 0..n {
+            for j in 0..n {
+                bt[i] += a[j * n + i] * x_true[j];
+            }
+        }
+        let xt = lu.solve_transpose(&bt).expect("solve_transpose");
+        for i in 0..n {
+            assert!(
+                (xt[i] - x_true[i]).abs() < 1e-10,
+                "solve_transpose x[{i}] = {}, expected {}",
+                xt[i],
+                x_true[i]
             );
         }
     }

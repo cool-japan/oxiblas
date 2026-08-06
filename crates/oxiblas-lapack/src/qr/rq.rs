@@ -141,8 +141,19 @@ impl<T: Field + Real + bytemuck::Zeroable> Rq<T> {
                     r[(i, j)] = self.factors[(i, j)];
                 }
             } else {
-                // For tall matrices, only the last n rows have non-zero R
-                if i >= m - n {
+                // For tall matrices (m > n), R is stored on and above the
+                // (m - n)-th subdiagonal (LAPACK DGERQF/ZGERQF convention):
+                // - rows i < m - n form a full, dense m-n x n block (never a
+                //   defining row for any reflector, but transformed by every
+                //   reflection applied to the right, so all n columns are
+                //   part of R -- they must NOT be zeroed).
+                // - rows i >= m - n form an n x n upper-triangular block,
+                //   shifted so row i's diagonal sits at column i - (m - n).
+                if i < m - n {
+                    for j in 0..n {
+                        r[(i, j)] = self.factors[(i, j)];
+                    }
+                } else {
                     let local_i = i - (m - n);
                     for j in local_i..n {
                         r[(i, j)] = self.factors[(i, j)];
@@ -375,6 +386,61 @@ mod tests {
                 assert!(
                     approx_eq(sum, a[(i, j)], 1e-10),
                     "Reconstruction[{},{}] = {}, expected {}",
+                    i,
+                    j,
+                    sum,
+                    a[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// Regression test for the tall-matrix (m > n) `r_factor` zeroing bug:
+    /// the dense top (m-n) x n block of R was being left as zeros instead
+    /// of copied from `factors`, so `A != R * Q` for any m > n input. A
+    /// square or wide matrix cannot exercise this branch at all, so the
+    /// test deliberately uses m > n (4x2).
+    #[test]
+    fn test_rq_reconstruction_tall() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0], &[7.0, 9.0]]);
+
+        let rq = Rq::compute(a.as_ref()).unwrap();
+        let r = rq.r_factor();
+        let q = rq.q_factor();
+
+        let m = a.nrows();
+        let n = a.ncols();
+        assert_eq!(r.nrows(), m);
+        assert_eq!(r.ncols(), n);
+        assert_eq!(q.nrows(), n);
+        assert_eq!(q.ncols(), n);
+
+        // Guard against the exact regression: the top (m-n) x n block of R
+        // must not have been silently zeroed.
+        let mut top_block_all_zero = true;
+        for i in 0..(m - n) {
+            for j in 0..n {
+                if r[(i, j)].abs() > 1e-10 {
+                    top_block_all_zero = false;
+                }
+            }
+        }
+        assert!(
+            !top_block_all_zero,
+            "top (m-n)x n block of R is all zero -- regression of the r_factor zeroing bug"
+        );
+
+        // A = R * Q must hold for every entry, including the dense top
+        // block of R.
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    sum += r[(i, k)] * q[(k, j)];
+                }
+                assert!(
+                    approx_eq(sum, a[(i, j)], 1e-10),
+                    "Tall reconstruction[{},{}] = {}, expected {}",
                     i,
                     j,
                     sum,

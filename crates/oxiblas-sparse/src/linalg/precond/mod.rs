@@ -311,6 +311,44 @@ mod tests {
     }
 
     #[test]
+    fn test_ssor_diagonal_relaxation_scaling() {
+        // For a diagonal matrix, L = U = 0, so both SOR sweeps degenerate to
+        // plain diagonal scaling and the *only* effect of ω != 1 is the
+        // ω(2-ω) SSOR scaling factor:
+        //   z[i] = ω(2-ω) * r[i] / diag[i]
+        // This directly exercises the standard SSOR preconditioner formula
+        //   M_SSOR^{-1} = ω(2-ω) (D+ωU)^{-1} D (D+ωL)^{-1}
+        // and would fail if the ω(2-ω) factor were missing (in which case
+        // z[i] would simply equal r[i] / diag[i], independent of ω).
+        let values = vec![2.0, 3.0, 4.0];
+        let col_indices = vec![0, 1, 2];
+        let row_ptrs = vec![0, 1, 2, 3];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+
+        let omega = 1.5_f64;
+        let ssor = SSOR::new(&a, omega).unwrap();
+
+        let r = vec![4.0, 9.0, 16.0];
+        let mut z = vec![0.0; 3];
+        ssor.apply(&r, &mut z);
+
+        let scale = omega * (2.0 - omega);
+        let diag = [2.0_f64, 3.0, 4.0];
+        for i in 0..3 {
+            let expected = scale * r[i] / diag[i];
+            assert!(
+                (z[i] - expected).abs() < 1e-10,
+                "z[{i}] = {} should be {expected} (ω(2-ω) = {scale})",
+                z[i]
+            );
+        }
+
+        // Sanity check: the result must differ from the unscaled ω=1 case
+        // (scale = 1), otherwise the ω(2-ω) factor is not being applied.
+        assert!((scale - 1.0).abs() > 1e-10);
+    }
+
+    #[test]
     fn test_ssor_with_relaxation() {
         // Test SSOR with ω = 1.5
         let values = vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0];
@@ -989,6 +1027,202 @@ mod tests {
 
         assert_eq!(spai.dim(), 3);
         assert!(spai.nnz() >= 3, "Should have at least diagonal entries");
+    }
+
+    /// Build the n x n tridiagonal SPD matrix tridiag(-1, 4, -1) in CSR.
+    ///
+    /// Its inverse is fully dense, so growing the SPAI sparsity pattern
+    /// genuinely reduces the per-column least-squares residual, which makes it a
+    /// good stress case for the tuning parameters.
+    fn spai_tridiag(n: usize) -> CsrMatrix<f64> {
+        let mut values = Vec::new();
+        let mut col_indices = Vec::new();
+        let mut row_ptrs = vec![0];
+        for i in 0..n {
+            if i > 0 {
+                values.push(-1.0);
+                col_indices.push(i - 1);
+            }
+            values.push(4.0);
+            col_indices.push(i);
+            if i < n - 1 {
+                values.push(-1.0);
+                col_indices.push(i + 1);
+            }
+            row_ptrs.push(col_indices.len());
+        }
+        CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap()
+    }
+
+    /// Total squared SPAI residual sum_j || A * (M e_j) - e_j ||_2^2.
+    ///
+    /// This is exactly the quantity the SPAI least-squares solve minimizes, so a
+    /// tighter `tolerance` (more pattern augmentation) must drive it down.
+    fn spai_am_error(a: &CsrMatrix<f64>, spai: &SPAI<f64>, n: usize) -> f64 {
+        let mut total = 0.0;
+        for j in 0..n {
+            let mut e_j = vec![0.0; n];
+            e_j[j] = 1.0;
+            // Column j of M.
+            let mut m_j = vec![0.0; n];
+            spai.apply(&e_j, &mut m_j);
+            // w = A * m_j (CSR matvec).
+            for i in 0..n {
+                let start = a.row_ptrs()[i];
+                let end = a.row_ptrs()[i + 1];
+                let mut acc = 0.0;
+                for idx in start..end {
+                    acc += a.values()[idx] * m_j[a.col_indices()[idx]];
+                }
+                let d = acc - e_j[i];
+                total += d * d;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn test_spai_max_nnz_per_col_bounds_sparsity() {
+        // Starting from the diagonal pattern, max_nnz_per_col must genuinely cap
+        // the per-column fill and therefore the total nnz of M.
+        let n = 5;
+        let a = spai_tridiag(n);
+
+        let mut prev_nnz = 0usize;
+        for max_nnz in [1usize, 2, 3] {
+            let config = SPAIConfig {
+                tolerance: 1e-6, // tight enough that the cap, not tol, binds
+                max_nnz_per_col: max_nnz,
+                use_a_pattern: false, // diagonal start so the cap is the only limit
+                max_iterations: 100,  // large enough to not bind
+            };
+            let spai = SPAI::new(&a, config).unwrap();
+
+            // Aggregate cap: sum of per-column nnz never exceeds n * max_nnz.
+            assert!(
+                spai.nnz() <= n * max_nnz,
+                "nnz {} exceeds cap n*max_nnz {} for max_nnz={}",
+                spai.nnz(),
+                n * max_nnz,
+                max_nnz
+            );
+            // A larger budget must admit strictly more fill for a dense inverse.
+            assert!(
+                spai.nnz() > prev_nnz,
+                "nnz did not grow: {} !> {} at max_nnz={}",
+                spai.nnz(),
+                prev_nnz,
+                max_nnz
+            );
+            prev_nnz = spai.nnz();
+        }
+
+        // max_nnz_per_col = 1 forces a purely diagonal M (n entries).
+        let diag = SPAI::new(
+            &a,
+            SPAIConfig {
+                tolerance: 1e-6,
+                max_nnz_per_col: 1,
+                use_a_pattern: false,
+                max_iterations: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(diag.nnz(), n, "max_nnz_per_col=1 must give a diagonal M");
+    }
+
+    #[test]
+    fn test_spai_max_iterations_bounds_augmentation() {
+        // With an ample sparsity budget and a tight tolerance, max_iterations is
+        // the binding constraint on how far each column's pattern grows.
+        let n = 5;
+        let a = spai_tridiag(n);
+
+        let nnz_for = |max_iterations: usize| {
+            let config = SPAIConfig {
+                tolerance: 1e-6,
+                max_nnz_per_col: 20, // large enough not to bind
+                use_a_pattern: false,
+                max_iterations,
+            };
+            SPAI::new(&a, config).unwrap().nnz()
+        };
+
+        let nnz0 = nnz_for(0);
+        let nnz1 = nnz_for(1);
+        let nnz2 = nnz_for(2);
+
+        // Zero augmentation rounds => diagonal-only M.
+        assert_eq!(nnz0, n, "max_iterations=0 must give a diagonal M");
+        // Each additional round adds (at most) one index per column, so the fill
+        // strictly increases while candidates remain.
+        assert!(
+            nnz1 > nnz0,
+            "one round did not grow fill: {} !> {}",
+            nnz1,
+            nnz0
+        );
+        assert!(
+            nnz2 > nnz1,
+            "two rounds did not grow fill: {} !> {}",
+            nnz2,
+            nnz1
+        );
+    }
+
+    #[test]
+    fn test_spai_tolerance_controls_accuracy_and_sparsity() {
+        // A looser residual tolerance stops augmentation earlier, yielding both a
+        // sparser and a less accurate approximate inverse than a tight one.
+        let n = 6;
+        let a = spai_tridiag(n);
+
+        let loose = SPAI::new(
+            &a,
+            SPAIConfig {
+                tolerance: 2.0, // so loose the initial diagonal solve satisfies it
+                max_nnz_per_col: 20,
+                use_a_pattern: false,
+                max_iterations: 100,
+            },
+        )
+        .unwrap();
+
+        let tight = SPAI::new(
+            &a,
+            SPAIConfig {
+                tolerance: 1e-3,
+                max_nnz_per_col: 20,
+                use_a_pattern: false,
+                max_iterations: 100,
+            },
+        )
+        .unwrap();
+
+        // Loose tolerance stops at the diagonal; tight tolerance fills in.
+        assert_eq!(loose.nnz(), n, "loose tolerance should give a diagonal M");
+        assert!(
+            tight.nnz() > loose.nnz(),
+            "tight tolerance must produce more fill: {} !> {}",
+            tight.nnz(),
+            loose.nnz()
+        );
+
+        // Accuracy must improve (residual shrink) as the tolerance tightens.
+        let err_loose = spai_am_error(&a, &loose, n);
+        let err_tight = spai_am_error(&a, &tight, n);
+        assert!(
+            err_tight < err_loose,
+            "tighter tolerance must reduce residual: {} !< {}",
+            err_tight,
+            err_loose
+        );
+        // The tight configuration should be a genuinely good inverse.
+        assert!(
+            err_tight < 1e-3,
+            "tight tolerance residual too large: {}",
+            err_tight
+        );
     }
 
     // ========================================

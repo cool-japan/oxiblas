@@ -1,7 +1,25 @@
 //! Symmetric Eigenvalue Decomposition using Divide-and-Conquer.
 //!
-//! Uses Householder tridiagonalization followed by the divide-and-conquer algorithm.
-//! This is typically faster than the QR algorithm for large matrices.
+//! Uses Householder tridiagonalization followed by Cuppen's divide-and-conquer
+//! algorithm for the symmetric tridiagonal eigenvalue problem.
+//!
+//! The tridiagonal matrix `T` is split into two sub-blocks `T1`, `T2` plus a
+//! rank-one update `rho * z z^T`.  The two sub-blocks are solved recursively and
+//! their eigensystems are merged by
+//!
+//! 1. deflating negligible components of `z` and (near-)equal eigenvalues
+//!    (Gu-Eisenstat / LAPACK `dlaed2`-style deflation),
+//! 2. solving the secular equation
+//!    `f(lambda) = 1 + rho * sum_i z_i^2 / (d_i - lambda) = 0`
+//!    for the non-deflated eigenvalues with a safeguarded rational-interpolation
+//!    root finder (LAPACK `dlaed4`-style "middle way"),
+//! 3. forming the eigenvectors from the *stabilised* rank-one vector recomputed
+//!    via the Löwner formula (LAPACK `dlaed3`) and combining them with the
+//!    block-diagonal sub-block eigenvectors — **not** by copying the block
+//!    diagonal eigenvectors.
+//!
+//! This is typically faster than the QR algorithm for large matrices and, unlike
+//! a naïve implementation, produces numerically orthogonal eigenvectors.
 
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
@@ -46,12 +64,15 @@ pub struct SymmetricEvdDc<T: Scalar> {
     n: usize,
 }
 
-/// Threshold for switching to direct QR algorithm.
-/// For matrices smaller than this, use QR directly.
-/// Temporarily set high to use QR for all practical sizes until D&C merge is fixed.
-const DC_THRESHOLD: usize = 100;
+/// Sub-problem size at or below which the base-case QR solver is used.
+///
+/// This mirrors LAPACK's `SMLSIZ`.  For blocks larger than this the genuine
+/// divide-and-conquer merge is used; for smaller blocks the (already correct and
+/// numerically robust) tridiagonal QR iteration is cheaper.  The merge is exact
+/// at every size, so this threshold only trades performance, never correctness.
+const SMLSIZ: usize = 25;
 
-/// Maximum iterations for secular equation solver.
+/// Maximum number of iterations for a single secular-equation root.
 const MAX_SECULAR_ITER: usize = 100;
 
 impl<T: Field + Real + bytemuck::Zeroable> SymmetricEvdDc<T> {
@@ -111,17 +132,27 @@ impl<T: Field + Real + bytemuck::Zeroable> SymmetricEvdDc<T> {
             }
         }
 
-        // Initialize eigenvector matrix to identity
+        // Accumulated orthogonal transform from tridiagonalization: A = Q * T * Q^T.
+        let mut q = Mat::eye(n);
+
+        // Tridiagonalize.
+        let (diag, off_diag) = tridiagonalize(&mut work, &mut q, n);
+
+        // Solve the tridiagonal eigenproblem by divide-and-conquer, obtaining the
+        // eigenvalues and the eigenvectors `z_mat` of the tridiagonal matrix.
+        let (eigenvalues, z_mat) = tridiag_dc(diag, off_diag, SMLSIZ)?;
+
+        // Eigenvectors of A are V = Q * z_mat.
         let mut v = Mat::zeros(n, n);
-        for i in 0..n {
-            v[(i, i)] = T::one();
+        for jc in 0..n {
+            for r in 0..n {
+                let mut acc = T::zero();
+                for kk in 0..n {
+                    acc = acc + q[(r, kk)] * z_mat[(kk, jc)];
+                }
+                v[(r, jc)] = acc;
+            }
         }
-
-        // Tridiagonalize: A = Q * T * Q^T
-        let (diag, off_diag) = tridiagonalize(&mut work, &mut v, n);
-
-        // Apply divide-and-conquer algorithm to tridiagonal matrix
-        let eigenvalues = divide_and_conquer(diag, off_diag, &mut v, n)?;
 
         Ok(Self {
             eigenvalues,
@@ -258,300 +289,482 @@ fn tridiagonalize<T: Field + Real>(a: &mut Mat<T>, v: &mut Mat<T>, n: usize) -> 
     (diag, off_diag)
 }
 
-/// Divide-and-conquer algorithm for symmetric tridiagonal eigenvalue problem.
-fn divide_and_conquer<T: Field + Real + bytemuck::Zeroable>(
+/// Cuppen divide-and-conquer for the symmetric tridiagonal eigenvalue problem.
+///
+/// Given the diagonal `diag` (length `n`) and off-diagonal `off_diag` (length
+/// `n-1`) of a symmetric tridiagonal matrix `T`, returns its eigenvalues (ascending)
+/// and the matrix whose columns are the corresponding eigenvectors.
+///
+/// `smlsiz` is the sub-problem size at or below which the base-case QR solver is
+/// used.  A value of `1` forces the divide-and-conquer merge at every level.
+fn tridiag_dc<T: Field + Real + bytemuck::Zeroable>(
     diag: Vec<T>,
     off_diag: Vec<T>,
-    v: &mut Mat<T>,
-    n: usize,
-) -> Result<Vec<T>, SymmetricEvdDcError> {
-    if n <= 1 {
-        return Ok(diag);
+    smlsiz: usize,
+) -> Result<(Vec<T>, Mat<T>), SymmetricEvdDcError> {
+    let n = diag.len();
+
+    if n == 0 {
+        return Ok((Vec::new(), Mat::zeros(0, 0)));
+    }
+    if n == 1 {
+        let mut z = Mat::zeros(1, 1);
+        z[(0, 0)] = T::one();
+        return Ok((diag, z));
     }
 
-    // For small matrices, use direct QR
-    if n <= DC_THRESHOLD {
-        return qr_algorithm(diag, off_diag, v, n);
+    // Base case: tridiagonal QR iteration with eigenvectors accumulated from the
+    // identity.  Correct and numerically robust for small blocks.
+    if n <= smlsiz {
+        let mut z = Mat::eye(n);
+        let eig = qr_algorithm(diag, off_diag, &mut z, n)?;
+        return Ok((eig, z));
     }
 
-    // Divide: split at the middle
+    // Divide: split at the middle.
     let m = n / 2;
     let beta = off_diag[m - 1];
+    let abs_beta = Scalar::abs(beta);
 
-    // Create sub-problems
-    // T1 = diag[0..m] with off_diag[0..m-1]
-    // T2 = diag[m..n] with off_diag[m..n-1]
-
-    // Modify the diagonal elements at the split point (rank-1 modification)
+    // Rank-one tearing:  T = diag(T1, T2) + rho * v v^T  with  rho = |beta|  and
+    // v = [0,..,0, 1, sign(beta), 0,..,0]^T  (ones at positions m-1 and m).
+    // This removes |beta| from the coupling diagonal entries of each block.
     let mut diag1: Vec<T> = diag[0..m].to_vec();
     let mut diag2: Vec<T> = diag[m..n].to_vec();
-
-    // β comes from the (m-1, m) entry
-    // T = [T1     ] + β * z * z^T where z = [0,...,0,1,1,0,...,0]^T
-    //     [    T2 ]
-    let abs_beta = Scalar::abs(beta);
     diag1[m - 1] = diag1[m - 1] - abs_beta;
     diag2[0] = diag2[0] - abs_beta;
 
-    let off_diag1: Vec<T> = if m > 1 {
+    let off1: Vec<T> = if m > 1 {
         off_diag[0..(m - 1)].to_vec()
     } else {
-        vec![]
+        Vec::new()
     };
-    let off_diag2: Vec<T> = if n - m > 1 {
+    let off2: Vec<T> = if n - m > 1 {
         off_diag[m..(n - 1)].to_vec()
     } else {
-        vec![]
+        Vec::new()
     };
 
-    // Create temporary eigenvector matrices for subproblems
-    let mut v1: Mat<T> = Mat::zeros(m, m);
-    let mut v2: Mat<T> = Mat::zeros(n - m, n - m);
-    for i in 0..m {
-        v1[(i, i)] = T::one();
-    }
-    for i in 0..(n - m) {
-        v2[(i, i)] = T::one();
-    }
+    // Recursively solve the two sub-problems.
+    let (eig1, q1) = tridiag_dc(diag1, off1, smlsiz)?;
+    let (eig2, q2) = tridiag_dc(diag2, off2, smlsiz)?;
 
-    // Recursively solve subproblems
-    let eig1 = divide_and_conquer(diag1, off_diag1, &mut v1, m)?;
-    let eig2 = divide_and_conquer(diag2, off_diag2, &mut v2, n - m)?;
-
-    // Merge: solve the secular equation
-    // The merged eigenvalues satisfy: 1 + rho * sum_i (z_i^2 / (d_i - lambda)) = 0
-    // where d_i are the combined eigenvalues and z is the perturbation vector
-
-    let rho = abs_beta;
-
-    // Build the z vector from the last row of V1 and first row of V2
-    let mut z = vec![T::zero(); n];
-    for i in 0..m {
-        z[i] = v1[(m - 1, i)];
-    }
-    for i in 0..(n - m) {
-        z[m + i] = v2[(0, i)];
-    }
-
-    // Sign of beta determines the sign of z components
-    if beta < T::zero() {
-        for i in 0..(n - m) {
-            z[m + i] = -z[m + i];
-        }
-    }
-
-    // Combine eigenvalues from subproblems
-    let mut d: Vec<T> = Vec::with_capacity(n);
-    d.extend_from_slice(&eig1);
-    d.extend_from_slice(&eig2);
-
-    // Sort eigenvalues and permute z accordingly
-    let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_by(|&i, &j| d[i].partial_cmp(&d[j]).unwrap_or(std::cmp::Ordering::Equal));
-
-    let d_sorted: Vec<T> = perm.iter().map(|&i| d[i]).collect();
-    let z_sorted: Vec<T> = perm.iter().map(|&i| z[i]).collect();
-
-    // Solve secular equation for each eigenvalue
-    let merged_eigenvalues = solve_secular_equations(&d_sorted, &z_sorted, rho, n)?;
-
-    // Compute eigenvectors of merged problem
-    let merged_v = compute_merged_eigenvectors(&d_sorted, &z_sorted, &merged_eigenvalues, rho, n);
-
-    // Apply permutation to eigenvectors
-    let mut unperm_v: Mat<T> = Mat::zeros(n, n);
-    for j in 0..n {
-        for i in 0..n {
-            unperm_v[(perm[i], j)] = merged_v[(i, j)];
-        }
-    }
-
-    // Combine with subproblem eigenvectors
-    // V_new = [V1 0 ] * merged_V
-    //         [0  V2]
-    let mut combined: Mat<T> = Mat::zeros(n, n);
-    for j in 0..n {
-        for i in 0..m {
-            let mut sum = T::zero();
-            for k in 0..m {
-                sum = sum + v1[(i, k)] * unperm_v[(k, j)];
-            }
-            combined[(i, j)] = sum;
-        }
-        for i in 0..(n - m) {
-            let mut sum = T::zero();
-            for k in 0..(n - m) {
-                sum = sum + v2[(i, k)] * unperm_v[(m + k, j)];
-            }
-            combined[(m + i, j)] = sum;
-        }
-    }
-
-    // Apply the accumulated transformation from tridiagonalization
-    // V_final = V * combined
-    let v_copy = v.clone();
-    for j in 0..n {
-        for i in 0..n {
-            let mut sum = T::zero();
-            for k in 0..n {
-                sum = sum + v_copy[(i, k)] * combined[(k, j)];
-            }
-            v[(i, j)] = sum;
-        }
-    }
-
-    // Sort final eigenvalues and eigenvectors
-    let mut eigenvalues = merged_eigenvalues;
-    sort_eigenvalues(&mut eigenvalues, v, n);
-
-    Ok(eigenvalues)
+    // Merge the two eigensystems through the rank-one update.
+    merge_rank_one(&eig1, &q1, &eig2, &q2, beta, m, n)
 }
 
-/// Solve secular equations: 1 + rho * sum_i (z_i^2 / (d_i - lambda)) = 0
-fn solve_secular_equations<T: Field + Real>(
-    d: &[T],
-    z: &[T],
-    rho: T,
+/// Merges the eigensystems of two sub-blocks joined by a rank-one update.
+///
+/// The combined matrix is `diag(Q1 D1 Q1^T, Q2 D2 Q2^T) = Q (D + rho z z^T) Q^T`
+/// with `Q = diag(Q1, Q2)`, `D = diag(eig1, eig2)`, `rho = |beta|` and
+/// `z = [last row of Q1 ; sign(beta) * first row of Q2]`.
+///
+/// Returns the eigenvalues (ascending) and the eigenvectors of the combined
+/// tridiagonal block.
+fn merge_rank_one<T: Field + Real + bytemuck::Zeroable>(
+    eig1: &[T],
+    q1: &Mat<T>,
+    eig2: &[T],
+    q2: &Mat<T>,
+    beta: T,
+    m: usize,
     n: usize,
-) -> Result<Vec<T>, SymmetricEvdDcError> {
-    let mut eigenvalues = Vec::with_capacity(n);
+) -> Result<(Vec<T>, Mat<T>), SymmetricEvdDcError> {
+    // Assemble combined d, z and the block-diagonal eigenvector matrix.
+    let mut d = vec![T::zero(); n];
+    let mut z = vec![T::zero(); n];
+    let mut qmat: Mat<T> = Mat::zeros(n, n);
 
-    for k in 0..n {
-        // Find eigenvalue k in the interval (d[k], d[k+1]) or beyond
-        let (lower, upper) = if k < n - 1 {
-            (d[k], d[k + 1])
+    for a in 0..m {
+        d[a] = eig1[a];
+        z[a] = q1[(m - 1, a)];
+        for r in 0..m {
+            qmat[(r, a)] = q1[(r, a)];
+        }
+    }
+    let sgn = if beta < T::zero() {
+        -T::one()
+    } else {
+        T::one()
+    };
+    for a in 0..(n - m) {
+        d[m + a] = eig2[a];
+        z[m + a] = sgn * q2[(0, a)];
+        for r in 0..(n - m) {
+            qmat[(m + r, m + a)] = q2[(r, a)];
+        }
+    }
+
+    let mut rho = Scalar::abs(beta);
+
+    // If the coupling is (numerically) absent the problem is block diagonal.
+    let mut znorm_sq = T::zero();
+    for &za in z.iter() {
+        znorm_sq = znorm_sq + za * za;
+    }
+    if !(rho > T::zero()) || !(znorm_sq > T::zero()) {
+        let mut eigenvalues = d;
+        let mut vmat = qmat;
+        sort_eigenvalues(&mut eigenvalues, &mut vmat, n);
+        return Ok((eigenvalues, vmat));
+    }
+
+    // Normalise z to unit length and fold the scale into rho.
+    let znorm = Real::sqrt(znorm_sq);
+    for za in z.iter_mut() {
+        *za = *za / znorm;
+    }
+    rho = rho * znorm_sq;
+
+    // Sort the combined eigenvalues ascending, permuting z and the columns of Q.
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&x, &y| d[x].partial_cmp(&d[y]).unwrap_or(std::cmp::Ordering::Equal));
+    let d_sorted: Vec<T> = perm.iter().map(|&x| d[x]).collect();
+    let z_sorted: Vec<T> = perm.iter().map(|&x| z[x]).collect();
+    let mut q_sorted: Mat<T> = Mat::zeros(n, n);
+    for (newc, &oldc) in perm.iter().enumerate() {
+        for r in 0..n {
+            q_sorted[(r, newc)] = qmat[(r, oldc)];
+        }
+    }
+    let mut d = d_sorted;
+    let mut z = z_sorted;
+    let mut qmat = q_sorted;
+
+    // Deflation tolerance (LAPACK dlaed2).
+    let eps = <T as Scalar>::epsilon();
+    let mut dmax = T::zero();
+    let mut zmax = T::zero();
+    for (&da, &za) in d.iter().zip(z.iter()) {
+        let ad = Scalar::abs(da);
+        if ad > dmax {
+            dmax = ad;
+        }
+        let az = Scalar::abs(za);
+        if az > zmax {
+            zmax = az;
+        }
+    }
+    let eight = T::from_f64(8.0).unwrap_or(T::one());
+    let tol = eight * eps * if dmax > zmax { dmax } else { zmax };
+
+    // Deflation pass.  `active` collects the poles kept in the secular equation;
+    // `deflated` collects the eigenpairs that need no further work.
+    let mut active: Vec<usize> = Vec::new();
+    let mut deflated: Vec<usize> = Vec::new();
+    let mut pj: Option<usize> = None;
+
+    for s in 0..n {
+        if rho * Scalar::abs(z[s]) <= tol {
+            // Type-1 deflation: negligible z component -> d[s] is an eigenvalue.
+            deflated.push(s);
+            continue;
+        }
+        match pj {
+            None => pj = Some(s),
+            Some(p) => {
+                let zp = z[p];
+                let zc = z[s];
+                let tau = Real::hypot(zc, zp);
+                let c = zc / tau;
+                let sn = zp / tau;
+                let t = d[s] - d[p];
+                if Scalar::abs(t * c * sn) <= tol {
+                    // Type-2 deflation: (near-)equal poles.  Rotate columns p, s of
+                    // Q so that the new z has a zero in position p; that column
+                    // deflates with eigenvalue d[p].
+                    for r in 0..n {
+                        let qa = qmat[(r, p)];
+                        let qb = qmat[(r, s)];
+                        qmat[(r, p)] = c * qa - sn * qb;
+                        qmat[(r, s)] = sn * qa + c * qb;
+                    }
+                    let dp_new = d[p] * c * c + d[s] * sn * sn;
+                    let ds_new = d[p] * sn * sn + d[s] * c * c;
+                    d[p] = dp_new;
+                    d[s] = ds_new;
+                    z[p] = T::zero();
+                    z[s] = tau;
+                    deflated.push(p);
+                    pj = Some(s);
+                } else {
+                    active.push(p);
+                    pj = Some(s);
+                }
+            }
+        }
+    }
+    if let Some(p) = pj {
+        active.push(p);
+    }
+
+    // Keep the active poles strictly ascending (rotations can perturb d slightly).
+    active.sort_by(|&x, &y| d[x].partial_cmp(&d[y]).unwrap_or(std::cmp::Ordering::Equal));
+    let k = active.len();
+
+    let mut eigenvalues = vec![T::zero(); n];
+    let mut vmat: Mat<T> = Mat::zeros(n, n);
+
+    if k == 0 {
+        // Everything deflated.
+        for (idx, &col) in deflated.iter().enumerate() {
+            eigenvalues[idx] = d[col];
+            for r in 0..n {
+                vmat[(r, idx)] = qmat[(r, col)];
+            }
+        }
+        sort_eigenvalues(&mut eigenvalues, &mut vmat, n);
+        return Ok((eigenvalues, vmat));
+    }
+
+    // Reduced secular problem.
+    let dhat: Vec<T> = active.iter().map(|&a| d[a]).collect();
+    let zhat: Vec<T> = active.iter().map(|&a| z[a]).collect();
+    let zeta: Vec<T> = zhat.iter().map(|&zz| rho * zz * zz).collect();
+
+    // Solve the secular equation for every active eigenvalue, recording the
+    // accurate delta = dhat - lambda for each.
+    let mut lambda = vec![T::zero(); k];
+    let mut delta_mat: Vec<Vec<T>> = Vec::with_capacity(k);
+    for l in 0..k {
+        let (lam, del) = solve_secular_i(&dhat, &zeta, l, k)?;
+        lambda[l] = lam;
+        delta_mat.push(del);
+    }
+
+    // Gu-Eisenstat: recompute the magnitudes of z from the Löwner formula so the
+    // eigenvectors are numerically orthogonal.
+    //   rho * zt_a^2 = (lambda_a - dhat_a) * prod_{l != a} (lambda_l - dhat_a)/(dhat_l - dhat_a)
+    let mut zt = vec![T::zero(); k];
+    for a in 0..k {
+        let mut prod = -delta_mat[a][a]; // lambda_a - dhat_a
+        for l in 0..k {
+            if l == a {
+                continue;
+            }
+            let num = -delta_mat[l][a]; // lambda_l - dhat_a
+            let den = dhat[l] - dhat[a]; // != 0 (poles are distinct)
+            prod = prod * (num / den);
+        }
+        let val = prod / rho;
+        let mag = if val > T::zero() {
+            Real::sqrt(val)
         } else {
-            // Last eigenvalue: estimate upper bound
-            let sum_z_sq: T = z.iter().fold(T::zero(), |acc, &zi| acc + zi * zi);
-            (d[n - 1], d[n - 1] + rho * sum_z_sq)
+            T::zero()
+        };
+        zt[a] = if zhat[a] >= T::zero() { mag } else { -mag };
+    }
+
+    // Form the eigenvectors of the active problem and combine them with the
+    // (rotated) block-diagonal eigenvectors held in `qmat`.
+    for l in 0..k {
+        // Secular eigenvector in the reduced basis: u_a = zt_a / (dhat_a - lambda_l).
+        let mut u = vec![T::zero(); k];
+        let mut nrm_sq = T::zero();
+        for a in 0..k {
+            let val = zt[a] / delta_mat[l][a];
+            u[a] = val;
+            nrm_sq = nrm_sq + val * val;
+        }
+        let nrm = Real::sqrt(nrm_sq);
+        let inv = if nrm > T::zero() {
+            T::one() / nrm
+        } else {
+            T::one()
         };
 
-        // Use modified Newton's method with safeguards
-        let lambda = solve_single_secular(d, z, rho, lower, upper, k)?;
-        eigenvalues.push(lambda);
+        for r in 0..n {
+            let mut acc = T::zero();
+            for (a, &ua) in u.iter().enumerate() {
+                acc = acc + ua * qmat[(r, active[a])];
+            }
+            vmat[(r, l)] = acc * inv;
+        }
+        eigenvalues[l] = lambda[l];
     }
 
-    Ok(eigenvalues)
+    // Append the deflated eigenpairs (columns of the rotated Q).
+    for (idx, &col) in deflated.iter().enumerate() {
+        let slot = k + idx;
+        eigenvalues[slot] = d[col];
+        for r in 0..n {
+            vmat[(r, slot)] = qmat[(r, col)];
+        }
+    }
+
+    sort_eigenvalues(&mut eigenvalues, &mut vmat, n);
+    Ok((eigenvalues, vmat))
 }
 
-/// Solve a single secular equation in the given interval.
-fn solve_single_secular<T: Field + Real>(
+/// Solves the secular equation `1 + sum_j zeta_j / (d_j - lambda) = 0` for the
+/// `i`-th eigenvalue (0-indexed).
+///
+/// The root lies in `(d[i], d[i+1])` for `i < k-1` and in
+/// `(d[k-1], d[k-1] + sum(zeta))` for the last eigenvalue.  `zeta_j = rho * z_j^2`
+/// with `zeta_j > 0`, and the poles `d` are strictly ascending.
+///
+/// Uses a safeguarded rational-interpolation ("middle way") iteration with
+/// origin shifting, so the returned `delta[j] = d[j] - lambda` is accurate even
+/// for eigenvalues extremely close to a pole.
+fn solve_secular_i<T: Field + Real>(
     d: &[T],
-    z: &[T],
-    rho: T,
-    lower: T,
-    upper: T,
+    zeta: &[T],
+    i: usize,
     k: usize,
-) -> Result<T, SymmetricEvdDcError> {
+) -> Result<(T, Vec<T>), SymmetricEvdDcError> {
     let eps = <T as Scalar>::epsilon();
-    let tol = eps * T::from_f64(100.0).unwrap_or(T::one());
-
-    // Handle near-zero z[k] case (eigenvalue is approximately d[k])
-    if Scalar::abs(z[k]) < tol {
-        return Ok(d[k]);
-    }
-
     let two = T::one() + T::one();
+    let eight = T::from_f64(8.0).unwrap_or(T::one());
 
-    // Initial guess: midpoint or weighted average
-    let mut lambda = (lower + upper) / two;
-
-    // Newton iteration with bisection safeguard
-    let mut a = lower;
-    let mut b = upper;
-
-    for _ in 0..MAX_SECULAR_ITER {
-        // Evaluate secular function f(lambda) = 1 + rho * sum(z_i^2 / (d_i - lambda))
-        let (f, df) = secular_function_and_derivative(d, z, rho, lambda);
-
-        if Scalar::abs(f) < tol * (T::one() + Scalar::abs(lambda)) {
-            return Ok(lambda);
-        }
-
-        // Newton step
-        let delta = f / df;
-        let lambda_new = lambda - delta;
-
-        // Check if Newton step is within bounds
-        if lambda_new > a && lambda_new < b {
-            lambda = lambda_new;
-        } else {
-            // Bisection fallback
-            lambda = (a + b) / two;
-        }
-
-        // Update bounds based on function sign
-        let (f_new, _) = secular_function_and_derivative(d, z, rho, lambda);
-        if f_new < T::zero() {
-            a = lambda;
-        } else {
-            b = lambda;
-        }
-
-        // Check convergence
-        if b - a < tol * (T::one() + Scalar::abs(lambda)) {
-            return Ok((a + b) / two);
-        }
+    let mut sum_zeta = T::zero();
+    for &zj in zeta.iter() {
+        sum_zeta = sum_zeta + zj;
     }
 
-    // Return best estimate even if not fully converged
-    Ok(lambda)
-}
-
-/// Evaluate secular function f(λ) = 1 + ρ * Σ(z_i² / (d_i - λ)) and its derivative.
-fn secular_function_and_derivative<T: Field + Real>(d: &[T], z: &[T], rho: T, lambda: T) -> (T, T) {
-    let n = d.len();
-    let mut f = T::one();
-    let mut df = T::zero();
-
-    for i in 0..n {
-        let zi_sq = z[i] * z[i];
-        let diff = d[i] - lambda;
-        if Scalar::abs(diff) > <T as Scalar>::epsilon() {
-            f = f + rho * zi_sq / diff;
-            df = df + rho * zi_sq / (diff * diff);
+    // Choose the origin (nearest pole) and the eta = lambda - d[orig] bracket.
+    let (orig, mut elo, mut ehi) = if i + 1 < k {
+        let gap = d[i + 1] - d[i];
+        let mid = d[i] + gap / two;
+        let mut fmid = T::one();
+        for (&dj, &zj) in d.iter().zip(zeta.iter()) {
+            fmid = fmid + zj / (dj - mid);
         }
-    }
+        if fmid >= T::zero() {
+            (i, T::zero(), gap)
+        } else {
+            (i + 1, -gap, T::zero())
+        }
+    } else {
+        (k - 1, T::zero(), sum_zeta)
+    };
 
-    (f, df)
-}
+    let d_orig = d[orig];
+    let mut eta = (elo + ehi) / two;
+    let mut delta = vec![T::zero(); k];
 
-/// Compute eigenvectors of merged problem.
-fn compute_merged_eigenvectors<T: Field + Real + bytemuck::Zeroable>(
-    d: &[T],
-    z: &[T],
-    eigenvalues: &[T],
-    _rho: T,
-    n: usize,
-) -> Mat<T> {
-    let mut v: Mat<T> = Mat::zeros(n, n);
+    for _iter in 0..MAX_SECULAR_ITER {
+        for (deltaj, &dj) in delta.iter_mut().zip(d.iter()) {
+            *deltaj = (dj - d_orig) - eta;
+        }
 
-    for j in 0..n {
-        let lambda = eigenvalues[j];
+        let mut psi = T::zero();
+        let mut dpsi = T::zero();
+        let mut phi = T::zero();
+        let mut dphi = T::zero();
+        let mut err = T::one();
+        for (&zj, &dj) in zeta.iter().zip(delta.iter()).take(i + 1) {
+            let t = zj / dj;
+            psi = psi + t;
+            dpsi = dpsi + t / dj;
+            err = err + Scalar::abs(t);
+        }
+        for (&zj, &dj) in zeta.iter().zip(delta.iter()).skip(i + 1) {
+            let t = zj / dj;
+            phi = phi + t;
+            dphi = dphi + t / dj;
+            err = err + Scalar::abs(t);
+        }
+        let f = T::one() + psi + phi;
 
-        // v_j = (D - lambda*I)^{-1} * z / ||...||
-        let mut norm_sq = T::zero();
-        for i in 0..n {
-            let diff = d[i] - lambda;
-            if Scalar::abs(diff) > <T as Scalar>::epsilon() {
-                v[(i, j)] = z[i] / diff;
+        // f is increasing in eta; maintain the sign bracket.
+        if f >= T::zero() {
+            ehi = eta;
+        } else {
+            elo = eta;
+        }
+
+        if !(Scalar::abs(f) > eight * eps * err) {
+            break;
+        }
+
+        // Rational-interpolation step.
+        let step_opt = if i + 1 < k {
+            let dl = delta[i];
+            let dr = delta[i + 1];
+            let b1 = dpsi * dl * dl;
+            let a1 = psi - dpsi * dl;
+            let b2 = dphi * dr * dr;
+            let a2 = phi - dphi * dr;
+            let c0 = T::one() + a1 + a2;
+            let bq = c0 * (dl + dr) + b1 + b2;
+            let cq = c0 * dl * dr + b1 * dr + b2 * dl;
+            solve_quadratic_in_range(c0, bq, cq, dl, dr)
+        } else {
+            let dl = delta[k - 1];
+            let b1 = dpsi * dl * dl;
+            let a1 = psi - dpsi * dl;
+            let c0 = T::one() + a1 + phi;
+            if c0 != T::zero() {
+                let s = dl + b1 / c0;
+                if s > dl { Some(s) } else { None }
             } else {
-                // d[i] == lambda case
-                v[(i, j)] = T::one();
+                None
             }
-            norm_sq = norm_sq + v[(i, j)] * v[(i, j)];
-        }
+        };
 
-        // Normalize
-        let norm = Real::sqrt(norm_sq);
-        if norm > T::zero() {
-            for i in 0..n {
-                v[(i, j)] = v[(i, j)] / norm;
+        let eta_next = match step_opt {
+            Some(s) => {
+                let cand = eta + s;
+                if cand > elo && cand < ehi {
+                    cand
+                } else {
+                    (elo + ehi) / two
+                }
             }
+            None => (elo + ehi) / two,
+        };
+
+        if eta_next == eta {
+            let bis = (elo + ehi) / two;
+            if bis == eta {
+                break;
+            }
+            eta = bis;
+        } else {
+            eta = eta_next;
         }
     }
 
-    v
+    for (deltaj, &dj) in delta.iter_mut().zip(d.iter()) {
+        *deltaj = (dj - d_orig) - eta;
+    }
+
+    let lambda = d_orig + eta;
+    if !lambda.is_finite() {
+        return Err(SymmetricEvdDcError::SecularEquationFailed);
+    }
+    Ok((lambda, delta))
+}
+
+/// Solves `a*s^2 - b*s + c = 0` and returns the root strictly inside `(lo, hi)`,
+/// if any.  Used by the secular-equation rational interpolation.
+fn solve_quadratic_in_range<T: Field + Real>(a: T, b: T, c: T, lo: T, hi: T) -> Option<T> {
+    let two = T::one() + T::one();
+    let four = two * two;
+    if a == T::zero() {
+        if b == T::zero() {
+            return None;
+        }
+        let s = c / b;
+        if s > lo && s < hi {
+            return Some(s);
+        }
+        return None;
+    }
+    let disc = b * b - four * a * c;
+    if disc < T::zero() {
+        return None;
+    }
+    let sq = Real::sqrt(disc);
+    let r1 = (b - sq) / (two * a);
+    let r2 = (b + sq) / (two * a);
+    if r1 > lo && r1 < hi {
+        Some(r1)
+    } else if r2 > lo && r2 < hi {
+        Some(r2)
+    } else {
+        None
+    }
 }
 
 /// QR algorithm for small symmetric tridiagonal matrices (base case).
@@ -607,7 +820,10 @@ fn qr_algorithm<T: Field + Real>(
             let (c, s) = givens_rotation(x, z);
 
             if k > l {
-                off_diag[k - 1] = Real::hypot(x, z);
+                // The regenerated off-diagonal is r = c*x - s*z.  Using hypot(x, z)
+                // here loses the sign, which leaves eigenvalues correct but corrupts
+                // the accumulated eigenvectors.
+                off_diag[k - 1] = c * x - s * z;
             }
 
             // Update tridiagonal matrix
@@ -686,6 +902,112 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() < tol
+    }
+
+    /// Deterministic split-mix PRNG producing values in [-1, 1] (no external deps).
+    struct Prng {
+        state: u64,
+    }
+
+    impl Prng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+        }
+    }
+
+    /// Builds a dense symmetric matrix with pseudo-random entries.
+    fn random_symmetric(n: usize, seed: u64) -> Mat<f64> {
+        let mut prng = Prng::new(seed);
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in i..n {
+                let v = prng.next_f64();
+                a[(i, j)] = v;
+                a[(j, i)] = v;
+            }
+        }
+        a
+    }
+
+    /// Builds A = H * diag(eigs) * H where H = I - 2 w w^T is a Householder
+    /// reflector.  The eigenvalues of A are exactly `eigs` (with any repeats).
+    fn symmetric_with_spectrum(eigs: &[f64], seed: u64) -> Mat<f64> {
+        let n = eigs.len();
+        let mut prng = Prng::new(seed);
+        let mut w = vec![0.0f64; n];
+        let mut norm_sq = 0.0;
+        for wi in w.iter_mut() {
+            *wi = prng.next_f64();
+            norm_sq += *wi * *wi;
+        }
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            for wi in w.iter_mut() {
+                *wi /= norm;
+            }
+        }
+        // H = I - 2 w w^T ; A = H D H.
+        let mut h: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let delta = if i == j { 1.0 } else { 0.0 };
+                h[(i, j)] = delta - 2.0 * w[i] * w[j];
+            }
+        }
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0;
+                for k in 0..n {
+                    acc += h[(i, k)] * eigs[k] * h[(j, k)];
+                }
+                a[(i, j)] = acc;
+            }
+        }
+        a
+    }
+
+    /// Maximum |V^T V - I| over all entries.
+    fn orthogonality_error(v: MatRef<'_, f64>, n: usize) -> f64 {
+        let mut err = 0.0f64;
+        for i in 0..n {
+            for j in 0..n {
+                let mut dot = 0.0;
+                for k in 0..n {
+                    dot += v[(k, i)] * v[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                err = err.max((dot - expected).abs());
+            }
+        }
+        err
+    }
+
+    /// Maximum residual |A v_i - lambda_i v_i| over all eigenpairs.
+    fn residual_error(a: &Mat<f64>, evd: &SymmetricEvdDc<f64>, n: usize) -> f64 {
+        let v = evd.eigenvectors();
+        let eigs = evd.eigenvalues();
+        let mut err = 0.0f64;
+        for col in 0..n {
+            let lambda = eigs[col];
+            for row in 0..n {
+                let mut av = 0.0;
+                for k in 0..n {
+                    av += a[(row, k)] * v[(k, col)];
+                }
+                err = err.max((av - lambda * v[(row, col)]).abs());
+            }
+        }
+        err
     }
 
     #[test]
@@ -913,5 +1235,186 @@ mod tests {
                 eigs_dc[i]
             );
         }
+    }
+
+    /// Compares divide-and-conquer eigenvalues against the QR reference and checks
+    /// eigenvector orthogonality and residuals across a range of sizes, including
+    /// sizes well above `SMLSIZ` that exercise the real D&C merge.
+    #[test]
+    fn test_evd_dc_reference_across_sizes() {
+        use super::super::symmetric::SymmetricEvd;
+
+        for (idx, &n) in [3usize, 5, 10, 50, 150, 300].iter().enumerate() {
+            let a = random_symmetric(n, 0x1234_5678 + idx as u64 * 97);
+
+            let dc = SymmetricEvdDc::compute(a.as_ref()).unwrap();
+            let qr = SymmetricEvd::compute(a.as_ref()).unwrap();
+
+            let dc_eigs = dc.eigenvalues();
+            let qr_eigs = qr.eigenvalues();
+
+            // Scale tolerance by the spectral radius.
+            let scale = qr_eigs.iter().fold(1.0f64, |acc, &e| acc.max(e.abs()));
+            let eig_tol = 1e-7 * scale * (n as f64).sqrt();
+
+            for i in 0..n {
+                assert!(
+                    (dc_eigs[i] - qr_eigs[i]).abs() <= eig_tol,
+                    "n={}: eigenvalue {} mismatch DC={} QR={} (tol {})",
+                    n,
+                    i,
+                    dc_eigs[i],
+                    qr_eigs[i],
+                    eig_tol
+                );
+            }
+
+            let ortho = orthogonality_error(dc.eigenvectors(), n);
+            assert!(
+                ortho <= 1e-9 * (n as f64),
+                "n={}: orthogonality error {} too large",
+                n,
+                ortho
+            );
+
+            let resid = residual_error(&a, &dc, n);
+            assert!(
+                resid <= 1e-7 * scale * (n as f64),
+                "n={}: residual {} too large",
+                n,
+                resid
+            );
+        }
+    }
+
+    /// Directly exercises the divide-and-conquer merge at *every* level (smlsiz=1)
+    /// for small tridiagonal matrices, comparing against the QR base solver.
+    #[test]
+    fn test_tridiag_dc_forced_merge_small() {
+        for &n in &[2usize, 3, 5, 10] {
+            let mut prng = Prng::new(0xABCD_00FF + n as u64);
+            let diag: Vec<f64> = (0..n).map(|_| prng.next_f64() * 4.0).collect();
+            let off: Vec<f64> = (0..n - 1).map(|_| prng.next_f64() * 2.0 + 0.5).collect();
+
+            // Reference: QR base solver on the same tridiagonal.
+            let mut z_ref = Mat::eye(n);
+            let ref_eigs = qr_algorithm(diag.clone(), off.clone(), &mut z_ref, n).unwrap();
+
+            // Forced divide-and-conquer (merge at every level).
+            let (dc_eigs, dc_vec) = tridiag_dc(diag.clone(), off.clone(), 1).unwrap();
+
+            for i in 0..n {
+                assert!(
+                    (dc_eigs[i] - ref_eigs[i]).abs() <= 1e-9 * (1.0 + ref_eigs[i].abs()),
+                    "n={}: forced-merge eigenvalue {} mismatch DC={} REF={}",
+                    n,
+                    i,
+                    dc_eigs[i],
+                    ref_eigs[i]
+                );
+            }
+
+            let ortho = orthogonality_error(dc_vec.as_ref(), n);
+            assert!(
+                ortho <= 1e-10 * (n as f64),
+                "n={}: forced-merge orthogonality error {} too large",
+                n,
+                ortho
+            );
+        }
+    }
+
+    /// Exercises type-2 deflation in the merge path: a matrix built with many
+    /// exactly-repeated eigenvalues but non-trivial (dense) coupling.
+    #[test]
+    fn test_evd_dc_deflation_repeated_spectrum() {
+        // 40 eigenvalues with several repeats; SMLSIZ=25 forces one D&C merge.
+        let mut eigs = vec![
+            1.0, 1.0, 1.0, 1.0, 2.5, 2.5, 2.5, -3.0, -3.0, -3.0, -3.0, -3.0, 7.0, 7.0, 0.0, 0.0,
+            0.0, 5.5, 5.5, 9.0,
+        ];
+        // Pad up to 40 with a few more repeats and distinct values.
+        while eigs.len() < 40 {
+            let v = eigs.len() as f64 * 0.31 - 6.0;
+            eigs.push(v);
+            eigs.push(v); // ensure repeats appear across the split boundary
+        }
+        eigs.truncate(40);
+        let n = eigs.len();
+
+        let a = symmetric_with_spectrum(&eigs, 0x5151_2727);
+
+        let dc = SymmetricEvdDc::compute(a.as_ref()).unwrap();
+        let dc_eigs = dc.eigenvalues();
+
+        let mut sorted = eigs.clone();
+        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+
+        let scale = sorted.iter().fold(1.0f64, |acc, &e| acc.max(e.abs()));
+        for i in 0..n {
+            assert!(
+                (dc_eigs[i] - sorted[i]).abs() <= 1e-7 * scale * (n as f64).sqrt(),
+                "eigenvalue {} mismatch DC={} expected={}",
+                i,
+                dc_eigs[i],
+                sorted[i]
+            );
+        }
+
+        let ortho = orthogonality_error(dc.eigenvectors(), n);
+        assert!(
+            ortho <= 1e-9 * (n as f64),
+            "deflation orthogonality error {} too large",
+            ortho
+        );
+
+        let resid = residual_error(&a, &dc, n);
+        assert!(
+            resid <= 1e-7 * scale * (n as f64),
+            "deflation residual {} too large",
+            resid
+        );
+    }
+
+    /// f32 divide-and-conquer at a size that exercises the merge.
+    #[test]
+    fn test_evd_dc_f32_larger() {
+        let n = 60usize;
+        let mut prng = Prng::new(0x2468_ACE0);
+        let mut a: Mat<f32> = Mat::zeros(n, n);
+        for i in 0..n {
+            for j in i..n {
+                let v = (prng.next_f64() as f32) * 2.0;
+                a[(i, j)] = v;
+                a[(j, i)] = v;
+            }
+        }
+
+        let dc = SymmetricEvdDc::compute(a.as_ref()).unwrap();
+        let eigs = dc.eigenvalues();
+
+        // Ascending order.
+        for i in 0..n - 1 {
+            assert!(eigs[i] <= eigs[i + 1] + 1e-3);
+        }
+
+        // Orthogonality (looser for f32).
+        let v = dc.eigenvectors();
+        let mut ortho = 0.0f32;
+        for i in 0..n {
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for k in 0..n {
+                    dot += v[(k, i)] * v[(k, j)];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                ortho = ortho.max((dot - expected).abs());
+            }
+        }
+        assert!(
+            ortho <= 1e-3 * n as f32,
+            "f32 orthogonality {} too large",
+            ortho
+        );
     }
 }

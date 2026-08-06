@@ -20,6 +20,7 @@ rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+num-complex.workspace = true
 
 [features]
 default = ["oxiblas-core/std", "oxiblas-matrix/std"]
@@ -27,3 +28,6 @@ parallel = ["dep:rayon", "oxiblas-core/parallel"]
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

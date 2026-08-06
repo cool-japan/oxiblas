@@ -8,6 +8,17 @@
 //! - For `Trans::Trans`: C = α·A^T·A + β·C where A is k×n, C is n×n
 //!
 //! Only the specified triangle (upper or lower) of C is updated.
+//!
+//! # `ConjTrans` and complex element types
+//!
+//! SYRK is the *symmetric* rank-k update and always uses the plain transpose
+//! `A^T` (never the conjugate transpose `A^H`). The conjugate-transpose form is
+//! the domain of the Hermitian family (HERK/HER2K), so `Trans::ConjTrans` is
+//! meaningless for a complex-valued SYRK. Reference C/ZSYRK reject `'C'` outright,
+//! while reference S/DSYRK accept `'C'` and treat it exactly as `'T'` because
+//! conjugation is the identity on reals. This implementation mirrors that: for
+//! real element types `ConjTrans` is accepted and behaves like `Trans`, and for
+//! complex element types it is rejected with [`SyrkError::InvalidTrans`].
 
 use crate::level3::gemm::gemm;
 use crate::level3::gemm_kernel::GemmKernel;
@@ -22,6 +33,9 @@ pub enum SyrkError {
     NotSquare,
     /// Dimension mismatch.
     DimensionMismatch,
+    /// Invalid transpose option: `Trans::ConjTrans` is not allowed for a
+    /// complex-valued symmetric rank-k update (SYRK uses `A^T`, not `A^H`).
+    InvalidTrans,
 }
 
 impl core::fmt::Display for SyrkError {
@@ -29,6 +43,10 @@ impl core::fmt::Display for SyrkError {
         match self {
             Self::NotSquare => write!(f, "Matrix C is not square"),
             Self::DimensionMismatch => write!(f, "Dimension mismatch"),
+            Self::InvalidTrans => write!(
+                f,
+                "Invalid transpose option: complex SYRK only accepts NoTrans or Trans (ConjTrans is Hermitian-only)"
+            ),
         }
     }
 }
@@ -86,6 +104,16 @@ pub fn syrk<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: MatMut<'_, T>,
 ) -> Result<(), SyrkError> {
+    // SYRK computes the *symmetric* update using A^T. For complex element types the
+    // conjugate transpose A^H is a different operation (that of HERK), so silently
+    // treating ConjTrans as Trans would return a plausible-but-wrong result. Reject
+    // it explicitly, matching reference C/ZSYRK. For real element types conjugation
+    // is a no-op, so ConjTrans is legal and behaves exactly like Trans (matching
+    // reference S/DSYRK), and `T::is_real()` keeps it out of this branch.
+    if trans == Trans::ConjTrans && !T::is_real() {
+        return Err(SyrkError::InvalidTrans);
+    }
+
     // Validate inputs
     let n = c.nrows();
     if c.ncols() != n {
@@ -636,5 +664,81 @@ mod tests {
 
         // C[1,0] = sum_l A[1,l] * A[0,l] = 6*1 + 7*2 + 8*3 + 9*4 + 10*5 = 6+14+24+36+50 = 130
         assert!((c[(1, 0)] - 130.0).abs() < 1e-10);
+    }
+
+    /// For real element types, `ConjTrans` is accepted (not rejected) and must compute
+    /// exactly the same result as `Trans`, since conjugation is the identity on reals.
+    /// This is the documented "no-op" branch of the ConjTrans validation. (Complex
+    /// element types would be rejected with `SyrkError::InvalidTrans`, but SYRK's
+    /// `GemmKernel` bound is only satisfied by f32/f64, so that path is not runtime
+    /// reachable here.)
+    #[test]
+    fn test_syrk_conj_trans_real_matches_trans() {
+        let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
+
+        let mut c_trans = Mat::zeros(3, 3);
+        syrk(
+            Uplo::Lower,
+            Trans::Trans,
+            1.0,
+            a.as_ref(),
+            0.0,
+            c_trans.as_mut(),
+        )
+        .unwrap();
+
+        let mut c_conj = Mat::zeros(3, 3);
+        syrk(
+            Uplo::Lower,
+            Trans::ConjTrans,
+            1.0,
+            a.as_ref(),
+            0.0,
+            c_conj.as_mut(),
+        )
+        .unwrap();
+
+        for j in 0..3 {
+            for i in j..3 {
+                assert!((c_trans[(i, j)] - c_conj[(i, j)]).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// Regression: `beta == 0` must not read C on the GEMM path (`syrk_via_gemm`); a
+    /// NaN in the output buffer must not survive via `0*NaN`.
+    #[test]
+    fn test_syrk_beta_zero_ignores_nan_c() {
+        let n = 32usize;
+        let k = 8usize;
+        let mut a = Mat::<f64>::zeros(n, k);
+        for i in 0..n {
+            for j in 0..k {
+                a[(i, j)] = (i as f64) * 0.5 - (j as f64) + 1.0;
+            }
+        }
+
+        let mut c = Mat::<f64>::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                c[(i, j)] = f64::NAN;
+            }
+        }
+
+        syrk(
+            Uplo::Lower,
+            Trans::NoTrans,
+            1.0,
+            a.as_ref(),
+            0.0,
+            c.as_mut(),
+        )
+        .unwrap();
+
+        for j in 0..n {
+            for i in j..n {
+                assert!(c[(i, j)].is_finite(), "NaN leaked into C[{i},{j}]");
+            }
+        }
     }
 }

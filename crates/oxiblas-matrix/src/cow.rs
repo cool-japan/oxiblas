@@ -130,25 +130,13 @@ impl<T: Scalar> CowMat<T> {
     }
 
     /// Creates a COW matrix from an owned Mat.
-    pub fn from_mat(mat: Mat<T>) -> Self
-    where
-        T: bytemuck::Zeroable,
-    {
-        let nrows = mat.nrows();
-        let ncols = mat.ncols();
-        let row_stride = mat.row_stride();
-        let total = row_stride * ncols;
-
-        let mut data = AlignedVec::zeros(total);
-
-        // Copy data from mat
-        let mat_ref = mat.as_ref();
-        for j in 0..ncols {
-            for i in 0..nrows {
-                data[i + j * row_stride] = mat_ref[(i, j)];
-            }
-            // Fill padding with zeros (already done by zeros())
-        }
+    ///
+    /// Since `mat` is already uniquely owned, this takes ownership of its
+    /// backing buffer directly (via `Mat::into_raw_parts`) instead of
+    /// allocating a fresh buffer and copying every element -- an O(1) move
+    /// rather than an O(nrows * ncols) copy.
+    pub fn from_mat(mat: Mat<T>) -> Self {
+        let (data, nrows, ncols, row_stride) = mat.into_raw_parts();
 
         CowMat {
             inner: Arc::new(SharedMatData {
@@ -205,12 +193,17 @@ impl<T: Scalar> CowMat<T> {
     /// Returns an immutable view of the matrix.
     #[inline]
     pub fn as_ref(&self) -> MatRef<'_, T> {
-        MatRef::new(
-            self.inner.data.as_ptr(),
-            self.inner.nrows,
-            self.inner.ncols,
-            self.inner.row_stride,
-        )
+        // SAFETY: `self.inner.data` holds initialized, aligned elements kept alive
+        // by the shared `Arc` for the borrow's lifetime, and `row_stride >= nrows`,
+        // so every in-bounds `(i, j)` offset is within the allocation.
+        unsafe {
+            MatRef::new(
+                self.inner.data.as_ptr(),
+                self.inner.nrows,
+                self.inner.ncols,
+                self.inner.row_stride,
+            )
+        }
     }
 
     /// Returns a pointer to the first element.
@@ -309,12 +302,19 @@ impl<T: Scalar> CowMat<T> {
         // Safety: We just ensured we're the only owner
         let inner = Arc::get_mut(&mut self.inner).expect("Should be unique after clone");
 
-        MatMut::new(
-            inner.data.as_mut_ptr(),
-            inner.nrows,
-            inner.ncols,
-            inner.row_stride,
-        )
+        // SAFETY: `inner.data` holds `row_stride * ncols` initialized, aligned
+        // elements and `row_stride >= nrows`, so every in-bounds `(i, j)`
+        // offset is within the allocation and no two indices alias; the
+        // `Arc::get_mut` above proves this handle is unique, and `&mut self`
+        // keeps it alive and exclusive for the view's lifetime.
+        unsafe {
+            MatMut::new(
+                inner.data.as_mut_ptr(),
+                inner.nrows,
+                inner.ncols,
+                inner.row_stride,
+            )
+        }
     }
 
     /// Sets an element, cloning if the data is shared.
@@ -489,6 +489,55 @@ mod tests {
         assert_eq!(cow.ncols(), 3);
         assert_eq!(cow[(0, 0)], 1.0);
         assert_eq!(cow[(1, 2)], 6.0);
+    }
+
+    // Regression test for finding #2: `CowMat::from_mat` used to allocate a
+    // fresh zeroed buffer and copy the source `Mat` into it element by
+    // element, even though `mat` was already uniquely owned and could just
+    // be moved. A correct O(1) move must leave the backing pointer (and the
+    // exact bit pattern of the padding elements) untouched.
+    #[test]
+    fn test_cow_from_mat_moves_buffer_without_copy() {
+        let mut mat: Mat<f64> = Mat::from_rows(&[
+            &[1.0, 2.0, 3.0],
+            &[4.0, 5.0, 6.0],
+            &[7.0, 8.0, 9.0],
+            &[10.0, 11.0, 12.0],
+        ]);
+        // Stamp a sentinel into the row-stride padding region (rows beyond
+        // `nrows` up to `row_stride`, if any) so that a "reallocate + copy
+        // only the logical elements" implementation would be caught
+        // silently dropping it, in addition to the pointer-identity check
+        // below being the primary signal that no reallocation occurred.
+        let row_stride = mat.row_stride();
+        let nrows = mat.nrows();
+        for pad_row in nrows..row_stride {
+            mat.raw_data_mut()[pad_row] = -1.0;
+        }
+
+        let original_ptr = mat.as_ptr();
+        let original_row_stride = mat.row_stride();
+
+        let cow: CowMat<f64> = CowMat::from_mat(mat);
+
+        // A genuine move keeps the exact same allocation: the CowMat's
+        // backing pointer must be identical to the Mat's original pointer.
+        assert_eq!(cow.as_ptr(), original_ptr);
+        assert_eq!(cow.row_stride(), original_row_stride);
+        assert_eq!(cow.nrows(), 4);
+        assert_eq!(cow.ncols(), 3);
+        assert_eq!(cow[(0, 0)], 1.0);
+        assert_eq!(cow[(3, 2)], 12.0);
+
+        // A fresh `AlignedVec::zeros` + element-by-element copy (the old,
+        // buggy behavior) would have zeroed the padding region rather than
+        // preserving it, since only the logical `nrows x ncols` elements
+        // get copied. Reading the sentinel back proves the exact same
+        // memory (padding included) survived the move untouched.
+        if row_stride > nrows {
+            let padding_val = unsafe { *cow.as_ptr().add(nrows) };
+            assert_eq!(padding_val, -1.0);
+        }
     }
 
     #[test]

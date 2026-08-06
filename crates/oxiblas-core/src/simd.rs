@@ -1,7 +1,7 @@
 //! SIMD abstraction layer for OxiBLAS.
 //!
-//! This module provides a unified interface over architecture-specific SIMD
-//! intrinsics from `core::arch`. It supports:
+//! This module provides a unified, general-purpose interface over
+//! architecture-specific SIMD intrinsics from `core::arch`. It supports:
 //! - x86_64: AVX2 (256-bit), AVX512F (512-bit), SSE4.2 (128-bit)
 //! - AArch64: NEON (128-bit), 256-bit emulated
 //! - WASM32: SIMD128 (128-bit), 256-bit emulated
@@ -9,6 +9,46 @@
 //!
 //! The design uses runtime feature detection to dispatch to the best
 //! available implementation.
+//!
+//! # Integration status (read this before assuming it is on the hot path)
+//!
+//! This is a *general-purpose* SIMD toolkit that is available for downstream
+//! use, but it is **not** the code that powers OxiBLAS's tuned compute kernels.
+//! To avoid advertising an integration that does not exist:
+//!
+//! - The BLAS/LAPACK compute kernels in `oxiblas-blas` each perform their own
+//!   `is_x86_feature_detected!`-guarded dispatch and carry their own
+//!   hand-written intrinsics. As of this writing that includes
+//!   `level1::{dot, axpy, nrm2}`, `level2::gemv`, and
+//!   `level3::{gemm, gemm_kernel, gemm_packing, gemm_small, gemm_kernel_sse42}`.
+//!   None of them call the [`SimdRegister`]/[`SimdScalar`] register API below.
+//! - What *is* consumed outside this module's own tests is the lightweight
+//!   capability layer: [`SimdLevel`] and [`detect_simd_level`] /
+//!   [`detect_simd_level_raw`], which `crate::tuning` uses for cache/block-size
+//!   heuristics and which the crate re-exports.
+//! - The register-level API ([`SimdRegister`], [`SimdScalar`], the concrete
+//!   register types, and the [`complex`], [`dispatch`], [`multiver`], and
+//!   [`scalar`] submodules) is currently exercised only by this crate's unit
+//!   tests and the `simd` benchmark. It is correct and covered, but no kernel
+//!   is wired to it yet.
+//!
+//! A downstream Level-1 loop would adopt this layer by pairing [`SimdChunks`]
+//! (for head/body/tail splitting) with a [`SimdRegister`] type, as the
+//! `test_abstraction_level1_dot_matches_scalar` regression test demonstrates.
+//!
+//! # Safety: the target-feature contract of the wide registers
+//!
+//! The 128-bit SSE register methods are sound on x86_64 because SSE2 is part of
+//! the x86_64 baseline (the FMA path is selected at compile time via
+//! `#[cfg(target_feature = "fma")]`). The **256-bit (AVX2) and 512-bit
+//! (AVX-512) register methods are declared as safe `fn`s but emit AVX2/AVX-512
+//! instructions without an internal runtime feature guard**. Executing those
+//! instructions on a CPU that lacks the feature is undefined behavior, so a
+//! caller MUST confirm the feature is present (e.g. via
+//! `is_x86_feature_detected!("avx2")`) before constructing or operating on
+//! those register types. This unguarded contract is the reason the tuned
+//! kernels — and this module's own tests — gate every wide-register use behind
+//! runtime detection rather than calling the abstraction blindly.
 //!
 //! # Complex SIMD
 //!
@@ -399,11 +439,17 @@ impl SimdChunks {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
     fn test_detect_simd_level() {
         let level = detect_simd_level();
+        #[cfg(feature = "std")]
         println!("Detected SIMD level: {:?}", level);
 
         // When force-scalar is enabled, should always be Scalar
@@ -441,6 +487,7 @@ mod tests {
         let ptr = data.as_ptr();
 
         let chunks = SimdChunks::new(ptr, 100, SimdLevel::Simd256);
+        #[cfg(feature = "std")]
         println!(
             "Chunks: head_end={}, body_end={}",
             chunks.head_end, chunks.body_end
@@ -609,5 +656,127 @@ mod tests {
         let f = F32x4::splat(3.0);
 
         assert_eq!(e.add(f).reduce_sum(), 20.0); // 4 * 5.0
+    }
+
+    /// The SIMD body loop relies on [`SimdChunks`] to hand it a pointer that is
+    /// aligned to the register width so a subsequent `load_aligned` is sound.
+    /// This locks in that contract across every possible starting misalignment:
+    /// the head must land the body on a width-aligned address, and
+    /// head + body + tail must partition the length with a whole number of
+    /// vectors in the body. A regression in the chunk arithmetic (e.g. the
+    /// `(align - misalign) / size_of` head computation) would fault a real
+    /// `load_aligned`; asserting it here turns that latent segfault into a clean
+    /// test failure. Nothing else currently drives `SimdChunks` past its length
+    /// bookkeeping.
+    #[test]
+    fn test_simd_chunks_alignment_contract() {
+        let level = SimdLevel::Simd256;
+        let lanes = level.lanes::<f64>();
+        let align = level.width_bytes();
+        // Vec<f64> is at least 8-byte aligned, so offsetting the base by 0..8
+        // elements sweeps every residue class modulo the 32-byte register width.
+        let backing: Vec<f64> = vec![0.0; 256];
+
+        for start in 0..8usize {
+            let ptr = unsafe { backing.as_ptr().add(start) };
+            let len = 200;
+            let chunks = SimdChunks::new(ptr, len, level);
+
+            assert_eq!(
+                chunks.head_len() + chunks.body_len() + chunks.tail_len(),
+                len,
+                "partition must be exact for start offset {start}"
+            );
+            assert_eq!(
+                chunks.body_len() % lanes,
+                0,
+                "body must be a whole number of vectors for start offset {start}"
+            );
+
+            let body_ptr = unsafe { ptr.add(chunks.head_len()) };
+            assert_eq!(
+                (body_ptr as usize) % align,
+                0,
+                "body pointer not {align}-byte aligned for start offset {start}"
+            );
+        }
+    }
+
+    /// End-to-end proof that a Level-1 dot product built on the abstraction
+    /// ([`SimdChunks`]-style splitting plus a native [`SimdRegister`]) reproduces
+    /// the scalar result, including special-value propagation. This is exactly
+    /// the property any future BLAS wiring of this layer would depend on, and no
+    /// other test exercises the chunked load / FMA-accumulate / reduce path
+    /// together on a real wide register.
+    ///
+    /// # Safety
+    /// The 256-bit register methods emit AVX2/FMA instructions with no internal
+    /// runtime guard (see the module-level docs), so the whole body is gated
+    /// behind `is_x86_feature_detected!`; on hardware without AVX2+FMA the check
+    /// is skipped rather than risking undefined behavior.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[test]
+    fn test_abstraction_level1_dot_matches_scalar() {
+        use crate::simd::SimdScalar;
+
+        if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+            // No sound way to run the wide-register path; the scalar-fallback
+            // arithmetic is already covered by the other tests in this module.
+            return;
+        }
+
+        // Dot product through the abstraction: FMA-accumulate full vectors, then
+        // finish the ragged tail with scalars — the canonical Level-1 shape.
+        fn simd_dot(a: &[f64], b: &[f64]) -> f64 {
+            assert_eq!(a.len(), b.len());
+            type Reg = <f64 as SimdScalar>::Simd256;
+            let lanes = Reg::LANES;
+            let len = a.len();
+            let full = len / lanes * lanes;
+
+            let mut acc = Reg::zero();
+            let mut i = 0;
+            while i < full {
+                // SAFETY: `i + lanes <= full <= len`, so both loads read `lanes`
+                // in-bounds elements; the caller confirmed AVX2+FMA is present.
+                let va = unsafe { Reg::load_unaligned(a.as_ptr().add(i)) };
+                let vb = unsafe { Reg::load_unaligned(b.as_ptr().add(i)) };
+                acc = va.mul_add(vb, acc);
+                i += lanes;
+            }
+            let mut sum = acc.reduce_sum();
+            while i < len {
+                sum += a[i] * b[i];
+                i += 1;
+            }
+            sum
+        }
+
+        // Length deliberately not a multiple of 4 to force the scalar tail.
+        let len = 103usize;
+        let a: Vec<f64> = (0..len).map(|k| (k as f64) * 0.5 - 7.0).collect();
+        let b: Vec<f64> = (0..len).map(|k| 1.0 / (k as f64 + 1.0)).collect();
+
+        let reference: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let got = simd_dot(&a, &b);
+
+        // FMA accumulation can differ from separate mul+add in the final ULPs,
+        // so compare with a tight relative tolerance rather than bit-for-bit.
+        let tol = 1e-12 * reference.abs().max(1.0);
+        assert!(
+            (got - reference).abs() <= tol,
+            "simd dot {got} vs scalar {reference} (tol {tol})"
+        );
+
+        // A NaN in the vectorized body must propagate through load/FMA/reduce.
+        let mut a_nan = a.clone();
+        a_nan[50] = f64::NAN;
+        assert!(simd_dot(&a_nan, &b).is_nan(), "NaN did not propagate");
+
+        // +Inf against a positive weight must yield an infinite result (no
+        // silent saturation to a finite value).
+        let mut a_inf = a.clone();
+        a_inf[10] = f64::INFINITY;
+        assert!(simd_dot(&a_inf, &b).is_infinite(), "Inf did not propagate");
     }
 }

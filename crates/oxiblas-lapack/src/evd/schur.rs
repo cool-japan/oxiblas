@@ -133,6 +133,40 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
             return Self::compute_2x2(a);
         }
 
+        // n >= 3: reduce to Hessenberg form and run the Francis double-shift QR
+        // iteration. The iteration budget scales with n — `MAX_ITERATIONS` sweeps
+        // per row is the classic heuristic used by LAPACK's xHSEQR (`saturating_mul`
+        // guards the pathological huge-`n` case against usize overflow).
+        Self::compute_hessenberg_qr(a, Self::MAX_ITERATIONS.saturating_mul(n))
+    }
+
+    /// Reduces `a` (which must be square with `n >= 3`) to real Schur form via
+    /// Hessenberg reduction followed by the Francis double-shift QR iteration.
+    ///
+    /// `max_total_iterations` bounds the *total* number of QR sweeps across all
+    /// deflation blocks. If that budget is exhausted while the active window has
+    /// neither deflated to size `<= 2` nor reached real Schur form, this returns
+    /// [`SchurError::NotConverged`] instead of silently handing back a partially
+    /// reduced `T`/`Q` as if the decomposition had succeeded — matching the
+    /// `INFO > 0` failure contract of LAPACK's DHSEQR.
+    ///
+    /// # Why the post-loop convergence check is correct
+    ///
+    /// Every loop pass either deflates a converged 1×1/2×2 block (shrinking `p`
+    /// by 1 or 2) or performs a bulge-chasing QR sweep on the active window
+    /// `[0, p)`. On a successful run the loop therefore exits with `p <= 2`. The
+    /// *only* way to exit with `p > 2` is to trip the `iter_count` cap, i.e. the
+    /// iteration ran out of budget before finishing. Even then, the residual
+    /// window might coincidentally already be quasi-triangular, so we do not fail
+    /// blindly on `p > 2`: we fail only when the window still contains two
+    /// consecutive non-negligible sub-diagonals (a diagonal block of order `>= 3`),
+    /// which is exactly the LAPACK definition of "not yet in real Schur form".
+    fn compute_hessenberg_qr(
+        a: MatRef<'_, T>,
+        max_total_iterations: usize,
+    ) -> Result<Self, SchurError> {
+        let n = a.ncols();
+
         // Step 1: Reduce to upper Hessenberg form
         let hess = Hessenberg::compute(a).map_err(|_| SchurError::NotSquare)?;
         let mut t = Mat::zeros(n, n);
@@ -159,7 +193,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
         let mut p = n;
         let mut iter_count = 0;
 
-        while p > 2 && iter_count < Self::MAX_ITERATIONS * n {
+        while p > 2 && iter_count < max_total_iterations {
             iter_count += 1;
 
             // Find the active block
@@ -201,6 +235,14 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
             }
         }
 
+        // Report non-convergence honestly. If the QR sweeps exhausted their budget
+        // while an active window of order `> 2` remained *and* that window is still
+        // not in real Schur form, the eigenvalues extracted from `T` would be
+        // garbage — return NotConverged rather than a plausible-looking wrong answer.
+        if p > 2 && !Self::active_block_converged(&t, p, tol) {
+            return Err(SchurError::NotConverged);
+        }
+
         // Handle remaining 2×2 block if needed
         if p == 2 {
             let sub = Scalar::abs(t[(1, 0)]);
@@ -219,6 +261,60 @@ impl<T: Field + Real + bytemuck::Zeroable> Schur<T> {
             eigenvalues,
             n,
         })
+    }
+
+    /// Returns `true` when the leading `p`×`p` active window of `t` is already in
+    /// real Schur form, i.e. it contains no two *consecutive* non-negligible
+    /// sub-diagonal entries.
+    ///
+    /// A quasi-triangular matrix is built from isolated 1×1 and 2×2 diagonal
+    /// blocks, so a lone 2×2 block's single non-zero sub-diagonal is perfectly
+    /// converged. Only two adjacent non-negligible sub-diagonals — which would
+    /// imply an unreduced diagonal block of order `>= 3` — mean the QR iteration
+    /// still had work to do. This is the criterion used to distinguish a genuine
+    /// convergence failure from a budget exit that nonetheless landed on a valid
+    /// Schur form.
+    fn active_block_converged(t: &Mat<T>, p: usize, tol: T) -> bool {
+        // Sub-diagonal entry `t[k, k-1]` is negligible relative to its neighbouring
+        // diagonal magnitudes (the same deflation test used inside the QR loop).
+        let negligible = |k: usize| -> bool {
+            let sub = Scalar::abs(t[(k, k - 1)]);
+            let diag_sum = Scalar::abs(t[(k - 1, k - 1)]) + Scalar::abs(t[(k, k)]);
+            sub <= tol * diag_sum
+        };
+
+        // Scan for adjacent non-negligible sub-diagonals within the window.
+        for k in 1..p.saturating_sub(1) {
+            if !negligible(k) && !negligible(k + 1) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Test-only hook: runs the Schur decomposition with a custom QR iteration
+    /// budget so the [`SchurError::NotConverged`] path can be exercised
+    /// deterministically (a genuine slow-converging matrix would otherwise need to
+    /// be enormous to defeat the default `MAX_ITERATIONS * n` budget).
+    #[cfg(test)]
+    pub(crate) fn compute_with_iteration_budget(
+        a: MatRef<'_, T>,
+        max_total_iterations: usize,
+    ) -> Result<Self, SchurError> {
+        let m = a.nrows();
+        let n = a.ncols();
+
+        if m == 0 || n == 0 {
+            return Err(SchurError::EmptyMatrix);
+        }
+        if m != n {
+            return Err(SchurError::NotSquare);
+        }
+        if n <= 2 {
+            // Tiny cases are closed-form and never iterate; the budget is irrelevant.
+            return Self::compute(a);
+        }
+        Self::compute_hessenberg_qr(a, max_total_iterations)
     }
 
     /// Computes Schur decomposition for 2×2 matrix.
@@ -1296,7 +1392,12 @@ fn householder_3<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
         v_norm_sq = v_norm_sq + v[i] * v[i];
     }
 
-    if v_norm_sq > T::zero() {
+    // `!= zero` (not `> zero`): `v_norm_sq` is NaN whenever `x` contains a
+    // NaN (the un-gated sum-of-squares above propagates it correctly), and
+    // `>` is always false for NaN — silently downgrading a poisoned norm to
+    // the identity-reflector fallback (`tau = 0`) instead of honestly
+    // returning a NaN `tau`.
+    if v_norm_sq != T::zero() {
         let tau = T::from_f64(2.0).unwrap_or_else(T::zero) / v_norm_sq;
         (v, tau)
     } else {
@@ -1755,6 +1856,71 @@ mod tests {
             "sep[0]={}, sep[1]={} should be equal",
             sep[0],
             sep[1]
+        );
+    }
+
+    /// A 5×5 non-symmetric matrix with tightly clustered eigenvalues. It is
+    /// perfectly solvable, but a single QR sweep cannot possibly deflate it down
+    /// to a size-2 window, so an artificially tiny iteration budget must be
+    /// reported as a convergence failure — not silently returned as garbage.
+    ///
+    /// The eigenvalues cluster near 5 (this is `5*I` plus a small nilpotent-ish
+    /// bidiagonal + coupling perturbation), which is exactly the kind of spectrum
+    /// that makes the QR iteration work hardest.
+    fn slow_converging_5x5() -> Mat<f64> {
+        Mat::from_rows(&[
+            &[5.0, 1.0, 0.2, 0.0, 0.1],
+            &[0.3, 5.0, 1.0, 0.15, 0.0],
+            &[0.0, 0.25, 5.0, 1.0, 0.2],
+            &[0.1, 0.0, 0.3, 5.0, 1.0],
+            &[0.2, 0.1, 0.0, 0.35, 5.0],
+        ])
+    }
+
+    #[test]
+    fn test_schur_reports_non_convergence_when_budget_exhausted() {
+        let a = slow_converging_5x5();
+
+        // A total budget of 1 QR sweep is nowhere near enough to reduce a 5×5
+        // active window (which needs several sweeps and multiple deflations).
+        // Before the fix this fell through and returned a partially-reduced T as
+        // if valid; now it must surface NotConverged.
+        let result = Schur::compute_with_iteration_budget(a.as_ref(), 1);
+        assert_eq!(
+            result.err(),
+            Some(SchurError::NotConverged),
+            "tiny iteration budget must report NotConverged, not fabricate a result"
+        );
+    }
+
+    #[test]
+    fn test_schur_converges_with_full_budget() {
+        // Control for the non-convergence test: the SAME matrix must converge
+        // (and reconstruct as A = Q T Q^T) under the real default budget, proving
+        // the error above is caused purely by the artificial cap, not a defect in
+        // the matrix or the algorithm.
+        let a = slow_converging_5x5();
+
+        let schur = Schur::compute(a.as_ref()).expect("full budget must converge");
+        let rec = schur.reconstruct();
+        for i in 0..5 {
+            for j in 0..5 {
+                assert!(
+                    approx_eq(rec[(i, j)], a[(i, j)], 1e-8),
+                    "reconstruction mismatch at ({i},{j}): {} vs {}",
+                    rec[(i, j)],
+                    a[(i, j)]
+                );
+            }
+        }
+
+        // Trace is preserved by a similarity transform: sum of eigenvalue real
+        // parts must equal the trace (= 25 here).
+        let trace: f64 = (0..5).map(|i| a[(i, i)]).sum();
+        let eig_sum: f64 = schur.eigenvalues().iter().map(|e| e.real).sum();
+        assert!(
+            approx_eq(eig_sum, trace, 1e-8),
+            "eigenvalue real-part sum {eig_sum} != trace {trace}"
         );
     }
 }

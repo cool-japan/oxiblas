@@ -22,6 +22,7 @@
 //! - Irregular sparsity patterns
 //! - Very small matrices
 
+use num_traits::Zero;
 use oxiblas_core::scalar::{Field, Scalar};
 
 /// Error type for BSR matrix operations.
@@ -215,14 +216,17 @@ impl<T: Scalar + Clone> DenseBlock<T> {
         }
     }
 
-    /// Returns the Frobenius norm squared.
-    pub fn frobenius_norm_sq(&self) -> T
+    /// Returns the Frobenius norm squared (sum of |val|^2 over all entries).
+    ///
+    /// For complex `T`, this uses `val.conj() * val` (i.e. `abs_sq()`) rather than
+    /// `val * val`, so the result is always real-valued and mathematically correct.
+    pub fn frobenius_norm_sq(&self) -> T::Real
     where
         T: Field,
     {
         self.data
             .iter()
-            .fold(T::zero(), |acc, val| acc + val.clone() * val.clone())
+            .fold(T::Real::zero(), |acc, val| acc + val.abs_sq())
     }
 }
 
@@ -1149,6 +1153,51 @@ mod tests {
 
         assert_eq!(bsr.get(0, 0), Some(2.0));
         assert_eq!(bsr.get(1, 1), Some(8.0));
+    }
+
+    #[test]
+    fn test_dense_block_frobenius_norm_sq_real() {
+        let block = DenseBlock::new(2, 2, vec![1.0f64, 2.0, 3.0, 4.0]);
+
+        // 1^2 + 2^2 + 3^2 + 4^2 = 30
+        let norm_sq = block.frobenius_norm_sq();
+        assert!((norm_sq - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_dense_block_frobenius_norm_sq_complex() {
+        use num_complex::Complex64;
+
+        // Entries chosen so that val*val (the old, wrong formula) would sum to a
+        // non-zero, complex value, while |val|^2 = val.conj()*val must be real
+        // and strictly positive.
+        let block = DenseBlock::new(
+            2,
+            2,
+            vec![
+                Complex64::new(3.0, 4.0),  // |.|^2 = 25
+                Complex64::new(0.0, 1.0),  // |.|^2 = 1
+                Complex64::new(1.0, -1.0), // |.|^2 = 2
+                Complex64::new(2.0, 0.0),  // |.|^2 = 4
+            ],
+        );
+
+        let norm_sq = block.frobenius_norm_sq();
+
+        // The result type is `T::Real` (f64), so this is a compile-time guarantee
+        // that the result is real-valued, not just numerically zero imaginary part.
+        assert!((norm_sq - 32.0).abs() < 1e-12);
+
+        // Sanity check against the naive (incorrect) val*val sum to make sure the
+        // two really do differ for complex input.
+        let naive_sum: Complex64 = block
+            .data()
+            .iter()
+            .fold(Complex64::new(0.0, 0.0), |acc, val| acc + val * val);
+        assert!(
+            naive_sum.im.abs() > 1e-12,
+            "test fixture should exercise the complex case"
+        );
     }
 
     #[test]

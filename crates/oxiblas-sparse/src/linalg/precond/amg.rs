@@ -84,12 +84,24 @@ struct AMGLevel<T: Scalar> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::precond::{AMG, AMGConfig};
 ///
+/// // Diagonally dominant tridiagonal matrix [[4,1,0],[1,4,1],[0,1,4]].
+/// let matrix = CsrMatrix::new(
+///     3,
+///     3,
+///     vec![0, 2, 5, 7],
+///     vec![0, 1, 0, 1, 2, 1, 2],
+///     vec![4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+/// )
+/// .unwrap();
+///
 /// let config = AMGConfig::default();
-/// let amg = AMG::new(&matrix, config)?;
-/// let mut z = vec![0.0; n];
+/// let amg = AMG::new(&matrix, config).unwrap();
+/// let r = vec![1.0, 1.0, 1.0];
+/// let mut z = vec![0.0; 3];
 /// amg.apply(&r, &mut z);
 /// ```
 #[derive(Debug, Clone)]
@@ -188,14 +200,14 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
 
             // Build interpolation operator
             let interpolation =
-                Self::build_interpolation(&current_matrix, &strength, &splitting, num_coarse);
+                Self::build_interpolation(&current_matrix, &strength, &splitting, num_coarse)?;
 
             // Build restriction (transpose of interpolation for symmetric)
-            let restriction = Self::transpose_csr(&interpolation);
+            let restriction = Self::transpose_csr(&interpolation)?;
 
             // Build coarse grid operator: A_c = R * A * P
-            let ap = Self::spmm_csr(&current_matrix, &interpolation);
-            let coarse_matrix = Self::spmm_csr(&restriction, &ap);
+            let ap = Self::spmm_csr(&current_matrix, &interpolation)?;
+            let coarse_matrix = Self::spmm_csr(&restriction, &ap)?;
 
             levels.push(AMGLevel {
                 matrix: current_matrix,
@@ -367,7 +379,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
         strength: &[Vec<usize>],
         splitting: &[CFSplitting],
         num_coarse: usize,
-    ) -> CsrMatrix<T> {
+    ) -> Result<CsrMatrix<T>, PreconditionerError> {
         let n = a.nrows();
 
         // Map coarse points to coarse indices
@@ -510,14 +522,15 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
             }
         }
 
-        CsrMatrix::new(n, num_coarse, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(n, num_coarse, vec![0; n + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(n, num_coarse, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "AMG interpolation operator construction failed: {e}"
+            ))
         })
     }
 
     /// Transpose a CSR matrix.
-    fn transpose_csr(a: &CsrMatrix<T>) -> CsrMatrix<T> {
+    fn transpose_csr(a: &CsrMatrix<T>) -> Result<CsrMatrix<T>, PreconditionerError> {
         let nrows = a.nrows();
         let ncols = a.ncols();
 
@@ -552,20 +565,24 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
             }
         }
 
-        CsrMatrix::new(ncols, nrows, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(ncols, nrows, vec![0; ncols + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(ncols, nrows, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "AMG restriction operator (transpose) construction failed: {e}"
+            ))
         })
     }
 
     /// Sparse matrix-matrix multiplication: C = A * B
-    fn spmm_csr(a: &CsrMatrix<T>, b: &CsrMatrix<T>) -> CsrMatrix<T> {
+    fn spmm_csr(a: &CsrMatrix<T>, b: &CsrMatrix<T>) -> Result<CsrMatrix<T>, PreconditionerError> {
         let m = a.nrows();
         let n = b.ncols();
 
         if n == 0 || m == 0 {
-            return CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters");
+            return CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![]).map_err(|e| {
+                PreconditionerError::MatrixConstruction(format!(
+                    "AMG Galerkin coarse-grid operator construction failed: {e}"
+                ))
+            });
         }
 
         let mut row_ptrs = vec![0usize; m + 1];
@@ -625,9 +642,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
             row_ptrs[i + 1] = col_indices.len();
         }
 
-        CsrMatrix::new(m, n, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(m, n, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "AMG Galerkin coarse-grid operator construction failed: {e}"
+            ))
         })
     }
 

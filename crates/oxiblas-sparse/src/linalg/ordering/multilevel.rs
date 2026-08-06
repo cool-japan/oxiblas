@@ -760,17 +760,13 @@ fn mnd_recursive(
     config: &PartitionConfig,
 ) -> Result<(), OrderingError> {
     let sub_n = global_vertices.len();
-
-    // Base case: small subgraph — just number vertices in natural order.
-    if sub_n <= 2 * config.max_coarse_size {
-        for &v in global_vertices {
-            perm[*pos] = v;
-            *pos += 1;
-        }
+    if sub_n == 0 {
         return Ok(());
     }
 
-    // Build local subgraph.
+    // Build the local subgraph induced by `global_vertices` once. It drives both
+    // the tiny-graph base case (a local minimum-degree ordering) and the
+    // bisection that produces the vertex separator for larger blocks.
     let (local_xadj, local_adjncy, local_adjwgt, local_vwgt) = build_subgraph(
         full_n,
         full_xadj,
@@ -780,6 +776,20 @@ fn mnd_recursive(
         global_vertices,
     );
 
+    // Base case: only *genuinely* tiny blocks are ordered directly. Nested
+    // dissection stops paying off once a block is a handful of vertices, so we
+    // bottom out at `ND_BASE_CASE` — not at `2 * max_coarse_size`, which used to
+    // leave every graph of up to a few hundred vertices in its original
+    // (identity) order and thus performed no fill-reducing reordering at all.
+    if sub_n <= ND_BASE_CASE {
+        emit_minimum_degree_order(&local_xadj, &local_adjncy, global_vertices, perm, pos);
+        return Ok(());
+    }
+
+    // Bisect the block into two roughly balanced halves, then tighten the cut
+    // with Kernighan–Lin boundary refinement. The explicit refinement also
+    // improves blocks that were too small to trigger multilevel coarsening
+    // inside `bisect` (where refinement only runs during uncoarsening).
     let partitioner = MultilevelPartitioner::new(config.clone());
     let bisection = partitioner.bisect(
         sub_n,
@@ -788,38 +798,79 @@ fn mnd_recursive(
         &local_adjwgt,
         &local_vwgt,
     )?;
+    let mut part = bisection.part;
+    partitioner.refine_partition(
+        sub_n,
+        &local_xadj,
+        &local_adjncy,
+        &local_adjwgt,
+        &local_vwgt,
+        &mut part,
+    );
 
-    // Identify separator: local vertices in part 0 that have a neighbor in part 1,
-    // or vice versa. We include boundary vertices from the smaller cut side
-    // (simplified: all vertices adjacent to the other part form the separator).
-    let mut is_separator = vec![false; sub_n];
+    // Derive a vertex separator from the edge bisection. A vertex on one side of
+    // the cut that has any neighbor on the other side is a boundary vertex.
+    // Removing all boundary vertices of a *single* side disconnects the two
+    // remaining halves, yielding a valid (one-sided) vertex separator; we keep
+    // the smaller boundary to minimise the separator — and hence the fill it
+    // induces — rather than taking boundary vertices from both sides.
+    let mut boundary0: Vec<usize> = Vec::new();
+    let mut boundary1: Vec<usize> = Vec::new();
     for local_v in 0..sub_n {
-        let pv = bisection.part[local_v];
+        let pv = part[local_v];
+        let mut is_boundary = false;
         for idx in local_xadj[local_v]..local_xadj[local_v + 1] {
-            let local_u = local_adjncy[idx];
-            if bisection.part[local_u] != pv {
-                is_separator[local_v] = true;
+            if part[local_adjncy[idx]] != pv {
+                is_boundary = true;
                 break;
             }
         }
+        if is_boundary {
+            if pv == 0 {
+                boundary0.push(local_v);
+            } else {
+                boundary1.push(local_v);
+            }
+        }
+    }
+    let mut is_separator = vec![false; sub_n];
+    let separator_side = if boundary0.len() <= boundary1.len() {
+        &boundary0
+    } else {
+        &boundary1
+    };
+    for &local_v in separator_side {
+        is_separator[local_v] = true;
     }
 
-    // Partition vertices into: part0 (non-sep), part1 (non-sep), separator.
+    // Split vertices into: left half (non-separator part 0), right half
+    // (non-separator part 1), and the separator.
     let mut part0_global = Vec::new();
     let mut part1_global = Vec::new();
     let mut sep_global = Vec::new();
-
     for (local_v, &global_v) in global_vertices.iter().enumerate() {
         if is_separator[local_v] {
             sep_global.push(global_v);
-        } else if bisection.part[local_v] == 0 {
+        } else if part[local_v] == 0 {
             part0_global.push(global_v);
         } else {
             part1_global.push(global_v);
         }
     }
 
-    // Recurse: order part0, then part1, then separator (nested dissection order).
+    // Guard against non-progress. A degenerate bisection (all vertices on one
+    // side with no cut) would leave one recursive half equal to the whole block
+    // and recurse forever. Detect it — an empty separator together with an empty
+    // half — and bottom out with a direct minimum-degree ordering instead.
+    if sep_global.is_empty() && (part0_global.is_empty() || part1_global.is_empty()) {
+        emit_minimum_degree_order(&local_xadj, &local_adjncy, global_vertices, perm, pos);
+        return Ok(());
+    }
+
+    // Recurse: order the left half, then the right half, then place the
+    // separator vertices last — the defining property of nested dissection.
+    // Every recursive call receives a strictly smaller vertex set (the separator
+    // is written here, never recursed on), guaranteeing termination.
     if !part0_global.is_empty() {
         mnd_recursive(
             full_n,
@@ -846,13 +897,98 @@ fn mnd_recursive(
             config,
         )?;
     }
-    // Separator vertices numbered last at this level.
     for &v in &sep_global {
         perm[*pos] = v;
         *pos += 1;
     }
 
     Ok(())
+}
+
+/// Nested dissection stops recursing and orders a block directly once it has at
+/// most this many vertices. Deliberately small so that every larger block still
+/// receives a genuine separator-based ordering rather than being left untouched.
+const ND_BASE_CASE: usize = 16;
+
+/// Order a base-case block with a local minimum-degree elimination and write the
+/// resulting global vertices into `perm[*pos..]`, advancing `pos`.
+///
+/// `local_xadj`/`local_adjncy` describe the subgraph induced by
+/// `global_vertices` (local index `i` corresponds to `global_vertices[i]`).
+fn emit_minimum_degree_order(
+    local_xadj: &[usize],
+    local_adjncy: &[usize],
+    global_vertices: &[usize],
+    perm: &mut [usize],
+    pos: &mut usize,
+) {
+    let order = minimum_degree_local(global_vertices.len(), local_xadj, local_adjncy);
+    for &local_v in &order {
+        perm[*pos] = global_vertices[local_v];
+        *pos += 1;
+    }
+}
+
+/// Local minimum-degree ordering for tiny nested-dissection base-case blocks.
+///
+/// Performs symbolic Gaussian elimination: it repeatedly eliminates the current
+/// minimum-degree vertex, filling that vertex's remaining neighborhood into a
+/// clique (the fill edges a real factorization would create). Returns the
+/// elimination order as local indices, where `order[k]` is eliminated at step
+/// `k` and therefore numbered `k`-th. This is the same greedy heuristic that
+/// underpins AMD/MMD and directly reduces fill within the block.
+fn minimum_degree_local(n: usize, xadj: &[usize], adjncy: &[usize]) -> Vec<usize> {
+    use std::collections::BTreeSet;
+
+    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for v in 0..n {
+        for idx in xadj[v]..xadj[v + 1] {
+            let u = adjncy[idx];
+            if u != v {
+                adj[v].insert(u);
+                adj[u].insert(v);
+            }
+        }
+    }
+
+    let mut eliminated = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for _ in 0..n {
+        // Select the remaining vertex of minimum current degree.
+        let mut best: Option<usize> = None;
+        let mut best_deg = usize::MAX;
+        for v in 0..n {
+            if eliminated[v] {
+                continue;
+            }
+            let deg = adj[v].len();
+            if deg < best_deg {
+                best_deg = deg;
+                best = Some(v);
+            }
+        }
+        let v = match best {
+            Some(v) => v,
+            None => break,
+        };
+        eliminated[v] = true;
+        order.push(v);
+
+        // Fill: the surviving neighbors of the eliminated vertex become a clique.
+        let neighbors: Vec<usize> = adj[v].iter().copied().filter(|&u| !eliminated[u]).collect();
+        for &u in &neighbors {
+            adj[u].remove(&v);
+        }
+        for i in 0..neighbors.len() {
+            for j in (i + 1)..neighbors.len() {
+                let a = neighbors[i];
+                let b = neighbors[j];
+                adj[a].insert(b);
+                adj[b].insert(a);
+            }
+        }
+    }
+    order
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,5 +1176,66 @@ mod tests {
             mnd_fill,
             natural_fill
         );
+    }
+
+    #[test]
+    fn test_multilevel_nd_midsize_is_real_permutation_and_reduces_fill() {
+        // 15×15 grid = 225 vertices — squarely in the 50–400 range that the old
+        // `n <= 2 * max_coarse_size` base case left completely unordered
+        // (identity). Verify the result is a genuine permutation, that it is NOT
+        // the identity, and that it strictly reduces fill versus no ordering.
+        let (n, xadj, adjncy) = laplacian_2d(15, 15);
+        assert_eq!(n, 225);
+
+        let natural_perm: Vec<usize> = (0..n).collect();
+        let natural_fill = estimate_fill(n, &xadj, &adjncy, &natural_perm);
+
+        let mnd_perm =
+            multilevel_nested_dissection(n, &xadj, &adjncy).expect("multilevel ND failed");
+
+        // Genuine permutation: every vertex exactly once.
+        assert_eq!(mnd_perm.len(), n);
+        let mut seen = vec![false; n];
+        for &v in &mnd_perm {
+            assert!(v < n, "vertex {} out of range", v);
+            assert!(!seen[v], "vertex {} appears twice", v);
+            seen[v] = true;
+        }
+        assert!(seen.iter().all(|&b| b), "permutation missing a vertex");
+
+        // The ordering must actually do something — not return the identity.
+        assert_ne!(
+            mnd_perm, natural_perm,
+            "multilevel ND returned the identity ordering (no reordering performed)"
+        );
+
+        // Real fill reduction relative to the natural ordering.
+        let mnd_fill = estimate_fill(n, &xadj, &adjncy, &mnd_perm);
+        assert!(
+            mnd_fill < natural_fill,
+            "multilevel ND fill {} did not reduce natural fill {}",
+            mnd_fill,
+            natural_fill
+        );
+    }
+
+    #[test]
+    fn test_multilevel_nd_small_graphs_are_permutations() {
+        // Exercise a range of sizes spanning the old identity threshold to make
+        // sure every one produces a valid permutation without panicking or
+        // looping (progress guard + tiny base case).
+        for side in [4usize, 7, 10, 12] {
+            let (n, xadj, adjncy) = laplacian_2d(side, side);
+            let perm = multilevel_nested_dissection(n, &xadj, &adjncy)
+                .expect("multilevel ND failed on small grid");
+            assert_eq!(perm.len(), n);
+            let mut seen = vec![false; n];
+            for &v in &perm {
+                assert!(v < n);
+                assert!(!seen[v], "vertex {} duplicated for side {}", v, side);
+                seen[v] = true;
+            }
+            assert!(seen.iter().all(|&b| b), "missing vertex for side {}", side);
+        }
     }
 }

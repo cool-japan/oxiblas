@@ -353,19 +353,47 @@ pub fn from_diagonal<T: Scalar + Clone + Field>(diag: &[T]) -> CsrMatrix<T> {
     }
     unsafe { CsrMatrix::new_unchecked(n, n, row_ptrs, col_indices, values) }
 }
+/// Applies `y := beta * y` (or zeroes `y` outright when `beta` is numerically
+/// zero), the common first step shared by the symmetric/Hermitian SpMV
+/// variants below before they accumulate `alpha * A * x` into `y`.
+fn scale_y_by_beta<T: Scalar + Clone + Field>(beta: &T, y: &mut [T]) {
+    let is_beta_zero = Scalar::abs(beta.clone()) <= T::epsilon();
+    if is_beta_zero {
+        for val in y.iter_mut() {
+            *val = T::zero();
+        }
+    } else {
+        for val in y.iter_mut() {
+            *val = beta.clone() * val.clone();
+        }
+    }
+}
 /// Sparse symmetric matrix-vector multiplication: y = alpha * A * x + beta * y
 ///
-/// Only the lower triangle of A is accessed. The matrix is assumed to be symmetric.
-/// This is more efficient when only half the matrix is stored.
+/// The matrix is assumed to be symmetric (`A[j][i] == A[i][j]`). The
+/// `lower_only` flag controls how `a` is interpreted:
+///
+/// * `lower_only = true`: only the lower triangle (including the diagonal)
+///   of `A` is physically stored in `a`. Every stored entry `A[i][j]`
+///   (`j <= i`) is used both for row `i` and, by symmetry, mirrored into row
+///   `j` to account for the implicit upper-triangle entry `A[j][i]`. This is
+///   the memory-efficient mode: only half the non-zeros need to be stored.
+/// * `lower_only = false`: `a` already stores both triangles explicitly
+///   (i.e. it is a fully-populated symmetric matrix). No mirroring is
+///   performed - every stored entry is used exactly once, exactly like a
+///   plain [`spmv`], since the transposed entries are already present in
+///   the storage.
 ///
 /// # Arguments
 ///
 /// * `alpha` - Scalar multiplier for A*x
-/// * `a` - Symmetric sparse matrix in CSR format (only lower triangle used)
+/// * `a` - Symmetric sparse matrix in CSR format
 /// * `x` - Input vector (length = a.ncols())
 /// * `beta` - Scalar multiplier for y
 /// * `y` - Output vector (length = a.nrows()), modified in place
-/// * `lower_only` - If true, assume only lower triangle is stored
+/// * `lower_only` - If true, assume only the lower triangle is stored and
+///   mirror it into the upper triangle; if false, assume both triangles are
+///   already explicitly stored.
 ///
 /// # Panics
 ///
@@ -382,17 +410,10 @@ pub fn spmv_symmetric<T: Scalar + Clone + Field>(
     assert_eq!(x.len(), a.ncols(), "x length must equal number of columns");
     assert_eq!(y.len(), a.nrows(), "y length must equal number of rows");
     let n = a.nrows();
-    let is_beta_zero = Scalar::abs(beta.clone()) <= T::epsilon();
-    if is_beta_zero {
-        for val in y.iter_mut() {
-            *val = T::zero();
-        }
-    } else {
-        for val in y.iter_mut() {
-            *val = beta.clone() * val.clone();
-        }
-    }
+    scale_y_by_beta(&beta, y);
     if lower_only {
+        // Only the lower triangle is physically stored; reconstruct the
+        // implicit upper triangle via symmetry during the multiply.
         for i in 0..n {
             let start = a.row_ptrs()[i];
             let end = a.row_ptrs()[i + 1];
@@ -402,34 +423,52 @@ pub fn spmv_symmetric<T: Scalar + Clone + Field>(
                 if j <= i {
                     y[i] = y[i].clone() + alpha.clone() * aij.clone() * x[j].clone();
                     if i != j {
+                        // Implicit upper-triangle entry: A[j][i] == A[i][j].
                         y[j] = y[j].clone() + alpha.clone() * aij * x[i].clone();
                     }
                 }
             }
         }
     } else {
+        // Both triangles are already stored explicitly: a plain row-wise
+        // accumulation over every stored entry already represents the full
+        // symmetric matrix, so no mirroring must be applied here (mirroring
+        // stored upper-triangle entries again would double-count them).
         for i in 0..n {
             let start = a.row_ptrs()[i];
             let end = a.row_ptrs()[i + 1];
+            let mut sum = T::zero();
             for k in start..end {
                 let j = a.col_indices()[k];
-                if j <= i {
-                    let aij = a.values()[k].clone();
-                    y[i] = y[i].clone() + alpha.clone() * aij.clone() * x[j].clone();
-                    if i != j {
-                        y[j] = y[j].clone() + alpha.clone() * aij * x[i].clone();
-                    }
-                }
+                sum = sum + a.values()[k].clone() * x[j].clone();
             }
+            y[i] = y[i].clone() + alpha.clone() * sum;
         }
     }
 }
 /// Sparse Hermitian matrix-vector multiplication: y = alpha * A * x + beta * y
 ///
-/// For real matrices, this is equivalent to `spmv_symmetric`.
-/// For complex matrices, uses conjugate transpose.
+/// The matrix is assumed to be Hermitian (`A[j][i] == conj(A[i][j])`). The
+/// `lower_only` flag has the same meaning as in [`spmv_symmetric`]:
 ///
-/// Only the lower triangle of A is accessed.
+/// * `lower_only = true`: only the lower triangle (including the diagonal)
+///   of `A` is physically stored. Every stored entry `A[i][j]` (`j <= i`) is
+///   used for row `i`, and its **conjugate** is mirrored into row `j` to
+///   account for the implicit upper-triangle entry
+///   `A[j][i] = conj(A[i][j])`.
+/// * `lower_only = false`: `a` already stores both triangles explicitly, so
+///   every stored entry is used exactly once with no mirroring (and no
+///   conjugation), exactly like a plain [`spmv`].
+///
+/// For real scalar types Hermitian and symmetric coincide
+/// (`conj(v) == v`), so this delegates directly to the more efficient
+/// [`spmv_symmetric`] in that case. For complex scalar types the mirrored
+/// off-diagonal contributions are conjugated as required by the Hermitian
+/// property.
+///
+/// # Panics
+///
+/// Panics if dimensions don't match or if matrix is not square.
 pub fn spmv_hermitian<T: Scalar + Clone + Field>(
     alpha: T,
     a: &CsrMatrix<T>,
@@ -438,7 +477,50 @@ pub fn spmv_hermitian<T: Scalar + Clone + Field>(
     y: &mut [T],
     lower_only: bool,
 ) {
-    spmv_symmetric(alpha, a, x, beta, y, lower_only)
+    if T::is_real() {
+        // Hermitian reduces to symmetric for real scalars: reuse the
+        // efficient symmetric path directly (no conjugation needed).
+        spmv_symmetric(alpha, a, x, beta, y, lower_only);
+        return;
+    }
+    assert_eq!(a.nrows(), a.ncols(), "Matrix must be square");
+    assert_eq!(x.len(), a.ncols(), "x length must equal number of columns");
+    assert_eq!(y.len(), a.nrows(), "y length must equal number of rows");
+    let n = a.nrows();
+    scale_y_by_beta(&beta, y);
+    if lower_only {
+        // Only the lower triangle is physically stored; reconstruct the
+        // implicit conjugated upper triangle during the multiply.
+        for i in 0..n {
+            let start = a.row_ptrs()[i];
+            let end = a.row_ptrs()[i + 1];
+            for k in start..end {
+                let j = a.col_indices()[k];
+                let aij = a.values()[k].clone();
+                if j <= i {
+                    y[i] = y[i].clone() + alpha.clone() * aij.clone() * x[j].clone();
+                    if i != j {
+                        // Implicit upper-triangle entry: A[j][i] == conj(A[i][j]).
+                        y[j] = y[j].clone() + alpha.clone() * aij.conj() * x[i].clone();
+                    }
+                }
+            }
+        }
+    } else {
+        // Both triangles are already stored explicitly (each with the
+        // correct Hermitian value at its own position): plain row-wise
+        // accumulation, no mirroring or extra conjugation needed.
+        for i in 0..n {
+            let start = a.row_ptrs()[i];
+            let end = a.row_ptrs()[i + 1];
+            let mut sum = T::zero();
+            for k in start..end {
+                let j = a.col_indices()[k];
+                sum = sum + a.values()[k].clone() * x[j].clone();
+            }
+            y[i] = y[i].clone() + alpha.clone() * sum;
+        }
+    }
 }
 /// Sparse triangular matrix-vector multiplication: y = alpha * L * x + beta * y
 ///
@@ -1643,5 +1725,197 @@ mod tests {
         spmv_f64_blocked(1.0, &a, &x, 0.0, &mut y_blocked);
         assert!((y_simd[0] - 136.0).abs() < 1e-10);
         assert!((y_blocked[0] - 136.0).abs() < 1e-10);
+    }
+    #[test]
+    fn test_spmv_symmetric_lower_only() {
+        // Symmetric matrix:
+        //   [4 1 0]
+        //   [1 3 2]
+        //   [0 2 5]
+        // Only the lower triangle (including the diagonal) is stored.
+        let values = vec![4.0f64, 1.0, 3.0, 2.0, 5.0];
+        let col_indices = vec![0, 0, 1, 1, 2];
+        let row_ptrs = vec![0, 1, 3, 5];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+        let x = vec![1.0, 2.0, 3.0];
+        let mut y = vec![0.0, 0.0, 0.0];
+        spmv_symmetric(1.0, &a, &x, 0.0, &mut y, true);
+        // Full A*x: [4+2+0, 1+6+6, 0+4+15] = [6, 13, 19]
+        assert!((y[0] - 6.0).abs() < 1e-10);
+        assert!((y[1] - 13.0).abs() < 1e-10);
+        assert!((y[2] - 19.0).abs() < 1e-10);
+    }
+    #[test]
+    fn test_spmv_symmetric_full_stored_matches_lower_only() {
+        // Symmetric matrix:
+        //   [4 1 2]
+        //   [1 3 2]
+        //   [2 2 5]
+        let x = vec![1.0, 2.0, 3.0];
+
+        // Fully stored: both triangles explicit.
+        let full_values = vec![4.0f64, 1.0, 2.0, 1.0, 3.0, 2.0, 2.0, 2.0, 5.0];
+        let full_col_indices = vec![0, 1, 2, 0, 1, 2, 0, 1, 2];
+        let full_row_ptrs = vec![0, 3, 6, 9];
+        let a_full = CsrMatrix::new(3, 3, full_row_ptrs, full_col_indices, full_values).unwrap();
+        let mut y_full = vec![0.0, 0.0, 0.0];
+        spmv_symmetric(1.0, &a_full, &x, 0.0, &mut y_full, false);
+
+        // Lower-triangle-only storage of the same matrix.
+        let lower_values = vec![4.0f64, 1.0, 3.0, 2.0, 2.0, 5.0];
+        let lower_col_indices = vec![0, 0, 1, 0, 1, 2];
+        let lower_row_ptrs = vec![0, 1, 3, 6];
+        let a_lower =
+            CsrMatrix::new(3, 3, lower_row_ptrs, lower_col_indices, lower_values).unwrap();
+        let mut y_lower = vec![0.0, 0.0, 0.0];
+        spmv_symmetric(1.0, &a_lower, &x, 0.0, &mut y_lower, true);
+
+        // Both storage conventions must agree, and must equal a plain SpMV
+        // against the fully materialized matrix.
+        let mut y_plain = vec![0.0, 0.0, 0.0];
+        spmv(1.0, &a_full, &x, 0.0, &mut y_plain);
+        for i in 0..3 {
+            assert!(
+                (y_full[i] - y_plain[i]).abs() < 1e-10,
+                "full-stored mismatch at {i}: {} vs {}",
+                y_full[i],
+                y_plain[i]
+            );
+            assert!(
+                (y_lower[i] - y_plain[i]).abs() < 1e-10,
+                "lower-only mismatch at {i}: {} vs {}",
+                y_lower[i],
+                y_plain[i]
+            );
+        }
+    }
+    #[test]
+    fn test_spmv_symmetric_false_does_not_filter_or_mirror() {
+        // When `lower_only` is false, every stored entry must be used
+        // exactly as-is (no `j <= i` filtering, no mirroring). Use a matrix
+        // that only has strictly-upper-triangle entries stored to prove
+        // that those entries are not silently dropped.
+        let values = vec![2.0f64, 3.0, 4.0];
+        let col_indices = vec![1, 2, 2];
+        let row_ptrs = vec![0, 2, 3, 3];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+        let x = vec![1.0, 2.0, 3.0];
+        let mut y = vec![0.0, 0.0, 0.0];
+        spmv_symmetric(1.0, &a, &x, 0.0, &mut y, false);
+        // row0: 2*x1 + 3*x2 = 4 + 9 = 13; row1: 4*x2 = 12; row2: 0
+        assert!((y[0] - 13.0).abs() < 1e-10);
+        assert!((y[1] - 12.0).abs() < 1e-10);
+        assert!((y[2] - 0.0).abs() < 1e-10);
+    }
+    #[test]
+    fn test_spmv_symmetric_with_beta() {
+        let values = vec![4.0f64, 1.0, 3.0, 2.0, 5.0];
+        let col_indices = vec![0, 0, 1, 1, 2];
+        let row_ptrs = vec![0, 1, 3, 5];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+        let x = vec![1.0, 2.0, 3.0];
+        let mut y = vec![1.0, 1.0, 1.0];
+        spmv_symmetric(2.0, &a, &x, 2.0, &mut y, true);
+        // 2 * [6, 13, 19] + 2 * [1, 1, 1] = [14, 28, 40]
+        assert!((y[0] - 14.0).abs() < 1e-10);
+        assert!((y[1] - 28.0).abs() < 1e-10);
+        assert!((y[2] - 40.0).abs() < 1e-10);
+    }
+    #[test]
+    fn test_spmv_hermitian_real_matches_symmetric() {
+        let values = vec![4.0f64, 1.0, 3.0, 2.0, 5.0];
+        let col_indices = vec![0, 0, 1, 1, 2];
+        let row_ptrs = vec![0, 1, 3, 5];
+        let a = CsrMatrix::new(3, 3, row_ptrs, col_indices, values).unwrap();
+        let x = vec![1.0, 2.0, 3.0];
+        let mut y_sym = vec![0.0, 0.0, 0.0];
+        let mut y_herm = vec![0.0, 0.0, 0.0];
+        spmv_symmetric(1.0, &a, &x, 0.0, &mut y_sym, true);
+        spmv_hermitian(1.0, &a, &x, 0.0, &mut y_herm, true);
+        for i in 0..3 {
+            assert!((y_sym[i] - y_herm[i]).abs() < 1e-10);
+        }
+    }
+    #[test]
+    fn test_spmv_hermitian_complex_lower_only_conjugates_mirror() {
+        use num_complex::Complex64;
+        // Hermitian matrix:
+        //   [ 2      1+2i ]
+        //   [ 1-2i   3    ]
+        // Only the lower triangle (including the real diagonal) is stored.
+        let values = vec![
+            Complex64::new(2.0, 0.0),
+            Complex64::new(1.0, -2.0),
+            Complex64::new(3.0, 0.0),
+        ];
+        let col_indices = vec![0, 0, 1];
+        let row_ptrs = vec![0, 1, 3];
+        let a = CsrMatrix::new(2, 2, row_ptrs, col_indices, values).unwrap();
+        let x = vec![Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)];
+        let mut y = vec![Complex64::new(0.0, 0.0); 2];
+        spmv_hermitian(
+            Complex64::new(1.0, 0.0),
+            &a,
+            &x,
+            Complex64::new(0.0, 0.0),
+            &mut y,
+            true,
+        );
+        // Verified by hand / via full dense Hermitian multiply: y = [6+5i, 9-4i].
+        let expected = [Complex64::new(6.0, 5.0), Complex64::new(9.0, -4.0)];
+        for i in 0..2 {
+            let diff = y[i] - expected[i];
+            assert!(
+                (diff.re * diff.re + diff.im * diff.im).sqrt() < 1e-9,
+                "mismatch at {i}: got {:?}, expected {:?}",
+                y[i],
+                expected[i]
+            );
+        }
+        // A conjugation-blind mirror (i.e. delegating straight to
+        // spmv_symmetric, the old bug) would instead produce y[0] = 2-3i:
+        // make sure we do NOT match that wrong value.
+        let wrong_y0 = Complex64::new(2.0, -3.0);
+        let diff_from_wrong = y[0] - wrong_y0;
+        assert!(
+            (diff_from_wrong.re * diff_from_wrong.re + diff_from_wrong.im * diff_from_wrong.im)
+                .sqrt()
+                > 1e-6
+        );
+    }
+    #[test]
+    fn test_spmv_hermitian_complex_full_stored() {
+        use num_complex::Complex64;
+        // Same Hermitian matrix as above, but with both triangles stored
+        // explicitly (each already holding the correct Hermitian value).
+        let values = vec![
+            Complex64::new(2.0, 0.0),
+            Complex64::new(1.0, 2.0),
+            Complex64::new(1.0, -2.0),
+            Complex64::new(3.0, 0.0),
+        ];
+        let col_indices = vec![0, 1, 0, 1];
+        let row_ptrs = vec![0, 2, 4];
+        let a = CsrMatrix::new(2, 2, row_ptrs, col_indices, values).unwrap();
+        let x = vec![Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)];
+        let mut y = vec![Complex64::new(0.0, 0.0); 2];
+        spmv_hermitian(
+            Complex64::new(1.0, 0.0),
+            &a,
+            &x,
+            Complex64::new(0.0, 0.0),
+            &mut y,
+            false,
+        );
+        let expected = [Complex64::new(6.0, 5.0), Complex64::new(9.0, -4.0)];
+        for i in 0..2 {
+            let diff = y[i] - expected[i];
+            assert!(
+                (diff.re * diff.re + diff.im * diff.im).sqrt() < 1e-9,
+                "mismatch at {i}: got {:?}, expected {:?}",
+                y[i],
+                expected[i]
+            );
+        }
     }
 }

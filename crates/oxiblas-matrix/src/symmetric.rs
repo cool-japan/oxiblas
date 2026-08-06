@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use crate::packed::{PackedMat, PackedMut, PackedRef, TriangularKind};
 use crate::{Mat, MatMut, MatRef};
 use num_complex::Complex;
+use num_traits::{One, Zero};
 use oxiblas_core::scalar::Scalar;
 
 /// A symmetric matrix using packed storage.
@@ -197,21 +198,35 @@ impl<T: Scalar> SymmetricMat<T> {
     /// Sets the element at (row, col).
     ///
     /// This automatically sets (col, row) to the same value.
+    ///
+    /// # Panics
+    /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
+        let n = self.dim();
+        assert!(row < n && col < n, "Index out of bounds");
+
         match self.uplo() {
             TriangularKind::Upper => {
                 if row <= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row <= col is within the stored upper triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row > col swapped to (col, row) is within the upper triangle");
                 }
             }
             TriangularKind::Lower => {
                 if row >= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row >= col is within the stored lower triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row < col swapped to (col, row) is within the lower triangle");
                 }
             }
         }
@@ -307,49 +322,40 @@ impl<T: Scalar> SymmetricMat<T> {
     }
 }
 
-impl SymmetricMat<f32> {
-    /// Returns the Frobenius norm squared.
-    pub fn frobenius_norm_squared(&self) -> f32 {
+impl<T: Scalar> SymmetricMat<T> {
+    /// Returns the Frobenius norm squared: the sum of `|a_ij|^2` over all `i, j`.
+    ///
+    /// Off-diagonal entries are physically stored once but occur twice in the
+    /// full matrix (`a_ij` and `a_ji`), so their squared magnitude is counted
+    /// twice. Using `abs_sq` (`|z|^2`) instead of `val * val` makes the result
+    /// correct for complex scalars — where `val * val` is generally complex and
+    /// not the squared modulus — as well as for real scalars, for which the two
+    /// coincide.
+    pub fn frobenius_norm_squared(&self) -> T::Real {
         let n = self.dim();
-        let mut sum = 0.0f32;
+        // `T::Real: Scalar` supplies `One`, so `1 + 1` yields the real `2`
+        // without needing a fallible primitive conversion.
+        let two = T::Real::one() + T::Real::one();
+        let mut sum = T::Real::zero();
 
         for j in 0..n {
             for i in 0..n {
-                if let Some(&val) = self.get(i, j) {
-                    // For off-diagonal elements, count twice (since we only store once)
-                    if i == j {
-                        sum += val * val;
-                    } else if (self.uplo() == TriangularKind::Upper && i < j)
-                        || (self.uplo() == TriangularKind::Lower && i > j)
-                    {
-                        // Only count stored elements once, then double
-                        sum += 2.0 * val * val;
-                    }
+                // Visit each entry exactly once by reading only from the
+                // authoritative stored triangle: `get()` returns the raw stored
+                // value for BOTH orientations of an off-diagonal pair, so
+                // iterating the whole grid would double-visit every pair.
+                let in_stored_triangle = match self.uplo() {
+                    TriangularKind::Upper => i <= j,
+                    TriangularKind::Lower => i >= j,
+                };
+                if !in_stored_triangle {
+                    continue;
                 }
-            }
-        }
-
-        sum
-    }
-}
-
-impl SymmetricMat<f64> {
-    /// Returns the Frobenius norm squared.
-    pub fn frobenius_norm_squared(&self) -> f64 {
-        let n = self.dim();
-        let mut sum = 0.0f64;
-
-        for j in 0..n {
-            for i in 0..n {
                 if let Some(&val) = self.get(i, j) {
-                    // For off-diagonal elements, count twice (since we only store once)
                     if i == j {
-                        sum += val * val;
-                    } else if (self.uplo() == TriangularKind::Upper && i < j)
-                        || (self.uplo() == TriangularKind::Lower && i > j)
-                    {
-                        // Only count stored elements once, then double
-                        sum += 2.0 * val * val;
+                        sum += val.abs_sq();
+                    } else {
+                        sum += two * val.abs_sq();
                     }
                 }
             }
@@ -661,21 +667,35 @@ impl<T: Scalar> HermitianMat<T> {
     }
 
     /// Sets element at (row, col).
+    ///
+    /// # Panics
+    /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
+        let n = self.dim();
+        assert!(row < n && col < n, "Index out of bounds");
+
         match self.uplo() {
             TriangularKind::Upper => {
                 if row <= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row <= col is within the stored upper triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row > col swapped to (col, row) is within the upper triangle");
                 }
             }
             TriangularKind::Lower => {
                 if row >= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row >= col is within the stored lower triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row < col swapped to (col, row) is within the lower triangle");
                 }
             }
         }
@@ -739,10 +759,16 @@ impl<T: Scalar> HermitianMat<T> {
 
     /// Scales all elements by a real scalar.
     ///
-    /// For Hermitian matrices, scaling by a real preserves Hermitianness.
+    /// The factor is the real component type `T::Real`, not a full complex
+    /// scalar, because scaling a Hermitian matrix by a non-real number would
+    /// violate the invariant `A = A^H` (each off-diagonal pair `a_ij`,
+    /// `conj(a_ij)` would pick up mismatched phases and the diagonal would
+    /// gain an imaginary part). Enforcing realness in the type makes a complex
+    /// factor a compile error rather than a silent invariant break. For real
+    /// `T`, `T::Real` is simply `T`.
     #[inline]
-    pub fn scale(&mut self, alpha: T) {
-        self.packed.scale(alpha);
+    pub fn scale(&mut self, alpha: T::Real) {
+        self.packed.scale(T::from_real(alpha));
     }
 }
 
@@ -755,14 +781,27 @@ impl HermitianMat<Complex<f32>> {
         let n = self.dim();
         let mut mat = Mat::filled(n, n, Complex::new(0.0f32, 0.0f32));
 
+        // Read only from the authoritative stored triangle. `get()` returns the
+        // *raw* stored value for BOTH orientations of an off-diagonal pair (it
+        // never conjugates), so writing on every visited (i, j) would let the
+        // non-stored orientation overwrite the correct entry with its conjugate
+        // — producing conj(A) whenever the smaller `j` carries the wrong write,
+        // i.e. for Lower storage. Writing each pair exactly once from its single
+        // stored value keeps both triangles correct regardless of `uplo`.
         for j in 0..n {
             for i in 0..n {
+                let in_stored_triangle = match self.uplo() {
+                    TriangularKind::Upper => i <= j,
+                    TriangularKind::Lower => i >= j,
+                };
+                if !in_stored_triangle {
+                    continue;
+                }
                 if let Some(&val) = self.get(i, j) {
                     if i == j {
-                        // Diagonal: should be real
+                        // Diagonal of a Hermitian matrix is real; store as-is.
                         mat[(i, j)] = val;
                     } else {
-                        // Off-diagonal
                         mat[(i, j)] = val;
                         mat[(j, i)] = val.conj();
                     }
@@ -815,14 +854,27 @@ impl HermitianMat<Complex<f64>> {
         let n = self.dim();
         let mut mat = Mat::filled(n, n, Complex::new(0.0f64, 0.0f64));
 
+        // Read only from the authoritative stored triangle. `get()` returns the
+        // *raw* stored value for BOTH orientations of an off-diagonal pair (it
+        // never conjugates), so writing on every visited (i, j) would let the
+        // non-stored orientation overwrite the correct entry with its conjugate
+        // — producing conj(A) whenever the smaller `j` carries the wrong write,
+        // i.e. for Lower storage. Writing each pair exactly once from its single
+        // stored value keeps both triangles correct regardless of `uplo`.
         for j in 0..n {
             for i in 0..n {
+                let in_stored_triangle = match self.uplo() {
+                    TriangularKind::Upper => i <= j,
+                    TriangularKind::Lower => i >= j,
+                };
+                if !in_stored_triangle {
+                    continue;
+                }
                 if let Some(&val) = self.get(i, j) {
                     if i == j {
-                        // Diagonal: should be real
+                        // Diagonal of a Hermitian matrix is real; store as-is.
                         mat[(i, j)] = val;
                     } else {
-                        // Off-diagonal
                         mat[(i, j)] = val;
                         mat[(j, i)] = val.conj();
                     }
@@ -1034,21 +1086,35 @@ impl<'a, T: Scalar> SymmetricMut<'a, T> {
     }
 
     /// Sets element (symmetric: sets one storage location).
+    ///
+    /// # Panics
+    /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
+        let n = self.dim();
+        assert!(row < n && col < n, "Index out of bounds");
+
         match self.uplo() {
             TriangularKind::Upper => {
                 if row <= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row <= col is within the stored upper triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row > col swapped to (col, row) is within the upper triangle");
                 }
             }
             TriangularKind::Lower => {
                 if row >= col {
-                    self.packed.set(row, col, value);
+                    self.packed
+                        .set(row, col, value)
+                        .expect("row >= col is within the stored lower triangle");
                 } else {
-                    self.packed.set(col, row, value);
+                    self.packed
+                        .set(col, row, value)
+                        .expect("row < col swapped to (col, row) is within the lower triangle");
                 }
             }
         }
@@ -1287,5 +1353,160 @@ mod tests {
         smut.set(0, 1, 10.0);
         assert_eq!(smut.get(0, 1), Some(&10.0));
         assert_eq!(smut.get(1, 0), Some(&10.0)); // Both directions
+    }
+
+    /// Regression for the Lower-storage `to_dense` conjugate-transpose bug.
+    ///
+    /// Previously `to_dense` visited every (i, j) and wrote `mat[(i,j)] = val;
+    /// mat[(j,i)] = conj(val)` from the *raw* stored value returned by `get()`
+    /// for both orientations. Because the outer loop is over `j` ascending, for
+    /// Lower storage the correct write (from the stored triangle, at the smaller
+    /// `j`) was overwritten by the later non-stored-orientation write, yielding
+    /// `conj(A)` instead of `A`. This builds a Hermitian matrix from a Lower
+    /// triangle and checks the round trip reproduces the ORIGINAL dense matrix
+    /// element-for-element (not its conjugate mirror).
+    #[test]
+    fn test_hermitian_to_dense_lower_roundtrip() {
+        // A genuine 3x3 Hermitian matrix: A[i,j] == conj(A[j,i]), real diagonal.
+        let original = Mat::from_rows(&[
+            &[
+                Complex64::new(1.0, 0.0),
+                Complex64::new(3.0, 4.0),
+                Complex64::new(5.0, -2.0),
+            ],
+            &[
+                Complex64::new(3.0, -4.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(6.0, 1.0),
+            ],
+            &[
+                Complex64::new(5.0, 2.0),
+                Complex64::new(6.0, -1.0),
+                Complex64::new(7.0, 0.0),
+            ],
+        ]);
+
+        let herm =
+            HermitianMat::from_dense_checked(&original.as_ref(), TriangularKind::Lower, 1e-12)
+                .expect("matrix is Hermitian by construction");
+        let dense = herm.to_dense();
+
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(
+                    dense[(i, j)],
+                    original[(i, j)],
+                    "mismatch at ({i}, {j}): Lower-storage to_dense must reproduce A, not conj(A)"
+                );
+            }
+        }
+
+        // Explicitly pin the pair the finding flagged: A[1,0] = 3-4i must stay
+        // 3-4i (not become 3+4i), and its partner A[0,1] must be its conjugate.
+        assert_eq!(dense[(1, 0)], Complex64::new(3.0, -4.0));
+        assert_eq!(dense[(0, 1)], Complex64::new(3.0, 4.0));
+    }
+
+    /// Same Lower-storage round-trip regression for the f32 `to_dense_f32` path.
+    #[test]
+    fn test_hermitian_to_dense_f32_lower_roundtrip() {
+        let original = Mat::from_rows(&[
+            &[Complex::new(1.0f32, 0.0), Complex::new(3.0, 4.0)],
+            &[Complex::new(3.0, -4.0), Complex::new(2.0, 0.0)],
+        ]);
+
+        let herm =
+            HermitianMat::from_dense_checked_f32(&original.as_ref(), TriangularKind::Lower, 1e-6)
+                .expect("matrix is Hermitian by construction");
+        let dense = herm.to_dense_f32();
+
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_eq!(dense[(i, j)], original[(i, j)], "mismatch at ({i}, {j})");
+            }
+        }
+        assert_eq!(dense[(1, 0)], Complex::new(3.0f32, -4.0));
+        assert_eq!(dense[(0, 1)], Complex::new(3.0f32, 4.0));
+    }
+
+    /// The Upper-storage path (the only one the original test covered) must keep
+    /// working after the fix.
+    #[test]
+    fn test_hermitian_to_dense_upper_roundtrip() {
+        let original = Mat::from_rows(&[
+            &[Complex64::new(1.0, 0.0), Complex64::new(3.0, 4.0)],
+            &[Complex64::new(3.0, -4.0), Complex64::new(2.0, 0.0)],
+        ]);
+
+        let herm =
+            HermitianMat::from_dense_checked(&original.as_ref(), TriangularKind::Upper, 1e-12)
+                .expect("matrix is Hermitian by construction");
+        let dense = herm.to_dense();
+
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_eq!(dense[(i, j)], original[(i, j)], "mismatch at ({i}, {j})");
+            }
+        }
+    }
+
+    /// `frobenius_norm_squared` is now generic over `Scalar`; verify it works for
+    /// complex scalars using `|z|^2` (not `z * z`) and still matches the real
+    /// case. For a symmetric matrix (A = A^T) the norm is the sum of `|a_ij|^2`
+    /// over the full matrix, with off-diagonals counted twice.
+    #[test]
+    fn test_symmetric_frobenius_norm_squared_generic() {
+        // Real case: full matrix is
+        //   [1 2 3; 2 4 5; 3 5 6]
+        // sum of squares = 1+4+9 + 4+16+25 + 9+25+36 = 129.
+        let mut s: SymmetricMat<f64> = SymmetricMat::zeros(3, TriangularKind::Upper);
+        s.set(0, 0, 1.0);
+        s.set(0, 1, 2.0);
+        s.set(0, 2, 3.0);
+        s.set(1, 1, 4.0);
+        s.set(1, 2, 5.0);
+        s.set(2, 2, 6.0);
+        assert_eq!(s.frobenius_norm_squared(), 129.0);
+
+        // Complex case: symmetric (A = A^T), 2x2
+        //   [1+1i  2+0i]
+        //   [2+0i  3-1i]
+        // sum |a_ij|^2 = |1+1i|^2 + 2*|2|^2 + |3-1i|^2 = 2 + 8 + 10 = 20.
+        let mut c: SymmetricMat<Complex64> = SymmetricMat::zeros(2, TriangularKind::Upper);
+        c.set(0, 0, Complex64::new(1.0, 1.0));
+        c.set(0, 1, Complex64::new(2.0, 0.0));
+        c.set(1, 1, Complex64::new(3.0, -1.0));
+        let norm_sq: f64 = c.frobenius_norm_squared();
+        assert!((norm_sq - 20.0).abs() < 1e-12, "got {norm_sq}");
+
+        // Lower storage must give the same result as Upper storage.
+        let mut c_lower: SymmetricMat<Complex64> = SymmetricMat::zeros(2, TriangularKind::Lower);
+        c_lower.set(0, 0, Complex64::new(1.0, 1.0));
+        c_lower.set(1, 0, Complex64::new(2.0, 0.0));
+        c_lower.set(1, 1, Complex64::new(3.0, -1.0));
+        let norm_sq_lower: f64 = c_lower.frobenius_norm_squared();
+        assert!((norm_sq_lower - 20.0).abs() < 1e-12, "got {norm_sq_lower}");
+    }
+
+    /// `HermitianMat::scale` now takes a real factor (`T::Real`); scaling by a
+    /// real value must preserve the Hermitian invariant and simply scale every
+    /// entry. (A complex factor is now rejected at compile time.)
+    #[test]
+    fn test_hermitian_scale_real_preserves_hermitian() {
+        let mut h: HermitianMat<Complex64> = HermitianMat::zeros(2, TriangularKind::Upper);
+        h.set(0, 0, Complex64::new(1.0, 0.0));
+        h.set(1, 1, Complex64::new(2.0, 0.0));
+        h.set(0, 1, Complex64::new(3.0, 4.0));
+
+        // `alpha` is f64 (== Complex64::Real), enforced by the signature.
+        h.scale(2.0);
+
+        let dense = h.to_dense();
+        assert_eq!(dense[(0, 0)], Complex64::new(2.0, 0.0));
+        assert_eq!(dense[(1, 1)], Complex64::new(4.0, 0.0));
+        assert_eq!(dense[(0, 1)], Complex64::new(6.0, 8.0));
+        // Hermitian invariant: A[1,0] == conj(A[0,1]).
+        assert_eq!(dense[(1, 0)], dense[(0, 1)].conj());
+        assert_eq!(dense[(1, 0)], Complex64::new(6.0, -8.0));
     }
 }

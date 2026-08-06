@@ -1,11 +1,20 @@
 # oxiblas-ffi
 
-> **DEPRECATED: This crate has been retired as of v0.2.0. The COOLJAPAN ecosystem is Pure Rust. This crate is no longer part of the workspace and will not receive further updates.**
+> ## ⚠️ RETIRED / UNMAINTAINED
+>
+> **This crate is retired as of the v0.2.0 "Pure Rust ecosystem" pivot and is unsupported.**
+>
+> - It is **excluded from the Cargo workspace** and is **not built or tested by CI**.
+> - It is **not published** to crates.io.
+> - It has **known correctness defects that will not be fixed**.
+> - **Do not use this crate.** For the supported, actively maintained path, use the
+>   Pure Rust crates instead: [`oxiblas`](../oxiblas/), [`oxiblas-blas`](../oxiblas-blas/),
+>   and [`oxiblas-lapack`](../oxiblas-lapack/).
+>
+> Everything below this notice is retained for historical reference only and may be
+> inaccurate or aspirational.
 
 **C FFI bindings for OxiBLAS - Drop-in replacement for BLAS/LAPACK libraries**
-
-[![Crates.io](https://img.shields.io/crates/v/oxiblas-ffi.svg)](https://crates.io/crates/oxiblas-ffi)
-[![Documentation](https://docs.rs/oxiblas-ffi/badge.svg)](https://docs.rs/oxiblas-ffi)
 
 ## Overview
 
@@ -258,7 +267,8 @@ end program test_oxiblas
 
 ## Performance
 
-OxiBLAS FFI provides **80-172% of OpenBLAS performance** depending on operation and platform (see main README for detailed benchmarks).
+Not benchmarked; see the retirement notice at the top of this document. Performance
+comparisons against OpenBLAS are not available for this crate.
 
 ## Building for Different Platforms
 

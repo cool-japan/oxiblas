@@ -71,5 +71,7 @@ pub use matfun::{
     MatFunError, cond_expm, cosm, expm, frechet_expm, frechet_logm, frechet_sqrtm, logm, powm,
     signm, sinm, sqrtm,
 };
-pub use norms::{norm_1, norm_2, norm_frobenius, norm_inf, norm_max, norm_nuclear, trace};
+pub use norms::{
+    TraceError, norm_1, norm_2, norm_frobenius, norm_inf, norm_max, norm_nuclear, trace,
+};
 pub use rank_null::{RankError, col_space, left_null_space, null_space, nullity, rank, row_space};

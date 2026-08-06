@@ -6,6 +6,8 @@
 //! # Operations
 //!
 //! - [`gemm_batched`]: Batched general matrix-matrix multiplication
+//! - [`gemm_batched_c64`] / [`gemm_batched_c32`]: Batched complex GEMM, including
+//!   `Transpose::ConjTrans` for `A^H` / `B^H`
 //! - [`gemm_strided_batched`]: Strided batched GEMM (matrices at regular offsets)
 //! - [`axpy_batched`]: Batched vector addition (y\[i\] = alpha * x\[i\] + y\[i\])
 //! - [`gemv_batched`]: Batched matrix-vector multiplication
@@ -17,8 +19,10 @@
 
 use crate::level1::axpy;
 use crate::level2::{GemvTrans, gemv};
+use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
 use crate::level3::gemm::gemm;
 use crate::level3::gemm_kernel::GemmKernel;
+use num_complex::{Complex32, Complex64};
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatMut, MatRef};
 
@@ -115,6 +119,9 @@ pub enum Transpose {
     NoTrans,
     /// Transpose: use A^T.
     Trans,
+    /// Conjugate transpose: use A^H (for complex types). Equivalent to
+    /// `Trans` for real-valued matrices, since `conj(x) == x` for reals.
+    ConjTrans,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +244,127 @@ pub fn gemm_batched_parallel<T: Field + GemmKernel + bytemuck::Zeroable>(
 }
 
 // ---------------------------------------------------------------------------
+// Batched complex GEMM (array-of-pointers style)
+// ---------------------------------------------------------------------------
+//
+// `GemmKernel` (used by the generic `gemm_batched` above) is implemented
+// only for `f32`/`f64`; complex scalars go through the 3M complex GEMM
+// method instead ([`gemm3m_c64`]/[`gemm3m_c32`]). These entry points give
+// batched complex GEMM -- including `Transpose::ConjTrans` for A^H / B^H --
+// a public home, mirroring [`gemm_batched`].
+
+/// Batched `Complex64` GEMM: C\[i\] = alpha * op(A\[i\]) * op(B\[i\]) + beta * C\[i\]
+///
+/// Complex counterpart of [`gemm_batched`]. Supports `Transpose::ConjTrans`
+/// so that `op(A) = A^H` (and/or `op(B) = B^H`) can be expressed directly,
+/// matching Netlib `zgemm`'s `'C'` transpose flag.
+///
+/// # Errors
+///
+/// Returns [`BatchedError`] if batch sizes are mismatched, if any batch
+/// element has incompatible dimensions, or if the batch is empty.
+pub fn gemm_batched_c64(
+    trans_a: Transpose,
+    trans_b: Transpose,
+    alpha: Complex64,
+    a_batch: &[MatRef<'_, Complex64>],
+    b_batch: &[MatRef<'_, Complex64>],
+    beta: Complex64,
+    c_batch: &mut [MatMut<'_, Complex64>],
+) -> Result<(), BatchedError> {
+    let batch_count = a_batch.len();
+
+    if batch_count == 0 {
+        return Err(BatchedError::EmptyBatch);
+    }
+    if b_batch.len() != batch_count {
+        return Err(BatchedError::BatchSizeMismatch {
+            expected: batch_count,
+            actual: b_batch.len(),
+        });
+    }
+    if c_batch.len() != batch_count {
+        return Err(BatchedError::BatchSizeMismatch {
+            expected: batch_count,
+            actual: c_batch.len(),
+        });
+    }
+
+    for i in 0..batch_count {
+        validate_gemm_dims(trans_a, trans_b, &a_batch[i], &b_batch[i], &c_batch[i], i)?;
+    }
+
+    for i in 0..batch_count {
+        execute_single_gemm_c64(
+            trans_a,
+            trans_b,
+            alpha,
+            &a_batch[i],
+            &b_batch[i],
+            beta,
+            &mut c_batch[i],
+        );
+    }
+
+    Ok(())
+}
+
+/// Batched `Complex32` GEMM: C\[i\] = alpha * op(A\[i\]) * op(B\[i\]) + beta * C\[i\]
+///
+/// Complex counterpart of [`gemm_batched`] for single-precision complex
+/// numbers. See [`gemm_batched_c64`] for details.
+///
+/// # Errors
+///
+/// Returns [`BatchedError`] if batch sizes are mismatched, if any batch
+/// element has incompatible dimensions, or if the batch is empty.
+pub fn gemm_batched_c32(
+    trans_a: Transpose,
+    trans_b: Transpose,
+    alpha: Complex32,
+    a_batch: &[MatRef<'_, Complex32>],
+    b_batch: &[MatRef<'_, Complex32>],
+    beta: Complex32,
+    c_batch: &mut [MatMut<'_, Complex32>],
+) -> Result<(), BatchedError> {
+    let batch_count = a_batch.len();
+
+    if batch_count == 0 {
+        return Err(BatchedError::EmptyBatch);
+    }
+    if b_batch.len() != batch_count {
+        return Err(BatchedError::BatchSizeMismatch {
+            expected: batch_count,
+            actual: b_batch.len(),
+        });
+    }
+    if c_batch.len() != batch_count {
+        return Err(BatchedError::BatchSizeMismatch {
+            expected: batch_count,
+            actual: c_batch.len(),
+        });
+    }
+
+    for i in 0..batch_count {
+        validate_gemm_dims(trans_a, trans_b, &a_batch[i], &b_batch[i], &c_batch[i], i)?;
+    }
+
+    for i in 0..batch_count {
+        execute_single_gemm_c32(
+            trans_a,
+            trans_b,
+            alpha,
+            &a_batch[i],
+            &b_batch[i],
+            beta,
+            &mut c_batch[i],
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Strided Batched GEMM
 // ---------------------------------------------------------------------------
 
@@ -300,11 +428,11 @@ pub fn gemm_strided_batched<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Compute physical dimensions of stored matrices
     let (a_rows, a_cols) = match trans_a {
         Transpose::NoTrans => (m, k),
-        Transpose::Trans => (k, m),
+        Transpose::Trans | Transpose::ConjTrans => (k, m),
     };
     let (b_rows, b_cols) = match trans_b {
         Transpose::NoTrans => (k, n),
-        Transpose::Trans => (n, k),
+        Transpose::Trans | Transpose::ConjTrans => (n, k),
     };
 
     // Validate leading dimensions
@@ -384,9 +512,13 @@ pub fn gemm_strided_batched<T: Field + GemmKernel + bytemuck::Zeroable>(
 
         // Create matrix views into the strided buffers.
         // SAFETY: We validated buffer sizes and strides above.
-        let a_ref = MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda);
-        let b_ref = MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb);
-        let mut c_mut = MatMut::new(c[c_offset..].as_mut_ptr(), m, n, ldc);
+        // SAFETY: We validated buffer sizes and strides above; each view stays
+        // within its slice's bounds for the duration of this borrow.
+        let a_ref = unsafe { MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda) };
+        let b_ref = unsafe { MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb) };
+        // SAFETY: as above; the validated `stride_c`/`ldc` keep the `m x n`
+        // view inside `c[c_offset..]` and the batch slots are disjoint.
+        let mut c_mut = unsafe { MatMut::new(c[c_offset..].as_mut_ptr(), m, n, ldc) };
 
         execute_single_gemm(trans_a, trans_b, alpha, &a_ref, &b_ref, beta, &mut c_mut);
     }
@@ -434,11 +566,11 @@ pub fn gemm_strided_batched_parallel<T: Field + GemmKernel + bytemuck::Zeroable>
 
     let (a_rows, a_cols) = match trans_a {
         Transpose::NoTrans => (m, k),
-        Transpose::Trans => (k, m),
+        Transpose::Trans | Transpose::ConjTrans => (k, m),
     };
     let (b_rows, b_cols) = match trans_b {
         Transpose::NoTrans => (k, n),
-        Transpose::Trans => (n, k),
+        Transpose::Trans | Transpose::ConjTrans => (n, k),
     };
 
     validate_leading_dim(lda, a_rows, "lda")?;
@@ -518,8 +650,10 @@ pub fn gemm_strided_batched_parallel<T: Field + GemmKernel + bytemuck::Zeroable>
         let b_offset = i * stride_b;
         let c_offset = i * stride_c;
 
-        let a_ref = MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda);
-        let b_ref = MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb);
+        // SAFETY: We validated buffer sizes and strides above; each view stays
+        // within its slice's bounds for the duration of this borrow.
+        let a_ref = unsafe { MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda) };
+        let b_ref = unsafe { MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb) };
 
         // SAFETY: Each iteration writes to a disjoint region of c.
         let mut c_mut = unsafe {
@@ -788,7 +922,7 @@ fn validate_gemv_dims<T: Field>(
 fn effective_dims(nrows: usize, ncols: usize, trans: Transpose) -> (usize, usize) {
     match trans {
         Transpose::NoTrans => (nrows, ncols),
-        Transpose::Trans => (ncols, nrows),
+        Transpose::Trans | Transpose::ConjTrans => (ncols, nrows),
     }
 }
 
@@ -808,10 +942,50 @@ fn validate_leading_dim(
     Ok(())
 }
 
+/// A GEMM operand after applying its requested [`Transpose`] operation.
+///
+/// `NoTrans` never needs to copy data, so it borrows the caller's matrix
+/// directly. `Trans` and `ConjTrans` materialize a transposed (and, for
+/// `ConjTrans`, conjugated) copy because the underlying multiply routines
+/// (`gemm`, `gemm3m_c64`, `gemm3m_c32`) always operate on their operands
+/// as-stored.
+enum Operand<'a, T: Field> {
+    Borrowed(MatRef<'a, T>),
+    Owned(Mat<T>),
+}
+
+impl<T: Field + bytemuck::Zeroable> Operand<'_, T> {
+    /// Returns a view of the prepared operand, regardless of whether it is
+    /// borrowed or owned.
+    fn as_view(&self) -> MatRef<'_, T> {
+        match self {
+            Operand::Borrowed(m) => *m,
+            Operand::Owned(m) => m.as_ref(),
+        }
+    }
+}
+
+/// Prepares a GEMM operand for the requested transpose mode.
+///
+/// `Transpose::Trans` produces `src^T`; `Transpose::ConjTrans` produces
+/// `src^H` (element-wise conjugate of the transpose). For real scalars
+/// `conj` is the identity, so `ConjTrans` and `Trans` are numerically
+/// equivalent there, matching Netlib BLAS convention.
+fn prepare_operand<'a, T: Field + bytemuck::Zeroable>(
+    src: &MatRef<'a, T>,
+    trans: Transpose,
+) -> Operand<'a, T> {
+    match trans {
+        Transpose::NoTrans => Operand::Borrowed(*src),
+        Transpose::Trans => Operand::Owned(transpose_to_mat(src, false)),
+        Transpose::ConjTrans => Operand::Owned(transpose_to_mat(src, true)),
+    }
+}
+
 /// Executes a single GEMM with optional transpose on A and/or B.
 ///
-/// This creates temporary transposed copies when needed, then delegates
-/// to the optimized `gemm` kernel.
+/// This creates temporary transposed (or conjugate-transposed) copies when
+/// needed, then delegates to the optimized `gemm` kernel.
 fn execute_single_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     trans_a: Transpose,
     trans_b: Transpose,
@@ -821,34 +995,59 @@ fn execute_single_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
 ) {
-    match (trans_a, trans_b) {
-        (Transpose::NoTrans, Transpose::NoTrans) => {
-            gemm(alpha, *a, *b, beta, c.rb_mut());
-        }
-        (Transpose::Trans, Transpose::NoTrans) => {
-            let a_t = transpose_to_mat(a);
-            gemm(alpha, a_t.as_ref(), *b, beta, c.rb_mut());
-        }
-        (Transpose::NoTrans, Transpose::Trans) => {
-            let b_t = transpose_to_mat(b);
-            gemm(alpha, *a, b_t.as_ref(), beta, c.rb_mut());
-        }
-        (Transpose::Trans, Transpose::Trans) => {
-            let a_t = transpose_to_mat(a);
-            let b_t = transpose_to_mat(b);
-            gemm(alpha, a_t.as_ref(), b_t.as_ref(), beta, c.rb_mut());
-        }
-    }
+    let a_op = prepare_operand(a, trans_a);
+    let b_op = prepare_operand(b, trans_b);
+    gemm(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
 }
 
-/// Creates a transposed copy of a matrix (columns become rows).
-fn transpose_to_mat<T: Field + bytemuck::Zeroable>(src: &MatRef<'_, T>) -> Mat<T> {
+/// Executes a single `Complex64` GEMM with optional (conjugate) transpose on
+/// A and/or B, via the 3M complex GEMM method.
+///
+/// `GemmKernel` (and therefore [`gemm`]) is only implemented for real
+/// scalars, so batched complex GEMM routes through [`gemm3m_c64`] instead,
+/// exactly like the non-batched Hermitian/complex operations in this crate
+/// (see `hemm_via_gemm_c64`).
+fn execute_single_gemm_c64(
+    trans_a: Transpose,
+    trans_b: Transpose,
+    alpha: Complex64,
+    a: &MatRef<'_, Complex64>,
+    b: &MatRef<'_, Complex64>,
+    beta: Complex64,
+    c: &mut MatMut<'_, Complex64>,
+) {
+    let a_op = prepare_operand(a, trans_a);
+    let b_op = prepare_operand(b, trans_b);
+    gemm3m_c64(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
+}
+
+/// Executes a single `Complex32` GEMM with optional (conjugate) transpose on
+/// A and/or B, via the 3M complex GEMM method. See
+/// [`execute_single_gemm_c64`] for details.
+fn execute_single_gemm_c32(
+    trans_a: Transpose,
+    trans_b: Transpose,
+    alpha: Complex32,
+    a: &MatRef<'_, Complex32>,
+    b: &MatRef<'_, Complex32>,
+    beta: Complex32,
+    c: &mut MatMut<'_, Complex32>,
+) {
+    let a_op = prepare_operand(a, trans_a);
+    let b_op = prepare_operand(b, trans_b);
+    gemm3m_c32(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
+}
+
+/// Creates a transposed copy of a matrix (columns become rows), optionally
+/// conjugating each element in the process (used for `Transpose::ConjTrans`).
+fn transpose_to_mat<T: Field + bytemuck::Zeroable>(src: &MatRef<'_, T>, conjugate: bool) -> Mat<T> {
     let m = src.nrows();
     let n = src.ncols();
     let mut dst = Mat::<T>::zeros(n, m);
     for i in 0..m {
         for j in 0..n {
-            dst.set(j, i, src[(i, j)]);
+            let value = src[(i, j)];
+            dst.set(j, i, if conjugate { value.conj() } else { value });
         }
     }
     dst
@@ -1431,5 +1630,132 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 17: Batched complex GEMM with ConjTrans on A (Complex64)
+    //
+    // Regression test for the missing `Transpose::ConjTrans` variant: builds
+    // a batch of two `Complex64` GEMMs computing C = A^H * B (A stored
+    // non-square, k=3 x m=2, so the transpose dimension swap is exercised
+    // too) and checks every batch element against a hand-computed
+    // conjugate-transpose product.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_gemm_batched_c64_conj_trans_a() {
+        use num_complex::Complex64;
+
+        fn cplx(re: f64, im: f64) -> Complex64 {
+            Complex64::new(re, im)
+        }
+
+        // A stored as k x m = 3 x 2 (physical storage); op(A) = A^H is m x k = 2 x 3.
+        let a_mat = Mat::<Complex64>::from_rows(&[
+            &[cplx(1.0, 1.0), cplx(2.0, 0.0)],
+            &[cplx(0.0, 2.0), cplx(1.0, -1.0)],
+            &[cplx(1.0, 0.0), cplx(0.0, 1.0)],
+        ]);
+        // B is k x n = 3 x 2, used as-is (NoTrans).
+        let b_mat = Mat::<Complex64>::from_rows(&[
+            &[cplx(1.0, 0.0), cplx(0.0, 1.0)],
+            &[cplx(2.0, 0.0), cplx(1.0, 0.0)],
+            &[cplx(0.0, 1.0), cplx(1.0, 1.0)],
+        ]);
+
+        // Two batch elements sharing the same operands, to confirm the loop
+        // applies ConjTrans consistently across the whole batch.
+        let a_batch = [a_mat.as_ref(), a_mat.as_ref()];
+        let b_batch = [b_mat.as_ref(), b_mat.as_ref()];
+
+        let mut c0 = Mat::<Complex64>::zeros(2, 2);
+        let mut c1 = Mat::<Complex64>::zeros(2, 2);
+        {
+            let mut c_batch = [c0.as_mut(), c1.as_mut()];
+            let result = gemm_batched_c64(
+                Transpose::ConjTrans,
+                Transpose::NoTrans,
+                cplx(1.0, 0.0),
+                &a_batch,
+                &b_batch,
+                cplx(0.0, 0.0),
+                &mut c_batch,
+            );
+            assert!(result.is_ok());
+        }
+
+        // Hand-computed C = A^H * B:
+        //   A^H = [[1-1i, 0-2i, 1+0i],
+        //          [2+0i, 1+1i, 0-1i]]
+        //   B   = [[1+0i, 0+1i],
+        //          [2+0i, 1+0i],
+        //          [0+1i, 1+1i]]
+        //   A^H * B = [[1-4i, 2+0i],
+        //              [5+2i, 2+2i]]
+        let expected = [
+            [cplx(1.0, -4.0), cplx(2.0, 0.0)],
+            [cplx(5.0, 2.0), cplx(2.0, 2.0)],
+        ];
+
+        for c in [&c0, &c1] {
+            for i in 0..2 {
+                for j in 0..2 {
+                    let got = c[(i, j)];
+                    let exp = expected[i][j];
+                    assert!(
+                        (got - exp).norm() < 1e-10,
+                        "c[{i},{j}] = {got}, expected {exp}",
+                    );
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 18: Batched complex GEMM ConjTrans differs from Trans
+    //
+    // Sanity check that ConjTrans actually conjugates (and is not silently
+    // aliased to Trans): using a purely-imaginary A, A^H * B and A^T * B
+    // must differ by a sign flip on the affected terms.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_gemm_batched_c64_conj_trans_differs_from_trans() {
+        use num_complex::Complex64;
+
+        fn cplx(re: f64, im: f64) -> Complex64 {
+            Complex64::new(re, im)
+        }
+
+        // A = [[i]] (1x1), purely imaginary so conj(A) = -A.
+        let a_mat = Mat::<Complex64>::from_rows(&[&[cplx(0.0, 1.0)]]);
+        let b_mat = Mat::<Complex64>::from_rows(&[&[cplx(1.0, 0.0)]]);
+
+        let mut c_conj = Mat::<Complex64>::zeros(1, 1);
+        let conj_result = gemm_batched_c64(
+            Transpose::ConjTrans,
+            Transpose::NoTrans,
+            cplx(1.0, 0.0),
+            &[a_mat.as_ref()],
+            &[b_mat.as_ref()],
+            cplx(0.0, 0.0),
+            &mut [c_conj.as_mut()],
+        );
+        assert!(conj_result.is_ok());
+
+        let mut c_trans = Mat::<Complex64>::zeros(1, 1);
+        let trans_result = gemm_batched_c64(
+            Transpose::Trans,
+            Transpose::NoTrans,
+            cplx(1.0, 0.0),
+            &[a_mat.as_ref()],
+            &[b_mat.as_ref()],
+            cplx(0.0, 0.0),
+            &mut [c_trans.as_mut()],
+        );
+        assert!(trans_result.is_ok());
+
+        // A^H = -i, A^T = i: results must be negatives of each other.
+        assert!((c_conj[(0, 0)] - cplx(0.0, -1.0)).norm() < 1e-10);
+        assert!((c_trans[(0, 0)] - cplx(0.0, 1.0)).norm() < 1e-10);
+        assert!((c_conj[(0, 0)] + c_trans[(0, 0)]).norm() < 1e-10);
     }
 }

@@ -9,6 +9,23 @@ use crate::simd::{SimdRegister, SimdScalar};
 
 use core::arch::aarch64::*;
 
+/// Cold, never-inlined panic path for an out-of-range SIMD lane index.
+///
+/// `SimdRegister::extract` / `insert` are *safe* fns, but the underlying NEON
+/// `vgetq_lane_*` / `vsetq_lane_*` intrinsics require a **compile-time-constant**
+/// lane, so the runtime `index` is dispatched through a `match`. An index
+/// `>= LANES` is a caller programming error; we turn it into a *defined* panic
+/// (like slice indexing) instead of `core::hint::unreachable_unchecked()`, which
+/// was **undefined behavior reachable from safe code** in release builds (where
+/// the old `debug_assert!` was compiled out). Kept `#[cold]`/`#[inline(never)]`
+/// so the valid-index path stays branch-predictable and the panic string is not
+/// duplicated into every lane accessor.
+#[cold]
+#[inline(never)]
+fn lane_index_out_of_range(index: usize, lanes: usize) -> ! {
+    panic!("SIMD lane index {index} out of range (register has {lanes} lanes)");
+}
+
 // =============================================================================
 // NEON (128-bit) implementations
 // =============================================================================
@@ -107,24 +124,22 @@ impl SimdRegister for F64x2 {
 
     #[inline]
     fn extract(self, index: usize) -> f64 {
-        debug_assert!(index < 2);
         unsafe {
             match index {
                 0 => vgetq_lane_f64(self.0, 0),
                 1 => vgetq_lane_f64(self.0, 1),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f64) -> Self {
-        debug_assert!(index < 2);
         unsafe {
             match index {
                 0 => F64x2(vsetq_lane_f64(value, self.0, 0)),
                 1 => F64x2(vsetq_lane_f64(value, self.0, 1)),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
@@ -221,28 +236,26 @@ impl SimdRegister for F32x4 {
 
     #[inline]
     fn extract(self, index: usize) -> f32 {
-        debug_assert!(index < 4);
         unsafe {
             match index {
                 0 => vgetq_lane_f32(self.0, 0),
                 1 => vgetq_lane_f32(self.0, 1),
                 2 => vgetq_lane_f32(self.0, 2),
                 3 => vgetq_lane_f32(self.0, 3),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f32) -> Self {
-        debug_assert!(index < 4);
         unsafe {
             match index {
                 0 => F32x4(vsetq_lane_f32(value, self.0, 0)),
                 1 => F32x4(vsetq_lane_f32(value, self.0, 1)),
                 2 => F32x4(vsetq_lane_f32(value, self.0, 2)),
                 3 => F32x4(vsetq_lane_f32(value, self.0, 3)),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
@@ -406,21 +419,19 @@ impl SimdRegister for F64x4 {
 
     #[inline]
     fn extract(self, index: usize) -> f64 {
-        debug_assert!(index < 4);
         unsafe {
             match index {
                 0 => vgetq_lane_f64(self.lo, 0),
                 1 => vgetq_lane_f64(self.lo, 1),
                 2 => vgetq_lane_f64(self.hi, 0),
                 3 => vgetq_lane_f64(self.hi, 1),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f64) -> Self {
-        debug_assert!(index < 4);
         unsafe {
             match index {
                 0 => F64x4 {
@@ -439,7 +450,7 @@ impl SimdRegister for F64x4 {
                     lo: self.lo,
                     hi: vsetq_lane_f64(value, self.hi, 1),
                 },
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
@@ -599,7 +610,6 @@ impl SimdRegister for F32x8 {
 
     #[inline]
     fn extract(self, index: usize) -> f32 {
-        debug_assert!(index < 8);
         unsafe {
             match index {
                 0 => vgetq_lane_f32(self.lo, 0),
@@ -610,14 +620,13 @@ impl SimdRegister for F32x8 {
                 5 => vgetq_lane_f32(self.hi, 1),
                 6 => vgetq_lane_f32(self.hi, 2),
                 7 => vgetq_lane_f32(self.hi, 3),
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
 
     #[inline]
     fn insert(self, index: usize, value: f32) -> Self {
-        debug_assert!(index < 8);
         unsafe {
             match index {
                 0 => F32x8 {
@@ -652,7 +661,7 @@ impl SimdRegister for F32x8 {
                     lo: self.lo,
                     hi: vsetq_lane_f32(value, self.hi, 3),
                 },
-                _ => core::hint::unreachable_unchecked(),
+                _ => lane_index_out_of_range(index, Self::LANES),
             }
         }
     }
@@ -662,14 +671,26 @@ impl SimdRegister for F32x8 {
 // SimdScalar implementations for AArch64
 // =============================================================================
 
+// AArch64/NEON has no true 512-bit register. `Simd512` therefore aliases the
+// 256-bit *emulated* register (two 128-bit NEON lanes). The `SimdScalar` trait's
+// default `LANES_512 = 64 / size_of::<Self>()` assumes a real 512-bit width and
+// would report 8 (f64) / 16 (f32) lanes, contradicting the aliased register which
+// only holds 4 / 8. Any loop that strided by the constant while operating on a
+// `Simd512` value would run off the end. We override `LANES_512` (and, for
+// symmetry/robustness, `LANES_256`) to the *actual* lane count of the concrete
+// register type so the constant can never disagree with the width it describes.
 impl SimdScalar for f64 {
     type Simd256 = F64x4;
-    type Simd512 = F64x4; // No 512-bit on ARM, use 256-bit emulation
+    type Simd512 = F64x4; // No true 512-bit on ARM; reuse the 256-bit emulation.
+    const LANES_256: usize = <F64x4 as SimdRegister>::LANES;
+    const LANES_512: usize = <F64x4 as SimdRegister>::LANES;
 }
 
 impl SimdScalar for f32 {
     type Simd256 = F32x8;
-    type Simd512 = F32x8; // No 512-bit on ARM, use 256-bit emulation
+    type Simd512 = F32x8; // No true 512-bit on ARM; reuse the 256-bit emulation.
+    const LANES_256: usize = <F32x8 as SimdRegister>::LANES;
+    const LANES_512: usize = <F32x8 as SimdRegister>::LANES;
 }
 
 // =============================================================================
@@ -678,6 +699,20 @@ impl SimdScalar for f32 {
 //
 // SVE provides scalable vectors from 128 to 2048 bits.
 // The actual vector length is implementation-defined and determined at runtime.
+//
+// # Toolchain requirements
+//
+// The SVE scalable-vector intrinsics in `core::arch::aarch64` (`svfloat64_t`,
+// `svld1_f64`, `svcntb`, ...) are **unstable** and only exist on a *nightly*
+// toolchain behind `#![feature(stdarch_aarch64_sve)]`. Gating this code merely
+// on `target_feature = "sve"` would try to compile these intrinsics on stable
+// whenever the target enables SVE (e.g. `-C target-cpu=neoverse-v1`), breaking
+// the build. All SVE items below are therefore gated on
+// `all(feature = "sve-nightly", target_feature = "sve")`: the `sve-nightly`
+// cargo feature is **off by default** and, when enabled, requires a nightly
+// compiler (see the crate-root `#![cfg_attr(..., feature(stdarch_aarch64_sve))]`).
+// On stable, or with the feature off, the crate falls back to the always-present
+// NEON (`F64x2`/`F32x4`) and emulated 256-bit (`F64x4`/`F32x8`) paths above.
 
 /// SVE feature detection and utilities.
 pub struct SveSupport;
@@ -686,11 +721,11 @@ impl SveSupport {
     /// Check if SVE is supported on this CPU.
     #[inline]
     pub fn is_available() -> bool {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
         {
             true
         }
-        #[cfg(not(target_feature = "sve"))]
+        #[cfg(not(all(feature = "sve-nightly", target_feature = "sve")))]
         {
             // Runtime detection - SVE is indicated by ID_AA64ZFR0_EL1 register
             // For now, we use a simple approach
@@ -716,13 +751,14 @@ impl SveSupport {
     /// Returns 0 if SVE is not available.
     #[inline]
     pub fn vector_length_bits() -> usize {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
         unsafe {
-            // Use svcntb() to get vector length in bytes
+            // `svcntb` returns the vector length in bytes as `u64`; widen/narrow
+            // to `usize` (a real SVE vector is 16..=256 bytes, always in range).
             use core::arch::aarch64::svcntb;
-            svcntb() * 8
+            svcntb() as usize * 8
         }
-        #[cfg(not(target_feature = "sve"))]
+        #[cfg(not(all(feature = "sve-nightly", target_feature = "sve")))]
         {
             0
         }
@@ -731,12 +767,12 @@ impl SveSupport {
     /// Returns the SVE vector length in bytes.
     #[inline]
     pub fn vector_length_bytes() -> usize {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
         unsafe {
             use core::arch::aarch64::svcntb;
-            svcntb()
+            svcntb() as usize
         }
-        #[cfg(not(target_feature = "sve"))]
+        #[cfg(not(all(feature = "sve-nightly", target_feature = "sve")))]
         {
             0
         }
@@ -745,12 +781,12 @@ impl SveSupport {
     /// Returns the number of f64 elements in an SVE vector.
     #[inline]
     pub fn f64_lanes() -> usize {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
         unsafe {
             use core::arch::aarch64::svcntd;
-            svcntd()
+            svcntd() as usize
         }
-        #[cfg(not(target_feature = "sve"))]
+        #[cfg(not(all(feature = "sve-nightly", target_feature = "sve")))]
         {
             0
         }
@@ -759,322 +795,67 @@ impl SveSupport {
     /// Returns the number of f32 elements in an SVE vector.
     #[inline]
     pub fn f32_lanes() -> usize {
-        #[cfg(target_feature = "sve")]
+        #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
         unsafe {
             use core::arch::aarch64::svcntw;
-            svcntw()
+            svcntw() as usize
         }
-        #[cfg(not(target_feature = "sve"))]
+        #[cfg(not(all(feature = "sve-nightly", target_feature = "sve")))]
         {
             0
         }
     }
 }
 
-/// SVE scalable vector for f64.
-///
-/// This type wraps the scalable `svfloat64_t` type and provides
-/// SIMD operations that work regardless of the actual vector length.
-#[cfg(target_feature = "sve")]
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct SveF64(core::arch::aarch64::svfloat64_t);
-
-#[cfg(target_feature = "sve")]
-impl SveF64 {
-    /// Creates a vector with all elements set to zero.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn zero() -> Self {
-        use core::arch::aarch64::{svdup_n_f64, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svdup_n_f64(0.0))
-    }
-
-    /// Creates a vector with all elements set to the same value.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn splat(value: f64) -> Self {
-        use core::arch::aarch64::svdup_n_f64;
-        SveF64(svdup_n_f64(value))
-    }
-
-    /// Loads a vector from memory.
-    ///
-    /// # Safety
-    /// The pointer must be valid for at least `SveSupport::f64_lanes()` elements.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn load(ptr: *const f64) -> Self {
-        use core::arch::aarch64::{svld1_f64, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svld1_f64(pred, ptr))
-    }
-
-    /// Stores a vector to memory.
-    ///
-    /// # Safety
-    /// The pointer must be valid for at least `SveSupport::f64_lanes()` elements.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn store(self, ptr: *mut f64) {
-        use core::arch::aarch64::{svptrue_b64, svst1_f64};
-        let pred = svptrue_b64();
-        svst1_f64(pred, ptr, self.0);
-    }
-
-    /// Element-wise addition.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn add(self, other: Self) -> Self {
-        use core::arch::aarch64::{svadd_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svadd_f64_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise subtraction.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn sub(self, other: Self) -> Self {
-        use core::arch::aarch64::{svptrue_b64, svsub_f64_x};
-        let pred = svptrue_b64();
-        SveF64(svsub_f64_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise multiplication.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn mul(self, other: Self) -> Self {
-        use core::arch::aarch64::{svmul_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svmul_f64_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise division.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn div(self, other: Self) -> Self {
-        use core::arch::aarch64::{svdiv_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svdiv_f64_x(pred, self.0, other.0))
-    }
-
-    /// Fused multiply-add: self * a + b
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn fma(self, a: Self, b: Self) -> Self {
-        use core::arch::aarch64::{svmla_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svmla_f64_x(pred, b.0, self.0, a.0))
-    }
-
-    /// Fused multiply-subtract: self * a - b
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn fms(self, a: Self, b: Self) -> Self {
-        use core::arch::aarch64::{svnmls_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svnmls_f64_x(pred, b.0, self.0, a.0))
-    }
-
-    /// Horizontal sum of all elements.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_add(self) -> f64 {
-        use core::arch::aarch64::{svaddv_f64, svptrue_b64};
-        let pred = svptrue_b64();
-        svaddv_f64(pred, self.0)
-    }
-
-    /// Horizontal maximum.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_max(self) -> f64 {
-        use core::arch::aarch64::{svmaxv_f64, svptrue_b64};
-        let pred = svptrue_b64();
-        svmaxv_f64(pred, self.0)
-    }
-
-    /// Horizontal minimum.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_min(self) -> f64 {
-        use core::arch::aarch64::{svminv_f64, svptrue_b64};
-        let pred = svptrue_b64();
-        svminv_f64(pred, self.0)
-    }
-
-    /// Absolute value.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn abs(self) -> Self {
-        use core::arch::aarch64::{svabs_f64_x, svptrue_b64};
-        let pred = svptrue_b64();
-        SveF64(svabs_f64_x(pred, self.0))
-    }
-
-    /// Square root.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn sqrt(self) -> Self {
-        use core::arch::aarch64::{svptrue_b64, svsqrt_f64_x};
-        let pred = svptrue_b64();
-        SveF64(svsqrt_f64_x(pred, self.0))
-    }
-}
-
-/// SVE scalable vector for f32.
-#[cfg(target_feature = "sve")]
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct SveF32(core::arch::aarch64::svfloat32_t);
-
-#[cfg(target_feature = "sve")]
-impl SveF32 {
-    /// Creates a vector with all elements set to zero.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn zero() -> Self {
-        use core::arch::aarch64::svdup_n_f32;
-        SveF32(svdup_n_f32(0.0))
-    }
-
-    /// Creates a vector with all elements set to the same value.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn splat(value: f32) -> Self {
-        use core::arch::aarch64::svdup_n_f32;
-        SveF32(svdup_n_f32(value))
-    }
-
-    /// Loads a vector from memory.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn load(ptr: *const f32) -> Self {
-        use core::arch::aarch64::{svld1_f32, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svld1_f32(pred, ptr))
-    }
-
-    /// Stores a vector to memory.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn store(self, ptr: *mut f32) {
-        use core::arch::aarch64::{svptrue_b32, svst1_f32};
-        let pred = svptrue_b32();
-        svst1_f32(pred, ptr, self.0);
-    }
-
-    /// Element-wise addition.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn add(self, other: Self) -> Self {
-        use core::arch::aarch64::{svadd_f32_x, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svadd_f32_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise subtraction.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn sub(self, other: Self) -> Self {
-        use core::arch::aarch64::{svptrue_b32, svsub_f32_x};
-        let pred = svptrue_b32();
-        SveF32(svsub_f32_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise multiplication.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn mul(self, other: Self) -> Self {
-        use core::arch::aarch64::{svmul_f32_x, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svmul_f32_x(pred, self.0, other.0))
-    }
-
-    /// Element-wise division.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn div(self, other: Self) -> Self {
-        use core::arch::aarch64::{svdiv_f32_x, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svdiv_f32_x(pred, self.0, other.0))
-    }
-
-    /// Fused multiply-add: self * a + b
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn fma(self, a: Self, b: Self) -> Self {
-        use core::arch::aarch64::{svmla_f32_x, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svmla_f32_x(pred, b.0, self.0, a.0))
-    }
-
-    /// Horizontal sum of all elements.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_add(self) -> f32 {
-        use core::arch::aarch64::{svaddv_f32, svptrue_b32};
-        let pred = svptrue_b32();
-        svaddv_f32(pred, self.0)
-    }
-
-    /// Horizontal maximum.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_max(self) -> f32 {
-        use core::arch::aarch64::{svmaxv_f32, svptrue_b32};
-        let pred = svptrue_b32();
-        svmaxv_f32(pred, self.0)
-    }
-
-    /// Horizontal minimum.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn reduce_min(self) -> f32 {
-        use core::arch::aarch64::{svminv_f32, svptrue_b32};
-        let pred = svptrue_b32();
-        svminv_f32(pred, self.0)
-    }
-
-    /// Absolute value.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn abs(self) -> Self {
-        use core::arch::aarch64::{svabs_f32_x, svptrue_b32};
-        let pred = svptrue_b32();
-        SveF32(svabs_f32_x(pred, self.0))
-    }
-
-    /// Square root.
-    #[inline]
-    #[target_feature(enable = "sve")]
-    pub unsafe fn sqrt(self) -> Self {
-        use core::arch::aarch64::{svptrue_b32, svsqrt_f32_x};
-        let pred = svptrue_b32();
-        SveF32(svsqrt_f32_x(pred, self.0))
-    }
-}
+// -----------------------------------------------------------------------------
+// NOTE: no `SveF64` / `SveF32` register-wrapper types are provided.
+//
+// A natural design would mirror the NEON `F64x2` / `F32x4` newtypes with, e.g.,
+// `#[repr(transparent)] struct SveF64(svfloat64_t)`. That is **not expressible**
+// in current Rust: SVE scalable vectors are *sizeless* types (their length is
+// only known at run time), so they are not `Sized` and rustc rejects them as
+// struct fields -- "scalable vectors cannot be fields of a struct" -- even under
+// `repr(transparent)`. Wrapping them behind the `sve-nightly` feature therefore
+// could never compile, so we do not ship a type that only pretends to exist.
+//
+// Until Rust gains first-class support for sizeless/scalable SIMD types, SVE is
+// exposed only through the free-function kernels below (`sve_dot_f64`,
+// `sve_dot_f32`, `sve_axpy_f64`), which keep the scalable values in locals
+// inside `#[target_feature(enable = "sve")]` fns where the language permits
+// them. The always-available NEON path (`F64x2` / `F32x4`) and the emulated
+// 256-bit path (`F64x4` / `F32x8`) remain the default SIMD abstraction.
+// -----------------------------------------------------------------------------
 
 /// Helper for SVE-accelerated dot product.
 ///
 /// Computes the dot product of two slices using SVE instructions.
-#[cfg(target_feature = "sve")]
+///
+/// # Safety
+/// - The target CPU must actually support SVE. This function emits SVE
+///   instructions with **no internal runtime guard**, so callers must confirm
+///   availability first (e.g. via [`SveSupport::is_available`]).
+/// - `x` and `y` must have the **same length**: the loop bound is `x.len()` and
+///   `y` is read up to that index, so a shorter `y` is an out-of-bounds read
+///   (checked only by `debug_assert` in debug builds).
+#[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
 #[inline]
 #[target_feature(enable = "sve")]
 pub unsafe fn sve_dot_f64(x: &[f64], y: &[f64]) -> f64 {
     use core::arch::aarch64::{
-        svaddv_f64, svcntd, svdup_n_f64, svld1_f64, svmla_f64_x, svptrue_b64, svwhilelt_b64,
+        svaddv_f64, svcntd, svdup_n_f64, svld1_f64, svmla_f64_m, svmla_f64_x, svptrue_b64,
+        svwhilelt_b64_u64,
     };
 
     debug_assert_eq!(x.len(), y.len());
     let n = x.len();
-    let lanes = svcntd();
+    // `svcntd` returns the f64 lane count as `u64`; use `usize` for index math.
+    let lanes = svcntd() as usize;
 
     let mut acc = svdup_n_f64(0.0);
     let mut i = 0usize;
 
-    // Main loop with full vectors
+    // Main loop with full vectors: every lane is active, so `_x` (don't-care
+    // on inactive lanes) is optimal and correct here.
     while i + lanes <= n {
         let pred = svptrue_b64();
         let va = svld1_f64(pred, x.as_ptr().add(i));
@@ -1083,33 +864,51 @@ pub unsafe fn sve_dot_f64(x: &[f64], y: &[f64]) -> f64 {
         i += lanes;
     }
 
-    // Handle remaining elements with predicate
+    // Tail: only the first `n - i` lanes are active. `acc` already holds valid
+    // per-lane partial sums (from the main loop) in *all* lanes, and the final
+    // reduction below sums *all* lanes with a full predicate. We must therefore
+    // use **merging** predication (`svmla_f64_m`): active lanes get
+    // `acc + va*vb`, inactive lanes keep the existing `acc`. The previous `_x`
+    // form left inactive lanes *unspecified*, so garbage from the inactive lanes
+    // leaked into the full-predicate reduction and corrupted the result whenever
+    // `n` was not a whole multiple of the vector length. (`_z` would be equally
+    // wrong here: it would zero the inactive lanes and destroy the main-loop
+    // partial sums they carry.)
     if i < n {
-        let pred = svwhilelt_b64(i as u64, n as u64);
+        let pred = svwhilelt_b64_u64(i as u64, n as u64);
         let va = svld1_f64(pred, x.as_ptr().add(i));
         let vb = svld1_f64(pred, y.as_ptr().add(i));
-        acc = svmla_f64_x(pred, acc, va, vb);
+        acc = svmla_f64_m(pred, acc, va, vb);
     }
 
     svaddv_f64(svptrue_b64(), acc)
 }
 
 /// Helper for SVE-accelerated dot product (f32).
-#[cfg(target_feature = "sve")]
+///
+/// # Safety
+/// - The target CPU must actually support SVE (no internal runtime guard; see
+///   [`SveSupport::is_available`]).
+/// - `x` and `y` must have the **same length** (the loop bound is `x.len()` and
+///   `y` is read up to that index; checked only by `debug_assert`).
+#[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
 #[inline]
 #[target_feature(enable = "sve")]
 pub unsafe fn sve_dot_f32(x: &[f32], y: &[f32]) -> f32 {
     use core::arch::aarch64::{
-        svaddv_f32, svcntw, svdup_n_f32, svld1_f32, svmla_f32_x, svptrue_b32, svwhilelt_b32,
+        svaddv_f32, svcntw, svdup_n_f32, svld1_f32, svmla_f32_m, svmla_f32_x, svptrue_b32,
+        svwhilelt_b32_u64,
     };
 
     debug_assert_eq!(x.len(), y.len());
     let n = x.len();
-    let lanes = svcntw();
+    // `svcntw` returns the f32 lane count as `u64`; use `usize` for index math.
+    let lanes = svcntw() as usize;
 
     let mut acc = svdup_n_f32(0.0);
     let mut i = 0usize;
 
+    // Main loop with full vectors: all lanes active, `_x` is correct/optimal.
     while i + lanes <= n {
         let pred = svptrue_b32();
         let va = svld1_f32(pred, x.as_ptr().add(i));
@@ -1118,28 +917,40 @@ pub unsafe fn sve_dot_f32(x: &[f32], y: &[f32]) -> f32 {
         i += lanes;
     }
 
+    // Tail: merging predication (`svmla_f32_m`) so the inactive lanes retain the
+    // main-loop partial sums that the full-predicate reduction below still adds
+    // in. See `sve_dot_f64` for the detailed rationale; `_x` left inactive lanes
+    // unspecified and corrupted non-multiple-of-vector-length reductions.
     if i < n {
-        let pred = svwhilelt_b32(i as u64, n as u64);
+        let pred = svwhilelt_b32_u64(i as u64, n as u64);
         let va = svld1_f32(pred, x.as_ptr().add(i));
         let vb = svld1_f32(pred, y.as_ptr().add(i));
-        acc = svmla_f32_x(pred, acc, va, vb);
+        acc = svmla_f32_m(pred, acc, va, vb);
     }
 
     svaddv_f32(svptrue_b32(), acc)
 }
 
 /// AXPY operation using SVE: y = alpha * x + y
-#[cfg(target_feature = "sve")]
+///
+/// # Safety
+/// - The target CPU must actually support SVE (no internal runtime guard; see
+///   [`SveSupport::is_available`]).
+/// - `x` and `y` must have the **same length**: the loop bound is `x.len()` and
+///   `y` is both read and written up to that index, so a shorter `y` is an
+///   out-of-bounds access (checked only by `debug_assert`).
+#[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
 #[inline]
 #[target_feature(enable = "sve")]
 pub unsafe fn sve_axpy_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     use core::arch::aarch64::{
-        svcntd, svdup_n_f64, svld1_f64, svmla_n_f64_x, svptrue_b64, svst1_f64, svwhilelt_b64,
+        svcntd, svld1_f64, svmla_n_f64_x, svptrue_b64, svst1_f64, svwhilelt_b64_u64,
     };
 
     debug_assert_eq!(x.len(), y.len());
     let n = x.len();
-    let lanes = svcntd();
+    // `svcntd` returns the f64 lane count as `u64`; use `usize` for index math.
+    let lanes = svcntd() as usize;
     let mut i = 0usize;
 
     while i + lanes <= n {
@@ -1152,7 +963,7 @@ pub unsafe fn sve_axpy_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     }
 
     if i < n {
-        let pred = svwhilelt_b64(i as u64, n as u64);
+        let pred = svwhilelt_b64_u64(i as u64, n as u64);
         let vx = svld1_f64(pred, x.as_ptr().add(i));
         let vy = svld1_f64(pred, y.as_ptr().add(i));
         let result = svmla_n_f64_x(pred, vy, vx, alpha);
@@ -1208,16 +1019,20 @@ mod tests {
     fn test_sve_support_detection() {
         // Test that SVE detection doesn't panic
         let is_available = SveSupport::is_available();
+        #[cfg(feature = "std")]
         let is_sve2 = SveSupport::is_sve2_available();
         let vlen_bits = SveSupport::vector_length_bits();
         let vlen_bytes = SveSupport::vector_length_bytes();
         let f64_lanes = SveSupport::f64_lanes();
         let f32_lanes = SveSupport::f32_lanes();
 
-        println!("SVE available: {}", is_available);
-        println!("SVE2 available: {}", is_sve2);
-        println!("Vector length: {} bits / {} bytes", vlen_bits, vlen_bytes);
-        println!("f64 lanes: {}, f32 lanes: {}", f64_lanes, f32_lanes);
+        #[cfg(feature = "std")]
+        {
+            println!("SVE available: {}", is_available);
+            println!("SVE2 available: {}", is_sve2);
+            println!("Vector length: {} bits / {} bytes", vlen_bits, vlen_bytes);
+            println!("f64 lanes: {}, f32 lanes: {}", f64_lanes, f32_lanes);
+        }
 
         // If SVE is not available, all values should be 0
         if !is_available {
@@ -1232,5 +1047,108 @@ mod tests {
             assert!(f64_lanes >= 2);
             assert!(f32_lanes >= 4);
         }
+    }
+
+    // --- Regression: Finding 1 (out-of-range lane index must be a *defined*
+    // panic, not UB via `unreachable_unchecked()` in release builds) ---------
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f64x2_extract_out_of_range_panics() {
+        let a = F64x2::splat(1.0);
+        // Index 2 is out of range for a 2-lane register. This must panic with a
+        // clear message on *every* profile, not invoke `unreachable_unchecked`.
+        let _ = a.extract(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_f32x8_insert_out_of_range_panics() {
+        let a = F32x8::splat(1.0);
+        // Index 8 is out of range for the 8-lane emulated register.
+        let _ = a.insert(8, 9.0);
+    }
+
+    #[test]
+    fn test_f64x4_all_lanes_roundtrip() {
+        // Guard against regressions in the lane dispatch after removing the
+        // `debug_assert!`: every in-range lane must still read/write correctly,
+        // including across the emulated lo/hi 128-bit boundary (lanes 1 -> 2).
+        let mut v = F64x4::zero();
+        for lane in 0..F64x4::LANES {
+            v = v.insert(lane, (lane as f64) + 0.5);
+        }
+        for lane in 0..F64x4::LANES {
+            assert_eq!(v.extract(lane), (lane as f64) + 0.5);
+        }
+    }
+
+    // --- Regression: Finding 2 (LANES_256/LANES_512 must equal the actual
+    // width of the concrete Simd256/Simd512 register type on NEON) -----------
+
+    #[test]
+    fn test_simd_lane_constants_match_register_width() {
+        // On AArch64 the 512-bit alias is the 4-lane (f64) / 8-lane (f32)
+        // emulation, so the trait-default LANES_512 (8 / 16) would over-report
+        // the width. These asserts fail on the pre-fix code.
+        assert_eq!(
+            <f64 as SimdScalar>::LANES_512,
+            <<f64 as SimdScalar>::Simd512 as SimdRegister>::LANES
+        );
+        assert_eq!(
+            <f32 as SimdScalar>::LANES_512,
+            <<f32 as SimdScalar>::Simd512 as SimdRegister>::LANES
+        );
+        assert_eq!(
+            <f64 as SimdScalar>::LANES_256,
+            <<f64 as SimdScalar>::Simd256 as SimdRegister>::LANES
+        );
+        assert_eq!(
+            <f32 as SimdScalar>::LANES_256,
+            <<f32 as SimdScalar>::Simd256 as SimdRegister>::LANES
+        );
+        // Concrete expected values for the NEON emulation.
+        assert_eq!(<f64 as SimdScalar>::LANES_512, 4);
+        assert_eq!(<f32 as SimdScalar>::LANES_512, 8);
+    }
+
+    // --- Regression: Finding 4 (SVE dot-product tail must use merging
+    // predication so inactive lanes do not corrupt the final reduction).
+    //
+    // This test only compiles/runs on a nightly toolchain with the
+    // `sve-nightly` feature and an SVE-enabled target; it exercises a length
+    // that is deliberately *not* a multiple of the (runtime) vector length so
+    // the predicated tail path is taken. On the pre-fix `_x` code the inactive
+    // lanes were unspecified and this assertion would fail. --------------------
+
+    #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
+    #[test]
+    fn test_sve_dot_f64_partial_tail_matches_scalar() {
+        let lanes = SveSupport::f64_lanes();
+        // Guarantee a non-empty, non-full tail: 3 full vectors + 1 element.
+        let n = lanes * 3 + 1;
+        let x: std::vec::Vec<f64> = (0..n).map(|k| (k as f64) * 0.5 + 1.0).collect();
+        let y: std::vec::Vec<f64> = (0..n).map(|k| (k as f64).mul_add(-0.25, 2.0)).collect();
+        let expected: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = unsafe { sve_dot_f64(&x, &y) };
+        assert!(
+            (got - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+            "sve_dot_f64 tail mismatch: got {got}, expected {expected}"
+        );
+    }
+
+    #[cfg(all(feature = "sve-nightly", target_feature = "sve"))]
+    #[test]
+    fn test_sve_dot_f32_partial_tail_matches_scalar() {
+        let lanes = SveSupport::f32_lanes();
+        let n = lanes * 3 + 1;
+        let x: std::vec::Vec<f32> = (0..n).map(|k| (k as f32) * 0.5 + 1.0).collect();
+        let y: std::vec::Vec<f32> = (0..n).map(|k| (k as f32).mul_add(-0.25, 2.0)).collect();
+        let expected: f32 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+        let got = unsafe { sve_dot_f32(&x, &y) };
+        assert!(
+            (got - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+            "sve_dot_f32 tail mismatch: got {got}, expected {expected}"
+        );
     }
 }

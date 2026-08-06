@@ -128,8 +128,19 @@ impl std::error::Error for LobpcgError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use oxiblas_sparse::csr::CsrMatrix;
 /// use oxiblas_sparse::linalg::eigenvalue::{Lobpcg, LobpcgConfig, LobpcgTarget};
+///
+/// // A diagonal matrix has its diagonal entries as eigenvalues: 1..=10.
+/// let csr = CsrMatrix::new(
+///     10,
+///     10,
+///     (0..=10).collect(),
+///     (0..10).collect(),
+///     (1..=10).map(|i| i as f64).collect(),
+/// )
+/// .unwrap();
 ///
 /// let config = LobpcgConfig {
 ///     num_eigenvalues: 3,
@@ -139,6 +150,11 @@ impl std::error::Error for LobpcgError {}
 /// };
 /// let solver = Lobpcg::new(config).unwrap();
 /// let result = solver.compute(&csr).unwrap();
+/// assert_eq!(result.eigenvalues.len(), 3);
+/// // Smallest 3 eigenvalues of diag(1..=10) are 1, 2, 3.
+/// assert!((result.eigenvalues[0] - 1.0).abs() < 1e-6);
+/// assert!((result.eigenvalues[1] - 2.0).abs() < 1e-6);
+/// assert!((result.eigenvalues[2] - 3.0).abs() < 1e-6);
 /// ```
 pub struct Lobpcg {
     config: LobpcgConfig,
@@ -329,30 +345,52 @@ impl Lobpcg {
             orthogonalize_against(wj, x);
         }
 
-        // --- Step 6: Build subspace S = [X | W | P] or [X | W] ---
-        let mut s: Vec<Vec<f64>> = Vec::new();
-        for xj in x.iter() {
-            s.push(xj.clone());
-        }
-        for wj in &w {
-            s.push(wj.clone());
-        }
+        // --- Step 5b: Re-orthogonalize the previous search-direction block P
+        // against the *current* X (X was updated at the end of the previous
+        // iteration, so P's components along the new X must be removed again). ---
         let has_p = iter > 0 && !p.is_empty();
         if has_p {
-            for pj in p.iter() {
-                s.push(pj.clone());
+            for pj in p.iter_mut() {
+                orthogonalize_against(pj, x);
             }
         }
 
-        // --- Step 7: Orthonormalize S ---
-        let s_cols = mgs_orthonormalize(&mut s)?;
-        s.truncate(s_cols);
+        // --- Step 6: Build the fixed-width correction block C = [W | P],
+        // orthonormalized among itself. This block (not a running concatenation
+        // of Ritz columns) is what P_{k+1} is later re-derived from, which is
+        // what keeps the block a fixed size across iterations instead of
+        // growing without bound. ---
+        let mut c: Vec<Vec<f64>> = Vec::with_capacity(bs + if has_p { p.len() } else { 0 });
+        for wj in &w {
+            c.push(wj.clone());
+        }
+        if has_p {
+            for pj in p.iter() {
+                c.push(pj.clone());
+            }
+        }
+        let c_cols = mgs_orthonormalize(&mut c).unwrap_or(0);
+        c.truncate(c_cols);
+
+        // --- Step 7: Build subspace S = [X | C]. X is already orthonormal
+        // (it was orthonormalized at the end of the previous iteration) and C
+        // is orthonormal and orthogonal to X by construction, so S is
+        // orthonormal without a further full Gram-Schmidt pass over it. This
+        // also lets us track the X/C block boundary exactly, which the P
+        // update below depends on. ---
+        let mut s: Vec<Vec<f64>> = Vec::with_capacity(bs + c_cols);
+        for xj in x.iter() {
+            s.push(xj.clone());
+        }
+        for cj in &c {
+            s.push(cj.clone());
+        }
+        let dim = s.len();
 
         // --- Step 8: Compute A*S ---
         let a_s = spmv_block(csr, &s);
 
         // --- Step 9: Projected matrix A_proj = S^T A S ---
-        let dim = s.len();
         let mut a_proj: Vec<Vec<f64>> = vec![vec![0.0; dim]; dim];
         for i in 0..dim {
             for jj in 0..dim {
@@ -386,11 +424,20 @@ impl Lobpcg {
             }
         }
 
-        // --- Step 13: Compute new X = S * evecs[:, col_offset..col_offset+bs] ---
+        // --- Step 13: Compute the new iterate X_{k+1} and search direction
+        // P_{k+1} from the SAME bs selected Ritz columns (Knyazev's locally
+        // optimal update):
+        //   X_{k+1}[:, j] = S      * evec[:, col]        (full combination)
+        //   P_{k+1}[:, j] = C(=S[bs..]) * evec[bs.., col] (correction part only)
+        // Because C always has at most `2*bs` columns (W plus the previous
+        // fixed-width P, orthonormalized together), P_{k+1} is always exactly
+        // `bs` columns wide -- it is re-derived each iteration from a bounded
+        // combination of the current X/P, never concatenated/accumulated. ---
         let mut x_new: Vec<Vec<f64>> = vec![vec![0.0; n]; bs];
+        let mut p_new: Vec<Vec<f64>> = vec![vec![0.0; n]; bs];
         for j in 0..bs {
             let col = col_offset + j;
-            if col >= evecs[0].len() {
+            if col >= dim {
                 continue;
             }
             for (si, sv) in s.iter().enumerate() {
@@ -398,53 +445,11 @@ impl Lobpcg {
                 for i in 0..n {
                     x_new[j][i] += coeff * sv[i];
                 }
-            }
-        }
-
-        // --- Step 14: Update P = S * evecs[:, (non-X columns)] ---
-        // P columns come from the W (and old P) block of Ritz vectors
-        let p_col_start = match self.config.which {
-            LobpcgTarget::Smallest => bs,        // skip first bs (X) cols
-            LobpcgTarget::Largest => col_offset, // skip last bs (X) cols (i.e. take first col_offset)
-        };
-        let p_col_end = match self.config.which {
-            LobpcgTarget::Smallest => dim,
-            LobpcgTarget::Largest => col_offset,
-        };
-
-        let mut p_new: Vec<Vec<f64>> = Vec::new();
-        if p_col_end > p_col_start {
-            for col in p_col_start..p_col_end {
-                if col >= evecs[0].len() {
-                    break;
-                }
-                let mut pj = vec![0.0_f64; n];
-                for (si, sv) in s.iter().enumerate() {
-                    let coeff = evecs[si][col];
+                if si >= bs {
                     for i in 0..n {
-                        pj[i] += coeff * sv[i];
+                        p_new[j][i] += coeff * sv[i];
                     }
                 }
-                p_new.push(pj);
-            }
-        } else if match self.config.which {
-            LobpcgTarget::Largest => true,
-            LobpcgTarget::Smallest => false,
-        } {
-            // For Largest: P is everything after col_offset (i.e. 0..col_offset already used for X)
-            // Actually re-derive: for Largest, X uses last bs cols, P uses first col_offset cols
-            for col in 0..col_offset {
-                if col >= evecs[0].len() {
-                    break;
-                }
-                let mut pj = vec![0.0_f64; n];
-                for (si, sv) in s.iter().enumerate() {
-                    let coeff = evecs[si][col];
-                    for i in 0..n {
-                        pj[i] += coeff * sv[i];
-                    }
-                }
-                p_new.push(pj);
             }
         }
 
@@ -917,5 +922,52 @@ mod tests {
             lambda0 > 0.0 && lambda0 < 1.0,
             "Smallest eigenvalue ~ 0.0955, got {lambda0}"
         );
+    }
+
+    /// Regression test for the "P block grows unbounded" bug: LOBPCG's search
+    /// direction block P must stay a FIXED width (== block_size) across every
+    /// iteration, never a growing concatenation of previous Ritz columns.
+    #[test]
+    fn test_lobpcg_p_block_stays_fixed_width() {
+        let n = 30;
+        let a = make_tridiagonal(n);
+        let block_size = 4usize;
+        let config = LobpcgConfig {
+            num_eigenvalues: block_size,
+            which: LobpcgTarget::Smallest,
+            tol: 1e-12, // very tight so the loop runs many iterations without early exit
+            max_iter: 40,
+            block_size: Some(block_size),
+        };
+        let solver = Lobpcg::new(config).unwrap();
+
+        let mut x = init_eigenvector_block(n, block_size).unwrap();
+        let mut p: Vec<Vec<f64>> = Vec::new();
+        let mut lambda = vec![0.0_f64; block_size];
+        let precond = |r: &[f64], w: &mut [f64]| w.copy_from_slice(r);
+
+        for iter in 0..25 {
+            let done = solver
+                .lobpcg_step(&a, &mut x, &mut p, &mut lambda, &precond, iter)
+                .unwrap();
+
+            // The whole point of the fixed 3-block LOBPCG design: P must never
+            // exceed block_size columns, at any iteration.
+            assert!(
+                p.len() <= block_size,
+                "iteration {iter}: P block grew to {} columns, expected <= {} (fixed block size)",
+                p.len(),
+                block_size
+            );
+            assert_eq!(
+                x.len(),
+                block_size,
+                "iteration {iter}: X block changed width unexpectedly"
+            );
+
+            if done {
+                break;
+            }
+        }
     }
 }

@@ -5,7 +5,9 @@
 //! - x86_64: AVX2 (256-bit), AVX512F (512-bit), SSE4.2 (128-bit)
 //! - AArch64: NEON (128-bit), 256-bit emulated
 //! - WASM32: SIMD128 (128-bit), 256-bit emulated
-//! - Scalar fallback for unsupported platforms
+//! - Every other architecture (riscv64, powerpc64, s390x, loongarch64, armv7,
+//!   i686, ...): portable array-backed registers from [`portable`], so the
+//!   generic path compiles and gives correct results everywhere
 //!
 //! The design uses runtime feature detection to dispatch to the best
 //! available implementation.
@@ -67,6 +69,7 @@ pub mod wasm32;
 pub mod complex;
 pub mod dispatch;
 pub mod multiver;
+pub mod portable;
 pub mod scalar;
 
 use crate::scalar::{Field, Real, Scalar};

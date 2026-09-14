@@ -1273,7 +1273,18 @@ mod tests {
 
         #[cfg(all(not(feature = "force-scalar"), not(feature = "max-simd-128")))]
         {
-            #[cfg(target_arch = "x86_64")]
+            // Without `std` the x86_64 level comes from compile-time target
+            // features only (baseline x86_64 = SSE2 = 128-bit), where the
+            // complex batch helpers have no kernel and must fall back to scalar.
+            #[cfg(all(target_arch = "x86_64", not(feature = "std")))]
+            {
+                if level < SimdLevel::Simd256 {
+                    assert_eq!(backend, ComplexSimdBackend::Scalar);
+                } else {
+                    assert_ne!(backend, ComplexSimdBackend::Scalar);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", feature = "std"))]
             {
                 // The dev/CI host for this crate exposes at least AVX2 (256-bit).
                 assert!(
@@ -1291,6 +1302,18 @@ mod tests {
                 assert_eq!(level, SimdLevel::Simd128);
                 assert_eq!(backend, ComplexSimdBackend::Simd128);
             }
+        }
+
+        // Architectures without a native complex kernel (wasm32, riscv64,
+        // powerpc64, ...) report at most 128-bit SIMD and must dispatch the
+        // complex batch helpers to the scalar path.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            assert!(
+                level <= SimdLevel::Simd128,
+                "unexpected SIMD level {level:?} on a non-x86_64/aarch64 target"
+            );
+            assert_eq!(backend, ComplexSimdBackend::Scalar);
         }
 
         // When scalar is explicitly forced, the dispatch must honor it.

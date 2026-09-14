@@ -36,6 +36,9 @@ criterion = { workspace = true, features = ["html_reports"] }
 num-complex.workspace = true
 half.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
+
 [features]
 default = []
 # Enable comparison benchmarks with OpenBLAS (BSD-3-Clause license, compatible)

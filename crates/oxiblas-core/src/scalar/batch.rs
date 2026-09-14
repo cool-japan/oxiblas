@@ -3,6 +3,10 @@
 use num_complex::{Complex32, Complex64};
 
 use super::traits::Scalar;
+// Inherent `f32`/`f64` float methods (`mul_add`, `sqrt`, ...) live in `std`,
+// so they are called through `num_traits::Float`: with `std` that forwards to
+// the inherent method (bit-identical), without it to `libm`.
+use num_traits::Float;
 
 #[cfg(feature = "f16")]
 use half::f16;
@@ -129,7 +133,7 @@ impl ScalarBatch for f32 {
         debug_assert_eq!(x.len(), y.len());
         let mut sum = 0.0f32;
         for i in 0..x.len() {
-            sum = x[i].mul_add(y[i], sum);
+            sum = Float::mul_add(x[i], y[i], sum);
         }
         sum
     }
@@ -174,7 +178,7 @@ impl ScalarBatch for f32 {
     fn axpy_batch(alpha: Self, x: &[Self], y: &mut [Self]) {
         debug_assert_eq!(x.len(), y.len());
         for i in 0..x.len() {
-            y[i] = alpha.mul_add(x[i], y[i]);
+            y[i] = Float::mul_add(alpha, x[i], y[i]);
         }
     }
 
@@ -184,7 +188,7 @@ impl ScalarBatch for f32 {
         debug_assert_eq!(a.len(), c.len());
         debug_assert_eq!(a.len(), out.len());
         for i in 0..a.len() {
-            out[i] = a[i].mul_add(b[i], c[i]);
+            out[i] = Float::mul_add(a[i], b[i], c[i]);
         }
     }
 }
@@ -195,7 +199,7 @@ impl ScalarBatch for f64 {
         debug_assert_eq!(x.len(), y.len());
         let mut sum = 0.0f64;
         for i in 0..x.len() {
-            sum = x[i].mul_add(y[i], sum);
+            sum = Float::mul_add(x[i], y[i], sum);
         }
         sum
     }
@@ -240,7 +244,7 @@ impl ScalarBatch for f64 {
     fn axpy_batch(alpha: Self, x: &[Self], y: &mut [Self]) {
         debug_assert_eq!(x.len(), y.len());
         for i in 0..x.len() {
-            y[i] = alpha.mul_add(x[i], y[i]);
+            y[i] = Float::mul_add(alpha, x[i], y[i]);
         }
     }
 
@@ -250,7 +254,7 @@ impl ScalarBatch for f64 {
         debug_assert_eq!(a.len(), c.len());
         debug_assert_eq!(a.len(), out.len());
         for i in 0..a.len() {
-            out[i] = a[i].mul_add(b[i], c[i]);
+            out[i] = Float::mul_add(a[i], b[i], c[i]);
         }
     }
 }

@@ -69,37 +69,37 @@ impl Scalar for f16 {
 impl Real for f16 {
     #[inline]
     fn sqrt(self) -> Self {
-        f16::from_f32(self.to_f32().sqrt())
+        f16::from_f32(Real::sqrt(self.to_f32()))
     }
 
     #[inline]
     fn ln(self) -> Self {
-        f16::from_f32(self.to_f32().ln())
+        f16::from_f32(Real::ln(self.to_f32()))
     }
 
     #[inline]
     fn exp(self) -> Self {
-        f16::from_f32(self.to_f32().exp())
+        f16::from_f32(Real::exp(self.to_f32()))
     }
 
     #[inline]
     fn sin(self) -> Self {
-        f16::from_f32(self.to_f32().sin())
+        f16::from_f32(Real::sin(self.to_f32()))
     }
 
     #[inline]
     fn cos(self) -> Self {
-        f16::from_f32(self.to_f32().cos())
+        f16::from_f32(Real::cos(self.to_f32()))
     }
 
     #[inline]
     fn atan2(self, other: Self) -> Self {
-        f16::from_f32(self.to_f32().atan2(other.to_f32()))
+        f16::from_f32(Real::atan2(self.to_f32(), other.to_f32()))
     }
 
     #[inline]
     fn powf(self, n: Self) -> Self {
-        f16::from_f32(self.to_f32().powf(n.to_f32()))
+        f16::from_f32(Real::powf(self.to_f32(), n.to_f32()))
     }
 
     #[inline]
@@ -115,32 +115,32 @@ impl Real for f16 {
 
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        f16::from_f32(self.to_f32().mul_add(a.to_f32(), b.to_f32()))
+        f16::from_f32(Real::mul_add(self.to_f32(), a.to_f32(), b.to_f32()))
     }
 
     #[inline]
     fn floor(self) -> Self {
-        f16::from_f32(self.to_f32().floor())
+        f16::from_f32(Real::floor(self.to_f32()))
     }
 
     #[inline]
     fn ceil(self) -> Self {
-        f16::from_f32(self.to_f32().ceil())
+        f16::from_f32(Real::ceil(self.to_f32()))
     }
 
     #[inline]
     fn round(self) -> Self {
-        f16::from_f32(self.to_f32().round())
+        f16::from_f32(Real::round(self.to_f32()))
     }
 
     #[inline]
     fn trunc(self) -> Self {
-        f16::from_f32(self.to_f32().trunc())
+        f16::from_f32(Real::trunc(self.to_f32()))
     }
 
     #[inline]
     fn hypot(self, other: Self) -> Self {
-        f16::from_f32(self.to_f32().hypot(other.to_f32()))
+        f16::from_f32(Real::hypot(self.to_f32(), other.to_f32()))
     }
 }
 
@@ -163,7 +163,7 @@ impl Field for f16 {
 
     #[inline]
     fn powi(self, n: i32) -> Self {
-        f16::from_f32(self.to_f32().powi(n))
+        f16::from_f32(Field::powi(self.to_f32(), n))
     }
 }
 
@@ -254,11 +254,11 @@ impl QuadFloat {
     #[inline]
     fn dd_floor(self) -> Self {
         let hi = self.0.hi();
-        let floored_hi = hi.floor();
+        let floored_hi = Real::floor(hi);
         if floored_hi != hi {
             QuadFloat(TwoFloat::from_f64(floored_hi))
         } else {
-            QuadFloat(TwoFloat::new_add(hi, self.0.lo().floor()))
+            QuadFloat(TwoFloat::new_add(hi, Real::floor(self.0.lo())))
         }
     }
 
@@ -268,11 +268,11 @@ impl QuadFloat {
     #[inline]
     fn dd_ceil(self) -> Self {
         let hi = self.0.hi();
-        let ceiled_hi = hi.ceil();
+        let ceiled_hi = Real::ceil(hi);
         if ceiled_hi != hi {
             QuadFloat(TwoFloat::from_f64(ceiled_hi))
         } else {
-            QuadFloat(TwoFloat::new_add(hi, self.0.lo().ceil()))
+            QuadFloat(TwoFloat::new_add(hi, Real::ceil(self.0.lo())))
         }
     }
 
@@ -301,7 +301,7 @@ impl QuadFloat {
     fn dd_round(self) -> Self {
         let hi = self.0.hi();
         let lo = self.0.lo();
-        let rounded_hi = hi.round();
+        let rounded_hi = Real::round(hi);
         if rounded_hi != hi {
             // `hi` is not an integer, so `round(hi+lo) == round(hi)` unless `hi`
             // is exactly a half-integer (its own tie), in which case the low
@@ -319,12 +319,12 @@ impl QuadFloat {
             }
         } else {
             // `hi` is an integer; the fractional part is entirely in `lo`.
-            let mut rounded_lo = lo.round();
+            let mut rounded_lo = Real::round(lo);
             // On a tie in `lo` whose away-from-zero direction disagrees with the
             // whole value's away-from-zero direction (opposite signs), pick the
             // neighbor lying on the whole value's side, i.e. `trunc(lo)`.
-            if (lo - lo.trunc()).abs() == 0.5 && (lo < 0.0) != (hi < 0.0) {
-                rounded_lo = lo.trunc();
+            if (lo - Real::trunc(lo)).abs() == 0.5 && (lo < 0.0) != (hi < 0.0) {
+                rounded_lo = Real::trunc(lo);
             }
             QuadFloat(TwoFloat::new_add(hi, rounded_lo))
         }

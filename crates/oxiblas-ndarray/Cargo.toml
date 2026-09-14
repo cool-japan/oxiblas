@@ -31,6 +31,9 @@ sparse = ["dep:oxiblas-sparse"]
 criterion.workspace = true
 faer.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
+
 [[bench]]
 name = "ndarray_blas"
 harness = false

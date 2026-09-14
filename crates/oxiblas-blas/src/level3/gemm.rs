@@ -1076,27 +1076,36 @@ unsafe fn prefetch_read_panel<T>(ptr: *const T, len: usize) {
     #[cfg(not(target_arch = "aarch64"))]
     const CACHE_LINE: usize = 64;
 
-    let byte_ptr = ptr.cast::<u8>();
-    let bytes = len * std::mem::size_of::<T>();
-    let lines = bytes.div_ceil(CACHE_LINE);
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let byte_ptr = ptr.cast::<u8>();
+        let bytes = len * std::mem::size_of::<T>();
+        let lines = bytes.div_ceil(CACHE_LINE);
 
-    for i in 0..lines.min(8) {
-        // Limit to 8 prefetch ops
-        #[cfg(target_arch = "aarch64")]
-        {
-            core::arch::asm!(
-                "prfm pldl1keep, [{0}]",
-                in(reg) byte_ptr.add(i * CACHE_LINE),
-                options(nostack, preserves_flags)
-            );
+        for i in 0..lines.min(8) {
+            // Limit to 8 prefetch ops
+            #[cfg(target_arch = "aarch64")]
+            {
+                core::arch::asm!(
+                    "prfm pldl1keep, [{0}]",
+                    in(reg) byte_ptr.add(i * CACHE_LINE),
+                    options(nostack, preserves_flags)
+                );
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::arch::x86_64::_mm_prefetch(
+                    byte_ptr.add(i * CACHE_LINE) as *const i8,
+                    core::arch::x86_64::_MM_HINT_T0,
+                );
+            }
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            core::arch::x86_64::_mm_prefetch(
-                byte_ptr.add(i * CACHE_LINE) as *const i8,
-                core::arch::x86_64::_MM_HINT_T0,
-            );
-        }
+    }
+
+    // No prefetch instruction is emitted on other architectures.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (ptr, len);
     }
 }
 

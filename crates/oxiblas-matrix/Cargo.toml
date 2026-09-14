@@ -28,7 +28,7 @@ quickcheck_macros.workspace = true
 
 [features]
 default = ["std"]
-std = ["oxiblas-core/std"]
+std = ["oxiblas-core/std", "num-traits/std", "num-complex/std"]
 serde = ["dep:serde", "std"]
 mmap = ["dep:memmap2", "std"]
 nalgebra = ["dep:nalgebra"]  # nalgebra type conversions

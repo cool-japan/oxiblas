@@ -40,23 +40,30 @@ oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.3" }
 # oxiblas-ffi has been retired as of v0.2.0 (Pure Rust ecosystem)
 
 # Essential dependencies
-num-complex = { version = "0.4", features = ["bytemuck"] }
-num-traits = "0.2"
+# `default-features = false` + `libm` keeps `oxiblas-core` / `oxiblas-matrix`
+# buildable on real no_std targets. Their `std` features re-enable
+# `num-traits/std` + `num-complex/std`, which take precedence over `libm`, so
+# default (std) builds keep using the std float intrinsics bit-for-bit.
+num-complex = { version = "0.4", default-features = false, features = ["bytemuck", "libm"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 
 # Optional dependencies
 rayon = "1.12"
 ndarray = "0.17"
 nalgebra = "0.35"
-twofloat = "0.8"
-half = { version = "2.7", features = ["num-traits", "bytemuck"] }
+# no_std-capable like num-traits above; `oxiblas-core/std` re-enables their `std`.
+twofloat = { version = "0.8", default-features = false, features = ["math_funcs"] }
+half = { version = "2.7", default-features = false, features = ["num-traits", "bytemuck"] }
 serde = { version = "1.0", features = ["std", "derive"] }
 serde_json = "1.0"
 memmap2 = "0.9"
 libc = "0.2"
 
 # Dev dependencies
-criterion = "0.8"
+# `rayon` is enabled per-crate for non-wasm32 targets only (criterion refuses
+# rayon on wasm32), see each crate's target-specific dev-dependencies.
+criterion = { version = "0.8", default-features = false, features = ["plotters", "cargo_bench_support"] }
 rand = "0.10"
 approx = "0.5"
 quickcheck = "1.1"

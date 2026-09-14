@@ -55,6 +55,9 @@ num-complex.workspace = true
 ndarray.workspace = true
 nalgebra.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
+
 [[bench]]
 name = "gemm_bench"
 harness = false

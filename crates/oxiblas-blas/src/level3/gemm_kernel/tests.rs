@@ -46,7 +46,8 @@ mod tests_2 {
             GemmKernelKind::Sse42 => ((4, 2), (4, 4)),
             #[cfg(target_arch = "aarch64")]
             GemmKernelKind::Neon => ((8, 6), (8, 8)),
-            _ => ((4, 4), (4, 4)),
+            GemmKernelKind::Scalar => ((4, 4), (4, 4)),
+            other => panic!("kernel kind {other:?} cannot be selected on this target"),
         };
 
         let s64 = f64::micro_kernel_shape();

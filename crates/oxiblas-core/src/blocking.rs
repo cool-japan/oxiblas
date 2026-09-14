@@ -21,6 +21,10 @@
 
 use crate::tuning::{L1_CACHE_SIZE, L2_CACHE_SIZE};
 use core::mem::size_of;
+// Inherent `f32`/`f64` float methods (`mul_add`, `sqrt`, ...) live in `std`,
+// so they are called through `num_traits::Float`: with `std` that forwards to
+// the inherent method (bit-identical), without it to `libm`.
+use num_traits::Float;
 
 /// Base case threshold for recursive algorithms.
 ///
@@ -57,7 +61,7 @@ pub fn gemm_block_sizes<T>(m: usize, n: usize, k: usize) -> (usize, usize, usize
     let target_bytes = L2_CACHE_SIZE / 2;
 
     // Start with a balanced block size
-    let max_block = ((target_bytes / elem_size / 3) as f64).sqrt() as usize;
+    let max_block = Float::sqrt((target_bytes / elem_size / 3) as f64) as usize;
     let mut block = max_block.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
 
     // Align to SIMD-friendly boundaries
@@ -84,7 +88,7 @@ pub fn trsm_block_size<T>(n: usize, nrhs: usize) -> usize {
 
     // Target: fit triangular block in L1
     // Triangular block: n² / 2 elements
-    let max_block = ((2 * L1_CACHE_SIZE / elem_size) as f64).sqrt() as usize;
+    let max_block = Float::sqrt((2 * L1_CACHE_SIZE / elem_size) as f64) as usize;
     let block = max_block.clamp(MIN_BLOCK_SIZE, MAX_BLOCK_SIZE / 2);
 
     // Align to SIMD-friendly boundaries. MIN_BLOCK_SIZE (16) is a multiple

@@ -52,7 +52,11 @@
 //! assert_eq!(view.diagonal()[2], 3.0);
 //! ```
 
-#![cfg_attr(not(feature = "std"), no_std)]
+// Unit-test builds always link `std` (the test harness needs it), so the unit
+// tests keep the std prelude (`vec!`, `format!`, `thread_local!`) even under
+// `--no-default-features`. The library itself stays `no_std`; that is
+// enforced by the `tests/no_std_build.rs` guard on a bare-metal target.
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]

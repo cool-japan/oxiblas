@@ -27,7 +27,7 @@
 //! ## Parallelization
 //!
 //! When the `parallel` feature is enabled and `Par::Rayon` is used,
-//! GEMM operations are parallelized over the outer loop (columns of C).
+//! GEMM operations are parallelized over a 2D grid of blocks of C.
 //! This provides good work distribution without requiring synchronization.
 
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
@@ -45,6 +45,10 @@ use oxiblas_matrix::{Mat, MatMut, MatRef};
 use oxiblas_core::parallel::ParThreshold;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Smallest number of multiply-adds for one task of the parallel GEMM.
+#[cfg(feature = "parallel")]
+const PAR_TASK_MIN_WORK: usize = 1 << 25;
 
 /// Smallest `m * n * k` below [`SMALL_THRESHOLD`] that uses the blocked path.
 const SMALL_BLOCKED_MIN: usize = 12 * 12 * 12;
@@ -784,7 +788,7 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         let threshold = ParThreshold::new(64 * 64 * 64, 32 * 32);
         let total_work = m * n * k;
 
-        if threshold.should_parallelize(total_work, par) {
+        if threshold.should_parallelize(total_work, par) && total_work >= 2 * PAR_TASK_MIN_WORK {
             gemm_blocked_parallel(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape, par);
             return;
         }
@@ -964,10 +968,37 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 }
 
+/// Block sizes `(rows, columns)` of the parallel task grid over C.
+///
+/// Columns are split into chunks of at most `nc`, then further (NR-aligned)
+/// until there is about one task per thread (at most one per
+/// [`PAR_TASK_MIN_WORK`] multiply-adds); rows are then split into chunks of at
+/// most `mc` (MR-aligned) to make up the rest. `m`, `n`, `k`, `mc`, `nc` > 0.
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+fn parallel_grid(
+    m: usize,
+    n: usize,
+    k: usize,
+    mc: usize,
+    nc: usize,
+    shape: &MicroKernelShape,
+    threads: usize,
+) -> (usize, usize) {
+    let (mr, nr) = (shape.mr, shape.nr);
+    let tasks = threads.min(m * n * k / PAR_TASK_MIN_WORK).max(1);
+    let n_target = n.div_ceil(nc).max(tasks.min(n.div_ceil(nr)));
+    let jw = n.div_ceil(n_target).next_multiple_of(nr).min(nc);
+    let m_target = tasks.div_ceil(n.div_ceil(jw)).min(m.div_ceil(mr));
+    let iw = m.div_ceil(m_target).next_multiple_of(mr).min(mc);
+    (iw, jw)
+}
+
 /// Parallel blocked GEMM implementation.
 ///
-/// Parallelizes over columns of C (the n dimension), which provides
-/// good work distribution without requiring synchronization for writes.
+/// Parallelizes over a 2D grid of C blocks (rows and columns), so that a
+/// problem with fewer NC column blocks than threads still uses every thread.
+/// Each task packs its own A and B blocks and writes a disjoint block of C.
 #[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 fn gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroable>(
@@ -982,9 +1013,6 @@ fn gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroable>(
     shape: &MicroKernelShape,
     par: Par,
 ) {
-    use oxiblas_core::parallel::partition_work;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     // Logical (post-transpose) dimensions.
     let (m, k) = op_dims(a, trans_a);
     let (_, n) = op_dims(b, trans_b);
@@ -996,77 +1024,59 @@ fn gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroable>(
     let mr = shape.mr;
     let nr = shape.nr;
 
-    // Number of column blocks
-    let n_blocks = (n + nc - 1) / nc;
-    let num_threads = par.num_threads().min(n_blocks);
+    let (iw, jw) = parallel_grid(m, n, k, mc, nc, shape, par.num_threads());
+    let m_chunks = m.div_ceil(iw);
+    let n_chunks = n.div_ceil(jw);
 
-    // Partition column blocks among threads
-    let work_ranges = partition_work(n_blocks, num_threads);
+    let padded_iw = iw.div_ceil(mr) * mr;
+    let padded_jw = jw.div_ceil(nr) * nr;
 
-    // Track if this is the first k-iteration (need to apply beta)
-    let first_k = AtomicBool::new(true);
+    // Get raw pointer to C for thread-safe access
+    let c_ptr = c.as_ptr() as usize;
+    let c_row_stride = c.row_stride();
+
+    let mut first_k = true;
 
     // Loop over k in blocks of kc
     for p in (0..k).step_by(kc) {
         let pb = kc.min(k - p);
-        let is_first_k = first_k.load(Ordering::SeqCst);
+        let effective_beta = if first_k { beta } else { T::one() };
 
-        // Get raw pointer to C for thread-safe access
-        let c_ptr = c.as_ptr() as usize;
-        let c_row_stride = c.row_stride();
+        (0..m_chunks * n_chunks).into_par_iter().for_each(|t| {
+            let i = (t % m_chunks) * iw;
+            let j = (t / m_chunks) * jw;
+            let ib = iw.min(m - i);
+            let jb = jw.min(n - j);
 
-        // Each thread processes a set of column blocks
-        work_ranges.par_iter().for_each(|range| {
             // Thread-local packing buffers
-            let padded_mc = ((mc + mr - 1) / mr) * mr;
-            let padded_nc = ((nc + nr - 1) / nr) * nr;
-            let mut pack_a: AlignedVec<T> = AlignedVec::zeros(padded_mc * kc);
-            let mut pack_b: AlignedVec<T> = AlignedVec::zeros(kc * padded_nc);
+            let mut pack_a: AlignedVec<T> = AlignedVec::zeros(padded_iw * kc);
+            let mut pack_b: AlignedVec<T> = AlignedVec::zeros(kc * padded_jw);
 
-            // Process column blocks assigned to this thread
-            for block_idx in range.start..range.end {
-                let j = block_idx * nc;
-                let jb = nc.min(n - j);
+            pack_b_trans_dispatch(b, trans_b, p, j, pb, jb, &mut pack_b, nr);
+            pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, &mut pack_a, mr);
 
-                // Pack op(B) block (transpose-aware)
-                pack_b_trans_dispatch(b, trans_b, p, j, pb, jb, &mut pack_b, nr);
+            // SAFETY: tasks cover disjoint (i, j) blocks of C inside its bounds,
+            // and C outlives the parallel loop.
+            let c_sub = unsafe {
+                let ptr = c_ptr as *mut T;
+                MatMut::new(ptr.add(i + j * c_row_stride), ib, jb, c_row_stride)
+            };
 
-                // Loop over m in blocks of mc
-                for i in (0..m).step_by(mc) {
-                    let ib = mc.min(m - i);
-
-                    // Pack op(A) block (transpose-aware)
-                    pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, &mut pack_a, mr);
-
-                    // Compute C[i:i+ib, j:j+jb] += alpha * pack_a * pack_b
-                    let effective_beta = if is_first_k { beta } else { T::one() };
-
-                    // Create a view into C for this submatrix
-                    // SAFETY: Each thread writes to non-overlapping columns of C
-                    let c_sub = unsafe {
-                        let ptr = c_ptr as *mut T;
-                        let offset = i + j * c_row_stride;
-                        let submat_ptr = ptr.add(offset);
-                        MatMut::new(submat_ptr, ib, jb, c_row_stride)
-                    };
-
-                    macro_panel_multiply(
-                        alpha,
-                        &pack_a,
-                        ib,
-                        pb,
-                        &pack_b,
-                        pb,
-                        jb,
-                        effective_beta,
-                        c_sub,
-                        shape,
-                    );
-                }
-            }
+            macro_panel_multiply(
+                alpha,
+                &pack_a,
+                ib,
+                pb,
+                &pack_b,
+                pb,
+                jb,
+                effective_beta,
+                c_sub,
+                shape,
+            );
         });
 
-        first_k.store(false, Ordering::SeqCst);
+        first_k = false;
     }
 }
 

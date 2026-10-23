@@ -782,3 +782,69 @@ fn test_gemm_small_alpha_zero_ignores_a_and_b() {
         }
     }
 }
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_parallel_grid_uses_all_threads() {
+    // One NC block covering all of N must still give about one task per thread (MR/NR rounding may drop a few).
+    let shape = MicroKernelShape { mr: 8, nr: 8 };
+    for &(m, n, k, mc, nc, threads) in &[
+        (4096, 4096, 4096, 832, 4096, 12),
+        (512, 512, 512, 512, 512, 12),
+        (1000, 1000, 1000, 832, 1000, 8),
+        (64, 2112, 7168, 64, 2112, 12),
+        (300, 7, 4096, 300, 7, 12),
+        (128, 128, 128, 128, 128, 12),
+        (64, 64, 64, 64, 64, 12),
+    ] {
+        let (iw, jw) = parallel_grid(m, n, k, mc, nc, &shape, threads);
+        let tasks = m.div_ceil(iw) * n.div_ceil(jw);
+        let possible = (m.div_ceil(shape.mr) * n.div_ceil(shape.nr))
+            .min(m * n * k / PAR_TASK_MIN_WORK)
+            .max(1);
+        assert!(
+            4 * tasks >= 3 * threads.min(possible),
+            "{m}x{n}: {tasks} tasks for {threads} threads"
+        );
+        assert!(
+            iw <= mc && jw <= nc,
+            "{m}x{n}: block {iw}x{jw} above {mc}x{nc}"
+        );
+        assert!(iw % shape.mr == 0 || iw == mc, "{m}x{n}: iw {iw}");
+        assert!(jw % shape.nr == 0 || jw == nc, "{m}x{n}: jw {jw}");
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn test_gemm_parallel_single_nc_block() {
+    // N inside one NC block, odd sizes, above 2 * PAR_TASK_MIN_WORK: the 2D task grid must cover C exactly once.
+    let (m, k, n) = (515usize, 131usize, 1003usize);
+    let a = pattern_f64(m, k, 7);
+    let b = pattern_f64(k, n, 8);
+    let c_init = pattern_f64(m, n, 9);
+    let mut c = pattern_f64(m, n, 9);
+    let blocking = GemmBlocking::custom(64, 32, 1024, &f64::micro_kernel_shape());
+    gemm_with_blocking(
+        1.25,
+        a.as_ref(),
+        b.as_ref(),
+        0.75,
+        c.as_mut(),
+        Par::Rayon,
+        &blocking,
+    );
+    let exp = naive_trans_f64(
+        Trans::NoTrans,
+        Trans::NoTrans,
+        1.25,
+        &a,
+        &b,
+        0.75,
+        &c_init,
+        m,
+        k,
+        n,
+    );
+    assert_close_f64(&c, &exp, "parallel single NC block");
+}

@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   micro-tile now use the blocked SIMD path instead of the scalar small-matrix loop
   (Apple M4 Pro, one thread: 32^3 f32 from 6 to 43 GFLOPS, f64 from 5 to 25 GFLOPS).
   `alpha == 0` and thin shapes stay on the small-matrix path.
+- `gemm` with `Par::Rayon`: the work is split over a 2D grid of blocks of C instead of
+  NC column blocks only. Square f32 problems up to N = NC had one work item and used
+  one thread (Apple M4 Pro, 12 threads: 4096^3 f32 from 111 to 803 GFLOPS, f64 from 60
+  to 401 GFLOPS). Problems below 2^26 multiply-adds stay sequential.
 
 ## [0.2.2] - 2026-08-06
 

@@ -46,6 +46,9 @@ use oxiblas_core::parallel::ParThreshold;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// Smallest `m * n * k` below [`SMALL_THRESHOLD`] that uses the blocked path.
+const SMALL_BLOCKED_MIN: usize = 12 * 12 * 12;
+
 /// Blocking parameters for GEMM.
 ///
 /// These parameters control the cache-aware blocking of the GEMM algorithm.
@@ -599,10 +602,11 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
 
     let shape = T::micro_kernel_shape();
 
-    // Small matrix fast path. The NoTrans/NoTrans case keeps using the
-    // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
-    // use the transpose-aware naive kernel.
-    if m * n * k <= SMALL_THRESHOLD {
+    // Small matrix fast path; transposed cases use the transpose-aware naive kernel.
+    // Problems that fill a micro-tile are faster blocked from SMALL_BLOCKED_MIN; alpha == 0 skips A and B there.
+    let blocked =
+        m >= shape.mr && n >= shape.nr && m * n * k >= SMALL_BLOCKED_MIN && alpha != T::zero();
+    if m * n * k <= SMALL_THRESHOLD && !blocked {
         if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
             gemm_small(alpha, &a, &b, beta, &mut c);
         } else {

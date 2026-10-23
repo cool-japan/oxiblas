@@ -719,3 +719,66 @@ fn test_gemm_blocking_custom_clamps_and_runs() {
         }
     }
 }
+
+fn assert_close_f64(got: &Mat<f64>, exp: &Mat<f64>, what: &str) {
+    for i in 0..exp.nrows() {
+        for j in 0..exp.ncols() {
+            let (g, e) = (got[(i, j)], exp[(i, j)]);
+            assert!(
+                (g - e).abs() <= 1e-9 * e.abs().max(1.0),
+                "{what} ({i},{j}): got {g} exp {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gemm_small_sizes_on_blocked_path() {
+    // Sizes from SMALL_BLOCKED_MIN to SMALL_THRESHOLD, all transpose combinations, beta != 0.
+    let combos = [
+        (Trans::NoTrans, Trans::NoTrans),
+        (Trans::Trans, Trans::NoTrans),
+        (Trans::NoTrans, Trans::Trans),
+        (Trans::Trans, Trans::Trans),
+    ];
+    for &(m, k, n) in &[
+        (12, 12, 12),
+        (16, 16, 16),
+        (31, 23, 29),
+        (32, 32, 32),
+        (8, 40, 6),
+    ] {
+        for &(ta, tb) in &combos {
+            let a = if ta == Trans::NoTrans {
+                pattern_f64(m, k, 1)
+            } else {
+                pattern_f64(k, m, 1)
+            };
+            let b = if tb == Trans::NoTrans {
+                pattern_f64(k, n, 2)
+            } else {
+                pattern_f64(n, k, 2)
+            };
+            let c_init = pattern_f64(m, n, 3);
+            let mut c = pattern_f64(m, n, 3);
+            gemm_transposed(ta, tb, 0.5, a.as_ref(), b.as_ref(), -1.5, c.as_mut());
+            let exp = naive_trans_f64(ta, tb, 0.5, &a, &b, -1.5, &c_init, m, k, n);
+            assert_close_f64(&c, &exp, &format!("{m}x{k}x{n} {ta:?} {tb:?}"));
+        }
+    }
+}
+
+#[test]
+fn test_gemm_small_alpha_zero_ignores_a_and_b() {
+    // alpha == 0 must not read A or B, also at sizes that otherwise use the blocked path.
+    let n = 16;
+    let a: Mat<f64> = Mat::filled(n, n, f64::NAN);
+    let b: Mat<f64> = Mat::filled(n, n, 1.0);
+    let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
+    gemm(0.0, a.as_ref(), b.as_ref(), 0.5, c.as_mut());
+    for i in 0..n {
+        for j in 0..n {
+            assert_eq!(c[(i, j)], 1.0, "c[{i},{j}]");
+        }
+    }
+}

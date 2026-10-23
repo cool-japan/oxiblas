@@ -5,6 +5,14 @@ All notable changes to OxiBLAS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `gemm`: problems from 12^3 to 32^3 multiply-adds whose `m` and `n` fill at least one
+  micro-tile now use the blocked SIMD path instead of the scalar small-matrix loop
+  (Apple M4 Pro, one thread: 32^3 f32 from 6 to 43 GFLOPS, f64 from 5 to 25 GFLOPS).
+  `alpha == 0` and thin shapes stay on the small-matrix path.
+
 ## [0.2.2] - 2026-08-06
 
 A production-readiness hardening release. A systematic multi-agent audit swept the

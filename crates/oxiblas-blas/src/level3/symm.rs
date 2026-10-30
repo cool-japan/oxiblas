@@ -42,6 +42,18 @@ impl core::fmt::Display for SymmError {
 
 impl std::error::Error for SymmError {}
 
+/// Applies the "scale only" update `C := beta * C` that reference ?SYMM / ?HEMM
+/// perform when `alpha == 0`: `beta == 0` zero-fills C without reading it and
+/// `beta == 1` leaves it untouched. A and B are never read on this path, so NaN
+/// or Inf in them cannot leak into C.
+pub(crate) fn scale_c_by_beta<T: Field>(c: &mut MatMut<'_, T>, beta: T) {
+    if beta == T::zero() {
+        c.fill_zero();
+    } else if beta != T::one() {
+        c.scale(beta);
+    }
+}
+
 /// Performs symmetric matrix-matrix multiplication.
 ///
 /// C = α·A·B + β·C (when side = Left)
@@ -95,7 +107,7 @@ pub fn symm<T: Field + GemmKernel + bytemuck::Zeroable>(
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
     beta: T,
-    c: MatMut<'_, T>,
+    mut c: MatMut<'_, T>,
 ) -> Result<(), SymmError> {
     // Validate A is square
     if a.nrows() != a.ncols() {
@@ -124,6 +136,13 @@ pub fn symm<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Handle empty cases
     if m == 0 || n == 0 {
+        return Ok(());
+    }
+
+    // Reference ?SYMM: with alpha == 0, A and B are never read and C := beta * C
+    // (beta == 0 zero-fills C without reading it; beta == 1 leaves it untouched).
+    if alpha == T::zero() {
+        scale_c_by_beta(&mut c, beta);
         return Ok(());
     }
 
@@ -224,6 +243,10 @@ fn symm_naive<T: Field>(
         }
     };
 
+    // beta == 0 must NOT read C: an uninitialised C may hold NaN/Inf and `0 * NaN`
+    // would poison the result (reference ?SYMM overwrites C in that case).
+    let beta_is_zero = beta == T::zero();
+
     match side {
         Side::Left => {
             // C = α·A·B + β·C where A is m×m symmetric
@@ -233,7 +256,11 @@ fn symm_naive<T: Field>(
                     for k in 0..ka {
                         sum += get_a(i, k) * b[(k, j)];
                     }
-                    let val = alpha * sum + beta * c[(i, j)];
+                    let val = if beta_is_zero {
+                        alpha * sum
+                    } else {
+                        alpha * sum + beta * c[(i, j)]
+                    };
                     c.set(i, j, val);
                 }
             }
@@ -246,7 +273,11 @@ fn symm_naive<T: Field>(
                     for k in 0..ka {
                         sum += b[(i, k)] * get_a(k, j);
                     }
-                    let val = alpha * sum + beta * c[(i, j)];
+                    let val = if beta_is_zero {
+                        alpha * sum
+                    } else {
+                        alpha * sum + beta * c[(i, j)]
+                    };
                     c.set(i, j, val);
                 }
             }
@@ -655,5 +686,99 @@ mod tests {
             c[(1, 0)],
             expected_10
         );
+    }
+
+    // Issue #9 class (complex symmetric, not reachable through the real-only cblas
+    // wrappers): alpha == 0 never reads A / B and beta == 0 never reads C, on both the
+    // naive (order 3 / 4) and the GEMM-routed (order >= 32) paths.
+    #[test]
+    fn test_issue_9_symm_complex_alpha_beta_zero_semantics() {
+        use num_complex::Complex64;
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        let inf = Complex64::new(f64::INFINITY, f64::NEG_INFINITY);
+        let zero = Complex64::new(0.0, 0.0);
+        let sym = |i: usize, j: usize| {
+            Complex64::new(
+                ((3 * i.min(j) + 5 * i.max(j)) % 7) as f64 * 0.125 + if i == j { 1.0 } else { 0.0 },
+                0.0625 * ((i + j) % 3) as f64,
+            )
+        };
+        let b_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.25 * ((i + 2 * j) % 5) as f64 - 0.5,
+                0.125 * ((3 * i + j) % 4) as f64,
+            )
+        };
+        let c_f = |i: usize, j: usize| Complex64::new(0.125 * ((2 * i + j) % 7) as f64, 0.25);
+        // (alpha, beta, A/B poisoned, C poisoned)
+        let scenarios = [
+            (0.0, 0.0, true, true),
+            (0.0, 2.0, true, false),
+            (0.0, 1.0, true, false),
+            (2.0, 0.0, false, true),
+            (2.0, 0.5, false, false),
+        ];
+        for (m, n) in [(3usize, 4usize), (40, 38)] {
+            for side in [Side::Left, Side::Right] {
+                for uplo in [Uplo::Lower, Uplo::Upper] {
+                    for (alpha, beta, poison_ab, poison_c) in scenarios {
+                        let ka = if side == Side::Left { m } else { n };
+                        let mut a: Mat<Complex64> = Mat::zeros(ka, ka);
+                        for j in 0..ka {
+                            for i in 0..ka {
+                                let in_tri = match uplo {
+                                    Uplo::Lower => i >= j,
+                                    Uplo::Upper => i <= j,
+                                };
+                                a[(i, j)] = if poison_ab {
+                                    nan
+                                } else if in_tri {
+                                    sym(i, j)
+                                } else {
+                                    Complex64::new(100.0, 100.0)
+                                };
+                            }
+                        }
+                        let mut b: Mat<Complex64> = Mat::zeros(m, n);
+                        let mut c: Mat<Complex64> = Mat::zeros(m, n);
+                        for j in 0..n {
+                            for i in 0..m {
+                                b[(i, j)] = if poison_ab { inf } else { b_f(i, j) };
+                                c[(i, j)] = if poison_c { nan } else { c_f(i, j) };
+                            }
+                        }
+                        symm(
+                            side,
+                            uplo,
+                            Complex64::new(alpha, 0.0),
+                            a.as_ref(),
+                            b.as_ref(),
+                            Complex64::new(beta, 0.0),
+                            c.as_mut(),
+                        )
+                        .unwrap();
+                        for j in 0..n {
+                            for i in 0..m {
+                                let prod = if alpha == 0.0 {
+                                    zero
+                                } else if side == Side::Left {
+                                    (0..m).map(|l| sym(i, l) * b_f(l, j)).sum::<Complex64>()
+                                } else {
+                                    (0..n).map(|l| b_f(i, l) * sym(l, j)).sum::<Complex64>()
+                                };
+                                let c_term = if beta == 0.0 { zero } else { c_f(i, j) * beta };
+                                let want = prod * alpha + c_term;
+                                let got = c[(i, j)];
+                                assert!(
+                                    (got - want).norm() <= 1e-10 * (1.0 + want.norm()),
+                                    "symm {side:?}/{uplo:?} {m}x{n} alpha={alpha} beta={beta}: \
+                                     C[{i},{j}] = {got:?}, expected {want:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

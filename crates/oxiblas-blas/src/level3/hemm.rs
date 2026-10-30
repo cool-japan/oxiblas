@@ -13,11 +13,13 @@
 //!
 //! # Optimization
 //!
-//! For larger matrices (n >= 32), uses optimized 3M complex GEMM after expanding the
+//! For larger matrices (order of A >= 64, the `HEMM_GEMM_THRESHOLD` of
+//! [`hemm_c32`]/[`hemm_c64`]), uses optimized 3M complex GEMM after expanding the
 //! Hermitian matrix to a full dense matrix. This provides significant speedup compared
 //! to the naive implementation.
 
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
+use crate::level3::symm::scale_c_by_beta;
 use crate::level3::trsm::{Side, Uplo};
 use num_complex::{Complex32, Complex64};
 use oxiblas_core::scalar::Field;
@@ -120,6 +122,13 @@ pub fn hemm<T: Field>(
 
     // Handle empty cases
     if m == 0 || n == 0 {
+        return Ok(());
+    }
+
+    // Reference ?HEMM: with alpha == 0, A and B are never read and C := beta * C
+    // (beta == 0 zero-fills C without reading it; beta == 1 leaves it untouched).
+    if alpha == T::zero() {
+        scale_c_by_beta(&mut c, beta);
         return Ok(());
     }
 
@@ -234,7 +243,7 @@ const HEMM_GEMM_THRESHOLD: usize = 64;
 
 /// Performs optimized Hermitian matrix-matrix multiplication for Complex64.
 ///
-/// Uses the 3M complex GEMM method for larger matrices (size >= 32).
+/// Uses the 3M complex GEMM method for larger matrices (order of A >= 64).
 ///
 /// C = α·A·B + β·C (when side = Left)
 /// C = α·B·A + β·C (when side = Right)
@@ -255,7 +264,7 @@ pub fn hemm_c64(
     a: MatRef<'_, Complex64>,
     b: MatRef<'_, Complex64>,
     beta: Complex64,
-    c: MatMut<'_, Complex64>,
+    mut c: MatMut<'_, Complex64>,
 ) -> Result<(), HemmError> {
     // Validate A is square
     if a.nrows() != a.ncols() {
@@ -281,6 +290,13 @@ pub fn hemm_c64(
     }
 
     if m == 0 || n == 0 {
+        return Ok(());
+    }
+
+    // Reference ?HEMM: alpha == 0 -> C := beta * C; A and B are never read (the
+    // GEMM path below would expand A first).
+    if alpha == Complex64::new(0.0, 0.0) {
+        scale_c_by_beta(&mut c, beta);
         return Ok(());
     }
 
@@ -343,7 +359,7 @@ fn hemm_via_gemm_c64(
 
 /// Performs optimized Hermitian matrix-matrix multiplication for Complex32.
 ///
-/// Uses the 3M complex GEMM method for larger matrices (size >= 32).
+/// Uses the 3M complex GEMM method for larger matrices (order of A >= 64).
 ///
 /// C = α·A·B + β·C (when side = Left)
 /// C = α·B·A + β·C (when side = Right)
@@ -354,7 +370,7 @@ pub fn hemm_c32(
     a: MatRef<'_, Complex32>,
     b: MatRef<'_, Complex32>,
     beta: Complex32,
-    c: MatMut<'_, Complex32>,
+    mut c: MatMut<'_, Complex32>,
 ) -> Result<(), HemmError> {
     // Validate A is square
     if a.nrows() != a.ncols() {
@@ -380,6 +396,12 @@ pub fn hemm_c32(
     }
 
     if m == 0 || n == 0 {
+        return Ok(());
+    }
+
+    // Reference ?HEMM: alpha == 0 -> C := beta * C; A and B are never read.
+    if alpha == Complex32::new(0.0, 0.0) {
+        scale_c_by_beta(&mut c, beta);
         return Ok(());
     }
 
@@ -741,7 +763,7 @@ mod tests {
             }
         }
 
-        // Compute with hemm_c64 (uses optimized GEMM path for n >= 32)
+        // Compute with hemm_c64 (uses optimized GEMM path for n >= 64)
         let mut c_opt: Mat<Complex64> = Mat::zeros(n, n);
         hemm_c64(
             Side::Left,

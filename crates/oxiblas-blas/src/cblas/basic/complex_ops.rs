@@ -1,7 +1,7 @@
 //! CBLAS complex-valued operations: dot products and GEMM.
 
 use super::super::types::*;
-use super::super::validate::{gemm_params_valid, inc_valid};
+use super::super::validate::gemm_params_valid;
 use super::vector_start_offset;
 use num_complex::{Complex32, Complex64};
 /// Complex double precision dot product.
@@ -44,13 +44,15 @@ pub unsafe extern "C" fn cblas_zdotu_sub(
     // n<=0 early return below, so it must be checked before anything else —
     // there is no way to signal failure back to the caller other than a
     // silent no-op. Once `dotu` is known valid, every other rejected input
-    // (n<=0, a zero increment, or a null `x`/`y`) still writes the ZDOTU
-    // identity, matching this function's own documented "overwrites `dotu`
-    // unconditionally" contract instead of leaving it uninitialized.
+    // (n<=0 or a null `x`/`y`) still writes the ZDOTU identity, matching
+    // this function's own documented "overwrites `dotu` unconditionally"
+    // contract instead of leaving it uninitialized. A zero increment is
+    // valid (Netlib 3.12): the loop below then re-reads element 0 on every
+    // iteration, exactly like the reference.
     if dotu.is_null() {
         return;
     }
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    if n <= 0 || x.is_null() || y.is_null() {
         *dotu = Complex64::new(0.0, 0.0);
         return;
     }
@@ -110,13 +112,15 @@ pub unsafe extern "C" fn cblas_zdotc_sub(
     // n<=0 early return below, so it must be checked before anything else —
     // there is no way to signal failure back to the caller other than a
     // silent no-op. Once `dotc` is known valid, every other rejected input
-    // (n<=0, a zero increment, or a null `x`/`y`) still writes the ZDOTC
-    // identity, matching this function's own documented "overwrites `dotc`
-    // unconditionally" contract instead of leaving it uninitialized.
+    // (n<=0 or a null `x`/`y`) still writes the ZDOTC identity, matching
+    // this function's own documented "overwrites `dotc` unconditionally"
+    // contract instead of leaving it uninitialized. A zero increment is
+    // valid (Netlib 3.12): the loop below then re-reads element 0 on every
+    // iteration, exactly like the reference.
     if dotc.is_null() {
         return;
     }
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    if n <= 0 || x.is_null() || y.is_null() {
         *dotc = Complex64::new(0.0, 0.0);
         return;
     }
@@ -176,13 +180,15 @@ pub unsafe extern "C" fn cblas_cdotu_sub(
     // n<=0 early return below, so it must be checked before anything else —
     // there is no way to signal failure back to the caller other than a
     // silent no-op. Once `dotu` is known valid, every other rejected input
-    // (n<=0, a zero increment, or a null `x`/`y`) still writes the CDOTU
-    // identity, matching this function's own documented "overwrites `dotu`
-    // unconditionally" contract instead of leaving it uninitialized.
+    // (n<=0 or a null `x`/`y`) still writes the CDOTU identity, matching
+    // this function's own documented "overwrites `dotu` unconditionally"
+    // contract instead of leaving it uninitialized. A zero increment is
+    // valid (Netlib 3.12): the loop below then re-reads element 0 on every
+    // iteration, exactly like the reference.
     if dotu.is_null() {
         return;
     }
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    if n <= 0 || x.is_null() || y.is_null() {
         *dotu = Complex32::new(0.0, 0.0);
         return;
     }
@@ -242,13 +248,15 @@ pub unsafe extern "C" fn cblas_cdotc_sub(
     // n<=0 early return below, so it must be checked before anything else —
     // there is no way to signal failure back to the caller other than a
     // silent no-op. Once `dotc` is known valid, every other rejected input
-    // (n<=0, a zero increment, or a null `x`/`y`) still writes the CDOTC
-    // identity, matching this function's own documented "overwrites `dotc`
-    // unconditionally" contract instead of leaving it uninitialized.
+    // (n<=0 or a null `x`/`y`) still writes the CDOTC identity, matching
+    // this function's own documented "overwrites `dotc` unconditionally"
+    // contract instead of leaving it uninitialized. A zero increment is
+    // valid (Netlib 3.12): the loop below then re-reads element 0 on every
+    // iteration, exactly like the reference.
     if dotc.is_null() {
         return;
     }
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    if n <= 0 || x.is_null() || y.is_null() {
         *dotc = Complex32::new(0.0, 0.0);
         return;
     }
@@ -388,7 +396,9 @@ unsafe fn zgemm_raw_colmajor(
         }
     }
 
-    if k == 0 {
+    // Reference BLAS reads neither A nor B when alpha == 0 (C = beta * C);
+    // `alpha * b` would otherwise turn NaN/Inf operands into NaN.
+    if k == 0 || alpha == zero {
         return;
     }
 
@@ -535,7 +545,8 @@ unsafe fn cgemm_raw_colmajor(
         }
     }
 
-    if k == 0 {
+    // Reference BLAS reads neither A nor B when alpha == 0 (C = beta * C).
+    if k == 0 || alpha == zero {
         return;
     }
 

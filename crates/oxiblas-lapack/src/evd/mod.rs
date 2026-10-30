@@ -7,8 +7,10 @@
 //! - **SymmetricEvd**: For symmetric/Hermitian matrices. Eigenvalues are always real.
 //! - **GeneralEvd**: For general (non-symmetric) matrices. Eigenvalues may be complex.
 //! - **SymmetricGeneralizedEvd**: For generalized symmetric-definite problems A*x = λ*B*x.
-//! - **GeneralizedEvd**: For general matrix pencils.
-//! - **Qz**: QZ algorithm for generalized Schur decomposition.
+//! - **GeneralizedEvd**: For general matrix pencils with a nonsingular B (reduces
+//!   to the eigenproblem of `B⁻¹·A`; not a QZ decomposition).
+//! - **Qz**: QZ algorithm for generalized Schur decomposition; also handles a
+//!   singular B.
 //! - **Hessenberg**: Reduction to upper Hessenberg form.
 //! - **ComplexHessenberg**: Reduction to upper Hessenberg form for complex matrices.
 //! - **Schur**: Schur decomposition (real Schur form).
@@ -84,7 +86,7 @@ pub use hessenberg::{
     unghr, unmhr,
 };
 pub use mrrr::{MrrrError, MrrrEvd};
-pub use qz::{GeneralizedEigenvalue, Qz, QzError};
+pub use qz::{GeneralizedEigenvalue, Qz, QzError, QzOrdering, QzReorderError};
 pub use randomized::{
     RandomizedEvd, RandomizedEvdConfig, RandomizedEvdError, RandomizedEvdResult,
     RandomizedEvdTarget,

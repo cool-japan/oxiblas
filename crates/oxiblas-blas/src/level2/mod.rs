@@ -6,10 +6,23 @@
 //! - `symv` - Symmetric matrix-vector multiply: y = α·A·x + β·y
 //! - `hemv` - Hermitian matrix-vector multiply: y = α·A·x + β·y
 //! - `ger` - Rank-1 update: A = α·x·y^T + A
+//! - `gerc` - Conjugated rank-1 update: A = α·x·conj(y)^T + A
 //! - `trmv` - Triangular matrix-vector multiply: x = A·x
 //! - `trsv` - Triangular solve: x = A⁻¹·b
 //! - `syr` - Symmetric rank-1 update: A = α·x·x^T + A
 //! - `her` - Hermitian rank-1 update: A = α·x·x^H + A
+//! - `syr2` - Symmetric rank-2 update: A = α·x·y^T + α·y·x^T + A
+//! - `her2` - Hermitian rank-2 update: A = α·x·y^H + conj(α)·y·x^H + A
+//!
+//! ## Band Operations
+//!
+//! For general/symmetric/Hermitian/triangular matrices stored in band format:
+//!
+//! - `gbmv` - General band matrix-vector multiply: y = α·op(A)·x + β·y
+//! - `sbmv` - Symmetric band matrix-vector multiply: y = α·A·x + β·y
+//! - `hbmv` - Hermitian band matrix-vector multiply: y = α·A·x + β·y
+//! - `tbmv` - Triangular band matrix-vector multiply: x = op(A)·x
+//! - `tbsv` - Triangular band solve: x = op(A)⁻¹·b
 //!
 //! ## Packed Operations
 //!

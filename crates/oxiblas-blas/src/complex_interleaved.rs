@@ -1004,7 +1004,7 @@ pub fn scal_interleaved_f32(
 /// `Σ (re_i^2 + im_i^2)` over all complex elements is exactly the sum of
 /// squares of every individual real/imaginary component stored in the flat
 /// interleaved buffer, so this reuses the crate's numerically stable,
-/// scaled-accumulation (Blue's-algorithm-style) real `nrm2` kernel
+/// scaled-sum-of-squares real `nrm2` kernel
 /// ([`crate::level1::nrm2_f64`]) directly on `x`. This gives interleaved
 /// complex vectors with very large or very small magnitude components the
 /// same overflow/underflow protection as the real `nrm2` kernels.

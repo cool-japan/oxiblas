@@ -8,7 +8,9 @@
 //! - For `Trans::ConjTrans`: C = α·A^H·A + β·C where A is k×n, C is n×n
 //!
 //! Only the specified triangle (upper or lower) of C is updated.
-//! The diagonal of C is always real.
+//! Whenever C is updated its diagonal is made real. As in reference (Z/C)HERK,
+//! `(alpha == 0 || k == 0) && beta == 1` is a quick return that leaves C completely
+//! untouched (even a non-real diagonal).
 //!
 //! # Note
 //!
@@ -64,8 +66,9 @@ impl std::error::Error for HerkError {}
 /// * `a` - The input matrix A
 /// * `beta` - Scalar multiplier for C. Also a REAL scalar per (Z/C)HERK; for a
 ///   complex `T` any imaginary component is discarded.
-/// * `c` - The Hermitian output matrix C (updated in place). Its diagonal is always
-///   written as a real value.
+/// * `c` - The Hermitian output matrix C (updated in place). Its diagonal is written
+///   as a real value whenever C is updated; for `(alpha == 0 || k == 0) && beta == 1`
+///   (the reference quick return) C is left completely untouched.
 ///
 /// # Example
 ///
@@ -138,10 +141,18 @@ pub fn herk<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
+    // Reference quick return: for (alpha == 0 || k == 0) && beta == 1 nothing changes and C
+    // is left completely untouched (even a non-real diagonal; the real-diagonal projection
+    // only happens on the paths that actually update C).
+    if (alpha == T::zero() || k == 0) && beta == T::one() {
+        return Ok(());
+    }
+
     // Use GEMM-based optimization for larger matrices with real types
-    // For real types, HERK is equivalent to SYRK since conjugation has no effect
+    // For real types, HERK is equivalent to SYRK since conjugation has no effect.
+    // alpha == 0 never reads A (C := beta * C), so it stays on the naive path.
     const GEMM_THRESHOLD: usize = 32;
-    if n >= GEMM_THRESHOLD && k >= 8 {
+    if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
         herk_via_gemm(uplo, trans, alpha, a, beta, c, n, k)
     } else {
         herk_naive(uplo, trans, alpha, a, beta, c, n, k)
@@ -154,7 +165,8 @@ pub fn herk<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// * **`β == 0` must not read `C`.** The result is `temp` alone; reading the old
 ///   `C` and forming `0·C` would let NaN/garbage in an uninitialised `C` buffer
 ///   poison the output (`0·NaN == NaN`).
-/// * **The diagonal is real.** A Hermitian matrix has a real diagonal, but the
+/// * **The diagonal is real** (this helper only runs when C is actually updated; the
+///   reference quick return never gets here). A Hermitian matrix has a real diagonal, but the
 ///   GEMM accumulation of `A·Aᴴ` can leave rounding noise in the imaginary part,
 ///   so every `i == j` entry is projected back onto the reals.
 fn write_herk_triangle<T: Field>(
@@ -350,8 +362,13 @@ fn herk_naive<T: Field>(
 
     // The diagonal of a Hermitian matrix is real. β-scaling of a noisy input and the
     // α·A·Aᴴ accumulation can both leave rounding residue in the imaginary part, so
-    // project every diagonal entry back onto the reals (matching reference ZHERK,
-    // which stores `DBLE(C(J,J))`). No-op for real element types.
+    // project every diagonal entry back onto the reals (reference ZHERK also stores a
+    // real diagonal). No-op for real element types. The operation form is not ZHERK's:
+    // ZHERK scales only `DBLE(C(J,J))` by β (and adds the real `ALPHA*RTEMP` for
+    // `ConjTrans`), while the β pass above multiplies the whole complex entry by β + 0i
+    // (and `ConjTrans` adds the complex α·temp), so a non-finite imaginary part (of
+    // C(j,j), or of temp for `ConjTrans`) makes the real part NaN (see the herk/her2k
+    // NaN/Inf item in TODO.md).
     for i in 0..n {
         c.set(i, i, T::from_real(c[(i, i)].real()));
     }
@@ -710,5 +727,116 @@ mod tests {
         assert!((c[(0, 0)] - 5.0).abs() < 1e-10);
         assert!((c[(1, 0)] - 11.0).abs() < 1e-10);
         assert!((c[(1, 1)] - 25.0).abs() < 1e-10);
+    }
+
+    // Issue #9 class: reference ?HERK never reads A when alpha == 0 (or k == 0) and never
+    // reads C when beta == 0. The quick return `(alpha == 0 || k == 0) && beta == 1` leaves C
+    // completely untouched (even a non-real diagonal); otherwise the diagonal ends up real.
+    #[test]
+    fn test_issue_9_herk_alpha_beta_zero_semantics() {
+        use num_complex::Complex64;
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        let zero = Complex64::new(0.0, 0.0);
+        let same = |got: Complex64, want: Complex64| {
+            let eq = |a: f64, b: f64| (a.is_nan() && b.is_nan()) || a == b;
+            eq(got.re, want.re) && eq(got.im, want.im)
+        };
+        let a_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.5 * ((2 * i + 3 * j) % 7) as f64 - 1.0,
+                0.25 * ((i + 5 * j) % 6) as f64 - 0.5,
+            )
+        };
+        let c_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.5 + 0.125 * (i + j) as f64,
+                if i == j {
+                    0.3
+                } else {
+                    0.0625 * ((i + 3 * j) % 5) as f64
+                },
+            )
+        };
+        // (alpha, beta, A poisoned, C poisoned)
+        let scenarios = [
+            (0.0, 0.0, true, true),
+            (0.0, 2.0, true, false),
+            (0.0, 1.0, true, false),
+            (1.5, 0.0, false, true),
+            (1.5, 1.0, false, false),
+            (1.5, 0.5, false, false),
+        ];
+        // (40, 24) crosses the GEMM threshold (n >= 32, k >= 8) and the blocked GEMM path.
+        for (n, k) in [(4usize, 3usize), (40, 24), (5, 0)] {
+            for uplo in [Uplo::Lower, Uplo::Upper] {
+                for trans in [Trans::NoTrans, Trans::ConjTrans] {
+                    for (alpha, beta, poison_a, poison_c) in scenarios {
+                        let notrans = trans == Trans::NoTrans;
+                        let (ar, ac) = if notrans { (n, k) } else { (k, n) };
+                        let u = |i: usize, l: usize| {
+                            if notrans { a_f(i, l) } else { a_f(l, i).conj() }
+                        };
+                        let mut a: Mat<Complex64> = Mat::zeros(ar, ac);
+                        for j in 0..ac {
+                            for i in 0..ar {
+                                a[(i, j)] = if poison_a { nan } else { a_f(i, j) };
+                            }
+                        }
+                        let mut c: Mat<Complex64> = Mat::zeros(n, n);
+                        for j in 0..n {
+                            for i in 0..n {
+                                c[(i, j)] = if poison_c { nan } else { c_f(i, j) };
+                            }
+                        }
+                        herk(
+                            uplo,
+                            trans,
+                            Complex64::new(alpha, 0.0),
+                            a.as_ref(),
+                            Complex64::new(beta, 0.0),
+                            c.as_mut(),
+                        )
+                        .unwrap();
+                        let quick = (alpha == 0.0 || k == 0) && beta == 1.0;
+                        for j in 0..n {
+                            for i in 0..n {
+                                let in_tri = match uplo {
+                                    Uplo::Lower => i >= j,
+                                    Uplo::Upper => i <= j,
+                                };
+                                let got = c[(i, j)];
+                                if !in_tri {
+                                    let before = if poison_c { nan } else { c_f(i, j) };
+                                    assert!(same(got, before), "unreferenced C[{i},{j}] = {got:?}");
+                                    continue;
+                                }
+                                let want = if quick {
+                                    c_f(i, j)
+                                } else {
+                                    let acc = if alpha == 0.0 {
+                                        zero
+                                    } else {
+                                        (0..k).map(|l| u(i, l) * u(j, l).conj()).sum::<Complex64>()
+                                            * alpha
+                                    };
+                                    let c_term = if beta == 0.0 { zero } else { c_f(i, j) * beta };
+                                    let val = acc + c_term;
+                                    if i == j {
+                                        Complex64::new(val.re, 0.0)
+                                    } else {
+                                        val
+                                    }
+                                };
+                                assert!(
+                                    (got - want).norm() <= 1e-10 * (1.0 + want.norm()),
+                                    "herk {uplo:?}/{trans:?} n={n} k={k} alpha={alpha} beta={beta}: \
+                                     C[{i},{j}] = {got:?}, expected {want:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

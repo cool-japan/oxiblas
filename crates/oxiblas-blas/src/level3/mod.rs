@@ -23,6 +23,8 @@ pub mod gemm_cache_oblivious;
 pub mod gemm_kernel;
 pub mod gemm_kernel_sse42;
 pub mod gemm_packing;
+#[cfg(feature = "parallel")]
+mod gemm_parallel;
 pub mod gemm_small;
 pub mod gemm_winograd;
 pub mod gemmt;

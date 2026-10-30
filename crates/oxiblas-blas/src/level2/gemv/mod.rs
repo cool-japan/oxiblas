@@ -54,10 +54,19 @@ pub enum GemvTrans {
 ///
 /// * `trans` - Whether to transpose A
 /// * `alpha` - Scalar multiplier for A·x
-/// * `a` - The matrix A (m×n for `NoTrans`, n×m for Trans)
-/// * `x` - The input vector
+/// * `a` - The matrix A, always m×n as stored (`op(A)` is m×n for `NoTrans` and
+///   n×m for `Trans` / `ConjTrans`)
+/// * `x` - The input vector (n elements for `NoTrans`, m otherwise)
 /// * `beta` - Scalar multiplier for y
-/// * `y` - The output vector (modified in place)
+/// * `y` - The output vector (m elements for `NoTrans`, n otherwise; modified
+///   in place)
+///
+/// # Reference semantics
+///
+/// Like reference BLAS `?gemv`: if `A` is empty (`m == 0` or `n == 0`) the call
+/// returns immediately and `y` is left untouched (it is *not* scaled by `beta`);
+/// `beta == 0` overwrites `y` without reading it; and `alpha == 0` never reads
+/// `A` or `x`.
 ///
 /// # Panics
 ///
@@ -99,6 +108,12 @@ pub fn gemv<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], bet
         "x length must match number of columns of op(A)"
     );
     assert_eq!(y.len(), rows, "y length must match number of rows of op(A)");
+
+    // Reference quick return: for an empty A (m == 0 or n == 0) y is left
+    // untouched -- not even beta-scaled or zero-filled.
+    if m == 0 || n == 0 {
+        return;
+    }
 
     // Handle beta = 0 case (avoid multiplying uninitialized values)
     if beta == T::zero() {
@@ -533,6 +548,11 @@ pub fn gemv_with_par<T: Field + Send + Sync>(
         "x length must match number of columns of op(A)"
     );
     assert_eq!(y.len(), rows, "y length must match number of rows of op(A)");
+
+    // Reference quick return (see `gemv`): an empty A leaves y untouched.
+    if m == 0 || n == 0 {
+        return;
+    }
 
     // Suppress unused warning when parallel feature is disabled
     let _ = &par;
@@ -1035,6 +1055,12 @@ pub fn gemv_add_inplace<T: Field>(
 
     assert_eq!(x.len(), cols, "x length must match columns of op(A)");
     assert_eq!(y.len(), rows, "y length must match rows of op(A)");
+
+    // Empty op(A) adds nothing (same quick return as `gemv`; it also keeps an
+    // infinite/NaN alpha from turning `alpha * 0` into NaN in y).
+    if m == 0 || n == 0 {
+        return;
+    }
 
     if alpha == T::zero() {
         return;

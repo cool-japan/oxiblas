@@ -12,9 +12,20 @@
 //!
 //! # Performance
 //!
-//! For unit stride vectors (incx=1, incy=1), this module uses the optimized
-//! internal BLAS implementations with SIMD acceleration. For non-unit strides,
-//! scalar fallbacks are used.
+//! The wrappers validate their arguments (invalid input is a silent no-op) and
+//! then either call a native kernel or run a reference-order scalar loop:
+//!
+//! - Level 1 (real): unit-stride calls go to the native slice kernels of
+//!   [`crate::level1`] (SIMD where the kernel has one); any other increment,
+//!   negative and zero included, is a scalar loop over the raw pointers.
+//! - `gemv`: a scalar loop in the wrapper; the native `level2::gemv` is not
+//!   used.
+//! - Real `gemm`: the native `level3::gemm` when neither operand is
+//!   transposed, a scalar loop otherwise.
+//! - Complex dot products and `gemm`: scalar loops.
+//!
+//! Nothing here gathers or scatters vectors: strided data is read and written
+//! in place.
 //!
 //! Split into per-area submodules (2026-08 hygiene pass) to keep every file
 //! under the workspace's 2000-line limit; `vector_start_offset` below is a

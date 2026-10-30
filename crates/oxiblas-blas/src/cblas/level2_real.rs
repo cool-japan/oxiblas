@@ -14,6 +14,28 @@
 //! `x`/`y` operands and the `m`/`n` extents. For the triangular products/solves
 //! row-major flips `uplo` and toggles the transpose flag.
 //!
+//! # Rank updates
+//!
+//! Like reference BLAS, the rank updates skip the column of an exactly zero
+//! scaling element — `x(j) == 0` (SYR), `x(j) == y(j) == 0` (SYR2), `y(j) == 0`
+//! (GER) — so an Inf/NaN in the other operand cannot reach it. In row-major
+//! the kernel works on the buffer read as `A^T`, so the skipped column is row
+//! `j` of the caller's matrix (for GER: the row of a zero `x(i)`).
+//!
+//! # Known deviations from reference BLAS
+//!
+//! * A `NonUnit` triangular solve stops at the first exactly-zero diagonal
+//!   entry it reaches and writes back the partially solved `x`. Reference
+//!   BLAS never stops. In the `NoTrans` forms it skips the division and the
+//!   column update while the current `x(j)` is exactly zero, which gives a
+//!   finite solution of a consistent singular system. Otherwise it divides by
+//!   zero and propagates Inf/NaN; the `Trans` / `ConjTrans` forms always
+//!   divide.
+//! * The TRMV / TRSV kernels do not reproduce reference BLAS's per-column
+//!   "skip when `x(j) == 0`" branch of the `NoTrans` forms, so an Inf/NaN in
+//!   `A` facing a zero `x(j)` may reach the result where reference BLAS skips
+//!   it. Finite results agree to rounding.
+//!
 //! # Increment convention
 //!
 //! Following reference BLAS, a negative increment traverses the logical vector
@@ -800,7 +822,8 @@ unsafe fn trmv_impl<T: Field>(
 // TRSV — triangular solve: op(A)*x = b (b overwritten by x)
 // =============================================================================
 
-/// Double precision TRSV.
+/// Double precision TRSV: solves `op(A)*x = b`; `b` is overwritten by `x`. A
+/// singular `A` stops the solve; see the module docs.
 ///
 /// # Safety
 ///
@@ -852,7 +875,8 @@ pub unsafe extern "C" fn cblas_dtrsv(
     trsv_impl(layout, uplo, trans, diag, n, a, lda, x, incx);
 }
 
-/// Single precision TRSV.
+/// Single precision TRSV: solves `op(A)*x = b`; `b` is overwritten by `x`. A
+/// singular `A` stops the solve; see the module docs.
 ///
 /// # Safety
 ///
@@ -924,14 +948,12 @@ unsafe fn trsv_impl<T: Field>(
     // level2::TrsvTrans::ConjTrans natively).
     //
     // Row-major: flip uplo and reinterpret the buffer as A^T (swap
-    // NoTrans<->Trans). NOTE: this reinterpretation trick only swaps
-    // transposition, not conjugation, so a row-major ConjTrans request
-    // cannot be expressed as a single TrsvTrans variant here (it would need
-    // "conjugate without transposing", which the enum does not have) — this
-    // pre-existing limitation (the row-major path already silently dropped
-    // conjugation for both Trans and ConjTrans before this fix) is preserved
-    // rather than expanded in scope; row-major ConjTrans still does not
-    // conjugate. This is a known follow-up, not a regression.
+    // NoTrans<->Trans). ConjTrans maps exactly like Trans: this body is only
+    // instantiated by the real `cblas_strsv` / `cblas_dtrsv`, for which
+    // conjugation is the identity, as in reference `cblas_dtrsv.c`. (The
+    // complex row-major ConjTrans solve, which does need conjugation, is
+    // `cblas_?trsv` in `complex_level2_ext.rs`: it conjugates `x` around a
+    // NoTrans solve.)
     let (mode, trsv_trans) = match layout {
         CblasLayout::ColMajor => (
             map_trsv_mode(uplo),

@@ -147,6 +147,14 @@ pub fn gemm_strassen_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
         return;
     }
 
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0. The recursion
+        // below would multiply alpha into products already formed from A and
+        // B, so 0 * NaN would leak into C; scale C by beta instead.
+        scale_by_beta(&mut c, beta);
+        return;
+    }
+
     if !should_use_strassen(m, k, n) {
         // Too small to amortize Strassen's bookkeeping, or too rectangular
         // for its recursive halving to pay off: use the standard blocked GEMM.
@@ -160,6 +168,17 @@ pub fn gemm_strassen_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
     // individually rather than with a shared power-of-two of the largest
     // one. No upfront padded copy of the whole matrix is required.
     strassen_recursive(alpha, a, b, beta, c, 0, par);
+}
+
+/// `C = beta * C` without reading C when `beta == 0` (reference BLAS
+/// semantics for the `alpha == 0` early exit).
+#[inline]
+fn scale_by_beta<T: Field>(c: &mut MatMut<'_, T>, beta: T) {
+    if beta == T::zero() {
+        c.fill_zero();
+    } else if beta != T::one() {
+        c.scale(beta);
+    }
 }
 
 /// Invokes the standard blocked GEMM kernel directly, bypassing Strassen's
@@ -563,6 +582,12 @@ pub fn gemm_strassen_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send 
                 c.scale(beta);
             }
         }
+        return;
+    }
+
+    if alpha == T::zero() {
+        // A and B are not read when alpha == 0 (see `gemm_strassen_with_par`).
+        scale_by_beta(&mut c, beta);
         return;
     }
 
@@ -1434,6 +1459,51 @@ mod tests {
                     n
                 );
             }
+        }
+    }
+
+    /// Asserts every element of `c` equals `expected` exactly.
+    fn assert_all_eq(c: &Mat<f64>, expected: f64, what: &str) {
+        for j in 0..c.ncols() {
+            for i in 0..c.nrows() {
+                assert_eq!(
+                    c[(i, j)].to_bits(),
+                    expected.to_bits(),
+                    "{what} ({i},{j}): got {}",
+                    c[(i, j)]
+                );
+            }
+        }
+    }
+
+    // Issue #9: alpha == 0 must not read A/B. n = 40 takes the direct
+    // blocked path, n = 512 the Strassen recursion (whose combine step
+    // multiplies alpha into products already computed from A and B).
+    #[test]
+    fn test_issue_9_strassen_alpha_zero_ignores_nan_operands() {
+        for &n in &[40usize, 512] {
+            let a: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            let b: Mat<f64> = Mat::filled(n, n, f64::INFINITY);
+
+            let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
+            gemm_strassen(0.0, a.as_ref(), b.as_ref(), 0.5, c.as_mut());
+            assert_all_eq(&c, 1.0, "strassen alpha=0 beta=0.5");
+
+            let mut c: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            gemm_strassen_with_par(0.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut(), Par::Seq);
+            assert_all_eq(&c, 0.0, "strassen alpha=0 beta=0");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_issue_9_strassen_parallel_alpha_zero_ignores_nan_operands() {
+        for &n in &[40usize, 512] {
+            let a: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            let b: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
+            gemm_strassen_parallel(0.0, a.as_ref(), b.as_ref(), 0.5, c.as_mut());
+            assert_all_eq(&c, 1.0, "strassen parallel alpha=0");
         }
     }
 }

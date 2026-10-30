@@ -1,5 +1,24 @@
 # OxiBLAS TODO
 
+## v0.2.3 GitHub Issue Sweep (added 2026-10-29)
+
+Issues #4 and #6-#16 (#5, "Add CLAUDE.md/AGENTS.md", is not part of this sweep). Release notes: CHANGELOG.md `[0.2.3]`. Items in the v0.2.2 audit sections below that these issues showed to be incomplete carry a `0.2.3:` note.
+
+- [x] `crates/oxiblas-blas/src/level3/{autotune,gemm}.rs` — **GEMM auto-tuned blocking splits dimensions that fit in one block, re-packing A** _(bug)_ — `balanced_block` fits every MC/KC/NC target (#4)
+- [x] `crates/oxiblas-lapack/src/evd/qz/` — **Is Qz::compute (gges) considered complete? Wrong factors/eigenvalues for non-diagonal pencils** _(bug)_ — rewritten as DGGES (`SORT='N'`); `Qz::compute_sorted`/`Qz::reorder` add `SORT='S'` (#6)
+- [x] `crates/oxiblas-blas/src/cblas/triangular_symmetric.rs` — **Row-major cblas_{s,d}trmm / cblas_{s,d}trsm are a no-op when m != n** _(bug)_ (#7)
+- [x] `crates/oxiblas-blas/src/level3/trsm/complex32.rs` — **trsm_c32 ignores conjugation for ConjTrans** _(bug)_ (#8)
+- [x] `crates/oxiblas-blas/src/{level3,cblas}/` — **alpha=0 / beta=0 do not skip reading operands (NaN/Inf leaks): gemm variants, gemm3m, cblas gemv, scal_par** _(bug)_ — the same class was also fixed in the Level-3 natives and the cblas Level-3 wrappers (#9)
+- [x] `crates/oxiblas-blas/src/{level1,cblas}/` — **Zero/negative increment semantics differ from Netlib 3.12 (nrm2, cblas dot/axpy/copy/swap, complex scal, gemv)** _(bug)_ (#10)
+- [x] `crates/oxiblas-blas/src/level1/strided.rs` — **Complex iamax_strided / iamin_strided rank by modulus instead of |re|+|im|** _(bug)_ (#11)
+- [x] `crates/oxiblas-blas/src/level1/asum.rs` — **crotg overflows for large inputs and uses pre-3.10 a=0 convention** _(bug)_ (#12)
+- [x] `crates/oxiblas-blas/src/level2/{gemv,her,her2}` — **Native gemv scales y for empty A; her/her2 keep imaginary diagonal** _(bug)_ — also the reference zero-column skip of the rank updates (her/her2, then ger/gerc/syr/spr/syr2/spr2/hpr/hpr2) and packed/dense parity of hpr/hpr2 (#13, #14)
+- [x] `crates/oxiblas-blas/src/cblas/` — **cblas layer is missing 73 reference BLAS entry points (banded, packed, rot*, complex L2/L3, gemmtr)** _(missing-feature)_ — the issue counts 73; 74 routines were missing from `cblas.h` 3.12.0, plus 4 `?gemmtr` from 3.12.1: 78 added, 152 `cblas_*` symbols exported (all of `cblas.h` 3.12.1 except `cblas_xerbla`); signature deviations (`i?amax` return type, enum parameters, no `_64` API) are open under v0.3.0 (#14)
+- [x] `crates/oxiblas-blas/src/level1/` — **Native Level 1 gaps: complex nrm2, public cabs1, csscal/zdscal, strided rotm/zdrot** _(missing-feature)_ (#15)
+- [x] `crates/oxiblas-blas/src/level3/{gemm_parallel,gemm_small}.rs` — **Apple M4: GEMM at 0.03x-0.16x of Accelerate (no SME2 path, one thread for squares)** _(perf)_ — partial: the 2D parallel driver and the NEON small-GEMM dispatch are in; the SME2 path is open (see "Advanced SIMD"); `Par::RayonWith(n)` still runs on the ambient rayon pool (documented in 0.2.3, fix planned for 0.2.4) (#16)
+
+Open follow-ups from the 0.2.3 reviews are listed under "Release Milestones" (v0.2.4, v0.3.0, backlog) near the end of this file; SME2 is under "Advanced SIMD", the ggev item under "Generalized Eigenvalue", and DTGSEN `IJOB != 0` in `crates/oxiblas-lapack/TODO.md`.
+
 ## v0.2.2 Production-Readiness Audit TODO (added 2026-07-16)
 
 Multi-agent audit: 16 domain auditors + coverage critic + 4 gap auditors over the full workspace,
@@ -31,7 +50,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [x] `crates/oxiblas-blas/src/cblas/basic.rs:59` — **CBLAS Level-1 routines read out of bounds (UB) for negative increments** _(bug, medium)_
   - Fix: Compute the CBLAS start index for each vector when its increment is negative (`let mut ix = if incx < 0 { ((1 - n as isize) * incx) as usize } else { 0 };` style) and advance by the signed increment, matching reference BLAS.
-- [x] `crates/oxiblas-blas/src/cblas/basic.rs:295` — **Single-increment Level-1 wrappers (scal/nrm2/asum/iamax) OOB on incx<0; reference is no-op/returns-0 for incx<=0** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:295` — **Single-increment Level-1 wrappers (scal/nrm2/asum/iamax) OOB on incx<0; reference is no-op/returns-0 for incx<=0** _(bug, easy)_ — 0.2.3: `nrm2` is the exception: Netlib 3.10+ no longer returns 0 for `incx <= 0` (a negative `incx` walks the vector backwards, `incx == 0` gives `sqrt(n)*|x[0]|`) and `nrm2_strided`/`cblas_*nrm2` now follow it; the complex `scal` wrappers scaled negative increments back to front and now quick-return for `incx <= 0` or `alpha == 1`; `asum`/`iamax` keep the `incx <= 0` quick return (#10)
   - Fix: Guard `if incx <= 0 { return <0 or ()>; }` at the top of scal/nrm2/asum/iamax to match reference semantics (for idamax the fast path already handles incx==1; return 0 for incx<=0).
 - [x] `crates/oxiblas-blas/src/cblas/basic.rs:355` — **Two-increment Level-1 wrappers (dot/axpy/copy/swap) do OOB read/write on negative increments (a spec-valid input)** _(bug, medium)_
   - Fix: Compute the reference start index: `let mut ix = if incx < 0 { (1 - n as isize) * incx } else { 0 };` and `let mut iy = ...` similarly, then step `ix += incx; iy += incy;` each iteration instead of `i * incx`.
@@ -41,7 +60,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Use reference start-offset indexing: `ix = if incx<0 {(1-n as isize)*incx} else {0}` stepping by incx, likewise iy, matching the reference cblas complex dot implementations.
 - [x] `crates/oxiblas-blas/src/level1/parallel.rs:207` — **nrm2_par silently drops overflow/underflow protection: naive sum of squares in parallel path** _(bug, medium)_
   - Fix: In nrm2_parallel, do a parallel max-abs reduction first, then a scaled parallel sum of squares (sum of (x/scale)^2), returning scale*sqrt(sum); or reduce per-chunk (scale, ssq) pairs Blue's-style.
-- [x] `crates/oxiblas-blas/src/level3/trsm/complex64.rs:352` — **All TRSM paths divide by unconjugated diagonal for ConjTrans** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/trsm/complex64.rs:352` — **All TRSM paths divide by unconjugated diagonal for ConjTrans** _(bug, easy)_ — 0.2.3: not all paths: `trsm_c32`/`trsm_c32_in_place` still divided by the unconjugated diagonal for ConjTrans at 4 sites in `level3/trsm/complex32.rs` (blocked path included); fixed in 0.2.3 (#8)
   - Fix: At each diagonal-solve site, conjugate the diagonal when trans == Trans::ConjTrans: `let d = if trans == Trans::ConjTrans { a[(i,i)].conj() } else { a[(i,i)] };`.
 - [x] `crates/oxiblas-blas/src/level3/trsm/generic.rs:1011` — **Generic trsm_naive performs NO conjugation for Trans::ConjTrans (complex solves wrong)** _(bug, easy)_
   - Fix: In trsm_naive, replicate the conjugation logic used in trsm_naive_submatrix: `let val = a[(k,i)]; if trans == Trans::ConjTrans { val.conj() } else { val }` in all four branches.
@@ -118,13 +137,13 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 
 - [x] `.github/workflows.disabled/ci.yml:1` — **CI is entirely disabled — the whole workflows directory is renamed .disabled, so no automated validation runs** _(release, easy)_
   - Fix: Rename `.github/workflows.disabled/` back to `.github/workflows/` (after fixing the branch-trigger bug below), or explicitly document that CI is intentionally disabled and remove/adjust README-internal.md.
-- [x] `crates/oxiblas-blas/src/cblas/basic.rs:1065` — **beta==0 not special-cased: NaN/Inf in uninitialized C propagates (violates BLAS 'C need not be set when beta=0' contract)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/basic.rs:1065` — **beta==0 not special-cased: NaN/Inf in uninitialized C propagates (violates BLAS 'C need not be set when beta=0' contract)** _(bug, easy)_ — 0.2.3: still violated elsewhere until 0.2.3: `gemm3m_c64`/`gemm3m_c32` read C for `beta == 0`; the blocked, Strassen, Winograd, cache-oblivious, batched and `cblas_{s,d,c,z}gemm` paths and `cblas_{s,d,c,z}gemv` read A/B for `alpha == 0`; `scal_par(alpha = 0)` zero-filled instead of multiplying (#9)
   - Fix: Replace `*cp *= beta` with `if beta == 0 { *cp = <zero> } else { *cp *= beta }` in the beta-scaling loops of zgemm/cgemm/gemm-fallback and gemv (and confirm the level3::gemm fast path already zeroes on beta==0).
 - [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:77` — **Kernel shape/dispatch mismatch: AVX2-without-FMA CPUs get garbage GEMM results** _(bug, easy)_
   - Fix: Make shape selection match dispatch exactly: in micro_kernel_shape(), require `is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")` before returning the 8x6/8x8 shapes, falling through to the 4x2/4x4 SSE shapes otherwise.
 - [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:254` — **pack_a_contiguous produces wrong packed layout and uses wrong contiguity test** _(bug, easy)_
   - Fix: Either delete pack_a_contiguous (nothing uses it), or fix it: correct the check to `row_stride == a.nrows()` and only take the memcpy fast path when nrows == mr (single panel); otherwise always delegate to pack_a_optimized.
-- [x] `crates/oxiblas-blas/src/level3/herk.rs:177` — **beta==0 still reads C (NaN/garbage propagation) in herk/her2k/syr2k via-GEMM and symm/hemm naive paths** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/level3/herk.rs:177` — **beta==0 still reads C (NaN/garbage propagation) in herk/her2k/syr2k via-GEMM and symm/hemm naive paths** _(bug, easy)_ — 0.2.3: `symm`/`hemm` had no `alpha == 0` exit and naive `symm` still read C for `beta == 0`; `syrk`/`syr2k`/`herk`/`her2k` sent `alpha == 0` into the GEMM path and `syr2k` via GEMM read C for `beta == 0`; the cblas `herk`/`her2k` kernels and `cblas_{s,d}trsm` read operands the reference skips. All fixed in 0.2.3; native `trsm*` with `alpha == 0` now return zeros (a singular `A` is accepted) and `herk`/`her2k` leave C untouched for `(alpha == 0 || k == 0) && beta == 1` (#9)
   - Fix: Add the beta==0 branch at each listed site, mirroring syrk_via_gemm: `let val = if beta == T::zero() { temp[(i,j)] } else { temp[(i,j)] + beta * c[(i,j)] };` (and for symm/hemm: skip the beta*c term when beta==0).
 - [x] `crates/oxiblas-core/src/memory/arena.rs:126` — **Arena::alloc/try_alloc unchecked size arithmetic: overflow wraps and defeats the capacity check (OOB from safe code)** _(bug, easy)_
   - Fix: Use count.checked_mul(size_of::<T>()) and checked_add for the offset; panic/return None on overflow in both Arena (alloc, try_alloc) and MemStack::alloc.
@@ -136,7 +155,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Gate the std-dependent parts: either put `#[cfg(feature="std")]` on `OxiblasThreadConfig`/its impl (it is only used by build_pool which is already parallel/std-gated), or make it no_std-safe by `use alloc::string::String;` for the field/setter and gating only …
 - [x] `crates/oxiblas-core/src/parallel.rs:732` — **no_std build is broken: OxiblasThreadConfig uses std::thread and unimported String without cfg gates** _(release, easy)_
   - Fix: Gate OxiblasThreadConfig (and its lib.rs/prelude re-exports) behind #[cfg(feature = "std")], or import alloc::string::String and cfg-gate only effective_threads; add a no_std check target (e.g. thumbv7em or --no-default-features build) to CI.
-- [x] `crates/oxiblas-core/src/parallel.rs:809` — **set_global_thread_pool stores a pool that is never used to execute anything** _(fabrication, hard)_
+- [x] `crates/oxiblas-core/src/parallel.rs:809` — **set_global_thread_pool stores a pool that is never used to execute anything** _(fabrication, hard)_ — 0.2.3: used only by the oxiblas-core helpers (`for_each_range`, `map_reduce`, `for_each_indexed`); the oxiblas-blas / oxiblas-lapack drivers run `Par::Rayon` on the ambient rayon pool and ignore the registered pool (documented in 0.2.3, fix planned for 0.2.4)
   - Fix: Either route Par::Rayon execution through the registered pool (extend AnyPool with install/join/for_each and have for_each_range/map_reduce check GLOBAL_POOL first), or remove set_global_thread_pool/global_num_threads and direct users to …
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:115` — **Safe extract()/insert() reach unreachable_unchecked() on out-of-range index in release builds (UB from safe code)** _(bug, easy)_
   - Fix: Replace `_ => core::hint::unreachable_unchecked()` with a real `assert!(index < LANES)` (or return a Result / clamp), or make extract/insert unsafe fns in the SimdRegister trait with a documented index precondition.
@@ -196,7 +215,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:111` — **SIMD-control features (force-scalar / max-simd-128 / max-simd-256) are advertised but ignored by the actual BLAS kernels** _(fabrication, medium)_
 - [x] `crates/oxiblas-blas/src/level3/gemm_packing.rs:371` — **pack_a_simd_* SIMD paths are dead code: guard `row_stride == 1` is never true** _(fabrication, easy)_
 - [x] `crates/oxiblas-blas/src/level3/gemm_winograd.rs:246` — **Blocked Winograd recomputes row/column factors per output element, negating the algorithm's claimed savings** _(fabrication, medium)_
-- [x] `crates/oxiblas-core/src/parallel.rs:49` — **Par::RayonWith(n) does not run on n threads** _(fabrication, medium)_
+- [x] `crates/oxiblas-core/src/parallel.rs:49` — **Par::RayonWith(n) does not run on n threads** _(fabrication, medium)_ — 0.2.3: documented, not fixed: the oxiblas-core helpers install an `n`-thread pool, but every oxiblas-blas / oxiblas-lapack driver (GEMM 2D driver, gemv, Level-1 `*_par`, batched, Strassen, parallel SVD/EVD) uses `n` at most for its gate and work partition (batched, Strassen and the parallel SVD/EVD take no thread count) and runs on the ambient rayon pool; fix planned for 0.2.4 (#16)
 - [x] `crates/oxiblas-core/src/parallel.rs:607` — **PoolScope::for_each_range 'parallel' branch runs sequentially on the caller thread** _(fabrication, easy)_
 - [x] `crates/oxiblas-core/src/simd/dispatch.rs:266` — **SVE support is advertised but structurally unreachable (dead branch, compile-time-only detection, hardcoded false)** _(fabrication, easy)_
 - [x] `crates/oxiblas-core/src/simd/dispatch.rs:607` — **Orphaned oxiblas-core::simd dispatch/KernelSelector layer is advertised but never drives GEMM** _(fabrication, medium)_
@@ -219,10 +238,10 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **missing-feature** (13)
 
 - [x] `crates/oxiblas-blas/src/accuracy.rs:8` — **accuracy module advertises backward-error analysis it never implements** _(missing-feature, medium)_
-- [x] `crates/oxiblas-blas/src/cblas/mod.rs:1` — **CBLAS layer claims spec/BLAS-TESTER compatibility but omits most of the CBLAS surface (all Hermitian L3, complex L1/L2, real L2 beyond gemv)** _(missing-feature, hard)_
+- [x] `crates/oxiblas-blas/src/cblas/mod.rs:1` — **CBLAS layer claims spec/BLAS-TESTER compatibility but omits most of the CBLAS surface (all Hermitian L3, complex L1/L2, real L2 beyond gemv)** _(missing-feature, hard)_ — 0.2.3: only partly done: 74 of the 148 BLAS routines declared in reference `cblas.h` 3.12.0 were still missing (banded, packed, `rot*`, complex L2/L3, `sdsdot`/`dsdot`, `scabs1`/`dcabs1`, ...). 78 entry points added (16 L1, 48 L2, 14 L3 incl. `?gemmtr` from 3.12.1); 152 `cblas_*` symbols are now exported: all of `cblas.h` 3.12.1 (3.12.0 plus `?gemmtr`) except the `cblas_xerbla` handler. Signature deviations (`i?amax` return type, enum parameters, no `_64` API) are open under v0.3.0 (#14)
 - [x] `crates/oxiblas-blas/src/complex_interleaved.rs:686` — **nrm2_interleaved_f64 uses naive re^2+im^2 summation with no overflow/underflow scaling** _(missing-feature, medium)_
-- [x] `crates/oxiblas-blas/src/level1/asum.rs:22` — **Missing complex Level-1 routines: dzasum/scasum, complex rotg (crotg/zrotg), complex rot (zdrot)** _(missing-feature, medium)_
-- [x] `crates/oxiblas-blas/src/level1/mod.rs:40` — **No strided-vector (incx/incy) support anywhere in Level 1/2 — negative/zero-increment BLAS semantics unimplementable** _(missing-feature, hard)_
+- [x] `crates/oxiblas-blas/src/level1/asum.rs:22` — **Missing complex Level-1 routines: dzasum/scasum, complex rotg (crotg/zrotg), complex rot (zdrot)** _(missing-feature, medium)_ — 0.2.3: `crotg` overflowed/underflowed and used the pre-3.10 `a == 0` convention (now a port of `zrotg.f90` 3.12, #12); `zdrot` gave NaN cross terms for infinite input and had no strided form (componentwise now, `zdrot_strided` added, #15); `cblas_{c,z}rotg`, `cblas_csrot` and `cblas_zdrot` did not exist (added, #14)
+- [x] `crates/oxiblas-blas/src/level1/mod.rs:40` — **No strided-vector (incx/incy) support anywhere in Level 1/2 — negative/zero-increment BLAS semantics unimplementable** _(missing-feature, hard)_ — 0.2.3: the native strided layer honoured zero increments except in `nrm2_strided` (which returned 0 for `incx <= 0`), while the CBLAS Level-1 wrappers rejected `inc == 0` (and `cblas_*nrm2` returned 0 for `incx <= 0`) and `iamax_strided`/`iamin_strided` ranked complex input by modulus. All now follow Netlib 3.12 (Level 1 reuses element 0 for `inc == 0`; the CBLAS Level-2 wrappers reject it, `cblas_{s,d}gemv` included); `cnrm2_strided`, `rotm_strided` and `zdrot_strided` added (#10, #11, #15)
 - [x] `crates/oxiblas-blas/src/level2/trsv.rs:90` — **trsv lacks ConjTrans (A^H solve) and unit-diagonal support; TriangularSide enum is dead code with wrong docs** _(missing-feature, medium)_
 - [x] `crates/oxiblas-blas/src/level3/batched.rs:113` — **Batched GEMM Transpose enum lacks ConjTrans — complex batched A^H*B is inexpressible** _(missing-feature, easy)_
 - [x] `crates/oxiblas-blas/src/level3/gemm.rs:285` — **Level-3 GEMM has no transpose parameters; every consumer materializes full transposed/expanded copies** _(missing-feature, hard)_
@@ -284,8 +303,8 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 **bug** (19)
 
 - [x] `crates/oxiblas-blas/src/accuracy.rs:228` — **gemv_reference_f64/gemm_reference_f64 scale output by beta unconditionally, propagating NaN when beta=0** _(bug, easy)_
-- [x] `crates/oxiblas-blas/src/cblas/triangular_symmetric.rs:122` — **Internal Result silently discarded in trsm/trmm/syrk/syr2k/symm wrappers -> partial/no-op result on internal error** _(bug, easy)_
-- [x] `crates/oxiblas-blas/src/level1/iamax.rs:33` — **iamax for complex uses modulus |z| instead of BLAS-standard |re|+|im| (cabs1)** _(bug, easy)_
+- [x] `crates/oxiblas-blas/src/cblas/triangular_symmetric.rs:122` — **Internal Result silently discarded in trsm/trmm/syrk/syr2k/symm wrappers -> partial/no-op result on internal error** _(bug, easy)_ — 0.2.3: the discarded `Err` hid a real bug: row-major `cblas_{s,d}trsm`/`cblas_{s,d}trmm` with `m != n` built `A` with the wrong order, failed the dimension check and silently did nothing (`trsm` also left B scaled by alpha). Fixed by taking the order of `A` from the caller's side; the wrappers still ignore an `Err` by design (a C ABI cannot return it) (#7)
+- [x] `crates/oxiblas-blas/src/level1/iamax.rs:33` — **iamax for complex uses modulus |z| instead of BLAS-standard |re|+|im| (cabs1)** _(bug, easy)_ — 0.2.3: only the contiguous path ranked by cabs1; `iamax_strided`/`iamin_strided` ranked complex input by modulus for non-unit strides until 0.2.3 (#11)
 - [x] `crates/oxiblas-blas/src/level2/gemv.rs:1011` — **Public gemv_add_inplace takes redundant m/n parameters and performs no dimension validation** _(bug, easy)_
 - [x] `crates/oxiblas-blas/src/level3/gemm.rs:216` — **GemmBlocking::custom with mc<mr, nc<nr, or kc=0 yields zero block sizes and panics in gemm** _(bug, easy)_
 - [x] `crates/oxiblas-blas/src/level3/gemm_cache_oblivious.rs:204` — **gemm_cache_oblivious_with_threshold(threshold=0) recurses infinitely (stack overflow); base case is scalar-only** _(bug, easy)_
@@ -768,9 +787,11 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 - [x] `pttrs` - Positive definite tridiagonal solve from factorization
 
 ### Generalized Eigenvalue (Complete)
-- [x] Full `ggev` support (general eigenvalue)
+- [x] Full `ggev` support (general eigenvalue) — 0.2.3: `GeneralizedEvd` still reduces to a standard problem through an LU of `B` (`evd/generalized.rs`), so `B` must be nonsingular and infinite eigenvalues cannot be returned; it does not use `Qz` (see the follow-up below)
 - [x] `sygv` / `hegv` (symmetric/Hermitian generalized)
-- [x] `gges` (generalized Schur)
+- [x] `gges` (generalized Schur) — 0.2.3: the 0.2.2 `Qz::compute` was not a DGGES equivalent (`B != Q·T·Zᵀ`, non-triangular `T`, wrong eigenvalues, `NotConverged` on larger pencils); now `DGGES` with `SORT='N'`, and `SORT='S'` via `Qz::compute_sorted`/`Qz::reorder` (`DTGSEN`, `IJOB=0`) (#6)
+- [x] `Qz::compute_sorted` / `Qz::reorder` - eigenvalue reordering (`DGGES` `SORT='S'`, `DTGSEN` `IJOB=0`) with `QzOrdering` / `QzReorderError` (0.2.3, #6)
+- [ ] Rebuild `GeneralizedEvd` (ggev) on `Qz` so that a singular `B` / infinite eigenvalues work (0.2.3 only corrected its docs: it uses an LU of `B`, not the QZ algorithm)
 
 ### Balancing Algorithms (Complete)
 - [x] `gebal` - Balance a general matrix
@@ -864,6 +885,7 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 - [x] Runtime SIMD dispatch (already implemented via is_x86_feature_detected!)
 - [x] AVX-512 support (f64 16×6, f32 16×16 kernels implemented)
 - [ ] SVE support (ARM Scalable Vector Extension - requires nightly)
+- [ ] SME2 GEMM path for Apple M4 (cause 1 of issue #16; not in 0.2.3)
 - [x] SSE4.2 intermediate kernels - `gemm_kernel_sse42.rs` F64x2Sse/F32x4Sse 4×4 micro-kernels (v0.2.0)
 
 ### Specialized Algorithms
@@ -932,6 +954,8 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 | Complex GEMM 3M | 1024×1024 | - | 40.72 Gf/s | ✅ Complete |
 | Parallel GEMM | 1024×1024 | - | 130.81 Gf/s | ✅ Complete |
 
+*0.2.3 (#16): the Parallel GEMM row predates the 2D tile driver; see the note on item 2 under "Optimization Progress" below.*
+
 ### LAPACK Blocked Factorizations (Optimized via GEMM/TRSM)
 
 | Operation | Size | Unblocked → Blocked | Speedup | Status |
@@ -949,7 +973,7 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 
 **Optimization Progress:**
 1. ✅ GEMM: 79% of OpenBLAS (4×6 NEON + cache blocking + prefetching)
-2. ✅ Parallel GEMM: 2D decomposition, 130.81 Gf/s (f64), 324.31 Gf/s (f32)
+2. ✅ Parallel GEMM: 2D decomposition, 130.81 Gf/s (f64), 324.31 Gf/s (f32) — 0.2.3: not accurate for 0.2.2, whose driver split C over NC column blocks only, so square problems up to NC ran as a single work item and `Par::Rayon` was no faster than `Par::Seq` on squares (Apple M3, 8 threads); the 2D (M×N) tile driver is new in 0.2.3 and the figures here were not re-measured on a quiet machine (#16)
 3. ✅ Complex GEMM: 3M method, 40.72 Gf/s (c64), 88.95 Gf/s (c32)
 4. ✅ SYMM: GEMM-based, 1.1-1.8× speedup
 5. ✅ SYRK/SYR2K: GEMM-based, 6-15× speedup
@@ -1071,6 +1095,27 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 
 **oxiblas-sparse (Large-Scale Extensions)**
 - [x] Out-of-core factorization - `OutOfCoreLu`, `OutOfCoreCholesky` with block I/O + RAII temp files (v0.2.0)
+
+### v0.2.4 - Planned (from the 0.2.3 reviews)
+Sources name the review stage: Gate 1 / Gate 2 (code reviews), FB3 (GEMM gate benchmark), FX-A / FX-B / FX-D (fix-up batches), CBLAS check (comparison with netlib `cblas.h` 3.12.1).
+
+- [ ] cblas reference-order triangular kernels: a cblas-private `crates/oxiblas-blas/src/cblas/tri_ref.rs` that transcribes `dtrmv.f`/`dtrsv.f` (and the `z` forms) loop for loop, with the `NoTrans` zero-`x(j)` skip and no singular stop, used by the `?trmv`/`?trsv`/`?tbmv`/`?tbsv`/`?tpmv`/`?tpsv` wrappers; the native `Err(Singular)` semantics stay _(source: Gate 2, triangular disposition)_
+- [ ] `Par::RayonWith(n)` executes on an `n`-thread pool in every blas/lapack driver, via a public `oxiblas_core::parallel::install(par, op)` wrapping `run_in_pool`; `Par::num_threads()` for `Rayon` should honour `set_global_thread_pool` _(source: Gate 2, RayonWith disposition; documented in 0.2.3)_
+- [ ] cblas/native `herk`/`her2k` NaN/Inf propagation alignment with `zherk.f`/`zher2k.f`, as gfortran compiles them with default floating-point flags (a real scalar times a complex value is a complex multiply by `(r, 0)`); the cblas `NoTrans` part is also the G1-09 entry under Backlog. Paths: native `herk_naive`/`her2k_naive`, native `herk_via_gemm`/`her2k_via_gemm` (`n >= 32`, `k >= 8`, `alpha != 0`), cblas `herk_colmajor`/`her2k_colmajor` _(source: FX-D, differential against a gfortran build of `zherk.f`/`zher2k.f` 3.12.0; 0.2.4 candidate)_
+  - `NoTrans` loop form: the reference is an axpy per column `L` (`C(I,J) = C(I,J) + TEMP*A(I,L)`), skipped when `A(J,L) == 0` (`zher2k`: when `A(J,L)` and `B(J,L)` are both zero). `herk_naive`/`her2k_naive` have the axpy form without the skip; the GEMM path and the cblas kernels compute dot products. A zero `A(J,L)` next to an infinite `A(I,L)` gives NaN here, while the reference leaves `C(I,J)` finite.
+  - beta product form: the off-diagonal `BETA*C(I,J)` is a complex multiply (native matches; the cblas kernels use the componentwise `Complex::scale`), the diagonal is the real `BETA*DBLE(C(J,J))` (cblas matches; native multiplies the complex entry by `beta + 0i` and keeps the real part, NaN for an infinite or NaN imaginary part). At `beta == 1` the reference multiplies the off-diagonal elements by `(1, 0)` for `ConjTrans` only; `herk_naive`/`her2k_naive` and the cblas kernels leave `C` unscaled, `write_herk_triangle`/`write_her2k_triangle` (GEMM path) always multiply, the diagonal included.
+  - alpha temps: `zherk` `NoTrans` forms `TEMP = ALPHA*DCONJG(A(J,L))` as a complex multiply (`herk_naive` matches; cblas scales the dot product by `alpha` componentwise, so `A(J,L) = (Inf, 0)` gives an infinite diagonal where the reference gives NaN). `zherk` `ConjTrans` uses the complex `ALPHA*TEMP` off the diagonal (native matches, cblas componentwise) and the real `ALPHA*RTEMP` on it (cblas matches; native takes the real part of the complex `alpha*temp`, NaN where the reference gives Inf). `zher2k` `NoTrans` forms `TEMP1 = ALPHA*DCONJG(B(J,L))` (`her2k_naive` matches) and `TEMP2 = DCONJG(ALPHA*A(J,L))` (`her2k_naive` computes `conj(alpha)*conj(A(J,L))`, the form `her2`/`hpr2` dropped in 0.2.3; it differs only in the sign of an exact-zero or NaN imaginary part). `zher2k` `ConjTrans` forms `ALPHA*TEMP1 + DCONJG(ALPHA)*TEMP2` from two separate sums (cblas forms the same two products; `her2k_naive` multiplies `alpha` into every term of one running sum).
+  - GEMM path internals: on the blocked GEMM (`n*n*k > 32768`) the complex micro-kernel adds an existing partial result as `beta*C` with `beta = (1, 0)` (the second GEMM of `her2k_via_gemm`, and every KC block after the first), a complex multiply that turns `(Inf, NaN)` into `(NaN, NaN)`; `gemm_small` skips the multiply at `beta == 1`.
+
+### v0.3.0 - Planned (breaking)
+- [ ] `cblas_i{s,d,c,z}amax` return `size_t`/`usize` instead of `i32`, and the layout/trans/uplo/side/diag parameters are taken as `c_int` and validated (an out-of-range value is undefined behaviour while they are Rust enums) _(source: CBLAS check)_
+
+### Backlog (unscheduled, from the 0.2.3 reviews)
+- [ ] `her_new`/`her2_new`/`syr_new`/`syr2_new` compute direct products, without the zero-column skip; route them through the in-place kernels on a zero matrix (`hpr_new`/`hpr2_new`/`spr_new`/`spr2_new` already inherit the fix) _(source: FX-A)_
+- [ ] The pre-existing cblas Level-1 unit-stride fast paths (`cblas_?dot`, `?nrm2`, `?asum`, `?scal`, `?axpy`, `?copy`, `?swap`, `i?amax` and the complex `?copy`/`?swap`) build slices with `slice::from_raw_parts(x, n)`, which can exceed `isize::MAX` bytes on 32-bit targets for contract-violating input. The strided views (`StridedSlice[Mut]::from_raw_parts`, used by the rot, rotm, dot and complex nrm2 wrappers) and the unit-stride paths of `cblas_sdsdot`/`cblas_dsdot` are already guarded _(source: FX-B)_
+- [ ] Validate on x86_64 and re-measure the GEMM parallel gate (`PARALLEL_GATE`, 128³ total / 80³ per thread) there and on 12+ thread machines; it was tuned on an Apple M3 with 4 and 8 threads only, and the AVX2/AVX-512 paths were not exercised in 0.2.3 _(source: Gate 2, G2-08; Gate 1, G1-10)_
+- [ ] Apple Silicon cache detection reads the E-core `hw.l1dcachesize`/`hw.l2cachesize` (64 KB / 4 MiB) instead of `hw.perflevel0.*` (128 KB / 16 MiB), so the auto-tuned GEMM blocking (used when a dimension is >= 512) rests on E-core sizes; the gate crossover (96³-192³) runs on the static `for_kernel` targets and does not read them, but re-check `PARALLEL_GATE` if the detection changes _(source: FB3, Gate 2)_
+- [ ] Sweep of pre-existing items in files touched by 0.2.3: `unsafe` blocks without a `// SAFETY:` comment, `unreachable!()` panics, and the NaN propagation of cblas `?herk`/`?her2k` `NoTrans` (dot-product form instead of the reference axpy form with the `A(J,L) != 0` skip) _(source: Gate 1, G1-09)_
 
 ---
 

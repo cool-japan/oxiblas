@@ -121,9 +121,10 @@ pub fn syr2k<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // Use GEMM-based optimization for larger matrices
+    // Use GEMM-based optimization for larger matrices. alpha == 0 never reads A or B
+    // (reference ?SYR2K: C := beta * C on the triangle), so it stays on the naive path.
     const GEMM_THRESHOLD: usize = 32;
-    if n >= GEMM_THRESHOLD && k >= 8 {
+    if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
         syr2k_via_gemm(uplo, trans, alpha, a, b, beta, c, n, k)
     } else {
         syr2k_naive(uplo, trans, alpha, a, b, beta, c, n, k)
@@ -170,23 +171,8 @@ fn syr2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a, b_t.as_ref(), T::zero(), temp.as_mut()); // temp = α·A·B^T
             gemm(alpha, b, a_t.as_ref(), T::one(), temp.as_mut()); // temp += α·B·A^T
 
-            // Copy triangle with beta scaling
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for i in j..n {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for i in 0..=j {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-            }
+            // Copy triangle with beta scaling (beta == 0 must not read C)
+            add_temp_to_triangle(uplo, beta, &temp, &mut c, n);
         }
         Trans::Trans | Trans::ConjTrans => {
             // A is k×n, B is k×n
@@ -210,27 +196,40 @@ fn syr2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a_t.as_ref(), b, T::zero(), temp.as_mut()); // temp = α·A^T·B
             gemm(alpha, b_t.as_ref(), a, T::one(), temp.as_mut()); // temp += α·B^T·A
 
-            // Copy triangle with beta scaling
-            match uplo {
-                Uplo::Lower => {
-                    for j in 0..n {
-                        for i in j..n {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-                Uplo::Upper => {
-                    for j in 0..n {
-                        for i in 0..=j {
-                            c.set(i, j, beta * c[(i, j)] + temp[(i, j)]);
-                        }
-                    }
-                }
-            }
+            // Copy triangle with beta scaling (beta == 0 must not read C)
+            add_temp_to_triangle(uplo, beta, &temp, &mut c, n);
         }
     }
 
     Ok(())
+}
+
+/// Writes `temp`'s `uplo` triangle into `c` as `β·C + temp`.
+///
+/// `β == 0` must not read `C`: the result is `temp` alone, because forming `0·C` would
+/// let NaN/garbage in an uninitialised `C` poison the output (`0·NaN == NaN`).
+fn add_temp_to_triangle<T: Field>(
+    uplo: Uplo,
+    beta: T,
+    temp: &Mat<T>,
+    c: &mut MatMut<'_, T>,
+    n: usize,
+) {
+    let beta_is_zero = beta == T::zero();
+    for j in 0..n {
+        let i_range = match uplo {
+            Uplo::Lower => j..n,
+            Uplo::Upper => 0..(j + 1),
+        };
+        for i in i_range {
+            let val = if beta_is_zero {
+                temp[(i, j)]
+            } else {
+                beta * c[(i, j)] + temp[(i, j)]
+            };
+            c.set(i, j, val);
+        }
+    }
 }
 
 /// Naive SYR2K implementation for small matrices.

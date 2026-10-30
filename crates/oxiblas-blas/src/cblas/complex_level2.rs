@@ -232,11 +232,27 @@ unsafe fn gemv_c<F: Float>(
         _ => (n, m),
     };
     let zero = Complex::new(F::zero(), F::zero());
+    let one = Complex::new(F::one(), F::zero());
 
-    // Scale y by beta (beta == 0 must not read/propagate uninitialized y).
-    for i in 0..leny {
-        let p = y.offset(vec_offset(i, leny, incy));
-        *p = if beta == zero { zero } else { *p * beta };
+    // Reference quick return: nothing to do for alpha == 0 && beta == 1.
+    if alpha == zero && beta == one {
+        return;
+    }
+
+    // Scale y by beta (beta == 0 must not read/propagate uninitialized y). The
+    // reference skips the pass entirely for beta == 1: multiplying by (1 + 0i)
+    // would turn an infinite component into NaN (Inf * 0).
+    if beta != one {
+        for i in 0..leny {
+            let p = y.offset(vec_offset(i, leny, incy));
+            *p = if beta == zero { zero } else { *p * beta };
+        }
+    }
+
+    // alpha == 0: y := beta * y is all that is left. A and x are never read, so
+    // NaN/Inf in them must not reach y.
+    if alpha == zero {
+        return;
     }
 
     for i in 0..leny {
@@ -665,5 +681,193 @@ mod tests {
                 "row {r:?} col {c:?}"
             );
         }
+    }
+
+    // ---- Issue #9: alpha == 0 must not read A or x; beta rules match Netlib ----
+
+    const LAYOUTS: [CblasLayout; 2] = [CblasLayout::ColMajor, CblasLayout::RowMajor];
+    const TRANSES: [CblasTranspose; 3] = [
+        CblasTranspose::NoTrans,
+        CblasTranspose::Trans,
+        CblasTranspose::ConjTrans,
+    ];
+
+    /// Reference ?GEMV: alpha == 0 && beta == 1 leaves y untouched and never reads A or x.
+    #[test]
+    fn test_issue_9_zgemv_alpha_zero_does_not_read_a_or_x() {
+        let alpha = Complex64::new(0.0, 0.0);
+        let beta = Complex64::new(1.0, 0.0);
+        for bad in [f64::NAN, f64::INFINITY] {
+            for layout in LAYOUTS {
+                for trans in TRANSES {
+                    let a = [Complex64::new(bad, bad)];
+                    let x = [Complex64::new(bad, 1.0)];
+                    let mut y = [Complex64::new(2.0, -1.0)];
+                    // SAFETY: 1x1 operands with lda = 1 and unit increments.
+                    unsafe {
+                        cblas_zgemv(
+                            layout,
+                            trans,
+                            1,
+                            1,
+                            &alpha,
+                            a.as_ptr(),
+                            1,
+                            x.as_ptr(),
+                            1,
+                            &beta,
+                            y.as_mut_ptr(),
+                            1,
+                        );
+                    }
+                    assert_eq!(y, [Complex64::new(2.0, -1.0)], "{layout:?}/{trans:?} {bad}");
+                }
+            }
+        }
+    }
+
+    /// alpha == 0 still applies `y := beta * y` before returning.
+    #[test]
+    fn test_issue_9_zgemv_alpha_zero_still_scales_y_by_beta() {
+        let alpha = Complex64::new(0.0, 0.0);
+        let beta = Complex64::new(2.0, 0.0);
+        let a = [Complex64::new(f64::NAN, f64::NAN)];
+        let x = [Complex64::new(f64::NAN, f64::NAN)];
+        let mut y = [Complex64::new(3.0, 1.0)];
+        // SAFETY: 1x1 operands with lda = 1 and unit increments.
+        unsafe {
+            cblas_zgemv(
+                CblasLayout::ColMajor,
+                CblasTranspose::NoTrans,
+                1,
+                1,
+                &alpha,
+                a.as_ptr(),
+                1,
+                x.as_ptr(),
+                1,
+                &beta,
+                y.as_mut_ptr(),
+                1,
+            );
+        }
+        assert_eq!(y, [Complex64::new(6.0, 2.0)]);
+    }
+
+    /// alpha == 0 and beta == 0 zero-fills y without reading it.
+    #[test]
+    fn test_issue_9_zgemv_alpha_zero_beta_zero_zero_fills_nan_y() {
+        let alpha = Complex64::new(0.0, 0.0);
+        let beta = Complex64::new(0.0, 0.0);
+        let a = [Complex64::new(f64::NAN, 0.0); 6];
+        let x = [Complex64::new(f64::INFINITY, 0.0); 3];
+        let mut y = [Complex64::new(f64::NAN, f64::NAN); 2];
+        // SAFETY: A is 2x3 row-major (lda = 3), x has 3 and y has 2 elements.
+        unsafe {
+            cblas_zgemv(
+                CblasLayout::RowMajor,
+                CblasTranspose::NoTrans,
+                2,
+                3,
+                &alpha,
+                a.as_ptr(),
+                3,
+                x.as_ptr(),
+                1,
+                &beta,
+                y.as_mut_ptr(),
+                1,
+            );
+        }
+        assert_eq!(y, [Complex64::new(0.0, 0.0); 2]);
+    }
+
+    /// Reference ?GEMV skips the scaling pass entirely for beta == 1: multiplying
+    /// y = Inf + 0i by (1 + 0i) would turn the imaginary part into Inf * 0 = NaN.
+    #[test]
+    fn test_issue_9_zgemv_beta_one_does_not_rescale_y() {
+        let alpha = Complex64::new(1.0, 0.0);
+        let beta = Complex64::new(1.0, 0.0);
+        let a = [Complex64::new(0.0, 0.0)];
+        let x = [Complex64::new(0.0, 0.0)];
+        let mut y = [Complex64::new(f64::INFINITY, 0.0)];
+        // SAFETY: 1x1 operands with lda = 1 and unit increments.
+        unsafe {
+            cblas_zgemv(
+                CblasLayout::ColMajor,
+                CblasTranspose::NoTrans,
+                1,
+                1,
+                &alpha,
+                a.as_ptr(),
+                1,
+                x.as_ptr(),
+                1,
+                &beta,
+                y.as_mut_ptr(),
+                1,
+            );
+        }
+        assert_eq!(y, [Complex64::new(f64::INFINITY, 0.0)]);
+    }
+
+    #[test]
+    fn test_issue_9_cgemv_alpha_zero_does_not_read_a_or_x() {
+        let alpha = Complex32::new(0.0, 0.0);
+        let beta = Complex32::new(1.0, 0.0);
+        for bad in [f32::NAN, f32::INFINITY] {
+            for layout in LAYOUTS {
+                for trans in TRANSES {
+                    let a = [Complex32::new(bad, bad)];
+                    let x = [Complex32::new(bad, 1.0)];
+                    let mut y = [Complex32::new(2.0, -1.0)];
+                    // SAFETY: 1x1 operands with lda = 1 and unit increments.
+                    unsafe {
+                        cblas_cgemv(
+                            layout,
+                            trans,
+                            1,
+                            1,
+                            &alpha,
+                            a.as_ptr(),
+                            1,
+                            x.as_ptr(),
+                            1,
+                            &beta,
+                            y.as_mut_ptr(),
+                            1,
+                        );
+                    }
+                    assert_eq!(y, [Complex32::new(2.0, -1.0)], "{layout:?}/{trans:?} {bad}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_cgemv_alpha_zero_still_scales_y_by_beta() {
+        let alpha = Complex32::new(0.0, 0.0);
+        let beta = Complex32::new(2.0, 0.0);
+        let a = [Complex32::new(f32::NAN, f32::NAN)];
+        let x = [Complex32::new(f32::NAN, f32::NAN)];
+        let mut y = [Complex32::new(3.0, 1.0)];
+        // SAFETY: 1x1 operands with lda = 1 and unit increments.
+        unsafe {
+            cblas_cgemv(
+                CblasLayout::RowMajor,
+                CblasTranspose::ConjTrans,
+                1,
+                1,
+                &alpha,
+                a.as_ptr(),
+                1,
+                x.as_ptr(),
+                1,
+                &beta,
+                y.as_mut_ptr(),
+                1,
+            );
+        }
+        assert_eq!(y, [Complex32::new(6.0, 2.0)]);
     }
 }

@@ -134,7 +134,9 @@ unsafe fn gemm_raw_colmajor(
         }
     }
 
-    if k == 0 {
+    // Reference BLAS reads neither A nor B when alpha == 0 (C = beta * C);
+    // `alpha * b` / `a * 0` would otherwise turn NaN/Inf operands into NaN.
+    if k == 0 || alpha == 0.0 {
         return;
     }
 
@@ -289,7 +291,8 @@ unsafe fn sgemm_raw_colmajor(
         }
     }
 
-    if k == 0 {
+    // Reference BLAS reads neither A nor B when alpha == 0 (C = beta * C).
+    if k == 0 || alpha == 0.0 {
         return;
     }
 
@@ -310,6 +313,271 @@ unsafe fn sgemm_raw_colmajor(
                 let cp = c.add(i + j * ldc);
                 *cp += a_val * temp;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cblas_dgemm, cblas_sgemm};
+    use crate::cblas::types::{CblasLayout, CblasTranspose};
+    use crate::cblas::{cblas_cgemm, cblas_zgemm};
+    use num_complex::{Complex32, Complex64};
+
+    /// Layout / transpose combinations covering the ColMajor NoTrans/NoTrans
+    /// fast path (into `level3::gemm`), the scalar transpose fallback and the
+    /// RowMajor operand swap, at a small-path (5) and a blocked (40) size.
+    const CASES: [(CblasLayout, CblasTranspose, CblasTranspose, i32); 8] = [
+        (
+            CblasLayout::ColMajor,
+            CblasTranspose::NoTrans,
+            CblasTranspose::NoTrans,
+            5,
+        ),
+        (
+            CblasLayout::ColMajor,
+            CblasTranspose::NoTrans,
+            CblasTranspose::NoTrans,
+            40,
+        ),
+        (
+            CblasLayout::ColMajor,
+            CblasTranspose::Trans,
+            CblasTranspose::NoTrans,
+            5,
+        ),
+        (
+            CblasLayout::ColMajor,
+            CblasTranspose::Trans,
+            CblasTranspose::NoTrans,
+            40,
+        ),
+        (
+            CblasLayout::ColMajor,
+            CblasTranspose::NoTrans,
+            CblasTranspose::ConjTrans,
+            40,
+        ),
+        (
+            CblasLayout::RowMajor,
+            CblasTranspose::NoTrans,
+            CblasTranspose::NoTrans,
+            40,
+        ),
+        (
+            CblasLayout::RowMajor,
+            CblasTranspose::NoTrans,
+            CblasTranspose::Trans,
+            40,
+        ),
+        (
+            CblasLayout::RowMajor,
+            CblasTranspose::ConjTrans,
+            CblasTranspose::Trans,
+            5,
+        ),
+    ];
+
+    // Issue #9: reference BLAS reads neither A nor B when alpha == 0
+    // (C := beta * C), and never reads C when beta == 0.
+
+    #[test]
+    fn test_issue_9_cblas_dgemm_alpha_zero_ignores_nan_operands() {
+        for &(layout, ta, tb, n) in &CASES {
+            let len = (n * n) as usize;
+            let a = vec![f64::NAN; len];
+            let b = vec![f64::INFINITY; len];
+            for &(beta, c0, expected) in &[(0.5, 2.0, 1.0), (0.0, f64::NAN, 0.0)] {
+                let mut c = vec![c0; len];
+                // SAFETY: every buffer holds n*n elements with leading dimension n.
+                unsafe {
+                    cblas_dgemm(
+                        layout,
+                        ta,
+                        tb,
+                        n,
+                        n,
+                        n,
+                        0.0,
+                        a.as_ptr(),
+                        n,
+                        b.as_ptr(),
+                        n,
+                        beta,
+                        c.as_mut_ptr(),
+                        n,
+                    );
+                }
+                assert!(
+                    c.iter().all(|&v| v.to_bits() == f64::to_bits(expected)),
+                    "dgemm {layout:?} {ta:?}/{tb:?} n={n} beta={beta}: {:?}",
+                    &c[..4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_cblas_sgemm_alpha_zero_ignores_nan_operands() {
+        for &(layout, ta, tb, n) in &CASES {
+            let len = (n * n) as usize;
+            let a = vec![f32::NAN; len];
+            let b = vec![f32::NEG_INFINITY; len];
+            for &(beta, c0, expected) in &[(0.5f32, 2.0f32, 1.0f32), (0.0, f32::NAN, 0.0)] {
+                let mut c = vec![c0; len];
+                // SAFETY: every buffer holds n*n elements with leading dimension n.
+                unsafe {
+                    cblas_sgemm(
+                        layout,
+                        ta,
+                        tb,
+                        n,
+                        n,
+                        n,
+                        0.0,
+                        a.as_ptr(),
+                        n,
+                        b.as_ptr(),
+                        n,
+                        beta,
+                        c.as_mut_ptr(),
+                        n,
+                    );
+                }
+                assert!(
+                    c.iter().all(|&v| v.to_bits() == f32::to_bits(expected)),
+                    "sgemm {layout:?} {ta:?}/{tb:?} n={n} beta={beta}: {:?}",
+                    &c[..4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_cblas_zgemm_alpha_zero_ignores_nan_operands() {
+        let zero = Complex64::new(0.0, 0.0);
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        for &(layout, ta, tb, n) in &CASES {
+            let len = (n * n) as usize;
+            let a = vec![nan; len];
+            let b = vec![Complex64::new(f64::INFINITY, 1.0); len];
+            let cases = [
+                (
+                    Complex64::new(0.5, 0.0),
+                    Complex64::new(2.0, -4.0),
+                    Complex64::new(1.0, -2.0),
+                ),
+                (zero, nan, zero),
+            ];
+            for &(beta, c0, expected) in &cases {
+                let mut c = vec![c0; len];
+                // SAFETY: every buffer holds n*n elements with leading dimension
+                // n; alpha/beta point to live locals.
+                unsafe {
+                    cblas_zgemm(
+                        layout,
+                        ta,
+                        tb,
+                        n,
+                        n,
+                        n,
+                        &zero,
+                        a.as_ptr(),
+                        n,
+                        b.as_ptr(),
+                        n,
+                        &beta,
+                        c.as_mut_ptr(),
+                        n,
+                    );
+                }
+                assert!(
+                    c.iter().all(|&v| v == expected),
+                    "zgemm {layout:?} {ta:?}/{tb:?} n={n} beta={beta}: {:?}",
+                    &c[..2]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_cblas_cgemm_alpha_zero_ignores_nan_operands() {
+        let zero = Complex32::new(0.0, 0.0);
+        let nan = Complex32::new(f32::NAN, f32::NAN);
+        for &(layout, ta, tb, n) in &CASES {
+            let len = (n * n) as usize;
+            let a = vec![nan; len];
+            let b = vec![Complex32::new(1.0, f32::INFINITY); len];
+            let cases = [
+                (
+                    Complex32::new(0.5, 0.0),
+                    Complex32::new(2.0, 4.0),
+                    Complex32::new(1.0, 2.0),
+                ),
+                (zero, nan, zero),
+            ];
+            for &(beta, c0, expected) in &cases {
+                let mut c = vec![c0; len];
+                // SAFETY: every buffer holds n*n elements with leading dimension
+                // n; alpha/beta point to live locals.
+                unsafe {
+                    cblas_cgemm(
+                        layout,
+                        ta,
+                        tb,
+                        n,
+                        n,
+                        n,
+                        &zero,
+                        a.as_ptr(),
+                        n,
+                        b.as_ptr(),
+                        n,
+                        &beta,
+                        c.as_mut_ptr(),
+                        n,
+                    );
+                }
+                assert!(
+                    c.iter().all(|&v| v == expected),
+                    "cgemm {layout:?} {ta:?}/{tb:?} n={n} beta={beta}: {:?}",
+                    &c[..2]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_cblas_dgemm_beta_zero_ignores_nan_c() {
+        // A = B = ones: every entry of op(A) * op(B) is n.
+        for &(layout, ta, tb, n) in &CASES {
+            let len = (n * n) as usize;
+            let ones = vec![1.0f64; len];
+            let mut c = vec![f64::NAN; len];
+            // SAFETY: every buffer holds n*n elements with leading dimension n.
+            unsafe {
+                cblas_dgemm(
+                    layout,
+                    ta,
+                    tb,
+                    n,
+                    n,
+                    n,
+                    1.0,
+                    ones.as_ptr(),
+                    n,
+                    ones.as_ptr(),
+                    n,
+                    0.0,
+                    c.as_mut_ptr(),
+                    n,
+                );
+            }
+            assert!(
+                c.iter().all(|&v| v == f64::from(n)),
+                "dgemm beta=0 {layout:?} {ta:?}/{tb:?} n={n}: {:?}",
+                &c[..4]
+            );
         }
     }
 }

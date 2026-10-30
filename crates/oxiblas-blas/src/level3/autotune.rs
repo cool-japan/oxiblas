@@ -330,6 +330,14 @@ pub struct AutoTunedBlocking {
 /// - MC × KC × sizeof(T) should fit in L2 (A macro-panel)
 /// - KC × NC × sizeof(T) should fit in L3 (B macro-panel)
 ///
+/// # Fitting to the dimensions
+///
+/// The cache model yields dimension-free *targets*, which are then fitted to
+/// `m`, `k`, `n`: a dimension that fits its target is a single block of
+/// exactly that size, and a larger one is split into the fewest near-equal
+/// blocks (multiples of MR for MC, of NR for NC and of 8 for KC). The packed volume of A is `m × k × ⌈n / NC⌉`, so an avoidable extra NC
+/// block re-packs the whole of A.
+///
 /// # Arguments
 ///
 /// * `m` - Number of rows in C
@@ -345,6 +353,15 @@ pub fn compute_blocking(
     elem_size: usize,
     shape: &MicroKernelShape,
 ) -> AutoTunedBlocking {
+    fit_to_dims(cache_targets(elem_size, shape), m, k, n, shape)
+}
+
+/// Dimension-free MC/KC/NC targets derived from the cache hierarchy.
+///
+/// See [`compute_blocking`] for the cache model. The cache-line alignment
+/// (`elems_per_line`) only shapes these targets; the final block sizes come
+/// from [`fit_to_dims`].
+fn cache_targets(elem_size: usize, shape: &MicroKernelShape) -> AutoTunedBlocking {
     let cache = get_cache_info();
     let mr = shape.mr;
     let nr = shape.nr;
@@ -442,19 +459,27 @@ pub fn compute_blocking(
     // NC should be a multiple of NR and cache-line aligned
     let nc = round_up_to_multiple(nc_from_l3, nr.max(elems_per_line));
 
-    // Clamp to actual matrix dimensions for small matrices
-    let mc_final = mc.min(m).max(mr);
-    let kc_final = kc.min(k).max(1);
-    let nc_final = nc.min(n).max(nr);
+    AutoTunedBlocking { mc, kc, nc }
+}
 
-    // Ensure MR/NR alignment (final pass)
-    let mc_final = round_down_to_multiple(mc_final, mr);
-    let nc_final = round_down_to_multiple(nc_final, nr);
-
+/// Fits dimension-free block targets to the actual GEMM dimensions with
+/// [`balanced_block`] (units: MR for MC, [`KC_BLOCK_UNIT`] for KC, NR for NC).
+///
+/// Clamping a target to its dimension and *then* rounding it down to a
+/// multiple of MR/NR used to split dimensions that fit in one block: `n = 256`
+/// with `NR = 6` gave `NC = 252`, i.e. blocks `[252, 4]`, and the 4-column tail
+/// re-packed all of A for a single micro-panel of work.
+fn fit_to_dims(
+    targets: AutoTunedBlocking,
+    m: usize,
+    k: usize,
+    n: usize,
+    shape: &MicroKernelShape,
+) -> AutoTunedBlocking {
     AutoTunedBlocking {
-        mc: if mc_final == 0 { mr } else { mc_final },
-        kc: kc_final,
-        nc: if nc_final == 0 { nr } else { nc_final },
+        mc: balanced_block(m, targets.mc, shape.mr),
+        kc: balanced_block(k, targets.kc, KC_BLOCK_UNIT),
+        nc: balanced_block(n, targets.nc, shape.nr),
     }
 }
 
@@ -476,6 +501,44 @@ const fn round_down_to_multiple(n: usize, m: usize) -> usize {
     (n / m) * m
 }
 
+/// Granularity of a KC (inner-dimension) block whenever `k` has to be split.
+///
+/// A multiple of 8 keeps every packed micro-panel stride (`KC × NR ×
+/// size_of::<T>()`) a multiple of 64 bytes and matches the 2×/4× k-loop
+/// unrolling of the micro-kernels.
+pub(crate) const KC_BLOCK_UNIT: usize = 8;
+
+/// Splits `dim` into the fewest blocks of at most `target` elements and
+/// returns the (balanced) block size.
+///
+/// - `dim <= target`: one block of exactly `dim`. A block that fits is never
+///   split by a rounding step.
+/// - Otherwise, with `t = max(round_down(target, unit), unit)`: if `dim <= t`
+///   (only possible when `target < unit`) one block of `dim`; else the result
+///   is `round_up(⌈dim / nb⌉, unit)` with `nb = ⌈dim / t⌉`. It is a multiple of
+///   `unit`, at most `t`, yields exactly `nb` blocks, and the padding of the
+///   last block is below `nb × unit`.
+/// - `dim == 0` yields `unit`, so no blocked loop can ever `step_by(0)`.
+///
+/// The result is idempotent: feeding it back as `target` returns it unchanged.
+#[must_use]
+pub(crate) const fn balanced_block(dim: usize, target: usize, unit: usize) -> usize {
+    let unit = if unit == 0 { 1 } else { unit };
+    if dim == 0 {
+        return unit;
+    }
+    if dim <= target {
+        return dim;
+    }
+    let rounded = round_down_to_multiple(target, unit);
+    let t = if rounded < unit { unit } else { rounded };
+    if dim <= t {
+        return dim;
+    }
+    let blocks = dim.div_ceil(t);
+    round_up_to_multiple(dim.div_ceil(blocks), unit)
+}
+
 /// Computes blocking optimized for specific matrix aspect ratios.
 ///
 /// This function handles edge cases better than the general algorithm:
@@ -483,6 +546,11 @@ const fn round_down_to_multiple(n: usize, m: usize) -> usize {
 /// - Very short-wide matrices (n >> m, n >> k)
 /// - Inner-product dominated (k >> m, k >> n)
 /// - Small matrices (use reduced blocking to minimize packing overhead)
+///
+/// Every adjustment scales the dimension-free cache *targets*; the result is
+/// then fitted to the dimensions exactly like [`compute_blocking`]. (Scaling
+/// values that were already clamped to a dimension used to re-split it, e.g.
+/// tall-thin 4096×512×256 got NC = 168, blocks `[168, 88]`.)
 #[must_use]
 pub fn compute_blocking_adaptive(
     m: usize,
@@ -491,80 +559,63 @@ pub fn compute_blocking_adaptive(
     elem_size: usize,
     shape: &MicroKernelShape,
 ) -> AutoTunedBlocking {
-    let mr = shape.mr;
-    let nr = shape.nr;
-    let cache = get_cache_info();
-    let line_size = cache.line_size;
-    let elems_per_line = (line_size / elem_size).max(1);
-
     // For small matrices, use minimal blocking to reduce packing overhead
     let total_flops = 2 * m * n * k;
     if total_flops < 100_000 {
         // Very small: just use minimal blocking
-        return AutoTunedBlocking {
-            mc: round_down_to_multiple(m.min(64), mr).max(mr),
-            kc: k.clamp(1, 128),
-            nc: round_down_to_multiple(n.min(64), nr).max(nr),
+        let targets = AutoTunedBlocking {
+            mc: 64,
+            kc: 128,
+            nc: 64,
         };
+        return fit_to_dims(targets, m, k, n, shape);
     }
 
-    // Start with general tuning
-    let base = compute_blocking(m, k, n, elem_size, shape);
+    // Start with the general cache targets
+    let base = cache_targets(elem_size, shape);
 
     // Compute aspect ratios
     let m_f = m as f64;
     let k_f = k as f64;
     let n_f = n as f64;
 
-    // Tall-thin (m >> k, m >> n): prioritize MC to process more rows per iteration
-    // The key is to maximize reuse of packed B data across many row blocks
-    if m_f > k_f * 4.0 && m_f > n_f * 4.0 {
-        let mc_boost = round_down_to_multiple((base.mc * 3 / 2).min(m), mr.max(elems_per_line));
-        let kc_reduced = (base.kc * 2 / 3).max(64);
-        let nc_reduced = round_down_to_multiple(base.nc * 2 / 3, nr);
-        return AutoTunedBlocking {
-            mc: mc_boost.max(mr),
-            kc: kc_reduced.min(k).max(1),
-            nc: nc_reduced.max(nr),
-        };
-    }
-
-    // Short-wide (n >> m, n >> k): prioritize NC to process more columns per iteration
-    // The key is to maximize reuse of packed A data across many column blocks
-    if n_f > m_f * 4.0 && n_f > k_f * 4.0 {
-        let mc_reduced = round_down_to_multiple(base.mc * 2 / 3, mr);
-        let nc_boost = round_down_to_multiple((base.nc * 3 / 2).min(n), nr.max(elems_per_line));
-        return AutoTunedBlocking {
-            mc: mc_reduced.max(mr),
-            kc: base.kc.min(k).max(1),
-            nc: nc_boost.max(nr),
-        };
-    }
-
-    // Inner-product dominated (k >> m, k >> n): prioritize KC to amortize packing
-    // Larger KC means fewer K-loop iterations = less packing overhead
-    if k_f > m_f * 4.0 && k_f > n_f * 4.0 {
-        let kc_boost = (base.kc * 2).min(k).min(1024); // Cap at 1024 for memory
-        let mc_reduced = round_down_to_multiple(base.mc * 2 / 3, mr);
-        let nc_reduced = round_down_to_multiple(base.nc * 2 / 3, nr);
-        return AutoTunedBlocking {
-            mc: mc_reduced.max(mr),
-            kc: kc_boost.max(64),
-            nc: nc_reduced.max(nr),
-        };
-    }
-
-    // Panel-panel (m >> k and n >> k): small K, large M and N
-    // Reduce KC to match K, but keep MC and NC large
-    if m_f > k_f * 4.0 && n_f > k_f * 4.0 && k < base.kc {
-        return AutoTunedBlocking {
-            mc: base.mc.min(m).max(mr),
+    let targets = if m_f > k_f * 4.0 && m_f > n_f * 4.0 {
+        // Tall-thin (m >> k, m >> n): prioritize MC to process more rows per iteration
+        // The key is to maximize reuse of packed B data across many row blocks
+        AutoTunedBlocking {
+            mc: base.mc * 3 / 2,
+            kc: (base.kc * 2 / 3).max(64),
+            nc: base.nc * 2 / 3,
+        }
+    } else if n_f > m_f * 4.0 && n_f > k_f * 4.0 {
+        // Short-wide (n >> m, n >> k): prioritize NC to process more columns per iteration
+        // The key is to maximize reuse of packed A data across many column blocks
+        AutoTunedBlocking {
+            mc: base.mc * 2 / 3,
+            kc: base.kc,
+            nc: base.nc * 3 / 2,
+        }
+    } else if k_f > m_f * 4.0 && k_f > n_f * 4.0 {
+        // Inner-product dominated (k >> m, k >> n): prioritize KC to amortize packing
+        // Larger KC means fewer K-loop iterations = less packing overhead
+        AutoTunedBlocking {
+            mc: base.mc * 2 / 3,
+            kc: (base.kc * 2).min(1024), // Cap at 1024 for memory
+            nc: base.nc * 2 / 3,
+        }
+    } else if m_f > k_f * 4.0 && n_f > k_f * 4.0 && k < base.kc {
+        // Panel-panel (m >> k and n >> k): small K, large M and N
+        // The whole of K forms one block; MC and NC stay large
+        AutoTunedBlocking {
+            mc: base.mc,
             kc: k,
-            nc: base.nc.min(n).max(nr),
-        };
-    }
+            nc: base.nc,
+        }
+    } else {
+        base
+    };
 
-    base
+    fit_to_dims(targets, m, k, n, shape)
 }
 
 #[cfg(test)]
@@ -652,11 +703,17 @@ mod tests {
 
         let block = compute_blocking(1000, 1000, 1000, 8, &shape);
 
-        // MC should be multiple of MR
-        assert_eq!(block.mc % shape.mr, 0, "MC should be aligned to MR");
-
-        // NC should be multiple of NR
-        assert_eq!(block.nc % shape.nr, 0, "NC should be aligned to NR");
+        // A dimension that is split uses MR/NR-multiples; one that fits its
+        // target is a single block of exactly the dimension.
+        assert!(block.mc <= 1000 && block.nc <= 1000, "{block:?}");
+        assert!(
+            block.mc == 1000 || block.mc % shape.mr == 0,
+            "MC should be the full dimension or aligned to MR: {block:?}"
+        );
+        assert!(
+            block.nc == 1000 || block.nc % shape.nr == 0,
+            "NC should be the full dimension or aligned to NR: {block:?}"
+        );
     }
 
     #[test]
@@ -671,5 +728,101 @@ mod tests {
         assert!(tiny.mc >= shape.mr || tiny.mc >= 4);
         assert!(tiny.kc >= 1);
         assert!(tiny.nc >= shape.nr || tiny.nc >= 4);
+    }
+
+    #[test]
+    fn test_issue_4_balanced_block_invariants() {
+        let dims = [
+            1usize, 2, 5, 7, 8, 63, 64, 65, 255, 256, 257, 500, 511, 512, 1000, 1023, 2048, 2050,
+            4096, 4099,
+        ];
+        let targets = [
+            0usize, 1, 3, 6, 8, 16, 64, 100, 168, 252, 256, 441, 448, 832, 2046, 5712,
+        ];
+        for &dim in &dims {
+            for &target in &targets {
+                for &unit in &[1usize, 4, 6, 8, 16] {
+                    let b = balanced_block(dim, target, unit);
+                    let ctx = format!("dim={dim} target={target} unit={unit} -> {b}");
+                    assert!(b >= 1 && b <= dim, "{ctx}");
+                    let t = (target / unit * unit).max(unit);
+                    let blocks = dim.div_ceil(b);
+                    if dim <= target || dim <= t {
+                        // I1: a dimension that fits is one block of exactly dim.
+                        assert_eq!(b, dim, "{ctx}");
+                    } else {
+                        // I2: unit-aligned, within the rounded target, and the
+                        // minimum number of blocks.
+                        assert_eq!(b % unit, 0, "{ctx}");
+                        assert!(b <= t, "{ctx}");
+                        assert_eq!(blocks, dim.div_ceil(t), "{ctx}");
+                    }
+                    // I3: total padding below one unit per block.
+                    assert!(blocks * b - dim < blocks * unit, "{ctx}");
+                    // I4: idempotent.
+                    assert_eq!(balanced_block(dim, b, unit), b, "{ctx}");
+                }
+            }
+        }
+        // An empty dimension never yields a zero step.
+        assert_eq!(balanced_block(0, 128, 8), 8);
+        assert_eq!(balanced_block(0, 0, 0), 1);
+        // Reporter-style examples (independent of the cache model).
+        assert_eq!(balanced_block(256, 5712, 6), 256);
+        assert_eq!(balanced_block(500, 448, 8), 256); // [256, 244], not [448, 52]
+        assert_eq!(balanced_block(2050, 2046, 6), 1026); // [1026, 1024], not [2046, 4]
+    }
+
+    /// I5 helper: `b` is a valid block for `dim` with granularity `unit`.
+    fn check_block(b: usize, dim: usize, unit: usize, ctx: &str) {
+        assert!(b >= 1 && b <= dim.max(1), "{ctx}: {b} vs dim {dim}");
+        assert!(b == dim || b % unit == 0, "{ctx}: {b} vs unit {unit}");
+        let blocks = dim.div_ceil(b);
+        assert!(blocks * b - dim < blocks * unit, "{ctx}: padding");
+    }
+
+    #[test]
+    fn test_issue_4_blocking_sweep_never_splits_needlessly() {
+        let dims = [
+            1usize, 5, 63, 64, 255, 256, 257, 511, 512, 1000, 1023, 2048, 4096,
+        ];
+        for &(mr, nr) in &[(4usize, 4usize), (8, 6), (8, 8), (16, 6), (16, 16)] {
+            let shape = MicroKernelShape { mr, nr };
+            for &elem in &[4usize, 8] {
+                let t = cache_targets(elem, &shape);
+                for &m in &dims {
+                    for &k in &dims {
+                        for &n in &dims {
+                            let ctx = format!("{mr}x{nr} elem={elem} ({m},{k},{n})");
+                            let plain = compute_blocking(m, k, n, elem, &shape);
+                            let adaptive = compute_blocking_adaptive(m, k, n, elem, &shape);
+                            for blk in [plain, adaptive] {
+                                check_block(blk.mc, m, mr, &ctx);
+                                check_block(blk.kc, k, KC_BLOCK_UNIT, &ctx);
+                                check_block(blk.nc, n, nr, &ctx);
+                            }
+                            // A dimension within its cache target is one block.
+                            assert!(m > t.mc || plain.mc == m, "{ctx}: {plain:?}");
+                            assert!(k > t.kc || plain.kc == k, "{ctx}: {plain:?}");
+                            assert!(n > t.nc || plain.nc == n, "{ctx}: {plain:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_4_reporter_shapes_keep_n_in_one_block() {
+        // f64 on an 8x6 micro-kernel: 256 is not a multiple of NR = 6.
+        // Reporter's cases: NC was 252 (blocks [252, 4]) for 1024x1024x256
+        // and 168 (blocks [168, 88]) for the tall-thin 4096x512x256.
+        let shape = MicroKernelShape { mr: 8, nr: 6 };
+        for &(m, k, n) in &[(1024usize, 1024usize, 256usize), (4096, 512, 256)] {
+            let blk = compute_blocking_adaptive(m, k, n, 8, &shape);
+            assert_eq!(blk.nc, n, "({m},{k},{n}) adaptive: {blk:?}");
+            let plain = compute_blocking(m, k, n, 8, &shape);
+            assert_eq!(plain.nc, n, "({m},{k},{n}) plain: {plain:?}");
+        }
     }
 }

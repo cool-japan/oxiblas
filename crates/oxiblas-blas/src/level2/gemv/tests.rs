@@ -695,3 +695,128 @@ fn test_gemv_sum2_large() {
         );
     }
 }
+
+// ========================================================================
+// Issue #13: reference ?GEMV quick-returns when m == 0 or n == 0, leaving y
+// untouched (no beta scaling). The old code scaled/zero-filled y first.
+// ========================================================================
+
+#[test]
+fn test_issue_13_gemv_trans_empty_a_leaves_y_untouched() {
+    // Reporter's repro: A is 0x1, op(A) = A^T is 1x0, so x is empty and y has 1 element.
+    let a: Mat<f64> = Mat::zeros(0, 1);
+    let x: [f64; 0] = [];
+    let mut y = [1.0f64];
+
+    gemv(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.5, &mut y);
+
+    assert_eq!(y, [1.0]);
+}
+
+#[test]
+fn test_issue_13_gemv_empty_a_leaves_y_untouched_for_every_trans_and_beta() {
+    for trans in [GemvTrans::NoTrans, GemvTrans::Trans, GemvTrans::ConjTrans] {
+        for beta in [0.0f64, 0.5, 1.0, 2.0] {
+            // n == 0: A is 2x0 (NoTrans: x empty, y has 2; Trans: x has 2, y empty).
+            let a: Mat<f64> = Mat::zeros(2, 0);
+            let (x, mut y): (Vec<f64>, Vec<f64>) = match trans {
+                GemvTrans::NoTrans => (vec![], vec![f64::NAN, 3.0]),
+                _ => (vec![1.0, 2.0], vec![]),
+            };
+            let before = y.clone();
+            gemv(trans, 1.0, a.as_ref(), &x, beta, &mut y);
+            assert_eq!(y.len(), before.len());
+            for (got, want) in y.iter().zip(before.iter()) {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "{trans:?} beta={beta} n=0: y changed from {want} to {got}"
+                );
+            }
+
+            // m == 0: A is 0x3 (NoTrans: x has 3, y empty; Trans: x empty, y has 3).
+            let a: Mat<f64> = Mat::zeros(0, 3);
+            let (x, mut y): (Vec<f64>, Vec<f64>) = match trans {
+                GemvTrans::NoTrans => (vec![1.0, 2.0, 3.0], vec![]),
+                _ => (vec![], vec![f64::NAN, 1.0, 2.0]),
+            };
+            let before = y.clone();
+            gemv(trans, 1.0, a.as_ref(), &x, beta, &mut y);
+            assert_eq!(y.len(), before.len());
+            for (got, want) in y.iter().zip(before.iter()) {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "{trans:?} beta={beta} m=0: y changed from {want} to {got}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_issue_13_gemv_with_par_empty_a_leaves_y_untouched() {
+    let a: Mat<f64> = Mat::zeros(0, 1);
+    let x: [f64; 0] = [];
+
+    let mut y = [1.0f64];
+    gemv_with_par(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.5, &mut y, Par::Seq);
+    assert_eq!(y, [1.0]);
+
+    // beta == 0 must not zero-fill y either.
+    let mut y = [f64::NAN];
+    gemv_with_par(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.0, &mut y, Par::Seq);
+    assert!(y[0].is_nan());
+
+    #[cfg(feature = "parallel")]
+    {
+        let mut y = [1.0f64];
+        gemv_with_par(
+            GemvTrans::Trans,
+            1.0,
+            a.as_ref(),
+            &x,
+            0.5,
+            &mut y,
+            Par::Rayon,
+        );
+        assert_eq!(y, [1.0]);
+    }
+}
+
+/// The fused `y += alpha * op(A) * x` entry points follow the same rule: an
+/// empty A adds nothing, even for an infinite alpha (`alpha * 0` would be NaN).
+#[test]
+fn test_issue_13_gemv_add_empty_a_leaves_y_untouched() {
+    let a: Mat<f64> = Mat::zeros(2, 0);
+    let x: [f64; 0] = [];
+
+    let mut y = vec![1.0f64, 2.0];
+    gemv_add_inplace(GemvTrans::NoTrans, f64::INFINITY, a.as_ref(), &x, &mut y);
+    assert_eq!(y, [1.0, 2.0]);
+
+    let z = gemv_add(
+        GemvTrans::NoTrans,
+        f64::INFINITY,
+        a.as_ref(),
+        &x,
+        vec![3.0, 4.0],
+    );
+    assert_eq!(z, [3.0, 4.0]);
+
+    // m == 0: A is 0x3, so Trans gives a 3-element y and an empty x.
+    let a: Mat<f64> = Mat::zeros(0, 3);
+    let mut y = vec![5.0f64, 6.0, 7.0];
+    gemv_add_inplace(GemvTrans::Trans, f64::INFINITY, a.as_ref(), &x, &mut y);
+    assert_eq!(y, [5.0, 6.0, 7.0]);
+}
+
+/// Non-empty operands are unaffected by the quick return (control).
+#[test]
+fn test_issue_13_gemv_non_empty_still_scales_y() {
+    let a = Mat::from_rows(&[&[1.0f64, 2.0]]);
+    let x = [1.0, 1.0];
+    let mut y = [4.0f64];
+
+    gemv(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, 0.5, &mut y);
+
+    assert!((y[0] - 5.0).abs() < 1e-12);
+}

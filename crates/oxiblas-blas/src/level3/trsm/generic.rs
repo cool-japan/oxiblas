@@ -60,6 +60,13 @@ pub fn trsm<T: Field + GemmKernel + bytemuck::Zeroable>(
     let m = b.nrows();
     let n = b.ncols();
 
+    // Reference ?TRSM validates the shapes first and, for alpha == 0, sets X := 0 without
+    // reading A or B (a singular A is accepted; NaN/Inf in A or B cannot leak into X).
+    super::check_trsm_dims(side, a.nrows(), a.ncols(), m, n)?;
+    if alpha == T::zero() {
+        return Ok(Mat::zeros(m, n));
+    }
+
     let mut x = Mat::zeros(m, n);
     // Copy B to X and scale by alpha
     for j in 0..n {
@@ -74,10 +81,13 @@ pub fn trsm<T: Field + GemmKernel + bytemuck::Zeroable>(
 
 /// Solves the triangular system in-place.
 ///
-/// B is overwritten with the solution X.
+/// B is overwritten with the solution X. This function has no `alpha`
+/// parameter: B is not scaled (use [`trsm`] for the α-scaled solve).
 ///
-/// For Left solve: A·X = α·B, where A is m×m
-/// For Right solve: X·A = α·B, where A is n×n
+/// For Left solve: op(A)·X = B, where A is m×m
+/// For Right solve: X·op(A) = B, where A is n×n
+///
+/// `op(A)` is `A`, `Aᵀ` or `Aᴴ` as selected by `trans`.
 ///
 /// For large matrices, uses blocked algorithm with GEMM for off-diagonal updates.
 pub fn trsm_in_place<T: Field + GemmKernel + bytemuck::Zeroable>(

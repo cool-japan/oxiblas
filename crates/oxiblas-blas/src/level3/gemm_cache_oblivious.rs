@@ -73,6 +73,11 @@ pub fn gemm_cache_oblivious<T>(
         }
     }
 
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0.
+        return;
+    }
+
     // Recursive computation
     gemm_recursive(alpha, a, b, c, 0, m, 0, n, 0, k);
 }
@@ -183,6 +188,11 @@ pub fn gemm_cache_oblivious_with_threshold<T>(
                 c[(i, j)] *= beta;
             }
         }
+    }
+
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0.
+        return;
     }
 
     let effective_threshold = threshold.max(1);
@@ -549,6 +559,49 @@ mod tests {
                     expected
                 );
             }
+        }
+    }
+
+    /// Asserts every element of `c` equals `expected` exactly.
+    fn assert_all_eq(c: &Mat<f64>, expected: f64, what: &str) {
+        for j in 0..c.ncols() {
+            for i in 0..c.nrows() {
+                assert_eq!(
+                    c[(i, j)].to_bits(),
+                    expected.to_bits(),
+                    "{what} ({i},{j}): got {}",
+                    c[(i, j)]
+                );
+            }
+        }
+    }
+
+    // Issue #9: alpha == 0 must not read A/B; beta == 0 must not read C.
+    // n = 5 stays in the base case, n = 40 recurses (BASE_CASE_SIZE = 32).
+    #[test]
+    fn test_issue_9_cache_oblivious_alpha_zero_ignores_nan_operands() {
+        for &n in &[5usize, 40] {
+            let a: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            let b: Mat<f64> = Mat::filled(n, n, f64::NEG_INFINITY);
+
+            let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
+            gemm_cache_oblivious(0.0, a.as_ref(), b.as_ref(), 0.5, &mut c.as_mut());
+            assert_all_eq(&c, 1.0, "cache_oblivious alpha=0 beta=0.5");
+
+            let mut c: Mat<f64> = Mat::filled(n, n, f64::NAN);
+            gemm_cache_oblivious(0.0, a.as_ref(), b.as_ref(), 0.0, &mut c.as_mut());
+            assert_all_eq(&c, 0.0, "cache_oblivious alpha=0 beta=0");
+
+            let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
+            gemm_cache_oblivious_with_threshold(
+                0.0,
+                a.as_ref(),
+                b.as_ref(),
+                0.5,
+                &mut c.as_mut(),
+                8,
+            );
+            assert_all_eq(&c, 1.0, "cache_oblivious_with_threshold alpha=0");
         }
     }
 }

@@ -68,7 +68,11 @@ fn lower_packed_index(i: usize, j: usize, n: usize) -> usize {
 
 /// Performs the symmetric packed rank-1 update: A = alpha * x * x^T + A
 ///
-/// Only the specified triangle (upper or lower) is stored and updated.
+/// Only the specified triangle (upper or lower) is stored and updated. As in
+/// reference BLAS `?spr`, column `j` is updated as
+/// `A[i,j] += x[i] * (alpha * x[j])`, and a column with `x[j] == 0` is skipped
+/// entirely, so an infinite or NaN `x[i]` cannot reach it as `x[i] * 0`. If
+/// `n == 0` or `alpha == 0` the packed array is left untouched.
 ///
 /// # Arguments
 ///
@@ -127,6 +131,11 @@ pub fn spr<T: Real>(
         SprUplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * x[i] * x[j] for i <= j
             for j in 0..n {
+                // Reference ?SPR skips the column when x(j) == 0, so an infinite
+                // or NaN x(i) cannot reach it as `x(i) * (alpha * 0)`.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in 0..=j {
                     let kij = upper_packed_index(i, j);
@@ -137,6 +146,10 @@ pub fn spr<T: Real>(
         SprUplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * x[i] * x[j] for i >= j
             for j in 0..n {
+                // Column skip for x(j) == 0, as in the upper branch.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in j..n {
                     let kij = lower_packed_index(i, j, n);
@@ -368,5 +381,34 @@ mod tests {
         assert!(approx_eq(ap[7], 8.0)); // 2*4
         assert!(approx_eq(ap[8], 12.0)); // 3*4
         assert!(approx_eq(ap[9], 16.0)); // 4*4
+    }
+
+    /// Issue #14: reference ?SPR skips column `j` when `x(j) == 0`, so an infinite
+    /// `x(i)` cannot reach it as `x(i) * (alpha * 0) = NaN`.
+    #[test]
+    fn test_issue_14_spr_zero_column_skip() {
+        let inf = f64::INFINITY;
+        let ap0 = [1.0f64, 0.5, 0.25, 2.0, 0.75, 3.0];
+
+        // Lower packed [A00, A10, A20, A11, A21, A22]: column 0 (x0 == 0) holds
+        // row 1, where x1 is infinite.
+        let mut ap = ap0;
+        spr(SprUplo::Lower, 3, 1.5, &[0.0, inf, 2.0], &mut ap).unwrap();
+        for k in 0..3 {
+            assert_eq!(ap[k].to_bits(), ap0[k].to_bits(), "Lower slot {k}");
+        }
+        // Column 1: temp = 1.5 * Inf, so A11 and A21 become Inf.
+        assert_eq!((ap[3], ap[4]), (inf, inf));
+        assert_eq!(ap[5], 3.0 + (1.5 * 2.0) * 2.0);
+
+        // Upper packed [A00, A01, A11, A02, A12, A22]: column 2 (x2 == -0) holds
+        // row 1, where x1 is infinite.
+        let mut ap = ap0;
+        spr(SprUplo::Upper, 3, 1.5, &[2.0, inf, -0.0], &mut ap).unwrap();
+        for k in 3..6 {
+            assert_eq!(ap[k].to_bits(), ap0[k].to_bits(), "Upper slot {k}");
+        }
+        assert_eq!((ap[1], ap[2]), (inf, inf));
+        assert_eq!(ap[0], 1.0 + (1.5 * 2.0) * 2.0);
     }
 }

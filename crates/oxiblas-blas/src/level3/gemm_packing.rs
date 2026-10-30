@@ -41,6 +41,14 @@ const PREFETCH_DISTANCE: usize = 4; // 4 cache lines = 256 bytes
 ///
 /// This version uses 4-way unrolling and prefetching for better performance.
 ///
+/// # Layout requirement
+///
+/// `a` must have unit column stride (`a.col_stride() == 1`, plain column-major
+/// storage): element `(i, j)` is read from `ptr + i + j * a.row_stride()` and
+/// the column stride is never consulted, so a view with any other column stride
+/// (for example a transposed view) packs the wrong elements. The GEMM drivers
+/// call this routine only for such operands.
+///
 /// # Arguments
 ///
 /// * `a` - Source matrix
@@ -137,6 +145,14 @@ pub fn pack_a_optimized<T: Field>(
 /// Packs a panel of B with optimized memory access patterns.
 ///
 /// This version uses 4-way unrolling and cache-aware access for better performance.
+///
+/// # Layout requirement
+///
+/// `b` must have unit column stride (`b.col_stride() == 1`, plain column-major
+/// storage): element `(i, j)` is read from `ptr + i + j * b.row_stride()` and
+/// the column stride is never consulted, so a view with any other column stride
+/// (for example a transposed view) packs the wrong elements. The GEMM drivers
+/// call this routine only for such operands.
 ///
 /// # Arguments
 ///

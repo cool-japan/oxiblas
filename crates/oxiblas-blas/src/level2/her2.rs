@@ -44,11 +44,27 @@ impl core::fmt::Display for Her2Error {
 
 impl std::error::Error for Her2Error {}
 
+/// Rewrites the diagonal element `(j, j)` as `real(A[j,j])`, i.e. drops its imaginary part.
+///
+/// # Safety
+///
+/// `a_ptr.add(j + j * rs)` must be a valid element of an exclusively borrowed matrix view.
+#[inline]
+unsafe fn drop_diagonal_imag<T: Field>(a_ptr: *const T, rs: usize, j: usize) {
+    let ptr = a_ptr.add(j + j * rs).cast_mut();
+    *ptr = T::from_real((*ptr).real());
+}
+
 /// Performs the Hermitian rank-2 update: A = alpha * x * y^H + conj(alpha) * y * x^H + A
 ///
 /// Only the specified triangle (upper or lower) of A is accessed and modified.
 /// The other triangle is not referenced. The diagonal elements of A are assumed
-/// to be real, and remain real after the update.
+/// to be real; as in reference BLAS `?her2`, the imaginary part of every diagonal
+/// element is *set to zero* by the update (`A[j,j] = real(A[j,j]) + real(update)`).
+/// Also as in the reference, a column with `x[j]` and `y[j]` both zero is skipped
+/// entirely (only `A[j,j] = real(A[j,j])` is applied), so an infinite or NaN neighbour
+/// cannot reach it. If `n == 0` or `alpha == 0` the matrix is left completely
+/// untouched (including an imaginary diagonal).
 ///
 /// # Arguments
 ///
@@ -103,27 +119,38 @@ pub fn her2<T: Field>(
     let a_ptr = a.as_ptr();
     let rs = a.row_stride();
 
-    // conj(alpha) for the second term
-    let alpha_conj = alpha.conj();
-
+    // The column temps are the reference ones, `TEMP1 = ALPHA*DCONJG(Y(J))` and
+    // `TEMP2 = DCONJG(ALPHA*X(J))`: conjugating the product rather than its factors
+    // gives the reference sign of an exact-zero imaginary part.
     match uplo {
         Her2Uplo::Lower => {
             // Update lower triangle: A[i,j] += alpha*x[i]*conj(y[j]) + conj(alpha)*y[i]*conj(x[j])
             // for i >= j
             for j in 0..n {
+                // Reference ?HER2 skips the column update when x(j) == 0 and y(j) == 0 (so an
+                // infinite or NaN neighbour cannot reach it as `x(i) * conj(0)`) and only
+                // drops the imaginary part of the diagonal.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `j < n`.
+                    unsafe { drop_diagonal_imag(a_ptr, rs, j) };
+                    continue;
+                }
                 let alpha_yj_conj = alpha * y[j].conj();
-                let alpha_conj_xj_conj = alpha_conj * x[j].conj();
+                let conj_alpha_xj = (alpha * x[j]).conj();
                 for i in j..n {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i, j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         if i == j {
-                            // Diagonal: ensure result is real
-                            // A[i,i] += alpha*x[i]*conj(y[i]) + conj(alpha)*y[i]*conj(x[i])
-                            // For Hermitian, this sum should be real
-                            let val = alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
-                            *ptr += T::from_real(val.real());
+                            // Diagonal: A[i,i] = real(A[i,i]) + real(alpha*x[i]*conj(y[i])
+                            // + conj(alpha)*y[i]*conj(x[i])). The sum is real for a Hermitian
+                            // update; like reference ?HER2 the stored imaginary part is
+                            // dropped, so the diagonal is exactly real afterwards.
+                            let val = alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
+                            *ptr = T::from_real((*ptr).real() + val.real());
                         } else {
-                            *ptr = *ptr + alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
+                            *ptr = *ptr + alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
                         }
                     }
                 }
@@ -133,17 +160,26 @@ pub fn her2<T: Field>(
             // Update upper triangle: A[i,j] += alpha*x[i]*conj(y[j]) + conj(alpha)*y[i]*conj(x[j])
             // for i <= j
             for j in 0..n {
+                // Column skip for x(j) == 0 && y(j) == 0, as in the lower branch.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `j < n`.
+                    unsafe { drop_diagonal_imag(a_ptr, rs, j) };
+                    continue;
+                }
                 let alpha_yj_conj = alpha * y[j].conj();
-                let alpha_conj_xj_conj = alpha_conj * x[j].conj();
+                let conj_alpha_xj = (alpha * x[j]).conj();
                 for i in 0..=j {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i <= j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         if i == j {
-                            // Diagonal: ensure result is real
-                            let val = alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
-                            *ptr += T::from_real(val.real());
+                            // Diagonal: real(A[i,i]) + real(update); stored imaginary
+                            // part dropped, as in reference ?HER2.
+                            let val = alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
+                            *ptr = T::from_real((*ptr).real() + val.real());
                         } else {
-                            *ptr = *ptr + alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
+                            *ptr = *ptr + alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
                         }
                     }
                 }
@@ -495,5 +531,183 @@ mod tests {
         assert!(a[(0, 0)].im.abs() < 1e-10);
         assert!(a[(1, 1)].im.abs() < 1e-10);
         assert!(a[(2, 2)].im.abs() < 1e-10);
+    }
+
+    // Issue #13: reference ?HER2 sets the imaginary part of every diagonal element
+    // to zero (A(j,j) = real(A(j,j)) + real(x(j)*temp1 + y(j)*temp2), or
+    // real(A(j,j)) when x(j) and y(j) are both zero) whenever n > 0 and alpha != 0.
+
+    /// Reporter's repro: x = y = [1], alpha = 1, A = [2+0.7i] -> 4+0i (not 4+0.7i).
+    #[test]
+    fn test_issue_13_her2_zeroes_diagonal_imaginary_part() {
+        for uplo in [Her2Uplo::Lower, Her2Uplo::Upper] {
+            let mut a: Mat<Complex64> = Mat::filled(1, 1, c(2.0, 0.7));
+            let x = [c(1.0, 0.0)];
+            her2(uplo, c(1.0, 0.0), &x, &x, a.as_mut()).unwrap();
+            assert_eq!(a[(0, 0)], c(4.0, 0.0), "{uplo:?}");
+        }
+    }
+
+    /// x(j) == y(j) == 0 still rewrites the diagonal as `real(A(j,j))`, and the
+    /// unreferenced triangle is left alone.
+    #[test]
+    fn test_issue_13_her2_zero_vector_element_still_zeroes_diagonal_imaginary_part() {
+        let junk = c(9.0, 9.0);
+        // Upper triangle stored; the strict lower triangle is junk that must survive.
+        let mut a: Mat<Complex64> = Mat::from_rows(&[
+            &[c(1.0, 0.5), c(0.2, 0.1), c(0.3, -0.2)],
+            &[junk, c(2.0, 0.7), c(0.4, 0.6)],
+            &[junk, junk, c(3.0, -0.8)],
+        ]);
+        let x = [c(1.0, 0.0), c(0.0, 0.0), c(0.0, 1.0)];
+        let y = [c(1.0, 0.0), c(0.0, 0.0), c(1.0, 0.0)];
+
+        her2(Her2Uplo::Upper, c(1.0, 0.0), &x, &y, a.as_mut()).unwrap();
+
+        // A00 = 1 + (1*1 + 1*1) = 3; A11 = real(2+0.7i) = 2 (x1 = y1 = 0);
+        // A22 = 3 + real(x2*conj(y2) + y2*conj(x2)) = 3 + real(i + (-i)) = 3.
+        assert_eq!(a[(0, 0)], c(3.0, 0.0));
+        assert_eq!(a[(1, 1)], c(2.0, 0.0));
+        assert_eq!(a[(2, 2)], c(3.0, 0.0));
+        // A01 += x0*conj(y1) + y0*conj(x1) = 0.
+        assert_eq!(a[(0, 1)], c(0.2, 0.1));
+        // A02: x0*conj(y2) = 1*1 = 1, y0*conj(x2) = 1*(-i) = -i.
+        assert_eq!(a[(0, 2)], c(0.3 + 1.0, -0.2 - 1.0));
+        // A12: x1 = y1 = 0 -> x1*conj(y2) + y1*conj(x2) = 0.
+        assert_eq!(a[(1, 2)], c(0.4, 0.6));
+        assert_eq!(a[(1, 0)], junk);
+        assert_eq!(a[(2, 0)], junk);
+        assert_eq!(a[(2, 1)], junk);
+    }
+
+    /// Reference ?HER2 skips the column update only when BOTH x(j) and y(j) are zero (then
+    /// just `A(j,j) = real(A(j,j))`): an infinite neighbour must not reach that column
+    /// (`x(i) * conj(0)` would be `Inf * 0 = NaN`), but a zero x(j) with a non-zero y(j)
+    /// is still updated. Real arithmetic keeps the expected values exact.
+    #[test]
+    fn test_issue_13_her2_skips_column_only_when_x_and_y_are_zero() {
+        let x = [0.0f64, f64::INFINITY, 2.0];
+        let y = [0.0f64, 1.0, 3.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 9.0, 9.0], &[0.5, 2.0, 9.0], &[0.25, 0.75, 3.0]]);
+        her2(Her2Uplo::Lower, 1.0, &x, &y, a.as_mut()).unwrap();
+        // Column 0 (x0 == y0 == 0) is skipped.
+        assert_eq!(a[(0, 0)], 1.0);
+        assert_eq!(a[(1, 0)], 0.5);
+        assert_eq!(a[(2, 0)], 0.25);
+        // Column 1: temp1 = y1 = 1, temp2 = x1 = Inf -> A21 = 0.75 + 2*1 + 3*Inf, A11 = 2 + Inf + Inf.
+        assert_eq!(a[(2, 1)], f64::INFINITY);
+        assert_eq!(a[(1, 1)], f64::INFINITY);
+        // Column 2: A22 = 3 + x2*y2 + y2*x2 = 3 + 6 + 6.
+        assert_eq!(a[(2, 2)], 15.0);
+        assert_eq!((a[(0, 1)], a[(0, 2)], a[(1, 2)]), (9.0, 9.0, 9.0));
+
+        // x(0) == 0 but y(0) != 0: the column is NOT skipped.
+        let x = [0.0f64, 1.0];
+        let y = [1.0f64, 0.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 9.0], &[0.5, 2.0]]);
+        her2(Her2Uplo::Lower, 1.0, &x, &y, a.as_mut()).unwrap();
+        // A10 = 0.5 + x1*y0 + y1*x0 = 0.5 + 1.
+        assert_eq!(a[(1, 0)], 1.5);
+        assert_eq!(a[(0, 0)], 1.0);
+        assert_eq!(a[(1, 1)], 2.0);
+    }
+
+    /// Complex counterpart: the skipped column stays untouched and its diagonal loses its
+    /// imaginary part (whatever happens in the non-skipped columns is not asserted).
+    #[test]
+    fn test_issue_13_her2_complex_zero_column_untouched_with_real_diagonal() {
+        let junk = c(9.0, 9.0);
+        let mut a: Mat<Complex64> = Mat::from_rows(&[
+            &[c(1.0, 0.5), c(0.2, 0.1), c(0.3, -0.2)],
+            &[junk, c(2.0, 0.7), c(0.4, 0.6)],
+            &[junk, junk, c(3.0, -0.8)],
+        ]);
+        let x = [c(2.0, 0.0), c(f64::INFINITY, 0.0), c(0.0, 0.0)];
+        let y = [c(1.0, 0.0), c(1.0, 0.0), c(0.0, 0.0)];
+        her2(Her2Uplo::Upper, c(1.0, 0.0), &x, &y, a.as_mut()).unwrap();
+        // Column 2 (x2 == y2 == 0) is skipped.
+        assert_eq!(a[(0, 2)], c(0.3, -0.2));
+        assert_eq!(a[(1, 2)], c(0.4, 0.6));
+        assert_eq!(a[(2, 2)], c(3.0, 0.0));
+    }
+
+    /// alpha == 0 (or n == 0) leaves A untouched, including an imaginary diagonal.
+    #[test]
+    fn test_issue_13_her2_zero_alpha_leaves_complex_diagonal_untouched() {
+        let mut a: Mat<Complex64> =
+            Mat::from_rows(&[&[c(1.0, 0.5), c(0.2, 0.1)], &[c(0.3, 0.2), c(2.0, -0.7)]]);
+        let before = a.clone();
+        let x = [c(1.0, 1.0), c(2.0, 2.0)];
+        her2(Her2Uplo::Lower, c(0.0, 0.0), &x, &x, a.as_mut()).unwrap();
+        for j in 0..2 {
+            for i in 0..2 {
+                assert_eq!(a[(i, j)], before[(i, j)], "({i},{j})");
+            }
+        }
+    }
+
+    /// A purely imaginary alpha: the Hermitian sum on the diagonal is real, so the
+    /// stored imaginary part must still end up zero.
+    #[test]
+    fn test_issue_13_her2_complex_alpha_zeroes_diagonal_imaginary_part() {
+        let mut a: Mat<Complex64> = Mat::filled(2, 2, c(1.0, 0.25));
+        let x = [c(1.0, 1.0), c(2.0, -1.0)];
+        let y = [c(0.5, 0.0), c(0.0, 1.0)];
+
+        her2(Her2Uplo::Lower, c(0.0, 1.0), &x, &y, a.as_mut()).unwrap();
+
+        assert_eq!(a[(0, 0)].im, 0.0);
+        assert_eq!(a[(1, 1)].im, 0.0);
+        // A00 = 1 + real(alpha*x0*conj(y0) + conj(alpha)*y0*conj(x0))
+        //     = 1 + real(i*(1+i)*0.5 + (-i)*0.5*(1-i)) = 1 + real((-0.5+0.5i) + (-0.5-0.5i)) = 0.
+        assert!((a[(0, 0)].re - 0.0).abs() < 1e-12, "{:?}", a[(0, 0)]);
+    }
+
+    fn bits(z: Complex64) -> (u64, u64) {
+        (z.re.to_bits(), z.im.to_bits())
+    }
+
+    /// Reference ?HER2 / ?HPR2 form `TEMP2 = DCONJG(ALPHA*X(J))`. With alpha = 1+i
+    /// and x(j) = 1-i, `re(alpha)*im(x(j)) + im(alpha)*re(x(j)) == 0` exactly, so
+    /// `conj(alpha*x(j)) = (2, -0)` while `conj(alpha)*conj(x(j)) = (2, +0)`. The
+    /// off-diagonal `A(i,j) + x(i)*temp1 + y(i)*temp2` below has a running imaginary
+    /// part of -0 and `im(y(i)) = -0`, so it keeps the sign of that zero and must
+    /// match the reference expression bit for bit, in `her2` and in `hpr2`.
+    #[test]
+    fn test_issue_13_her2_temp2_matches_reference_signed_zero() {
+        use crate::level2::{Hpr2Uplo, hpr2};
+        let alpha = c(1.0, 1.0);
+        let (xj, yj) = (c(1.0, -1.0), c(1.0, 0.0));
+        let (xi, yi) = (c(-0.0, -0.0), c(0.25, -0.0));
+        let aij = c(0.5, -0.0);
+        // Reference temps: TEMP1 = ALPHA*DCONJG(Y(J)), TEMP2 = DCONJG(ALPHA*X(J)).
+        let temp1 = alpha * yj.conj();
+        let temp2 = (alpha * xj).conj();
+        assert_eq!(bits(temp2), bits(c(2.0, -0.0)));
+        // A(I,J) + X(I)*TEMP1 + Y(I)*TEMP2, evaluated left to right as in ZHER2.
+        let want = aij + xi * temp1 + yi * temp2;
+        assert_eq!(bits(want), bits(c(1.0, -0.0)));
+        // The data discriminates: conjugating the factors instead flips the zero.
+        let conj_factors = alpha.conj() * xj.conj();
+        assert_eq!(bits(conj_factors), bits(c(2.0, 0.0)));
+        assert_ne!(bits(aij + xi * temp1 + yi * conj_factors), bits(want));
+
+        let (d0, d1, junk) = (c(1.0, 0.0), c(2.0, 0.0), c(9.0, 9.0));
+        // Lower: (i, j) = (1, 0); packed [A00, A10, A11].
+        let (x, y) = ([xj, xi], [yj, yi]);
+        let mut a: Mat<Complex64> = Mat::from_rows(&[&[d0, junk], &[aij, d1]]);
+        her2(Her2Uplo::Lower, alpha, &x, &y, a.as_mut()).unwrap();
+        assert_eq!(bits(a[(1, 0)]), bits(want), "her2 Lower");
+        let mut ap = [d0, aij, d1];
+        hpr2(Hpr2Uplo::Lower, 2, alpha, &x, &y, &mut ap).unwrap();
+        assert_eq!(bits(ap[1]), bits(want), "hpr2 Lower");
+        // Upper: (i, j) = (0, 1); packed [A00, A01, A11].
+        let (x, y) = ([xi, xj], [yi, yj]);
+        let mut a: Mat<Complex64> = Mat::from_rows(&[&[d0, aij], &[junk, d1]]);
+        her2(Her2Uplo::Upper, alpha, &x, &y, a.as_mut()).unwrap();
+        assert_eq!(bits(a[(0, 1)]), bits(want), "her2 Upper");
+        let mut ap = [d0, aij, d1];
+        hpr2(Hpr2Uplo::Upper, 2, alpha, &x, &y, &mut ap).unwrap();
+        assert_eq!(bits(ap[1]), bits(want), "hpr2 Upper");
     }
 }

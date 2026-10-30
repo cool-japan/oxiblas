@@ -34,15 +34,20 @@ pub struct RotgResult<T> {
 ///
 /// # Algorithm
 ///
-/// Uses the stable BLAS algorithm:
-/// - If |b| > |a|, compute tan(θ) = a/b, then c and s
-/// - Otherwise compute cot(θ) = b/a, then c and s
-/// - Special handling for a = 0 and b = 0
+/// A translation of the reference `drotg.f90` / `srotg.f90` (Netlib BLAS
+/// 3.12):
+/// - `b == 0`: `c = 1`, `s = 0`, `r = a`, `z = 0`.
+/// - `a == 0` (and `b != 0`): `c = 0`, `s = 1`, `r = b`, `z = 1`.
+/// - Otherwise `r = ±scl·sqrt((a/scl)² + (b/scl)²)` with
+///   `scl = min(safmax, max(safmin, |a|, |b|))` (so finite inputs anywhere up
+///   to the overflow threshold neither overflow nor underflow), the sign of `r`
+///   taken from whichever of `a`, `b` has the larger magnitude (`b` on a tie),
+///   `c = a/r` and `s = b/r`.
 ///
-/// The z parameter encodes either c or 1/s for reconstruction:
-/// - z = 0 if a = b = 0
-/// - z = 1 if |b| > |a| (c = 1/z, s = √(1 - c²))
-/// - z = s if |b| ≤ |a| (c = √(1 - z²), s = z)
+/// The `z` parameter allows `c` and `s` to be reconstructed: in the general
+/// case `z = s` if `|a| > |b|`, else `z = 1/c` (or `1` when `c == 0`). Then
+/// `z == 1` means `c = 0, s = 1`; `|z| < 1` means `c = √(1 - z²), s = z`;
+/// `|z| > 1` means `c = 1/z, s = √(1 - c²)`.
 ///
 /// # Example
 ///
@@ -59,35 +64,49 @@ pub fn rotg<T: Float>(a: T, b: T) -> RotgResult<T> {
     let zero = T::zero();
     let one = T::one();
 
-    // Handle the case where both are zero
-    if a.is_zero() && b.is_zero() {
+    let anorm = a.abs();
+    let bnorm = b.abs();
+
+    // Reference special cases: exact `c`/`s`/`z` (in particular +0, never a
+    // signed zero produced by dividing by a negative `r`).
+    if bnorm == zero {
         return RotgResult {
-            r: zero,
+            r: a,
             c: one,
             s: zero,
             z: zero,
         };
     }
+    if anorm == zero {
+        return RotgResult {
+            r: b,
+            c: zero,
+            s: one,
+            z: one,
+        };
+    }
 
-    let abs_a = a.abs();
-    let abs_b = b.abs();
-    let scale = abs_a + abs_b;
-
-    // Compute |r| = scale * sqrt((a/scale)^2 + (b/scale)^2)
-    let r_magnitude = scale * ((a / scale).powi(2) + (b / scale).powi(2)).sqrt();
-
-    // Determine sign of r based on larger magnitude input
-    let r = if abs_a > abs_b {
-        r_magnitude.copysign(a)
+    // `rotg.f90` scaling constants: safmin = radix**max(minexp-1, 1-maxexp)
+    // is the smallest positive normal and safmax = radix**max(1-minexp,
+    // maxexp-1) = 2 / safmin. Scaling by max(|a|, |b|) -- not |a| + |b|,
+    // which overflows for huge finite inputs -- keeps every intermediate
+    // representable.
+    let safmin = T::min_positive_value();
+    let safmax = (one + one) / safmin;
+    let scl = safmax.min(safmin.max(anorm).max(bnorm));
+    let sigma = if anorm > bnorm {
+        one.copysign(a)
     } else {
-        r_magnitude.copysign(b)
+        one.copysign(b)
     };
+    let (sa, sb) = (a / scl, b / scl);
+    let r = sigma * (scl * (sa * sa + sb * sb).sqrt());
 
     let c = a / r;
     let s = b / r;
 
     // Compute z for reconstruction
-    let z = if abs_a > abs_b {
+    let z = if anorm > bnorm {
         s
     } else if c != zero {
         one / c
@@ -228,9 +247,8 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
     let _two = one + one;
     let minus_one = -one;
 
-    // GAM and GAMSQ are the machine-dependent constants
-    // GAM = 2^(base/2) where base is the number of bits in the mantissa
-    // For simplicity, use reasonable constants
+    // Reference `DATA` constants: GAM = 4096 = 2^12, and every rescaling below
+    // multiplies or divides by GAM**2 = 2^24 exactly.
     let gam: T = T::from(4096.0).unwrap_or_else(|| {
         // Fallback: 2^12 = 4096
         let two = one + one;
@@ -240,8 +258,10 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
         }
         v
     }); // 2^12
-    let gamsq: T = gam * gam;
-    let rgamsq: T = one / gamsq;
+    let gam_sq: T = gam * gam;
+    // The range tests compare against the reference GAMSQ / RGAMSQ literals,
+    // which are precision-specific and not exactly 2^24 / 2^-24.
+    let (gamsq, rgamsq) = rotmg_range_thresholds::<T>(gam_sq);
 
     // Handle special cases
     if *d1 < zero {
@@ -319,7 +339,8 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
         h21 = minus_one;
     }
 
-    // Scale d1 if necessary
+    // Scale d1 if necessary. The plain `else` below mirrors reference
+    // `?rotmg.f` 3.12 exactly (it is also taken when `flag` is already -1).
     if *d1 != zero {
         while *d1 <= rgamsq || *d1 >= gamsq {
             if flag == zero {
@@ -332,12 +353,12 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
                 flag = minus_one;
             }
             if *d1 <= rgamsq {
-                *d1 = *d1 * gamsq;
+                *d1 = *d1 * gam_sq;
                 *x1 = *x1 / gam;
                 h11 = h11 / gam;
                 h12 = h12 / gam;
             } else {
-                *d1 = *d1 / gamsq;
+                *d1 = *d1 / gam_sq;
                 *x1 = *x1 * gam;
                 h11 = h11 * gam;
                 h12 = h12 * gam;
@@ -358,11 +379,11 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
                 flag = minus_one;
             }
             if d2.abs() <= rgamsq {
-                *d2 = *d2 * gamsq;
+                *d2 = *d2 * gam_sq;
                 h21 = h21 / gam;
                 h22 = h22 / gam;
             } else {
-                *d2 = *d2 / gamsq;
+                *d2 = *d2 / gam_sq;
                 h21 = h21 * gam;
                 h22 = h22 * gam;
             }
@@ -378,15 +399,43 @@ pub fn rotmg<T: Float>(d1: &mut T, d2: &mut T, x1: &mut T, y1: T) -> RotmParams<
     }
 }
 
+/// The `?ROTMG` range-test thresholds `(GAMSQ, RGAMSQ)`, i.e. the reference
+/// `DATA` constants verbatim: `srotmg.f` uses `1.67772E7, 5.96046E-8` and
+/// `drotmg.f` uses `16777216.D0, 5.9604645D-8`. As decimal literals they are
+/// not exactly `GAM**2 = 2^24` / `2^-24` (the double `RGAMSQ` lies just above
+/// `2^-24`, both single constants just below their powers of two), and the
+/// reference compares against them while rescaling by the exact `GAM**2`.
+/// Element types no more precise than `f32` use the single-precision pair.
+fn rotmg_range_thresholds<T: Float>(gam_sq: T) -> (T, T) {
+    let single = T::epsilon()
+        .to_f64()
+        .is_some_and(|eps| eps >= f64::from(f32::EPSILON));
+    let (gamsq, rgamsq) = if single {
+        (f64::from(1.677_72e7_f32), f64::from(5.960_46e-8_f32))
+    } else {
+        (16_777_216.0_f64, 5.960_464_5e-8_f64)
+    };
+    (
+        T::from(gamsq).unwrap_or(gam_sq),
+        T::from(rgamsq).unwrap_or_else(|| T::one() / gam_sq),
+    )
+}
+
 /// Applies a modified Givens rotation to vectors x and y.
 ///
 /// Applies the rotation defined by the parameters from [`rotmg`].
 ///
-/// The form of the rotation matrix H depends on the flag:
-/// - `flag = -1.0`: H = [[h11, h12], [h21, h22]]
-/// - `flag = 0.0`: H = [[1.0, h12], [h21, 1.0]]
-/// - `flag = 1.0`: H = [[h11, 1.0], [-1.0, h22]]
+/// The form of the rotation matrix H depends on the flag, classified exactly
+/// like Netlib `DROTM` (3.12) so that every flag value -- not only the four
+/// canonical ones [`rotmg`] produces -- behaves as in the reference:
 /// - `flag = -2.0`: H = I (identity, no operation)
+/// - `flag < 0.0` (canonically `-1.0`): H = [[h11, h12], [h21, h22]]
+/// - `flag = 0.0`: H = [[1.0, h12], [h21, 1.0]]
+/// - otherwise (`flag > 0.0`, canonically `1.0`; also NaN):
+///   H = [[h11, 1.0], [-1.0, h22]]
+///
+/// For increments (including zero and negative ones) see
+/// [`rotm_strided`](crate::level1::rotm_strided).
 ///
 /// For each element i:
 /// ```text
@@ -426,18 +475,15 @@ pub fn rotm<T: Float>(params: &RotmParams<T>, x: &mut [T], y: &mut [T]) {
     let zero = T::zero();
     let one = T::one();
     let two = one + one;
-    let minus_one = -one;
-    let minus_two = -two;
 
-    // Check flag to determine operation
-    if params.flag == minus_two {
-        // Identity - no operation needed
+    // Netlib DROTM: `IF (N.LE.0 .OR. (DFLAG+TWO.EQ.ZERO)) RETURN` -- identity.
+    if params.flag + two == zero {
         return;
     }
 
     let n = x.len();
 
-    if params.flag == minus_one {
+    if params.flag < zero {
         // H = [[h11, h12], [h21, h22]]
         for i in 0..n {
             let xi = x[i];
@@ -453,8 +499,9 @@ pub fn rotm<T: Float>(params: &RotmParams<T>, x: &mut [T], y: &mut [T]) {
             x[i] = xi + params.h12 * yi;
             y[i] = params.h21 * xi + yi;
         }
-    } else if params.flag == one {
-        // H = [[h11, 1], [-1, h22]]
+    } else {
+        // H = [[h11, 1], [-1, h22]] -- the reference's ELSE branch, taken for
+        // any other flag (positive, or NaN since every comparison failed).
         for i in 0..n {
             let xi = x[i];
             let yi = y[i];
@@ -707,5 +754,37 @@ mod tests {
 
         assert!((x[0] - 5.0).abs() < 1e-5);
         assert!(y[0].abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_issue_15_rotm_noncanonical_flags_follow_netlib() {
+        // Netlib DROTM classifies the flag as: +2 == 0 -> identity, < 0 ->
+        // full H, == 0 -> unit diagonal, otherwise (incl. NaN) -> unit
+        // off-diagonal. `rotm` used to silently no-op for any flag other
+        // than exactly -2/-1/0/1; `rotm_strided` forwards unit strides here,
+        // so both must agree with the reference for every flag value.
+        let h = |flag: f64| RotmParams {
+            flag,
+            h11: 2.0,
+            h12: 0.5,
+            h21: -1.0,
+            h22: 3.0,
+        };
+        let apply = |p: RotmParams<f64>| {
+            let mut x = [1.0f64, -2.0];
+            let mut y = [4.0f64, 0.5];
+            rotm(&p, &mut x, &mut y);
+            (x, y)
+        };
+        // flag = -0.5 behaves like -1 (full H): x' = 2w + 0.5z, y' = -w + 3z.
+        assert_eq!(apply(h(-0.5)), ([4.0, -3.75], [11.0, 3.5]));
+        assert_eq!(apply(h(-0.5)), apply(h(-1.0)));
+        // flag = 0.5 and NaN behave like +1: x' = 2w + z, y' = -w + 3z.
+        assert_eq!(apply(h(0.5)), ([6.0, -3.5], [11.0, 3.5]));
+        assert_eq!(apply(h(f64::NAN)), apply(h(1.0)));
+        // flag = 0: x' = w + 0.5z, y' = -w + z.
+        assert_eq!(apply(h(0.0)), ([3.0, -1.75], [3.0, 2.5]));
+        // flag = -2: identity.
+        assert_eq!(apply(h(-2.0)), ([1.0, -2.0], [4.0, 0.5]));
     }
 }

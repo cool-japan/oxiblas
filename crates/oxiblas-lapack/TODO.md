@@ -33,7 +33,7 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] General eigenvalues (Schur-based)
 - [x] Left and right eigenvectors
 - [x] Generalized symmetric eigenvalues (partial)
-- [x] QZ algorithm
+- [x] QZ algorithm - `Qz::compute` is a LAPACK DGGES equivalent (`SORT='N'`) since 0.2.3; the 0.2.2 iteration returned wrong factors and eigenvalues (#6)
 
 ### Missing
 - [x] Divide-and-conquer symmetric EVD (SymmetricEvdDc, HermitianEvdDc)
@@ -44,6 +44,8 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Eigenvector refinement (trevc) - trevc_right, trevc_left, Schur::eigenvectors
 - [x] Balancing (gebal/gebak)
 - [x] Randomized EVD (HMT algorithm) - RandomizedEvd with power iteration, f64/f32 (v0.2.0)
+- [x] Generalized eigenvalue reordering - `Qz::compute_sorted` (DGGES `SORT='S'`) and `Qz::reorder` (DTGSEN `IJOB=0`), `QzOrdering`, `QzReorderError` (both `#[non_exhaustive]`) (0.2.3, #6)
+- [ ] DTGSEN condition estimates (`IJOB != 0`: PL/PR/DIF via DTGSYL/DLATDF/DLACN2)
 
 ---
 

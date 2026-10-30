@@ -1,7 +1,8 @@
 //! Small matrix GEMM specializations.
 //!
-//! This module provides optimized GEMM implementations for small matrices
-//! (dimensions < 32) where the overhead of packing and blocked algorithms
+//! This module provides optimized GEMM implementations for small problems
+//! (`m * n * k <= SMALL_THRESHOLD`, i.e. at most 32³ multiply-adds however the
+//! dimensions are split) where the overhead of packing and blocked algorithms
 //! outweighs their benefits.
 //!
 //! For small matrices, we use:
@@ -15,14 +16,20 @@ use oxiblas_matrix::{MatMut, MatRef};
 
 /// Threshold for using small matrix specialization.
 ///
-/// When m * n * k is below this threshold, small matrix kernels are used.
+/// When m * n * k is at most this threshold, small matrix kernels are used.
 pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 
 /// Performs small matrix GEMM with unrolled loops.
 ///
 /// C = alpha * A * B + beta * C
 ///
-/// This is optimized for matrices where m, n, k < 32.
+/// This is optimized for small problems (the blocked GEMM routes here when
+/// `m * n * k <= SMALL_THRESHOLD`). As in reference BLAS, C is not read when
+/// `beta == 0` and A/B are not read when `alpha == 0`.
+///
+/// On aarch64, `f64`/`f32` problems with `m, n >= 4` and column-major operands
+/// (`col_stride() == 1`) run on the NEON kernels (`gemm_small_f64_simd` /
+/// `gemm_small_f32_simd`); all other cases use the portable loops.
 pub fn gemm_small<T: Field>(
     alpha: T,
     a: &MatRef<'_, T>,
@@ -30,11 +37,7 @@ pub fn gemm_small<T: Field>(
     beta: T,
     c: &mut MatMut<'_, T>,
 ) {
-    let m = a.nrows();
-    let k = a.ncols();
-    let n = b.ncols();
-
-    // Handle beta scaling
+    // Handle beta scaling (C is not read when beta == 0)
     if beta == T::zero() {
         c.fill_zero();
     } else if beta != T::one() {
@@ -44,6 +47,88 @@ pub fn gemm_small<T: Field>(
     if alpha == T::zero() {
         return;
     }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if gemm_small_simd_dispatch(alpha, a, b, c) {
+            return;
+        }
+    }
+
+    gemm_small_acc(alpha, a, b, c);
+}
+
+/// Routes `C += alpha * A * B` to the NEON kernels when `T` is `f64`/`f32` and
+/// the operands qualify; returns `false` (having done nothing) otherwise.
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+#[inline]
+fn gemm_small_simd_dispatch<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    c: &mut MatMut<'_, T>,
+) -> bool {
+    use core::any::TypeId;
+
+    let m = a.nrows();
+    let k = a.ncols();
+    let n = b.ncols();
+
+    // The NEON kernels need at least one full 4x4 tile, unit row-to-row
+    // strides (plain column-major A and B; `MatMut` always has them) and
+    // consistent shapes, because they address the operands through raw
+    // pointers.
+    let eligible = m >= 4
+        && n >= 4
+        && a.col_stride() == 1
+        && b.col_stride() == 1
+        && b.nrows() == k
+        && c.nrows() == m
+        && c.ncols() == n;
+    if !eligible {
+        return false;
+    }
+
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        // SAFETY: `T` is `f64` (identical `TypeId`s), so every cast below
+        // reinterprets a value as its own type. The rebuilt views keep the
+        // original pointers, shapes and leading dimensions; the unit
+        // row-to-row stride implied by `MatRef::new`/`MatMut::new` is exact
+        // because `col_stride() == 1` was checked above. Exclusive access to C
+        // is inherited from `c: &mut MatMut`, and no view outlives this block.
+        unsafe {
+            let a64 = MatRef::<f64>::new(a.as_ptr().cast::<f64>(), m, k, a.row_stride());
+            let b64 = MatRef::<f64>::new(b.as_ptr().cast::<f64>(), k, n, b.row_stride());
+            let mut c64 = MatMut::<f64>::new(c.as_mut_ptr().cast::<f64>(), m, n, c.row_stride());
+            let alpha64 = *(&raw const alpha).cast::<f64>();
+            gemm_small_f64_simd(alpha64, &a64, &b64, &mut c64);
+        }
+        return true;
+    }
+
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        // SAFETY: as above, with `T` being `f32`.
+        unsafe {
+            let a32 = MatRef::<f32>::new(a.as_ptr().cast::<f32>(), m, k, a.row_stride());
+            let b32 = MatRef::<f32>::new(b.as_ptr().cast::<f32>(), k, n, b.row_stride());
+            let mut c32 = MatMut::<f32>::new(c.as_mut_ptr().cast::<f32>(), m, n, c.row_stride());
+            let alpha32 = *(&raw const alpha).cast::<f32>();
+            gemm_small_f32_simd(alpha32, &a32, &b32, &mut c32);
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Portable small GEMM accumulation: `C += alpha * A * B` (no beta).
+///
+/// Dispatches to the size-specialized loops; operands are read through the
+/// view's `Index`, so arbitrary strides (e.g. transposed views) are honoured.
+fn gemm_small_acc<T: Field>(alpha: T, a: &MatRef<'_, T>, b: &MatRef<'_, T>, c: &mut MatMut<'_, T>) {
+    let m = a.nrows();
+    let k = a.ncols();
+    let n = b.ncols();
 
     // Dispatch to size-specific implementations
     // For very small matrices, use fully unrolled versions
@@ -361,7 +446,16 @@ fn gemm_small_general<T: Field>(
     }
 }
 
-/// SIMD-optimized small GEMM for f64 (when NEON or AVX2 is available).
+/// NEON (aarch64) small GEMM for f64: `C += alpha * A * B`.
+///
+/// Beta is handled by the caller (see [`gemm_small`]); C is accumulated into,
+/// never overwritten. Operands that are not plain column-major
+/// (`col_stride() != 1`) and very small problems take the portable loops.
+///
+/// # Panics
+///
+/// Panics if `B.nrows != A.ncols`, `C.nrows != A.nrows` or
+/// `C.ncols != B.ncols`.
 #[cfg(target_arch = "aarch64")]
 pub fn gemm_small_f64_simd(
     alpha: f64,
@@ -373,15 +467,22 @@ pub fn gemm_small_f64_simd(
     let k = a.ncols();
     let n = b.ncols();
 
+    // The NEON tiles address A, B and C through raw pointers, so the shapes
+    // must be consistent.
+    assert_eq!(b.nrows(), k, "B.nrows must equal A.ncols");
+    assert_eq!(c.nrows(), m, "C.nrows must equal A.nrows");
+    assert_eq!(c.ncols(), n, "C.ncols must equal B.ncols");
+
     // Handle beta scaling is done by caller
 
     if alpha == 0.0 {
         return;
     }
 
-    // For very small matrices, SIMD overhead isn't worth it
-    if m * n * k < 64 {
-        gemm_small(alpha, a, b, 0.0, c);
+    // For very small matrices SIMD overhead isn't worth it, and the tiles
+    // assume unit row-to-row strides (column-major A and B).
+    if m * n * k < 64 || a.col_stride() != 1 || b.col_stride() != 1 {
+        gemm_small_acc(alpha, a, b, c);
         return;
     }
 
@@ -396,6 +497,11 @@ pub fn gemm_small_f64_simd(
 
             if im == MR && jn == NR {
                 // Full 4x4 block - use SIMD
+                // SAFETY: the tile is full (`ib + 4 <= m`, `jb + 4 <= n`), the
+                // shapes were asserted above and A/B have unit row-to-row
+                // strides, so every element the kernel reads (A[ib..ib+4, ..k],
+                // B[..k, jb..jb+4]) and writes (C[ib..ib+4, jb..jb+4]) lies in
+                // its view.
                 unsafe {
                     gemm_4x4_neon(alpha, a, b, c, ib, jb, k);
                 }
@@ -421,7 +527,14 @@ pub fn gemm_small_f64_simd(
     }
 }
 
-/// 4x4 NEON kernel for f64.
+/// 4x4 NEON kernel for f64:
+/// `C[i..i+4, j..j+4] += alpha * A[i..i+4, ..k] * B[..k, j..j+4]`.
+///
+/// # Safety
+///
+/// `i + 4 <= A.nrows == C.nrows`, `j + 4 <= B.ncols == C.ncols`,
+/// `k == A.ncols == B.nrows`, and A and B must have unit row-to-row stride
+/// (`col_stride() == 1`).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn gemm_4x4_neon(
@@ -532,7 +645,15 @@ unsafe fn gemm_4x4_neon(
     *c_col3.add(3) += tmp[1];
 }
 
-/// SIMD-optimized small GEMM for f32 (when NEON or AVX2 is available).
+/// NEON (aarch64) small GEMM for f32: `C += alpha * A * B`.
+///
+/// See [`gemm_small_f64_simd`]: beta is handled by the caller, and strided or
+/// very small operands take the portable loops.
+///
+/// # Panics
+///
+/// Panics if `B.nrows != A.ncols`, `C.nrows != A.nrows` or
+/// `C.ncols != B.ncols`.
 #[cfg(target_arch = "aarch64")]
 pub fn gemm_small_f32_simd(
     alpha: f32,
@@ -544,13 +665,20 @@ pub fn gemm_small_f32_simd(
     let k = a.ncols();
     let n = b.ncols();
 
+    // The NEON tiles address A, B and C through raw pointers, so the shapes
+    // must be consistent.
+    assert_eq!(b.nrows(), k, "B.nrows must equal A.ncols");
+    assert_eq!(c.nrows(), m, "C.nrows must equal A.nrows");
+    assert_eq!(c.ncols(), n, "C.ncols must equal B.ncols");
+
     if alpha == 0.0 {
         return;
     }
 
-    // For very small matrices, SIMD overhead isn't worth it
-    if m * n * k < 64 {
-        gemm_small(alpha, a, b, 0.0, c);
+    // For very small matrices SIMD overhead isn't worth it, and the tiles
+    // assume unit row-to-row strides (column-major A and B).
+    if m * n * k < 64 || a.col_stride() != 1 || b.col_stride() != 1 {
+        gemm_small_acc(alpha, a, b, c);
         return;
     }
 
@@ -565,6 +693,10 @@ pub fn gemm_small_f32_simd(
 
             if im == MR && jn == NR {
                 // Full 4x4 block - use SIMD
+                // SAFETY: the tile is full (`ib + 4 <= m`, `jb + 4 <= n`), the
+                // shapes were asserted above and A/B have unit row-to-row
+                // strides, so every element the kernel reads and writes lies
+                // in its view.
                 unsafe {
                     gemm_4x4_neon_f32(alpha, a, b, c, ib, jb, k);
                 }
@@ -590,7 +722,12 @@ pub fn gemm_small_f32_simd(
     }
 }
 
-/// 4x4 NEON kernel for f32.
+/// 4x4 NEON kernel for f32 (same contract as [`gemm_4x4_neon`]).
+///
+/// # Safety
+///
+/// `i + 4 <= A.nrows == C.nrows`, `j + 4 <= B.ncols == C.ncols`,
+/// `k == A.ncols == B.nrows`, and A and B must have unit row-to-row stride.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn gemm_4x4_neon_f32(
@@ -683,6 +820,8 @@ unsafe fn gemm_4x4_neon_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_traits::ToPrimitive;
+    use oxiblas_core::scalar::Scalar;
     use oxiblas_matrix::Mat;
 
     #[test]
@@ -845,6 +984,184 @@ mod tests {
         for i in 0..n {
             for j in 0..n {
                 assert!((c[(i, j)] - n as f32).abs() < 1e-5);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #16 (cause 3): `gemm_small` dispatches to the SIMD kernels.
+    // These tests pin down the full alpha/beta contract of `gemm_small`
+    // (including the reference-BLAS rule that A/B are not read when
+    // alpha == 0 and C is not read when beta == 0) against an independent
+    // naive reference, for sizes on both sides of the 4x4 SIMD tile and
+    // for strided (transposed-view) operands that must take the generic path.
+    // ------------------------------------------------------------------
+
+    /// Deterministic, non-symmetric fill in roughly [-1, 1].
+    fn pattern<T: Field + bytemuck::Zeroable>(rows: usize, cols: usize, seed: usize) -> Mat<T> {
+        let mut m: Mat<T> = Mat::zeros(rows, cols);
+        for j in 0..cols {
+            for i in 0..rows {
+                let v = ((i * 7 + j * 13 + seed * 5) % 23) as f64 / 11.0 - 1.0;
+                m[(i, j)] = T::from_f64(v).unwrap_or_else(T::zero);
+            }
+        }
+        m
+    }
+
+    /// Naive `alpha * A * B + beta * C` honouring the BLAS zero rules.
+    fn reference<T: Field + bytemuck::Zeroable>(
+        alpha: T,
+        a: &MatRef<'_, T>,
+        b: &MatRef<'_, T>,
+        beta: T,
+        c: &Mat<T>,
+    ) -> Mat<T> {
+        let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
+        let mut out: Mat<T> = Mat::zeros(m, n);
+        for j in 0..n {
+            for i in 0..m {
+                let mut acc = T::zero();
+                if alpha != T::zero() {
+                    for p in 0..k {
+                        acc += a[(i, p)] * b[(p, j)];
+                    }
+                }
+                let scaled = if alpha == T::zero() {
+                    T::zero()
+                } else {
+                    alpha * acc
+                };
+                out[(i, j)] = if beta == T::zero() {
+                    scaled
+                } else {
+                    scaled + beta * c[(i, j)]
+                };
+            }
+        }
+        out
+    }
+
+    fn check_gemm_small_contract<T: Field + bytemuck::Zeroable>(tol: f64) {
+        let nan = T::from_f64(f64::NAN).unwrap_or_else(T::zero);
+        let sizes = [
+            (2usize, 2usize, 3usize),
+            (3, 5, 4),
+            (4, 4, 1),
+            (4, 4, 2),
+            (4, 4, 4),
+            (5, 7, 3),
+            (8, 8, 8),
+            (13, 6, 11),
+            (16, 16, 16),
+            (17, 9, 20),
+            (32, 32, 32),
+        ];
+        let minus_two = T::from_f64(-2.0).unwrap_or_else(T::zero);
+        let half = T::from_f64(0.5).unwrap_or_else(T::zero);
+        for &(m, k, n) in &sizes {
+            for &alpha in &[T::zero(), T::one(), minus_two] {
+                for &beta in &[T::zero(), T::one(), half] {
+                    // alpha == 0 poisons A/B, beta == 0 poisons C: neither may
+                    // reach the result.
+                    let (a, b) = if alpha == T::zero() {
+                        (Mat::filled(m, k, nan), Mat::filled(k, n, nan))
+                    } else {
+                        (pattern::<T>(m, k, 1), pattern::<T>(k, n, 2))
+                    };
+                    let c_init = if beta == T::zero() {
+                        Mat::filled(m, n, nan)
+                    } else {
+                        pattern::<T>(m, n, 3)
+                    };
+                    let expected = reference(alpha, &a.as_ref(), &b.as_ref(), beta, &c_init);
+
+                    // Contiguous operands (SIMD-eligible when m, n >= 4).
+                    let mut c = c_init.clone();
+                    gemm_small(alpha, &a.as_ref(), &b.as_ref(), beta, &mut c.as_mut());
+                    assert_close(&c, &expected, tol, m, k, n);
+
+                    // Strided transposed views (col_stride != 1): generic path.
+                    let mut a_store: Mat<T> = Mat::zeros(k, m);
+                    let mut b_store: Mat<T> = Mat::zeros(n, k);
+                    for j in 0..k {
+                        for i in 0..m {
+                            a_store[(j, i)] = a[(i, j)];
+                        }
+                    }
+                    for j in 0..n {
+                        for i in 0..k {
+                            b_store[(j, i)] = b[(i, j)];
+                        }
+                    }
+                    let a_view = a_store.as_ref().transpose();
+                    let b_view = b_store.as_ref().transpose();
+                    let mut c = c_init.clone();
+                    gemm_small(alpha, &a_view, &b_view, beta, &mut c.as_mut());
+                    assert_close(&c, &expected, tol, m, k, n);
+                }
+            }
+        }
+    }
+
+    fn assert_close<T: Field>(
+        got: &Mat<T>,
+        expected: &Mat<T>,
+        tol: f64,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        for j in 0..n {
+            for i in 0..m {
+                let (g, e) = (got[(i, j)], expected[(i, j)]);
+                let err = Scalar::abs(g - e).to_f64().unwrap_or(f64::NAN);
+                let scale = Scalar::abs(e).to_f64().unwrap_or(f64::NAN).max(1.0);
+                assert!(
+                    err <= tol * scale,
+                    "{m}x{k}x{n} ({i},{j}): got {g} expected {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_16_gemm_small_matches_reference_f64() {
+        check_gemm_small_contract::<f64>(1e-12);
+    }
+
+    #[test]
+    fn test_issue_16_gemm_small_matches_reference_f32() {
+        check_gemm_small_contract::<f32>(1e-5);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_issue_16_simd_small_kernels_accumulate_into_c() {
+        // The SIMD kernels compute C += alpha * A * B ("beta handled by the
+        // caller"). Their tiny path (m*n*k < 64) used to call
+        // gemm_small(.., beta = 0, ..), zero-filling C instead.
+        for &(m, k, n) in &[(4usize, 2usize, 4usize), (4, 3, 5), (8, 8, 8), (6, 5, 7)] {
+            let a: Mat<f64> = Mat::filled(m, k, 1.0);
+            let b: Mat<f64> = Mat::filled(k, n, 1.0);
+            let mut c: Mat<f64> = Mat::filled(m, n, 1.0);
+            gemm_small_f64_simd(2.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
+            let expected = 1.0 + 2.0 * k as f64;
+            for j in 0..n {
+                for i in 0..m {
+                    assert_eq!(c[(i, j)], expected, "f64 {m}x{k}x{n} ({i},{j})");
+                }
+            }
+
+            let a: Mat<f32> = Mat::filled(m, k, 1.0);
+            let b: Mat<f32> = Mat::filled(k, n, 1.0);
+            let mut c: Mat<f32> = Mat::filled(m, n, 1.0);
+            gemm_small_f32_simd(2.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
+            let expected = 1.0 + 2.0 * k as f32;
+            for j in 0..n {
+                for i in 0..m {
+                    assert_eq!(c[(i, j)], expected, "f32 {m}x{k}x{n} ({i},{j})");
+                }
             }
         }
     }

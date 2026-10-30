@@ -38,7 +38,10 @@ impl std::error::Error for SyrError {}
 /// Performs the symmetric rank-1 update: A = alpha * x * x^T + A
 ///
 /// Only the specified triangle (upper or lower) of A is accessed and modified.
-/// The other triangle is not referenced.
+/// The other triangle is not referenced. As in reference BLAS `?syr`, column `j`
+/// is updated as `A[i,j] += x[i] * (alpha * x[j])`, and a column with
+/// `x[j] == 0` is skipped entirely, so an infinite or NaN `x[i]` cannot reach it
+/// as `x[i] * 0`. If `n == 0` or `alpha == 0` the matrix is left untouched.
 ///
 /// # Arguments
 ///
@@ -92,8 +95,15 @@ pub fn syr<T: Real>(uplo: SyrUplo, alpha: T, x: &[T], a: MatMut<'_, T>) -> Resul
         SyrUplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * x[i] * x[j] for i >= j
             for j in 0..n {
+                // Reference ?SYR skips the column when x(j) == 0, so an infinite
+                // or NaN x(i) cannot reach it as `x(i) * (alpha * 0)`.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in j..n {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i, j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         *ptr += alpha_xj * x[i];
@@ -104,8 +114,14 @@ pub fn syr<T: Real>(uplo: SyrUplo, alpha: T, x: &[T], a: MatMut<'_, T>) -> Resul
         SyrUplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * x[i] * x[j] for i <= j
             for j in 0..n {
+                // Column skip for x(j) == 0, as in the lower branch.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in 0..=j {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i <= j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         *ptr += alpha_xj * x[i];
@@ -316,5 +332,47 @@ mod tests {
         assert!((a[(0, 0)] + 1.0).abs() < 1e-10); // -1*1
         assert!((a[(1, 0)] + 2.0).abs() < 1e-10); // -2*1
         assert!((a[(1, 1)] + 4.0).abs() < 1e-10); // -2*2
+    }
+
+    /// Issue #14: reference ?SYR skips column `j` when `x(j) == 0`, so an infinite
+    /// `x(i)` cannot reach it as `x(i) * (alpha * 0) = NaN`.
+    #[test]
+    fn test_issue_14_syr_zero_column_skip() {
+        let inf = f64::INFINITY;
+
+        // Lower: column 0 (x0 == 0) holds row 1, where x1 is infinite.
+        let x = [0.0, inf, 2.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 9.0, 9.0], &[0.5, 2.0, 9.0], &[0.25, 0.75, 3.0]]);
+        let before = a.clone();
+        syr(SyrUplo::Lower, 1.5, &x, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 0)].to_bits(),
+                before[(i, 0)].to_bits(),
+                "Lower ({i},0)"
+            );
+        }
+        // Column 1: temp = 1.5 * Inf, so A11 and A21 become Inf.
+        assert_eq!(a[(1, 1)], inf);
+        assert_eq!(a[(2, 1)], inf);
+        assert_eq!(a[(2, 2)], 3.0 + (1.5 * 2.0) * 2.0);
+        assert_eq!((a[(0, 1)], a[(0, 2)], a[(1, 2)]), (9.0, 9.0, 9.0));
+
+        // Upper: column 2 (x2 == -0) holds row 1, where x1 is infinite.
+        let x = [2.0, inf, -0.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 0.5, 0.25], &[9.0, 2.0, 0.75], &[9.0, 9.0, 3.0]]);
+        let before = a.clone();
+        syr(SyrUplo::Upper, 1.5, &x, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 2)].to_bits(),
+                before[(i, 2)].to_bits(),
+                "Upper ({i},2)"
+            );
+        }
+        assert_eq!(a[(0, 1)], inf);
+        assert_eq!(a[(1, 1)], inf);
+        assert_eq!(a[(0, 0)], 1.0 + (1.5 * 2.0) * 2.0);
+        assert_eq!((a[(1, 0)], a[(2, 0)], a[(2, 1)]), (9.0, 9.0, 9.0));
     }
 }

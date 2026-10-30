@@ -995,9 +995,24 @@ fn execute_single_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
 ) {
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0, so skip the
+        // transposed copies as well and only apply beta.
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
+}
+
+/// `C = beta * C`, never reading C when `beta == 0` (the `alpha == 0` exit).
+fn scale_by_beta<T: Field>(c: &mut MatMut<'_, T>, beta: T) {
+    if beta == T::zero() {
+        c.fill_zero();
+    } else if beta != T::one() {
+        c.scale(beta);
+    }
 }
 
 /// Executes a single `Complex64` GEMM with optional (conjugate) transpose on
@@ -1016,6 +1031,10 @@ fn execute_single_gemm_c64(
     beta: Complex64,
     c: &mut MatMut<'_, Complex64>,
 ) {
+    if alpha == Complex64::new(0.0, 0.0) {
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm3m_c64(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
@@ -1033,6 +1052,10 @@ fn execute_single_gemm_c32(
     beta: Complex32,
     c: &mut MatMut<'_, Complex32>,
 ) {
+    if alpha == Complex32::new(0.0, 0.0) {
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm3m_c32(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());

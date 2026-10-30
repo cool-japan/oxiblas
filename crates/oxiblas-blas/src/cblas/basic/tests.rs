@@ -143,10 +143,56 @@ fn test_dscal_positive_strided() {
 }
 
 #[test]
-fn test_dnrm2_negative_incx_is_zero() {
+fn test_issue_10_dnrm2_negative_incx_walks_backwards() {
+    // Netlib >= 3.10 (`dnrm2.f90`) accepts incx < 0: the walk starts at
+    // offset (1 - n) * incx and steps backwards. The pre-3.10 rule (return 0)
+    // no longer matches the reference.
     let x = [3.0f64, 4.0];
     let got = unsafe { cblas_dnrm2(2, x.as_ptr(), -1) };
-    assert_eq!(got, 0.0);
+    assert_eq!(got, 5.0);
+    // Reporter's case: dnrm2(1, [0.326], -1) == 0.326.
+    let single = [0.326f64];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    assert_eq!(unsafe { cblas_dnrm2(1, single.as_ptr(), -1) }, 0.326);
+    // A longer non-palindromic vector: same set of elements as forward.
+    let y = [1.0f64, 9.0, -2.0, 9.0, 3.0];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let backward = unsafe { cblas_dnrm2(3, y.as_ptr(), -2) };
+    assert!((backward - 14.0f64.sqrt()).abs() < EPS, "got {backward}");
+}
+
+#[test]
+fn test_issue_10_dnrm2_zero_incx_is_sqrt_n_abs_x0() {
+    // incx == 0 reads x[0] on every iteration: sqrt(n) * |x[0]|.
+    let x = [-3.0f64, 100.0];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    assert_eq!(unsafe { cblas_dnrm2(4, x.as_ptr(), 0) }, 6.0);
+    // Scaled accumulation: x[0]^2 overflows, the norm does not.
+    let big = [1e300f64];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let got = unsafe { cblas_dnrm2(4, big.as_ptr(), 0) };
+    assert!((got - 2e300).abs() / 2e300 < EPS, "got {got}");
+}
+
+#[test]
+fn test_issue_10_snrm2_zero_incx_is_sqrt_n_abs_x0() {
+    let x = [-3.0f32, 100.0];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    assert_eq!(unsafe { cblas_snrm2(4, x.as_ptr(), 0) }, 6.0);
+    let big = [1e30f32];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let got = unsafe { cblas_snrm2(9, big.as_ptr(), 0) };
+    assert!((got - 3e30).abs() / 3e30 < EPS_F32, "got {got}");
+}
+
+#[test]
+fn test_issue_10_dnrm2_negative_incx_large_no_overflow() {
+    let x = [1e300f64, 0.0, -1e300, 0.0, 1e300];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let got = unsafe { cblas_dnrm2(3, x.as_ptr(), -2) };
+    let expected = 3.0f64.sqrt() * 1e300;
+    assert!(got.is_finite(), "norm overflowed to {got}");
+    assert!((got - expected).abs() / expected < EPS);
 }
 
 #[test]
@@ -158,7 +204,7 @@ fn test_dnrm2_strided() {
 
 #[test]
 fn test_dnrm2_strided_no_overflow() {
-    // Blue's scaled accumulation must not overflow where a naive Σx² would.
+    // The scaled accumulation must not overflow where a naive Σx² would.
     // Squaring 1e200 overflows f64, but ||[1e200, 1e200]||_2 = √2·1e200.
     let x = [1e200f64, 0.0, 1e200, 0.0];
     let got = unsafe { cblas_dnrm2(2, x.as_ptr(), 2) };
@@ -205,16 +251,18 @@ fn test_idamax_strided() {
     assert_eq!(got, 1);
 }
 
-// ---- Level 1: null-pointer / zero-increment guards ---------------------
+// ---- Level 1: null-pointer guards / zero-increment semantics -----------
 //
-// Wave 1 hardened level2_real.rs / complex_level1.rs / complex_level2.rs /
-// hermitian.rs / triangular_symmetric.rs with `is_null()` and `inc_valid()`
-// checks; ddot..sswap (this file) were the one Level-1 family still missing
-// them. Every fast/strided path below unconditionally dereferences its
-// pointer(s), so without the guard a null pointer or a zero increment
-// reaching it is an instant out-of-bounds/UB access — these tests would
-// crash the test binary (value-returning routines: silently return a wrong,
+// Every fast/strided path below unconditionally dereferences its pointer(s),
+// so a null pointer must be rejected up front — these tests would crash the
+// test binary (value-returning routines: silently return a wrong,
 // non-identity result) if the corresponding guard were ever removed.
+//
+// A zero increment, on the other hand, is *valid* for the Level-1 routines
+// (issue #10): Netlib 3.12 runs its usual loop with `ix += 0`, so every
+// iteration reuses x[0] (resp. y[0]). LAPACK relies on this, e.g.
+// `dcopy(n, zero, 0, x, 1)` to broadcast a scalar. Only the Level-2 routines
+// reject `inc == 0` (via `validate::inc_valid`).
 
 #[test]
 fn test_ddot_null_x_returns_identity() {
@@ -231,11 +279,16 @@ fn test_ddot_null_y_returns_identity() {
 }
 
 #[test]
-fn test_ddot_zero_incx_returns_identity() {
-    let x = [1.0f64, 2.0, 3.0];
+fn test_issue_10_ddot_zero_incx_reuses_x0() {
+    // incx == 0: every term uses x[0] -> x[0] * (y0 + y1 + y2).
+    let x = [2.0f64, 100.0, 100.0];
     let y = [1.0f64, 2.0, 3.0];
     let got = unsafe { cblas_ddot(3, x.as_ptr(), 0, y.as_ptr(), 1) };
-    assert_eq!(got, 0.0);
+    assert_eq!(got, 12.0);
+    // Both increments zero: n * x[0] * y[0].
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let got = unsafe { cblas_ddot(3, x.as_ptr(), 0, y.as_ptr(), 0) };
+    assert_eq!(got, 6.0);
 }
 
 #[test]
@@ -246,11 +299,15 @@ fn test_sdot_null_x_returns_identity() {
 }
 
 #[test]
-fn test_sdot_zero_incy_returns_identity() {
+fn test_issue_10_sdot_zero_incy_reuses_y0() {
     let x = [1.0f32, 2.0, 3.0];
-    let y = [1.0f32, 2.0, 3.0];
+    let y = [2.0f32, 50.0, 50.0];
     let got = unsafe { cblas_sdot(3, x.as_ptr(), 1, y.as_ptr(), 0) };
-    assert_eq!(got, 0.0);
+    assert_eq!(got, 12.0);
+    // Mixed with a negative increment on x: (x2 + x1 + x0) * y0.
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    let got = unsafe { cblas_sdot(3, x.as_ptr(), -1, y.as_ptr(), 0) };
+    assert_eq!(got, 12.0);
 }
 
 #[test]
@@ -266,10 +323,13 @@ fn test_snrm2_null_x_is_zero() {
 }
 
 #[test]
-fn test_snrm2_negative_incx_is_zero() {
+fn test_issue_10_snrm2_negative_incx_walks_backwards() {
     let x = [3.0f32, 4.0];
     let got = unsafe { cblas_snrm2(2, x.as_ptr(), -1) };
-    assert_eq!(got, 0.0);
+    assert_eq!(got, 5.0);
+    let single = [0.326f32];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    assert_eq!(unsafe { cblas_snrm2(1, single.as_ptr(), -1) }, 0.326);
 }
 
 #[test]
@@ -345,11 +405,42 @@ fn test_daxpy_null_y_is_noop() {
 }
 
 #[test]
-fn test_daxpy_zero_incx_leaves_y_untouched() {
+fn test_issue_10_daxpy_zero_incx_reuses_x0() {
+    // incx == 0: y[i] += alpha * x[0] for every i.
     let x = [1.0f64, 2.0, 3.0];
     let mut y = [9.0f64, 9.0, 9.0];
     unsafe { cblas_daxpy(3, 2.0, x.as_ptr(), 0, y.as_mut_ptr(), 1) };
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(y, [11.0, 11.0, 11.0]);
+}
+
+#[test]
+fn test_issue_10_daxpy_alpha_zero_is_noop_for_every_stride() {
+    // Netlib DAXPY returns before touching y when alpha == 0, so neither a
+    // NaN/Inf in x nor the sign of a zero in y may change -- on every stride.
+    let x = [f64::NAN, f64::INFINITY, 1.0];
+    let y0 = [-0.0f64, 5.0, f64::NEG_INFINITY];
+    for &(n, incx, incy) in &[(3, 1, 1), (2, 2, 1), (3, 0, 1), (3, 1, 0), (3, -1, -1)] {
+        let mut y = y0;
+        // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+        unsafe { cblas_daxpy(n, 0.0, x.as_ptr(), incx, y.as_mut_ptr(), incy) };
+        for (got, want) in y.iter().zip(&y0) {
+            assert_eq!(got.to_bits(), want.to_bits(), "incx={incx}, incy={incy}");
+        }
+    }
+}
+
+#[test]
+fn test_issue_10_saxpy_alpha_zero_is_noop_for_every_stride() {
+    let x = [f32::NAN, f32::INFINITY, 1.0];
+    let y0 = [-0.0f32, 5.0, f32::NEG_INFINITY];
+    for &(n, incx, incy) in &[(3, 1, 1), (2, 2, 1), (3, 0, 1), (3, 1, 0), (3, -1, -1)] {
+        let mut y = y0;
+        // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+        unsafe { cblas_saxpy(n, 0.0, x.as_ptr(), incx, y.as_mut_ptr(), incy) };
+        for (got, want) in y.iter().zip(&y0) {
+            assert_eq!(got.to_bits(), want.to_bits(), "incx={incx}, incy={incy}");
+        }
+    }
 }
 
 #[test]
@@ -360,11 +451,12 @@ fn test_saxpy_null_x_leaves_y_untouched() {
 }
 
 #[test]
-fn test_saxpy_zero_incy_leaves_y_untouched() {
+fn test_issue_10_saxpy_zero_incy_accumulates_into_y0() {
+    // incy == 0: y[0] += alpha * x[i] for every i -> 9 + 2*(1+2+3).
     let x = [1.0f32, 2.0, 3.0];
     let mut y = [9.0f32, 9.0, 9.0];
     unsafe { cblas_saxpy(3, 2.0, x.as_ptr(), 1, y.as_mut_ptr(), 0) };
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(y, [21.0, 9.0, 9.0]);
 }
 
 #[test]
@@ -375,11 +467,22 @@ fn test_dcopy_null_x_leaves_y_untouched() {
 }
 
 #[test]
-fn test_dcopy_zero_incx_leaves_y_untouched() {
+fn test_issue_10_dcopy_zero_incx_broadcasts_x0() {
     let x = [1.0f64, 2.0, 3.0];
     let mut y = [9.0f64, 9.0, 9.0];
     unsafe { cblas_dcopy(3, x.as_ptr(), 0, y.as_mut_ptr(), 1) };
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(y, [1.0, 1.0, 1.0]);
+    // The LAPACK idiom `dcopy(n, zero, 0, v, 1)` clears a vector.
+    let zero = [0.0f64];
+    let mut v = [4.0f64, -5.0, 6.0, 7.0, 8.0];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_dcopy(5, zero.as_ptr(), 0, v.as_mut_ptr(), 1) };
+    assert_eq!(v, [0.0; 5]);
+    // ... including into a strided destination.
+    let mut w = [4.0f64, -5.0, 6.0, 7.0, 8.0];
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_dcopy(3, zero.as_ptr(), 0, w.as_mut_ptr(), -2) };
+    assert_eq!(w, [0.0, -5.0, 0.0, 7.0, 0.0]);
 }
 
 #[test]
@@ -389,11 +492,12 @@ fn test_scopy_null_y_is_noop() {
 }
 
 #[test]
-fn test_scopy_zero_incy_leaves_y_untouched() {
+fn test_issue_10_scopy_zero_incy_keeps_last_x() {
+    // incy == 0: y[0] is overwritten n times, ending with the last x.
     let x = [1.0f32, 2.0, 3.0];
     let mut y = [9.0f32, 9.0, 9.0];
     unsafe { cblas_scopy(3, x.as_ptr(), 1, y.as_mut_ptr(), 0) };
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(y, [3.0, 9.0, 9.0]);
 }
 
 #[test]
@@ -404,12 +508,14 @@ fn test_dswap_null_x_leaves_y_untouched() {
 }
 
 #[test]
-fn test_dswap_zero_incx_leaves_buffers_untouched() {
+fn test_issue_10_dswap_zero_incx_follows_reference_loop() {
+    // Reference loop: for i { tmp = x[0]; x[0] = y[i]; y[i] = tmp } -- the
+    // values rotate through x[0].
     let mut x = [1.0f64, 2.0, 3.0];
-    let mut y = [9.0f64, 9.0, 9.0];
+    let mut y = [10.0f64, 20.0, 30.0];
     unsafe { cblas_dswap(3, x.as_mut_ptr(), 0, y.as_mut_ptr(), 1) };
-    assert_eq!(x, [1.0, 2.0, 3.0]);
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(x, [30.0, 2.0, 3.0]);
+    assert_eq!(y, [1.0, 10.0, 20.0]);
 }
 
 #[test]
@@ -420,12 +526,12 @@ fn test_sswap_null_y_leaves_x_untouched() {
 }
 
 #[test]
-fn test_sswap_zero_incy_leaves_buffers_untouched() {
+fn test_issue_10_sswap_zero_incy_follows_reference_loop() {
     let mut x = [1.0f32, 2.0, 3.0];
-    let mut y = [9.0f32, 9.0, 9.0];
+    let mut y = [9.0f32, 8.0, 7.0];
     unsafe { cblas_sswap(3, x.as_mut_ptr(), 1, y.as_mut_ptr(), 0) };
-    assert_eq!(x, [1.0, 2.0, 3.0]);
-    assert_eq!(y, [9.0, 9.0, 9.0]);
+    assert_eq!(x, [9.0, 1.0, 2.0]);
+    assert_eq!(y, [3.0, 8.0, 7.0]);
 }
 
 // ---- Level 2: GEMV ----------------------------------------------------
@@ -573,17 +679,18 @@ fn test_cdotc_negative_incx() {
     assert!((got.im - expected.im).abs() < EPS_F32);
 }
 
-// ---- Complex dot products: null-pointer / zero-increment guards -------
+// ---- Complex dot products: null-pointer guards / zero increments ------
 //
 // `dotu`/`dotc` used to be dereferenced for the write unconditionally,
 // including on the `n <= 0` early-return path, with no null check anywhere
-// and no `x`/`y` null or increment validation on the main path either —
+// and no `x`/`y` null validation on the main path either —
 // `cblas_zdotu_sub(0, x, 1, y, 1, ptr::null_mut())` was a null-pointer
 // *write* on an otherwise spec-legal call. These pin the fix: a null
 // output pointer must be a true no-op (nothing left to write through), and
-// once the output pointer is valid, a null `x`/`y` or a zero increment
-// must still land the documented identity rather than reading through a
-// bad pointer.
+// once the output pointer is valid, a null `x`/`y` must still land the
+// documented identity rather than reading through a bad pointer. A zero
+// increment is valid (issue #10): every term then reuses x[0] (resp. y[0]),
+// exactly like Netlib's ZDOTU/ZDOTC loop.
 
 #[test]
 fn test_zdotu_sub_null_dotu_is_noop() {
@@ -618,12 +725,15 @@ fn test_zdotu_sub_null_x_writes_identity() {
 }
 
 #[test]
-fn test_zdotu_sub_zero_incx_writes_identity() {
-    let x = [Complex64::new(1.0, 1.0)];
-    let y = [Complex64::new(1.0, 1.0)];
+fn test_issue_10_zdotu_sub_zero_incx_reuses_x0() {
+    // incx == 0: x[0] * y[0] + x[0] * y[1] (x[1] is never read).
+    let x = [Complex64::new(1.0, 1.0), Complex64::new(99.0, 99.0)];
+    let y = [Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)];
     let mut got = Complex64::new(9.0, 9.0);
-    unsafe { cblas_zdotu_sub(1, x.as_ptr(), 0, y.as_ptr(), 1, &mut got) };
-    assert_eq!(got, Complex64::new(0.0, 0.0));
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_zdotu_sub(2, x.as_ptr(), 0, y.as_ptr(), 1, &mut got) };
+    assert_eq!(got, x[0] * y[0] + x[0] * y[1]);
+    assert_eq!(got, Complex64::new(3.0, 3.0));
 }
 
 #[test]
@@ -635,12 +745,25 @@ fn test_zdotc_sub_null_y_writes_identity() {
 }
 
 #[test]
-fn test_zdotc_sub_zero_incy_writes_identity() {
-    let x = [Complex64::new(1.0, 1.0)];
-    let y = [Complex64::new(1.0, 1.0)];
+fn test_issue_10_zdotc_sub_zero_incy_reuses_y0() {
+    let x = [Complex64::new(1.0, 1.0), Complex64::new(2.0, -1.0)];
+    let y = [Complex64::new(1.0, 1.0), Complex64::new(99.0, 99.0)];
     let mut got = Complex64::new(9.0, 9.0);
-    unsafe { cblas_zdotc_sub(1, x.as_ptr(), 1, y.as_ptr(), 0, &mut got) };
-    assert_eq!(got, Complex64::new(0.0, 0.0));
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_zdotc_sub(2, x.as_ptr(), 1, y.as_ptr(), 0, &mut got) };
+    assert_eq!(got, x[0].conj() * y[0] + x[1].conj() * y[0]);
+    assert_eq!(got, Complex64::new(3.0, 3.0));
+}
+
+#[test]
+fn test_issue_10_cdotu_sub_zero_incy_reuses_y0() {
+    let x = [Complex32::new(1.0, 1.0), Complex32::new(2.0, -1.0)];
+    let y = [Complex32::new(1.0, 1.0), Complex32::new(99.0, 99.0)];
+    let mut got = Complex32::new(9.0, 9.0);
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_cdotu_sub(2, x.as_ptr(), 1, y.as_ptr(), 0, &mut got) };
+    assert_eq!(got, x[0] * y[0] + x[1] * y[0]);
+    assert_eq!(got, Complex32::new(3.0, 3.0));
 }
 
 #[test]
@@ -667,12 +790,14 @@ fn test_cdotc_sub_null_y_writes_identity() {
 }
 
 #[test]
-fn test_cdotc_sub_zero_incx_writes_identity() {
-    let x = [Complex32::new(1.0, 1.0)];
-    let y = [Complex32::new(1.0, 1.0)];
+fn test_issue_10_cdotc_sub_zero_incx_reuses_x0() {
+    let x = [Complex32::new(1.0, 1.0), Complex32::new(99.0, 99.0)];
+    let y = [Complex32::new(1.0, 1.0), Complex32::new(2.0, -1.0)];
     let mut got = Complex32::new(9.0, 9.0);
-    unsafe { cblas_cdotc_sub(1, x.as_ptr(), 0, y.as_ptr(), 1, &mut got) };
-    assert_eq!(got, Complex32::new(0.0, 0.0));
+    // SAFETY: pointers are to live local buffers covering this (n, inc) walk.
+    unsafe { cblas_cdotc_sub(2, x.as_ptr(), 0, y.as_ptr(), 1, &mut got) };
+    assert_eq!(got, x[0].conj() * y[0] + x[0].conj() * y[1]);
+    assert_eq!(got, Complex32::new(3.0, -3.0));
 }
 
 // ---- Level 3: beta==0 with uninitialized C ---------------------------

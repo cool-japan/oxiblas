@@ -145,7 +145,9 @@ pub fn syrk<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Threshold: when GEMM overhead is amortized
     const GEMM_THRESHOLD: usize = 32;
 
-    if n >= GEMM_THRESHOLD && k >= 8 {
+    // alpha == 0 never reads A (reference ?SYRK: C := beta * C on the triangle), so it
+    // stays on the naive path instead of transposing A and handing it to GEMM.
+    if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
         syrk_via_gemm(uplo, trans, alpha, a, beta, c, n, k)
     } else {
         syrk_naive(uplo, trans, alpha, a, beta, c, n, k)

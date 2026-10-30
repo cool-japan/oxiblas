@@ -906,4 +906,34 @@ mod tests {
         assert!((b[(2, 0)] - 7.0).abs() < 1e-10);
         assert!((b[(2, 1)] - 14.0).abs() < 1e-10);
     }
+
+    // Issue #9 class: alpha == 0 zero-fills B without reading A or B (reference ?TRMM).
+    #[test]
+    fn test_issue_9_trmm_alpha_zero_zero_fills_without_reading_a_or_b() {
+        for side in [TrmmSide::Left, TrmmSide::Right] {
+            for uplo in [TrmmUplo::Lower, TrmmUplo::Upper] {
+                for trans in [TrmmTrans::NoTrans, TrmmTrans::Trans] {
+                    // B is 3x2; A is 3x3 (Left) or 2x2 (Right).
+                    let ka = if side == TrmmSide::Left { 3 } else { 2 };
+                    let a: Mat<f64> = Mat::filled(ka, ka, f64::NAN);
+                    let b: Mat<f64> = Mat::filled(3, 2, f64::INFINITY);
+                    let result = trmm(
+                        side,
+                        uplo,
+                        trans,
+                        TrmmDiag::NonUnit,
+                        0.0,
+                        a.as_ref(),
+                        b.as_ref(),
+                    )
+                    .expect("shapes are consistent");
+                    for j in 0..2 {
+                        for i in 0..3 {
+                            assert!(result[(i, j)] == 0.0, "{side:?}/{uplo:?}/{trans:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

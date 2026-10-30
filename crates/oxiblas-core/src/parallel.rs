@@ -44,7 +44,19 @@ pub enum Par {
     /// Parallel execution with the default thread pool.
     #[cfg(feature = "parallel")]
     Rayon,
-    /// Parallel execution with a specific number of threads.
+    /// Parallel execution partitioned for a specific number of threads.
+    ///
+    /// `n` is the thread count that [`Par::num_threads`] reports. The
+    /// `oxiblas-blas` drivers that take a `Par` use it in their parallel gate
+    /// and, in GEMV and GEMM, to size the work partition (for GEMM also the
+    /// tile grid), but they execute on the ambient rayon pool, as do the
+    /// parallel `oxiblas-lapack` drivers, so `n` does not bound the number of
+    /// threads that run. To bound it, run the call inside
+    /// `rayon::ThreadPool::install` or set `RAYON_NUM_THREADS`.
+    ///
+    /// The helpers in this module that dispatch through the internal
+    /// `run_in_pool` ([`for_each_range`], [`map_reduce`] and
+    /// [`for_each_indexed`]) do install a cached pool of exactly `n` threads.
     #[cfg(feature = "parallel")]
     RayonWith(usize),
 }

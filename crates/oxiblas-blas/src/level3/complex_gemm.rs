@@ -56,8 +56,10 @@ pub fn gemm3m_c64(
         return;
     }
 
-    if k == 0 {
-        // C = beta * C
+    if k == 0 || alpha == Complex64::new(0.0, 0.0) {
+        // C = beta * C. When alpha == 0 reference BLAS reads neither A nor B,
+        // and when beta == 0 it does not read C: NaN/Inf in an ignored
+        // operand must not leak into the result.
         if beta == Complex64::new(0.0, 0.0) {
             for i in 0..m {
                 for j in 0..n {
@@ -134,16 +136,20 @@ pub fn gemm3m_c64(
     gemm(1.0f64, a_sum.as_ref(), b_sum.as_ref(), 0.0f64, k3.as_mut());
 
     // Combine results: real = k1 - k2, imag = k3 - k1 - k2
-    // C = alpha * (real + i*imag) + beta * C
+    // C = alpha * (real + i*imag) + beta * C (C is not read when beta == 0)
+    let beta_is_zero = beta == Complex64::new(0.0, 0.0);
     for i in 0..m {
         for j in 0..n {
             let real_part = k1[(i, j)] - k2[(i, j)];
             let imag_part = k3[(i, j)] - k1[(i, j)] - k2[(i, j)];
 
             let product = Complex64::new(real_part, imag_part);
-            let old_val = c[(i, j)];
 
-            c[(i, j)] = alpha * product + beta * old_val;
+            c[(i, j)] = if beta_is_zero {
+                alpha * product
+            } else {
+                alpha * product + beta * c[(i, j)]
+            };
         }
     }
 }
@@ -233,6 +239,8 @@ fn gemm3m_c64_naive(
     }
 
     // Combine results: real = k1 - k2, imag = k3 - k1 - k2
+    // (C is not read when beta == 0)
+    let beta_is_zero = beta == Complex64::new(0.0, 0.0);
     for i in 0..m {
         for j in 0..n {
             let idx = i * n + j;
@@ -240,9 +248,12 @@ fn gemm3m_c64_naive(
             let imag_part = k3[idx] - k1[idx] - k2[idx];
 
             let product = Complex64::new(real_part, imag_part);
-            let old_val = c[(i, j)];
 
-            c[(i, j)] = alpha * product + beta * old_val;
+            c[(i, j)] = if beta_is_zero {
+                alpha * product
+            } else {
+                alpha * product + beta * c[(i, j)]
+            };
         }
     }
 }
@@ -272,8 +283,9 @@ pub fn gemm3m_c32(
         return;
     }
 
-    if k == 0 {
-        // C = beta * C
+    if k == 0 || alpha == Complex32::new(0.0, 0.0) {
+        // C = beta * C. When alpha == 0 reference BLAS reads neither A nor B,
+        // and when beta == 0 it does not read C (see `gemm3m_c64`).
         if beta == Complex32::new(0.0, 0.0) {
             for i in 0..m {
                 for j in 0..n {
@@ -343,16 +355,20 @@ pub fn gemm3m_c32(
     gemm(1.0f32, a_im.as_ref(), b_im.as_ref(), 0.0f32, k2.as_mut());
     gemm(1.0f32, a_sum.as_ref(), b_sum.as_ref(), 0.0f32, k3.as_mut());
 
-    // Combine results
+    // Combine results (C is not read when beta == 0)
+    let beta_is_zero = beta == Complex32::new(0.0, 0.0);
     for i in 0..m {
         for j in 0..n {
             let real_part = k1[(i, j)] - k2[(i, j)];
             let imag_part = k3[(i, j)] - k1[(i, j)] - k2[(i, j)];
 
             let product = Complex32::new(real_part, imag_part);
-            let old_val = c[(i, j)];
 
-            c[(i, j)] = alpha * product + beta * old_val;
+            c[(i, j)] = if beta_is_zero {
+                alpha * product
+            } else {
+                alpha * product + beta * c[(i, j)]
+            };
         }
     }
 }
@@ -403,7 +419,9 @@ fn gemm3m_c32_naive(
         b_sum[i] = b_re[i] + b_im[i];
     }
 
-    // Three real matrix multiplications (fused for better cache usage)
+    // Three real matrix multiplications (fused for better cache usage);
+    // C is not read when beta == 0.
+    let beta_is_zero = beta == Complex32::new(0.0, 0.0);
     for i in 0..m {
         for j in 0..n {
             let mut sum1 = 0.0f32;
@@ -419,9 +437,12 @@ fn gemm3m_c32_naive(
             let imag_part = sum3 - sum1 - sum2;
 
             let product = Complex32::new(real_part, imag_part);
-            let old_val = c[(i, j)];
 
-            c[(i, j)] = alpha * product + beta * old_val;
+            c[(i, j)] = if beta_is_zero {
+                alpha * product
+            } else {
+                alpha * product + beta * c[(i, j)]
+            };
         }
     }
 }
@@ -624,5 +645,103 @@ mod tests {
         // C[0,0] = 2*(2+i) + 3*(1+i) = (4+2i) + (3+3i) = 7+5i
         assert!((c[(0, 0)].re - 7.0).abs() < 1e-10);
         assert!((c[(0, 0)].im - 5.0).abs() < 1e-10);
+    }
+
+    // Issue #9: alpha == 0 must not read A/B and beta == 0 must not read C.
+    // n = 3 takes the naive 3M path, n = 40 the blocked 3M path.
+
+    #[test]
+    fn test_issue_9_gemm3m_alpha_zero_ignores_nan_operands() {
+        for &n in &[3usize, 40] {
+            let a = Mat::filled(n, n, Complex64::new(f64::NAN, f64::NAN));
+            let b = Mat::filled(n, n, Complex64::new(f64::INFINITY, 1.0));
+            let mut c = Mat::filled(n, n, Complex64::new(2.0, -1.0));
+            gemm3m_c64(
+                Complex64::new(0.0, 0.0),
+                a.as_ref(),
+                b.as_ref(),
+                Complex64::new(0.5, 0.0),
+                c.as_mut(),
+            );
+            for j in 0..n {
+                for i in 0..n {
+                    assert_eq!(c[(i, j)], Complex64::new(1.0, -0.5), "c64 n={n} ({i},{j})");
+                }
+            }
+
+            let mut c = Mat::filled(n, n, Complex64::new(f64::NAN, f64::NAN));
+            gemm3m_c64(
+                Complex64::new(0.0, 0.0),
+                a.as_ref(),
+                b.as_ref(),
+                Complex64::new(0.0, 0.0),
+                c.as_mut(),
+            );
+            for j in 0..n {
+                for i in 0..n {
+                    assert_eq!(c[(i, j)], Complex64::new(0.0, 0.0), "c64 beta=0 n={n}");
+                }
+            }
+
+            let a = Mat::filled(n, n, Complex32::new(f32::NAN, 0.0));
+            let b = Mat::filled(n, n, Complex32::new(1.0, f32::NEG_INFINITY));
+            let mut c = Mat::filled(n, n, Complex32::new(2.0, 4.0));
+            gemm3m_c32(
+                Complex32::new(0.0, 0.0),
+                a.as_ref(),
+                b.as_ref(),
+                Complex32::new(0.5, 0.0),
+                c.as_mut(),
+            );
+            for j in 0..n {
+                for i in 0..n {
+                    assert_eq!(c[(i, j)], Complex32::new(1.0, 2.0), "c32 n={n} ({i},{j})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_gemm3m_beta_zero_ignores_nan_c() {
+        // Reporter's case: A = B = ones(3), alpha = 1, C = NaN, beta = 0 -> 3 + 0i.
+        for &n in &[3usize, 40] {
+            let ones = Mat::filled(n, n, Complex64::new(1.0, 0.0));
+            let mut c = Mat::filled(n, n, Complex64::new(f64::NAN, f64::NAN));
+            gemm3m_c64(
+                Complex64::new(1.0, 0.0),
+                ones.as_ref(),
+                ones.as_ref(),
+                Complex64::new(0.0, 0.0),
+                c.as_mut(),
+            );
+            for j in 0..n {
+                for i in 0..n {
+                    assert_eq!(
+                        c[(i, j)],
+                        Complex64::new(n as f64, 0.0),
+                        "c64 n={n} ({i},{j})"
+                    );
+                }
+            }
+
+            let ones = Mat::filled(n, n, Complex32::new(1.0, 0.0));
+            let mut c = Mat::filled(n, n, Complex32::new(f32::NAN, f32::INFINITY));
+            gemm3m_c32(
+                Complex32::new(1.0, 0.0),
+                ones.as_ref(),
+                ones.as_ref(),
+                Complex32::new(0.0, 0.0),
+                c.as_mut(),
+            );
+            for j in 0..n {
+                for i in 0..n {
+                    assert_eq!(
+                        c[(i, j)],
+                        Complex32::new(n as f32, 0.0),
+                        "c32 n={n} ({i},{j})"
+                    );
+                }
+            }
+        }
     }
 }

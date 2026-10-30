@@ -7,6 +7,393 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.3] - Unreleased
 
+Fixes and additions for GitHub issues #4 and #6 through #16 (#16 only in part). The QZ
+decomposition is rewritten as a LAPACK `DGGES` equivalent, Level 1/2/3 and CBLAS
+behaviour is aligned with reference BLAS 3.12 (increments, `alpha == 0` and
+`beta == 0`, `crotg`), 78 CBLAS entry points and several Level-1 natives are added,
+and GEMM gets balanced blocking, a 2D parallel driver and aarch64 small-matrix
+kernels. No public item is removed or renamed and no signature changes; behaviour
+changes are listed under Fixed and Changed.
+
+### Added
+
+#### LAPACK
+
+- `Qz::compute_sorted` (`DGGES` with `SORT = 'S'`) and `Qz::reorder` (`DTGSEN` with
+  `IJOB = 0`) move the selected generalized eigenvalues to the leading positions of
+  the generalized Schur form. `select` sees the unscaled eigenvalues, and a complex
+  pair moves as a whole when either member is selected. `QzOrdering` (fields `sdim`
+  and `selection_changed`, i.e. `DGGES` `SDIM` and `INFO = N+2`) and
+  `QzReorderError { Qz(QzError), SwapFailed { position } }` are re-exported from
+  `oxiblas_lapack::evd`; both are `#[non_exhaustive]`, so read the fields of
+  `QzOrdering` and do not construct it. `SwapFailed` is `DTGSEN` `INFO = 1`
+  (`DGGES` `INFO = N+3`): `compute_sorted` then discards the factors and `reorder`
+  leaves the decomposition unchanged. Condition estimates (`IJOB != 0`) are not
+  implemented. If the internally scaled `A` and `B` still differ in norm by more than
+  about `1/eps`, every swap that moves a 2x2 block is rejected; pre-scale `A` or `B`
+  (see the `compute_sorted` docs). (#6)
+- Declared differences of `Qz::compute_sorted` and `Qz::reorder` from `DGGES` with
+  `SORT = 'S'` (#6):
+  - 2x2 blocks whose `T` diagonal comes out negative after a swap are sign-normalized
+    by negating the corresponding rows of `S` and `T` and columns of `Q`, an
+    extension of `DTGSEN`, which leaves them negative. `S`, `T` and `Q` can therefore
+    differ from Netlib by these sign flips; `Z`, `Q*S*Z^T`, `Q*T*Z^T` and the
+    eigenvalues are unaffected.
+  - `reorder` scales `S` and `T` into `[SMLNUM, BIGNUM]` around `DTGSEN` and unscales
+    with the `DGGES` guards, so they may change bitwise even when no swap is needed.
+  - After a rejected swap Netlib returns the partial factors, and its final check can
+    turn `INFO = N+3` into `N+2`; here `compute_sorted` discards the factors and
+    `reorder` restores `self`.
+  - The `DTGEX2` acceptance norms use the classical `DLASSQ` recurrence, which moves
+    the thresholds at the ulp level.
+  - We expect reference LAPACK to reject the same unbalanced pencils (see above); this
+    was derived by analysis and not checked against a LAPACK binary.
+
+#### BLAS
+
+- Level-1 natives in `oxiblas_blas::level1`, written from the Netlib 3.12 sources:
+  `cabs1` (previously crate-private), `scabs1`, `dcabs1`; the complex 2-norm `cnrm2`,
+  `scnrm2`, `dznrm2` and `cnrm2_strided`; `scal_real`, `csscal`, `zdscal` (complex
+  vector times a real scalar, componentwise, immediate return for `alpha == 1`, no
+  zero-fill for `alpha == 0`); `rotm_strided` and `zdrot_strided`. The strided forms
+  take positive, negative and zero increments. (#15)
+
+#### CBLAS
+
+- 78 reference CBLAS entry points (30 Level 1/3, 48 Level 2). Matrix routines work
+  in both layouts, a row-major call being mapped onto the column-major kernels as
+  netlib `cblas_*.c` does (flip `uplo`/`side`, swap `m`/`n`, toggle `Trans`,
+  conjugate where the reference does). The new Level-1 entry points with vector
+  arguments accept every increment (zero reuses element 0, a negative one starts at
+  `(1-n)*inc`), the new Level-2 ones reject `inc == 0` as a silent no-op, and quick
+  returns follow the reference. Finite results agree with a reference build to
+  rounding, not bit for bit. The crate now exports 152 `cblas_*` symbols (74 before):
+  every routine declared in netlib `cblas.h` 3.12.1 except the `cblas_xerbla` error
+  handler (3.12.0 lacks `?gemmtr`). Parameter counts and kinds match the header; the
+  deviations are listed below. (#14)
+  - Level 1 (16): `cblas_{s,d}rotg`, `cblas_{s,d}rotmg`, `cblas_{s,d}rot`,
+    `cblas_{s,d}rotm`, `cblas_{c,z}rotg`, `cblas_csrot`, `cblas_zdrot`,
+    `cblas_sdsdot`, `cblas_dsdot`, `cblas_scabs1`, `cblas_dcabs1`.
+  - Level 2 (48): `cblas_{s,d,c,z}gbmv`, `cblas_{s,d}sbmv`, `cblas_{c,z}hbmv`,
+    `cblas_{s,d,c,z}tbmv`, `cblas_{s,d,c,z}tbsv`, `cblas_{s,d}spmv`,
+    `cblas_{s,d}spr`, `cblas_{s,d}spr2`, `cblas_{c,z}hpmv`, `cblas_{c,z}hpr`,
+    `cblas_{c,z}hpr2`, `cblas_{s,d,c,z}tpmv`, `cblas_{s,d,c,z}tpsv`,
+    `cblas_{c,z}geru`, `cblas_{c,z}gerc`, `cblas_{c,z}her`, `cblas_{c,z}her2`,
+    `cblas_{c,z}trmv`, `cblas_{c,z}trsv`.
+  - Level 3 (14): `cblas_{s,d,c,z}gemmtr`, `cblas_{c,z}symm`, `cblas_{c,z}syrk`,
+    `cblas_{c,z}syr2k`, `cblas_{c,z}trmm`, `cblas_{c,z}trsm`.
+- Declared deviation: complex `cblas_{c,z}syrk` and `cblas_{c,z}syr2k` with
+  `ConjTrans` in column-major layout. Reference CBLAS forwards `'C'` to Fortran
+  `C/ZSYRK` and `C/ZSYR2K`, which reject it (`INFO = 2`), and `cblas_xerbla` then
+  terminates the process; here it is an invalid argument, a silent no-op that leaves
+  `C` untouched. In row-major layout `ConjTrans` maps to `'N'` exactly like `Trans`,
+  as in reference CBLAS 3.12.0 and 3.12.1. (#14)
+- Declared deviation: `cblas_?gemmtr` follows 3.12.1, the first release that ships
+  it. It adds the `?gemm`-style quick return `(alpha == 0 || k == 0) && beta == 1`
+  (`C` bitwise untouched), which ZGEMMTR 3.12.1 lacks: it returns early only for
+  `n == 0`, while the reference `?syrk`/`?syr2k` do have this quick return. Together
+  with the `k == 0 -> C := beta*C` shortcut of `?gemmtr`/`?syrk`/`?syr2k`, it
+  differs from the reference only in signed zeros, NaN or ±Inf `alpha` (with
+  `k == 0`) and, for complex `?gemmtr` with `beta == 1`, Inf components of `C`, which
+  the reference's `(1,0)*C` turns into NaN. (#14)
+- Other declared deviations of the CBLAS entry points (#14):
+  - There is no `cblas_xerbla`: invalid arguments and null pointers make the call a
+    silent no-op, and a null `A`/`B` is a no-op even when `alpha == 0` means it would
+    never be read, so `beta` is not applied in that case.
+  - The new Level-2 routines `?tbmv`, `?tbsv`, `?tpmv`, `?tpsv`, `?trmv` and `?trsv`,
+    and the existing real `?trmv`/`?trsv`, do not reproduce the reference's
+    per-column skip of a zero `x(j)` in their `NoTrans` forms. An Inf/NaN in `A`
+    facing a zero `x(j)` can therefore reach the result; finite results agree to
+    rounding. The rank updates do skip, like the reference.
+  - A `NonUnit` triangular solve (`?tbsv`, `?tpsv`, `?trsv`) stops at the first
+    exactly-zero diagonal entry it reaches and writes back the partially solved `x`.
+    Reference BLAS never stops. In the `NoTrans` forms it skips the division and the
+    column update while the current `x(j)` is exactly zero, which gives a finite
+    solution of a consistent singular system. Otherwise it divides by zero and
+    propagates Inf/NaN; the `Trans`/`ConjTrans` forms always divide.
+  - `rotmg` reproduces the 3.12.0/3.12.1 rescaling loops, in which a second rescale
+    pass resets `h12` and `h21` (netlib master fixed this).
+  - In row-major layout the conjugation paths can produce `+0.0` where reference
+    CBLAS produces `-0.0` in an imaginary part, or the reverse; the values compare
+    equal.
+  - `cblas_i{s,d,c,z}amax` return a 32-bit `int`, but `cblas.h` declares the return
+    type `CBLAS_INDEX` (`size_t`). These four entry points predate 0.2.3.
+  - The `layout`, `trans`, `uplo`, `side` and `diag` parameters of every Level-2 and
+    Level-3 entry point, new and old, are `#[repr(C)]` Rust enums carrying the
+    `cblas.h` values (101/102, 111-113, 121/122, 131/132, 141/142). A C caller that
+    passes any other value causes undefined behaviour, where reference CBLAS reports
+    it through `cblas_xerbla`. This predates 0.2.3 and also affects the existing
+    entry points.
+  - There is no `_64` (ILP64) API. The symbols are `#[no_mangle]` functions in the
+    `oxiblas-blas` rlib; this workspace builds no C-linkable library (`cdylib` or
+    `staticlib`).
+
+### Fixed
+
+- GEMM blocking no longer splits a dimension that fits in one block. Each
+  cache-derived block was clamped to its dimension and then rounded down to a
+  multiple of MR/NR, so f64 on the 8x6 kernel gave blocks `[252, 4]` for `n = 256`
+  and `[4092, 4]` for `n = 4096`, and rescaling already clamped values gave
+  `[168, 88]` for `4096x512x256`; every extra NC block re-packs all of `A`.
+  `compute_blocking`, `compute_blocking_adaptive` and `GemmBlocking::asymmetric` now
+  scale unclamped targets, and the GEMM core fits every blocking it receives
+  (`for_kernel` and `custom` included) with `balanced_block(dim, target, unit)`: a
+  dimension that fits is one block of exactly that size, a larger one is split into
+  the fewest near-equal blocks (multiples of MR for MC, NR for NC and 8 for KC).
+  Auto-tuned MC/KC/NC for f64 on the 8x6 kernel, with the cache sizes detected on an
+  Apple M3: (1024,1024,256) 832/441/252 -> 512/344/256; (4096,512,256)
+  1248/294/168 -> 1024/256/256; (64,64,4096) 40/64/4096 -> 64/64/4096; (2048,64,64)
+  1248/64/36 -> 1024/64/64. Sequential throughput of two rectangular shapes on an
+  Apple M3 is lower than before (64x64x4096 by about 10%, 37x4099x129 by 5-12%);
+  the drop is reproducible and not explained by the blocking change. (#4)
+- `Qz::compute` returned factors with `B != Q T Z^T`, a `T` that was not upper
+  triangular, wrong eigenvalues, `beta < 0`, and `NotConverged` for larger pencils
+  (for example `n = 12`) and for badly scaled ones; infinite eigenvalues were never
+  deflated. See Changed for the rewrite. (#6)
+- Row-major `cblas_{s,d}trsm` and `cblas_{s,d}trmm` were a silent no-op when
+  `m != n`: the order of `A` was taken from the flipped side together with the
+  unswapped `m`/`n`, the internal dimension check failed, and the wrapper dropped the
+  `Err` (`trsm` also left `B` scaled by `alpha`). The order of `A` now comes from the
+  caller's side. The other row-major Level-3 wrappers (`symm`, `syrk`, `syr2k`,
+  `hemm`, `herk`, `her2k`) were checked against a dense reference for `m != n` and
+  `n != k` and needed no change. (#7)
+- `trsm_c32` and `trsm_c32_in_place` divided by the unconjugated diagonal for
+  `Trans::ConjTrans` with `Diag::NonUnit`, at four sites in
+  `level3/trsm/complex32.rs` (the blocked path included); `trsm_c64` and the generic
+  `trsm` already conjugated it. (#8)
+- `alpha == 0` no longer reads `A`/`B` and `beta == 0` no longer reads `C` (reference
+  BLAS), so NaN/Inf in an ignored operand cannot reach the result in `gemm` and every
+  path behind it (small, blocked and parallel; `gemm_transposed*`,
+  `gemm_with_blocking`, `gemm_auto*`, `gemm_small`), `gemm3m_c64`/`gemm3m_c32` (and
+  with them `gemm_transposed_c64/c32` and HEMM via GEMM), `gemm_strassen*`,
+  `gemm_winograd*`, `gemm_cache_oblivious*`, the batched family (`gemm_batched*`,
+  `gemm_strided_batched*`, `gemm_batched_c64/c32`, which also skips the transposed
+  copies for `alpha == 0`) and `cblas_{s,d,c,z}gemm`. `scal_par` with `alpha == 0`
+  multiplies like `scal` instead of zero-filling. (#9)
+- `cblas_{s,d,c,z}gemv` follow the reference order for `alpha == 0`: quick return for
+  `alpha == 0 && beta == 1`, scale (or zero-fill without reading `y` for
+  `beta == 0`) only when `beta != 1`, then return before touching `A` and `x`. The
+  complex wrappers no longer rescale `y` for `beta == 1` (`Inf+0i` became
+  `Inf+NaN*i`). (#9)
+- The same class in Level 3, audited against the reference: native `symm` (which
+  also read `C` for `beta == 0`) and `hemm` had no `alpha == 0` exit;
+  `syrk`/`syr2k`/`herk`/`her2k` sent `alpha == 0` into the GEMM path that expands `A`
+  first (`syr2k` via GEMM also read `C` for `beta == 0`); the `cblas_{c,z}herk` and
+  `cblas_{c,z}her2k` kernels read `A`/`B` for `alpha == 0` and `C` for `beta == 0`;
+  and `cblas_{s,d}trsm` pre-scaled `B` by `alpha` and then solved with `A`. `trmm`
+  (native and CBLAS) was already correct. `hemm_c64`/`hemm_c32` leave `C` unread for
+  `beta == 0` on the 3M path without zero-filling it first, so a `-0.0` product
+  stays `-0.0` as in `ZHEMM`. (#9)
+- CBLAS Level-1 `cblas_?dot`, `?dotu_sub`, `?dotc_sub`, `?axpy`, `?copy` and `?swap`
+  rejected `inc == 0` (the Level-2 rule); they now run the reference loop, which
+  reuses element 0. The CBLAS Level-2 wrappers keep rejecting `inc == 0`, as the
+  reference does. `?axpy` returns before touching `y` for `alpha == 0` on every
+  stride (before, only on unit-stride real input). (#10)
+- `nrm2_strided`, `cblas_{s,d}nrm2` and `cblas_{sc,dz}nrm2` returned 0 for
+  `incx <= 0` (the pre-3.10 rule). They follow Netlib 3.10+: a negative increment
+  walks the vector backwards and `incx == 0` gives `sqrt(n) * |x[0]|`. The complex
+  norms go through the new `cnrm2_strided`, so `cblas_scnrm2` and `cblas_dznrm2` of
+  `[Inf+Inf*i]` return `Inf` instead of NaN. (#10)
+- `cblas_{c,z}scal` and `cblas_{cs,zd}scal` scaled the vector back to front for
+  `incx < 0` and turned `inf+0i` into `inf+NaN*i` for `alpha == 1`. They now
+  quick-return for `n <= 0`, `incx <= 0` or `alpha == 1`, as the reference `IF` does.
+  (#10)
+- `cblas_{s,d}gemv` now reject `incx == 0 || incy == 0` (a no-op that leaves `y`
+  untouched, as `cblas_{c,z}gemv` already did); they used to alias every element onto
+  element 0. (#10)
+- `StridedSlice::from_raw_parts` and `StridedSliceMut::from_raw_parts` return an
+  empty view, without touching the pointer, when the extent overflows `usize` (they
+  panicked) or when its elements span more than `isize::MAX` bytes (they built a
+  slice that `core::slice::from_raw_parts` forbids: undefined behaviour, an abort in
+  debug builds). Both need contract-violating input, since no buffer is that large.
+  Through the `extern "C"` wrappers that build strided views (`cblas_scnrm2`,
+  `cblas_dznrm2` and the new rot, rotm and dot entry points), where a panic aborts
+  the process, the first case needs a 32-bit `usize`, while the second is reachable
+  on 64-bit targets too, e.g. with `n` and `|inc|` near `2^31`. (#10)
+- `iamax_strided` and `iamin_strided` ranked complex elements by modulus for
+  non-unit strides while the contiguous kernels use `|Re| + |Im|`. Both now rank by
+  `cabs1` on every stride, with the same tie and NaN rules. (#11)
+- `crotg` overflowed or underflowed (NaN, 0 or Inf) once an input exceeded about
+  `sqrt(MAX)` (1e19 in f32, 1e154 in f64) or was tiny, because it divided complex by
+  complex. It is now a port of LAPACK 3.12 `zrotg.f90`/`crotg.f90` (real-scalar
+  divisions only, `safmax = 2/safmin`); the signature and `ComplexRotgResult` are
+  unchanged. It follows the 3.10+ conventions: `b == 0` gives `c = 1, s = 0, r = a`
+  (also for `a == b == 0`, which gave `c = 0, s = 1`), and `a == 0` gives `c = 0`,
+  `r = |b|`, `s = conj(b)/|b|` (before: `r = b`, `s = 1`). (#12)
+- `gemv`, `gemv_with_par` and `gemv_strided` applied `y := beta * y` (zero-filled `y`
+  for `beta == 0`) when `A` was empty; like reference `?GEMV` they now return
+  immediately and leave `y` untouched. `gemv_add_inplace` (so `gemv_add` and
+  `gemv_sum2`) no longer poisons `y` with `alpha * 0` for an infinite or NaN `alpha`
+  and an empty `op(A)`. (#13)
+- `her` and `her2` kept the stored imaginary part of the diagonal. They now write
+  `real(A(j,j)) + real(update)` and skip the column update when `x(j) == 0` (`her2`:
+  `x(j) == 0 && y(j) == 0`), applying only `A(j,j) = real(A(j,j))`, like
+  `?HER`/`?HER2`; `alpha == 0` and `n == 0` still leave `A` untouched. (#13)
+- Native `level2::{ger, gerc, syr, spr, syr2, spr2, hpr, hpr2}` skip the column
+  update of an exactly-zero scaling element, as reference BLAS does: `y(j)` for
+  `ger`/`gerc`, `x(j)` for `syr`/`spr`/`hpr`, and `x(j)` and `y(j)` together for
+  `syr2`/`spr2`/`hpr2` (`-0.0` counts as zero). An Inf/NaN in the other operand no
+  longer reaches that column as `Inf * 0 = NaN`. `hpr`/`hpr2` still drop the diagonal
+  imaginary part of a skipped column. `ger`/`gerc` now run column by column with the
+  reference association `A(i,j) + x(i)*(alpha*y(j))` (`gerc`: `alpha*conj(y(j))`),
+  and `syr2`/`spr2` evaluate `A(i,j) + x(i)*(alpha*y(j)) + y(i)*(alpha*x(j))` left to
+  right, so finite results can differ from 0.2.2 in the last bit and intermediate
+  over/underflow can differ. This also applies to `cblas_?ger`, `?syr`, `?syr2` and
+  the new `?geru`, `?gerc`, `?spr`, `?spr2`, `?hpr`, `?hpr2`; in `RowMajor`,
+  GER/GERU/GERC skip the row of a zero `x(i)`, as reference CBLAS does. (#14, #13)
+- `level2::hpr` and `hpr2` mirror `her` and `her2` operation for operation, including
+  the diagonals `real(A) + real(temp*x(j))` and
+  `real(A) + real(temp1*x(j) + temp2*y(j))`. Packed and dense storage now give
+  bitwise identical results for NaN-free input (with NaN input the NaN sign/payload
+  may differ): `cblas_?hpr`/`?hpr2` match `cblas_?her`/`?her2`, and
+  `cblas_?spr`/`?spr2` match `cblas_?syr`/`?syr2`, in both layouts. Diagonals of
+  finite `hpr`/`hpr2` input can differ from 0.2.2 in the last bit. `her2`/`hpr2` now
+  form the second temp as `conj(alpha*x(j))`, as ZHER2/ZHPR2 do, instead of
+  `conj(alpha)*conj(x(j))`. The two temps differ only in the sign of an exact-zero
+  (or NaN) imaginary part, so this changes only signed zeros and NaN signs, and the
+  signed zeros now match the reference. (#13, #14)
+- Native `rotg` and `rotmg` deviated from the reference in finite arithmetic. `rotg`
+  is now a transcription of `drotg.f90`/`srotg.f90`: it scaled by `|a| + |b|` and
+  overflowed to NaN for huge finite inputs, returned `-0.0` for `s`/`z` (`b == 0`,
+  `a < 0`) and for `c` (`a == 0`, `b < 0`) where the reference gives `+0.0`, and
+  differed in the last bit in ordinary f32 cases. `rotmg` compared against exactly
+  `2^24` and `2^-24`; it now uses the reference `GAMSQ`/`RGAMSQ` literals
+  (`16777216`/`5.9604645e-8` in f64, `1.67772e7`/`5.96046e-8` in f32) and still
+  rescales by exactly `2^24`, so inputs near `2^24` or `2^-24` rescale like the
+  reference. `cblas_?rotg` and `cblas_?rotmg` inherit both changes. Found while
+  adding the CBLAS entry points. (#14)
+- The new `cblas_{s,d}rot`, `cblas_{s,d}rotm`, `cblas_csrot`, `cblas_zdrot`,
+  `cblas_sdsdot` and `cblas_dsdot` return without touching the operands (`alpha` for
+  `sdsdot`, `0` for `dsdot`), instead of aborting the C caller with a length-mismatch
+  panic or building an oversized slice, when called with an `(n, inc)` that no buffer
+  can hold: an extent `(n-1)*|inc|+1` that overflows `usize` (32-bit targets such as
+  wasm32) or spans more than `isize::MAX` bytes (64-bit targets too, e.g. with `n`
+  and `|inc|` near `2^31`). The unit-increment path of `sdsdot`/`dsdot` applies the
+  same byte bound to `n`, which only a 32-bit target can exceed. Contract-violating
+  input only. (#14)
+- Contiguous `rotm` handled only the flags `-2`, `-1`, `0` and `1` and silently
+  ignored any other value; it now classifies the flag like `drotm.f` (`flag + 2 == 0`
+  is the identity, `flag < 0` the full `H`, `flag == 0` the unit diagonal, anything
+  else, NaN included, the unit off-diagonal). Contiguous `zdrot` multiplied by
+  `from_real(c)`, which gave NaN cross terms for infinite input; it now scales the
+  real and imaginary parts separately, as `zdrot.f` does. (#15)
+- Blocked GEMM (`m*n*k > 32^3`) read the wrong elements when an operand was a view
+  with `col_stride != 1`, such as `MatRef::transpose()`: the NoTrans fast packers
+  `pack_a_optimized` and `pack_b_optimized` assume unit column stride. They are now
+  used only for NoTrans operands with `col_stride == 1`, and every other operand is
+  read through `read_op`, which honours both strides. No call site in this workspace
+  was affected (LAPACK Cholesky transposes into an owned matrix); external callers
+  that passed such views to `gemm`, `gemm_with_par` or `gemm_with_blocking` got
+  wrong results. (No issue number; found while working on #4 and #16.)
+- `gemm_small_f32_simd` and `gemm_small_f64_simd` (aarch64) zero-filled `C` on their
+  tiny-problem path instead of accumulating into it. They now accumulate, fall back
+  to the portable loops for strided or tiny operands, and assert consistent shapes
+  (they panic on a mismatch, because the NEON tiles address the operands through raw
+  pointers). (#16)
+
+### Changed
+
+- `Qz::compute` is rewritten as a Pure Rust equivalent of LAPACK 3.12 `DGGES` with
+  `JOBVSL = JOBVSR = 'V'` and `SORT = 'N'`, in the new module `evd/qz/` (replacing
+  `evd/qz.rs`): norm scaling, `DGGBAL`/`DGGBAK` with `'P'`, QR of `B`, `DGGHRD`,
+  `DHGEQZ` with single and Francis double shifts and relative deflation tests,
+  zero-chasing deflation of infinite eigenvalues (exact `beta = 0`), `DLAG2`/`DLASV2`
+  standardization of 2x2 blocks, and the `DGGES` unscaling guards. Eigenvalues are
+  returned as `DHGEQZ` computes them: `beta >= 0` (enforced by negating column `j` of
+  `S`, `T` and `Z`, so `n = 1` with a negative `B` gives `Z = -1`), and a complex
+  pair stores the member with `alpha_imag > 0` first (the two `beta`s differ, so only
+  the ratios `alpha/beta` are conjugate). `Qz`, `QzError` (the same four variants)
+  and `GeneralizedEigenvalue` keep their public API. The factors `S`, `T`, `Q` and `Z`
+  differ from 0.2.2. The tests check the LAPACK `ddrges` ratios (threshold 30) and
+  the exact Schur structure; results are not claimed to match Netlib bit for bit.
+  (#6)
+- `GeneralizedEigenvalue::is_finite` is now `beta != 0` and `is_real` is now
+  `alpha_imag == 0`; they compared `|beta| > eps` and `|alpha_imag| <= eps` against
+  the machine epsilon, so the answer depended on the scale of the pencil. `value` and
+  `value_complex` follow. A singular pencil (`alpha == beta == 0`) is reported as not
+  finite. Non-finite input to `Qz::compute` returns
+  `QzError::NotConverged { iterations: 0 }`. The exact `beta = 0` holds for
+  `Qz::compute`. After `compute_sorted` or `reorder` the members of a complex pair
+  come from `DLAG2` on the final 2x2 block (shared `beta`, exactly negated
+  `alpha_imag`, unless a `DGGES` unscale guard rescaled one), and an infinite
+  eigenvalue that took part in a swap has a rounding-level `beta`, so `is_finite`
+  and `num_infinite` can count it as finite. (#6)
+- GEMM block sizes are targets fitted to each call: `gemm_with_blocking` and
+  `gemm_transposed_with_blocking` refit any `GemmBlocking` they receive
+  (`custom`, `asymmetric`, `for_kernel`, `auto_tuned`) with `balanced_block`. The
+  `mc`/`nc` from `compute_blocking` may therefore be the full dimension and need not
+  be multiples of MR/NR, and `custom(.., kc = 1, ..)` runs with `kc = 8` when
+  `k > 8` (the struct still reports `kc = 1`). KC is rebalanced, which changes the
+  floating-point summation order of GEMM wherever it is used, LAPACK included:
+  results are not bitwise equal to 0.2.2. (#4)
+- Native `trsm`, `trsm_c32` and `trsm_c64` with `alpha == 0` validate the shapes and
+  return zeros without reading `A` or `B`, as reference `?TRSM` does. A singular `A`
+  used to give `Err(Singular)`, and NaN/Inf in either operand leaked into the
+  result. (#9)
+- `herk` and `her2k` (native and CBLAS) follow the reference quick return: for
+  `(alpha == 0 || k == 0) && beta == 1`, `C` is left untouched, a non-real diagonal
+  included; whenever `C` is updated its diagonal is still made real. Declared
+  deviation: NaN and Inf propagate differently from Netlib `ZHERK`/`ZHER2K` as
+  gfortran compiles them with default floating-point flags, which turn a real scalar
+  times a complex value into a complex multiply by `(r, 0)`, so `2*(Inf, 1)` is
+  `(Inf, NaN)`. (#9)
+  - For `beta` other than 0 and 1, the native routines scale off-diagonal elements
+    by a complex multiply by `beta + 0i`, as the reference does, but multiply
+    diagonal elements the same way before keeping the real part, where the reference
+    scales the real part only (`BETA*DBLE(C(J,J))`): an infinite or NaN imaginary
+    part on the diagonal gives NaN instead of `beta*Re(C(j,j))`. The CBLAS kernels
+    scale the diagonal as the reference does and the off-diagonal elements
+    componentwise (`2*(Inf, 1)` gives `(Inf, 2)`).
+  - For `beta == 1` the reference leaves `C` unscaled for `NoTrans` but still
+    multiplies its off-diagonal elements by `(1, 0)` for `ConjTrans`. The CBLAS
+    kernels, and the native routines when `n < 32` or `k < 8`, leave `C` unscaled
+    in both cases; otherwise the native routines (GEMM path) multiply in both, the
+    diagonal included.
+  - NaN and Inf in `A` or `B`: the reference `NoTrans` update skips column `L` when
+    `A(J,L) == 0` (`ZHER2K`: when `A(J,L)` and `B(J,L)` are both zero), and no path
+    here has that skip. The CBLAS `NoTrans` kernels (pre-existing), like the native
+    GEMM path, form dot products and apply `alpha` to the sums, where the reference
+    multiplies `alpha` into each `A(J,L)` / `B(J,L)` first as a complex multiply
+    (`ZHERK`: `TEMP = ALPHA*DCONJG(A(J,L))`). TODO.md lists the remaining
+    differences in where `alpha` is applied; alignment is a 0.2.4 candidate.
+- Performance: `Par::Rayon` GEMM uses a new 2D (M x N) driver
+  (`level3/gemm_parallel.rs`, feature `parallel`). The old driver split `C` over NC
+  column blocks only; NC is sized for the last-level cache, so every problem with
+  `n <= NC`, square ones included, was a single work item. Each NC block of `C` is
+  now cut into a grid of tiles aligned to the micro-tile grid (about three per
+  thread), the `B` panel of each KC step is packed once, in parallel, into a shared
+  buffer, and the tiles run as one rayon task each on disjoint `MatMut` views.
+  Results are bitwise identical to `Par::Seq` for any thread count (tested on
+  aarch64 for f32, f64 and c64, every transpose combination, multi-block and strided
+  operands). `Par::RayonWith(n)` still does not install a pool of `n` threads: `n`
+  feeds the gate and sizes the tile grid, and the tasks run on the ambient rayon
+  pool (see the documentation note below). (#16)
+- Performance: the parallel GEMM gate moved from 64^3 total / 32^2 per thread to
+  128^3 total / 80^3 per thread (`m*n*k`); below it `Par::Rayon` runs the sequential
+  path. With integer division the gate opens at 128^3 on up to 4 threads, at 137^3
+  on 5 threads and at 160^3 on 8 threads. The constants were tuned on one Apple M3
+  (4 P + 4 E cores) with 4 and 8 threads; other thread counts are extrapolated.
+  (#16)
+- Performance: on aarch64, `gemm_small` (problems up to `m*n*k <= 32^3`) sends f32
+  and f64 operands with `m, n >= 4` and column-major `A` and `B` to the NEON 4x4
+  kernels, and uses the portable loops otherwise, including under `force-scalar`.
+  Results can differ from 0.2.2 in the last bit because the NEON kernels use FMA.
+  Only the parallel driver and this dispatch address #16; the SME2 path (Apple M4)
+  is not part of this release. (#16)
+- Documentation (no behaviour change):
+  - `GeneralizedEvd` reduces to `B⁻¹·A` through an LU of `B` and needs a nonsingular
+    `B`; it is not a QZ decomposition. Use `Qz` for a singular `B` or for generalized
+    Schur forms. (#6)
+  - `Par::RayonWith(n)` uses `n` in the parallel gate and, in GEMV and GEMM, to size
+    the work partition (GEMM: the tile grid), but runs on the ambient rayon pool. Use
+    `rayon::ThreadPool::install` or `RAYON_NUM_THREADS` to bound the thread count.
+    The `oxiblas-core` helpers that dispatch through `run_in_pool` (for example
+    `for_each_range`) do install an `n`-thread pool. (#16)
+  - Corrected stale docs: the HEMM 3M threshold (64), the `GemmBlocking::for_kernel`
+    values, the `gemm_with_par` auto-tuning condition, the `gemm_small` threshold,
+    the `tbsv` example, the nrm2 algorithm wording and the CBLAS module docs. (#4, #9,
+    #10, #14, #16)
+
 ## [0.2.2] - 2026-08-06
 
 A production-readiness hardening release. A systematic multi-agent audit swept the

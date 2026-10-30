@@ -15,25 +15,49 @@
 //!   that, when both `x` and `y` carry negative increments, the i-th product in
 //!   e.g. `ddot` pairs the same logical positions.
 //! * **Zero stride** — logical element `i` always maps to physical offset 0,
-//!   i.e. the same element is read `n` times. Reference BLAS permits this for
-//!   the "product/copy" family (DOT/AXPY/COPY/SWAP/ROT); for the "reduction"
-//!   family (SCAL/NRM2/ASUM/IAMAX) a non-positive increment is instead defined
-//!   as a no-op / zero result, and the routines below honour that split.
+//!   i.e. the same element is read (or written) `n` times. Reference BLAS
+//!   (Netlib 3.12) permits this for the "product/copy" family
+//!   (DOT/AXPY/COPY/SWAP/ROT/ROTM) and — since LAPACK 3.10's `?nrm2.f90` — for
+//!   NRM2, which also walks a negative increment backwards (the norm of `n`
+//!   reads of `x[0]` is `sqrt(n)·|x[0]|`). For SCAL/ASUM/IAMAX a non-positive
+//!   increment is instead defined as a no-op / zero result, and the routines
+//!   below honour that split.
 //!
-//! # Intended CBLAS integration point
+//! # CBLAS integration point
 //!
 //! The CBLAS compatibility layer (`crate::cblas`) receives raw
-//! `*const T`/`*mut T` pointers together with an `i32` increment. In a future
-//! integration pass it should build a [`StridedSlice`] / [`StridedSliceMut`]
-//! via the `unsafe` [`StridedSlice::from_raw_parts`] /
-//! [`StridedSliceMut::from_raw_parts`] constructors (which internally form a
-//! slice spanning the full strided extent `(n - 1) * |incx| + 1`) and forward
-//! to the `*_strided` routines here. That yields genuine non-unit-stride and
-//! negative-increment correctness — e.g. extracting a column of a row-major
-//! matrix — instead of merely re-slicing a contiguous buffer.
+//! `*const T`/`*mut T` pointers together with an `i32` increment. It builds a
+//! [`StridedSlice`] / [`StridedSliceMut`] via the `unsafe`
+//! [`StridedSlice::from_raw_parts`] / [`StridedSliceMut::from_raw_parts`]
+//! constructors and forwards to the `*_strided` routines here:
+//! `cblas_scnrm2`/`cblas_dznrm2` ([`cnrm2_strided`]), `cblas_srot`/`cblas_drot`
+//! ([`rot_strided`]), `cblas_srotm`/`cblas_drotm` ([`rotm_strided`]) and
+//! `cblas_csrot`/`cblas_zdrot` ([`zdrot_strided`]). `cblas_sdsdot` and
+//! `cblas_dsdot` build the same views for their strided branch and run the
+//! reference double-precision loop over them. The raw-buffer contract is
+//! exactly the reference one:
+//!
+//! * pass the array base pointer the caller holds — the *lowest* address the
+//!   vector touches — for every sign of the increment;
+//! * the view spans `(n - 1)·|inc| + 1` elements (just `1` when `inc == 0`);
+//! * a negative increment starts at offset `(n - 1)·|inc|` and walks down to
+//!   offset 0; a zero increment re-uses element 0 on every iteration;
+//! * an extent that overflows `usize`, or whose elements span more than
+//!   `isize::MAX` bytes, cannot describe a real allocation and yields an empty
+//!   view. With the `i32` CBLAS arguments the first case needs a 32-bit
+//!   `usize`, while the second is reachable on 64-bit targets too (`n` and
+//!   `|inc|` near `2^31`). A wrapper that builds two views therefore checks both
+//!   lengths before calling a paired routine, which asserts equal lengths.
+//!
+//! That yields genuine non-unit-stride and negative-increment correctness —
+//! e.g. extracting a column of a row-major matrix — instead of merely
+//! re-slicing a contiguous buffer.
 
-use num_traits::Float;
-use oxiblas_core::scalar::{Field, Real, Scalar};
+use num_traits::{Float, One, Zero};
+use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
+
+use super::RotmParams;
+use super::nrm2::{nrm2_finalize, nrm2_fold};
 
 /// Number of physical elements a strided vector spans.
 ///
@@ -48,6 +72,23 @@ fn strided_extent(len: usize, stride: isize) -> Option<usize> {
         return Some(0);
     }
     (len - 1).checked_mul(stride.unsigned_abs())?.checked_add(1)
+}
+
+/// `true` when `count` elements of `T` span at most `isize::MAX` bytes: the size
+/// limit `core::slice::from_raw_parts` puts on a slice, which no allocation can
+/// exceed either. A zero-sized `T` is held to `isize::MAX` elements, stricter than
+/// the slice rule but irrelevant for BLAS element types.
+#[inline]
+pub(crate) fn fits_isize_bytes<T>(count: usize) -> bool {
+    count <= isize::MAX.unsigned_abs() / core::mem::size_of::<T>().max(1)
+}
+
+/// [`strided_extent`] for a view over a raw pointer: also `None` when the extent
+/// spans more than `isize::MAX` bytes ([`fits_isize_bytes`]), so the raw-parts
+/// constructors never hand `core::slice::from_raw_parts` an illegal length.
+#[inline]
+fn raw_parts_extent<T>(len: usize, stride: isize) -> Option<usize> {
+    strided_extent(len, stride).filter(|&extent| fits_isize_bytes::<T>(extent))
 }
 
 /// An immutable strided view over a contiguous slice, modelling a BLAS vector
@@ -108,13 +149,28 @@ impl<'a, T> StridedSlice<'a, T> {
     ///   elements and that region must live for `'a`.
     /// * The region must be a single allocated object with no concurrent
     ///   mutation for `'a`.
-    /// * `len` and `stride` must not overflow `usize` when forming the extent.
+    /// * An extent that overflows `usize`, or whose elements span more than
+    ///   `isize::MAX` bytes, cannot describe a real allocation, so it is not an
+    ///   error: such a `(len, stride)` yields an empty view (`len() == 0`) and
+    ///   `ptr` is never accessed.
     #[inline]
     #[must_use]
     pub unsafe fn from_raw_parts(ptr: *const T, len: usize, stride: isize) -> Self {
-        let extent = strided_extent(len, stride).expect("strided extent must not overflow usize");
+        let Some(extent) = raw_parts_extent::<T>(len, stride) else {
+            // No real allocation can hold this vector (see `# Safety`). The CBLAS
+            // `extern "C"` entry points reach this path, where a panic would
+            // abort the C caller's process and an oversized slice would be
+            // undefined behaviour, so return an empty view instead and leave
+            // `ptr` untouched.
+            return Self {
+                data: &[],
+                len: 0,
+                stride,
+            };
+        };
         // SAFETY: contract of this function guarantees `ptr` is valid for
-        // `extent` reads for `'a` and points into a single allocation.
+        // `extent` reads for `'a` and points into a single allocation, and
+        // `raw_parts_extent` keeps `extent` elements within `isize::MAX` bytes.
         let data = unsafe { core::slice::from_raw_parts(ptr, extent) };
         Self { data, len, stride }
     }
@@ -219,15 +275,26 @@ impl<'a, T> StridedSliceMut<'a, T> {
     ///
     /// # Safety
     ///
-    /// Same obligations as [`StridedSlice::from_raw_parts`], plus: the region
-    /// must be uniquely borrowed (no other live reference, and no aliasing with
-    /// any other `x`/`y` passed to the same routine) for `'a`.
+    /// Same obligations as [`StridedSlice::from_raw_parts`] (including its empty
+    /// view, with `ptr` never accessed, for an extent that overflows `usize` or
+    /// spans more than `isize::MAX` bytes), plus: the region must be uniquely
+    /// borrowed (no other live reference, and no aliasing with any other `x`/`y`
+    /// passed to the same routine) for `'a`.
     #[inline]
     #[must_use]
     pub unsafe fn from_raw_parts(ptr: *mut T, len: usize, stride: isize) -> Self {
-        let extent = strided_extent(len, stride).expect("strided extent must not overflow usize");
+        let Some(extent) = raw_parts_extent::<T>(len, stride) else {
+            // Unsatisfiable extent: empty view, `ptr` untouched, no panic and no
+            // oversized slice (see `StridedSlice::from_raw_parts`).
+            return Self {
+                data: &mut [],
+                len: 0,
+                stride,
+            };
+        };
         // SAFETY: contract of this function guarantees `ptr` is valid for
-        // `extent` reads+writes for `'a`, uniquely borrowed, single allocation.
+        // `extent` reads+writes for `'a`, uniquely borrowed, single allocation,
+        // and `raw_parts_extent` keeps `extent` elements within `isize::MAX` bytes.
         let data = unsafe { core::slice::from_raw_parts_mut(ptr, extent) };
         Self { data, len, stride }
     }
@@ -454,9 +521,118 @@ pub fn rot_strided<T: Float>(
     }
 }
 
+/// Strided modified Givens rotation (`SROTM`/`DROTM` with increments).
+///
+/// Mirrors Netlib `drotm.f` (3.12) exactly:
+///
+/// * `n == 0` or `params.flag == -2` (the reference's `DFLAG + 2 == 0`):
+///   no-op.
+/// * `flag < 0`: `H = [[h11, h12], [h21, h22]]`.
+/// * `flag == 0`: `H = [[1, h12], [h21, 1]]` (unit diagonal implied).
+/// * otherwise (`flag > 0`, and also NaN): `H = [[h11, 1], [-1, h22]]`.
+///
+/// With `w = x[i]`, `z = y[i]` each pair becomes
+/// `(w·h11 + z·h12, w·h21 + z·h22)`, the implied entries substituted as
+/// above. Arbitrary positive, negative and zero increments are honoured (see
+/// the module docs for the raw-buffer contract): a negative increment walks
+/// its vector backwards, a zero increment re-reads and re-writes element 0
+/// on every iteration, exactly like the reference loop. A unit-stride call
+/// is forwarded to the contiguous [`rotm`](super::rotm), which uses the same
+/// classification.
+///
+/// The reference `DPARAM` array is ordered `[flag, h11, h21, h12, h22]`
+/// (column-major `H`), i.e.
+/// `RotmParams { flag: p[0], h11: p[1], h21: p[2], h12: p[3], h22: p[4] }`.
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different logical lengths.
+pub fn rotm_strided<T: Float>(
+    params: &RotmParams<T>,
+    mut x: StridedSliceMut<'_, T>,
+    mut y: StridedSliceMut<'_, T>,
+) {
+    assert_eq!(x.len(), y.len(), "Vector lengths must match");
+    let n = x.len();
+    let zero = T::zero();
+    let two = T::one() + T::one();
+    if n == 0 || params.flag + two == zero {
+        return;
+    }
+    if let (Some(xc), Some(yc)) = (x.as_contiguous_mut(), y.as_contiguous_mut()) {
+        super::rotm(params, xc, yc);
+        return;
+    }
+    let RotmParams {
+        flag,
+        h11,
+        h12,
+        h21,
+        h22,
+    } = *params;
+    if flag < zero {
+        for i in 0..n {
+            let (w, z) = (x.get(i), y.get(i));
+            x.set(i, w * h11 + z * h12);
+            y.set(i, w * h21 + z * h22);
+        }
+    } else if flag == zero {
+        for i in 0..n {
+            let (w, z) = (x.get(i), y.get(i));
+            x.set(i, w + z * h12);
+            y.set(i, w * h21 + z);
+        }
+    } else {
+        for i in 0..n {
+            let (w, z) = (x.get(i), y.get(i));
+            x.set(i, w * h11 + z);
+            y.set(i, -w + h22 * z);
+        }
+    }
+}
+
+/// Strided complex plane rotation with a **real** cosine and sine
+/// (`CSROT`/`ZDROT` with increments).
+///
+/// For each logical pair `x' = c·x + s·y`, `y' = c·y - s·x`, where `c` and
+/// `s` scale the real and imaginary parts separately, exactly like Netlib
+/// `zdrot.f`/`csrot.f` (3.12) -- see [`zdrot`](super::zdrot). Arbitrary
+/// positive, negative and zero increments are honoured (see the module docs
+/// for the raw-buffer contract): a negative increment walks its vector
+/// backwards, a zero increment re-reads and re-writes element 0 on every
+/// iteration, exactly like the reference loop. There is no quick return for
+/// `c == 1, s == 0`; like the reference, every pair is recomputed. A
+/// unit-stride call is forwarded to the contiguous [`zdrot`](super::zdrot).
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different logical lengths.
+pub fn zdrot_strided<T: ComplexScalar>(
+    c: T::Real,
+    s: T::Real,
+    mut x: StridedSliceMut<'_, T>,
+    mut y: StridedSliceMut<'_, T>,
+) {
+    assert_eq!(x.len(), y.len(), "Vector lengths must match");
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    if let (Some(xc), Some(yc)) = (x.as_contiguous_mut(), y.as_contiguous_mut()) {
+        super::zdrot(c, s, xc, yc);
+        return;
+    }
+    for i in 0..n {
+        let (xi, yi) = super::asum::zdrot_pair(c, s, x.get(i), y.get(i));
+        x.set(i, xi);
+        y.set(i, yi);
+    }
+}
+
 // =============================================================================
-// Reduction family: a non-positive increment is a no-op / zero result,
-// matching Netlib reference behaviour (see module docs).
+// Reduction family. SCAL/ASUM/IAMAX/IAMIN: a non-positive increment is a
+// no-op / zero result. NRM2 (Netlib >= 3.10): every increment is walked like
+// the product family. Both match Netlib 3.12 (see module docs).
 // =============================================================================
 
 /// Strided SCAL `x ← α·x`.
@@ -480,13 +656,17 @@ pub fn scal_strided<T: Field>(alpha: T, mut x: StridedSliceMut<'_, T>) {
 
 /// Strided NRM2 (Euclidean/L2 norm).
 ///
-/// General entry point behind the contiguous [`nrm2`](super::nrm2). Per
-/// reference BLAS a non-positive increment returns `0`. Uses the same
-/// overflow-safe scaled-sum-of-squares recurrence as the contiguous kernel.
+/// General entry point behind the contiguous [`nrm2`](super::nrm2). Follows
+/// Netlib >= 3.10 (`dnrm2.f90`, unchanged in 3.12): every increment is
+/// accepted — a negative stride walks the vector backwards from offset
+/// `(n - 1)·|stride|`, and a zero stride reads `x[0]` on every iteration,
+/// giving `sqrt(n)·|x[0]|`. (Pre-3.10 reference BLAS returned `0` for
+/// `incx <= 0`.) Uses the same overflow-safe scaled-sum-of-squares recurrence
+/// as the contiguous kernel, never a naive `Σx²`.
 #[must_use]
 pub fn nrm2_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
     let n = x.len();
-    if n == 0 || x.stride() <= 0 {
+    if n == 0 {
         return T::zero();
     }
     if let Some(xc) = x.as_contiguous() {
@@ -521,6 +701,31 @@ pub fn nrm2_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
     scale * Real::sqrt(ssq)
 }
 
+/// Strided complex NRM2 (`SCNRM2`/`DZNRM2` with an increment).
+///
+/// Same increment contract as [`nrm2_strided`] (Netlib >= 3.10
+/// `dznrm2.f90`, unchanged in 3.12): a negative stride walks the vector
+/// backwards from offset `(n - 1)·|stride|`, a zero stride reads `x[0]` on
+/// every iteration (`sqrt(n)·|x[0]|`). The real and imaginary parts are
+/// folded into the overflow-safe scaled sum of squares shared with
+/// [`cnrm2`](super::cnrm2), to which a unit-stride call is forwarded.
+#[must_use]
+pub fn cnrm2_strided<T: ComplexScalar>(x: StridedSlice<'_, T>) -> T::Real {
+    let n = x.len();
+    if n == 0 {
+        return T::Real::zero();
+    }
+    if let Some(xc) = x.as_contiguous() {
+        return super::cnrm2(xc);
+    }
+    let mut state = (T::Real::zero(), T::Real::one());
+    for i in 0..n {
+        let z = x.get(i);
+        state = nrm2_fold(nrm2_fold(state, z.real()), z.imag());
+    }
+    nrm2_finalize(state)
+}
+
 /// Strided ASUM (sum of absolute values, L1 norm).
 ///
 /// General entry point behind the contiguous [`asum`](super::asum). Per
@@ -545,6 +750,12 @@ pub fn asum_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
 ///
 /// General entry point behind the contiguous [`iamax`](super::iamax). Per
 /// reference BLAS a non-positive increment returns `0`.
+///
+/// For complex scalar types elements are ranked by
+/// [`cabs1`](super::cabs1)`(z) = |Re(z)| + |Im(z)|` on **every** stride,
+/// exactly like Netlib `ICAMAX`/`IZAMAX` and the contiguous [`iamax`](super::iamax)
+/// (not by the modulus `|z|`); ties keep the first occurrence and a NaN never
+/// displaces the running maximum. For real types this is plain `|x[i]|`.
 #[must_use]
 pub fn iamax_strided<T: Scalar>(x: StridedSlice<'_, T>) -> usize {
     let n = x.len();
@@ -555,9 +766,9 @@ pub fn iamax_strided<T: Scalar>(x: StridedSlice<'_, T>) -> usize {
         return super::iamax(xc);
     }
     let mut max_idx = 0;
-    let mut max_val = Scalar::abs(x.get(0));
+    let mut max_val = super::cabs1(x.get(0));
     for i in 1..n {
-        let abs_xi = Scalar::abs(x.get(i));
+        let abs_xi = super::cabs1(x.get(i));
         if abs_xi > max_val {
             max_val = abs_xi;
             max_idx = i;
@@ -570,6 +781,9 @@ pub fn iamax_strided<T: Scalar>(x: StridedSlice<'_, T>) -> usize {
 ///
 /// General entry point behind the contiguous [`iamin`](super::iamin). Per
 /// reference BLAS a non-positive increment returns `0`.
+///
+/// Complex elements are ranked by [`cabs1`](super::cabs1) on every stride,
+/// consistent with [`iamax_strided`] and the contiguous [`iamin`](super::iamin).
 #[must_use]
 pub fn iamin_strided<T: Scalar>(x: StridedSlice<'_, T>) -> usize {
     let n = x.len();
@@ -580,9 +794,9 @@ pub fn iamin_strided<T: Scalar>(x: StridedSlice<'_, T>) -> usize {
         return super::iamin(xc);
     }
     let mut min_idx = 0;
-    let mut min_val = Scalar::abs(x.get(0));
+    let mut min_val = super::cabs1(x.get(0));
     for i in 1..n {
-        let abs_xi = Scalar::abs(x.get(i));
+        let abs_xi = super::cabs1(x.get(i));
         if abs_xi < min_val {
             min_val = abs_xi;
             min_idx = i;
@@ -880,10 +1094,43 @@ mod tests {
     }
 
     #[test]
-    fn test_nrm2_nonpositive_is_zero() {
+    fn test_issue_10_nrm2_strided_negative_stride_walks_backwards() {
+        // Netlib >= 3.10 (`dnrm2.f90`) accepts incx < 0 and walks the vector
+        // backwards from offset (n-1)*|incx|; the pre-fix code returned 0.
         let xbuf = [3.0, 4.0];
-        assert_eq!(nrm2_strided(slice_view(&xbuf, 2, -1)), 0.0);
-        assert_eq!(nrm2_strided(slice_view(&xbuf, 2, 0)), 0.0);
+        assert_eq!(nrm2_strided(slice_view(&xbuf, 2, -1)), 5.0);
+        // Reporter's case: dnrm2(1, [0.326], -1) == 0.326.
+        assert_eq!(nrm2_strided(slice_view(&[0.326], 1, -1)), 0.326);
+        // Same set of elements as the forward walk.
+        let ybuf = [1.0, 9.0, -2.0, 9.0, 3.0, 9.0, -4.0];
+        let backward = nrm2_strided(slice_view(&ybuf, 4, -2));
+        let forward = nrm2_strided(slice_view(&ybuf, 4, 2));
+        assert!((backward - forward).abs() <= 4.0 * f64::EPSILON * forward);
+        assert!((backward - ref_nrm2(&ybuf, -2, 4)).abs() <= 4.0 * f64::EPSILON * forward);
+    }
+
+    #[test]
+    fn test_issue_10_nrm2_strided_zero_stride_is_sqrt_n_abs_x0() {
+        // incx == 0 reads x[0] on every iteration: sqrt(n) * |x[0]|.
+        let xbuf = [-3.0, 100.0];
+        assert_eq!(nrm2_strided(slice_view(&xbuf, 4, 0)), 6.0);
+        assert_eq!(nrm2_strided(slice_view(&xbuf, 1, 0)), 3.0);
+        // Scaled correctly: no overflow even though x[0]^2 overflows f64.
+        let big = [1e300];
+        let got = nrm2_strided(slice_view(&big, 9, 0));
+        assert!(
+            (got - 3e300).abs() <= 4.0 * f64::EPSILON * 3e300,
+            "got {got}"
+        );
+    }
+
+    #[test]
+    fn test_issue_10_nrm2_strided_negative_stride_large_no_overflow() {
+        let xbuf = [1e300, 0.0, -1e300, 0.0, 1e300];
+        let got = nrm2_strided(slice_view(&xbuf, 3, -2));
+        let expected = 3.0f64.sqrt() * 1e300;
+        assert!(got.is_finite(), "norm overflowed to {got}");
+        assert!((got - expected).abs() <= 4.0 * f64::EPSILON * expected);
     }
 
     #[test]
@@ -921,6 +1168,82 @@ mod tests {
     fn test_iamin_stride2() {
         let xbuf = [5.0, 100.0, 1.0, 100.0, 3.0];
         assert_eq!(iamin_strided(slice_view(&xbuf, 3, 2)), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #11: complex IAMAX / IAMIN rank by cabs1 for every stride
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_issue_11_iamax_strided_complex_uses_cabs1() {
+        use num_complex::Complex64;
+        // Reporter's case: x = [4+0i, 0, 3+2i], n = 2, inc = 2 selects 4
+        // (cabs1 4) and 3+2i (cabs1 5). Netlib izamax returns 2 (1-based),
+        // i.e. 1 here; ranking by modulus (4 > 3.606) picked 0.
+        let x = [
+            Complex64::new(4.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(3.0, 2.0),
+        ];
+        let view = StridedSlice::try_new(&x, 2, 2).expect("view fits");
+        assert_eq!(iamax_strided(view), 1);
+        // Ties keep the first occurrence: cabs1(2+2i) == cabs1(4) == 4.
+        let tie = [
+            Complex64::new(2.0, 2.0),
+            Complex64::new(9.0, 9.0),
+            Complex64::new(4.0, 0.0),
+        ];
+        let view = StridedSlice::try_new(&tie, 2, 2).expect("view fits");
+        assert_eq!(iamax_strided(view), 0);
+    }
+
+    #[test]
+    fn test_issue_11_iamin_strided_complex_uses_cabs1() {
+        use num_complex::Complex32;
+        // Elements 3+2i (cabs1 5, modulus 3.606) and 4 (cabs1 4, modulus 4):
+        // cabs1 ranks 4 as the minimum (index 1); the modulus picked 0.
+        let x = [
+            Complex32::new(3.0, 2.0),
+            Complex32::new(0.0, 0.0),
+            Complex32::new(0.0, 0.0),
+            Complex32::new(4.0, 0.0),
+        ];
+        let view = StridedSlice::try_new(&x, 2, 3).expect("view fits");
+        assert_eq!(iamin_strided(view), 1);
+    }
+
+    #[test]
+    fn test_issue_11_iamax_iamin_strided_random_c64_match_gathered_contiguous() {
+        use num_complex::Complex64;
+        // xorshift64* -- deterministic, no external RNG dependency.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_unit = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let bits = state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+            (bits as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        for trial in 0..4000usize {
+            let n = 1 + trial % 9;
+            let stride = 2 + (trial / 9) % 4;
+            let len = (n - 1) * stride + 1;
+            let buf: Vec<Complex64> = (0..len)
+                .map(|_| Complex64::new(next_unit(), next_unit()))
+                .collect();
+            let gathered: Vec<Complex64> = (0..n).map(|i| buf[i * stride]).collect();
+            let view = StridedSlice::try_new(&buf, n, stride as isize).expect("view fits");
+            assert_eq!(
+                iamax_strided(view),
+                super::super::iamax(&gathered),
+                "iamax trial {trial}: n={n}, stride={stride}"
+            );
+            assert_eq!(
+                iamin_strided(view),
+                super::super::iamin(&gathered),
+                "iamin trial {trial}: n={n}, stride={stride}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -993,5 +1316,420 @@ mod tests {
         };
         let expected = ref_dot(&xbuf, -1, &ybuf, -1, n);
         assert!((got - expected).abs() < 1e-12);
+    }
+
+    /// An extent that overflows `usize` cannot describe a real allocation, so
+    /// the raw-parts constructors must return an empty view -- never panic (the
+    /// `extern "C"` CBLAS entry points reach them) and never touch `ptr`.
+    #[test]
+    fn test_strided_from_raw_parts_overflowing_extent_is_empty() {
+        // Non-null and aligned but not backed by any allocation: any access
+        // through it would fault, so the test also proves `ptr` is left alone.
+        let ptr = core::ptr::NonNull::<f64>::dangling().as_ptr();
+        // `(usize::MAX - 1) * |stride| + 1` overflows `usize` for every stride
+        // here; `isize::MIN` also covers the `unsigned_abs` edge.
+        for stride in [2_isize, -2, isize::MIN] {
+            assert_eq!(strided_extent(usize::MAX, stride), None, "stride {stride}");
+
+            // SAFETY: an overflowing extent yields an empty view without
+            // reading `ptr`, so the dangling pointer is never dereferenced.
+            let view =
+                unsafe { StridedSlice::from_raw_parts(ptr.cast_const(), usize::MAX, stride) };
+            assert_eq!(view.len(), 0, "stride {stride}");
+            assert!(view.is_empty(), "stride {stride}");
+            assert_eq!(nrm2_strided(view), 0.0, "stride {stride}");
+
+            // SAFETY: as above; the empty mutable view never reads or writes
+            // `ptr`, so uniqueness and validity are vacuous.
+            let view_mut = unsafe { StridedSliceMut::from_raw_parts(ptr, usize::MAX, stride) };
+            assert_eq!(view_mut.len(), 0, "stride {stride}");
+            assert!(view_mut.is_empty(), "stride {stride}");
+            // `nrm2_strided` only takes an immutable view, so check instead that
+            // a mutating routine treats the empty mutable view as a no-op.
+            scal_strided(2.0, view_mut);
+        }
+    }
+
+    /// The raw-parts constructors also reject an extent whose elements would span
+    /// more than `isize::MAX` bytes (`slice::from_raw_parts` forbids it and no
+    /// allocation is that large), even when the element count fits in `usize`.
+    #[test]
+    fn test_strided_raw_parts_extent_respects_isize_max_bytes() {
+        let isize_max = isize::MAX.unsigned_abs();
+        let max_f64 = isize_max / core::mem::size_of::<f64>();
+        // Exact boundary at unit stride: the largest legal extent passes, one more
+        // element fails.
+        assert!(fits_isize_bytes::<f64>(max_f64));
+        assert!(!fits_isize_bytes::<f64>(max_f64 + 1));
+        assert_eq!(raw_parts_extent::<f64>(max_f64, 1), Some(max_f64));
+        assert_eq!(raw_parts_extent::<f64>(max_f64 + 1, 1), None);
+        // The same boundary through a stride: extent = (2 - 1)·|stride| + 1.
+        let stride = isize::try_from(max_f64 - 1).expect("below isize::MAX");
+        assert_eq!(raw_parts_extent::<f64>(2, stride), Some(max_f64));
+        assert_eq!(raw_parts_extent::<f64>(2, -stride), Some(max_f64));
+        assert_eq!(raw_parts_extent::<f64>(2, stride + 1), None);
+        assert_eq!(raw_parts_extent::<f64>(2, -stride - 1), None);
+        // The bound scales with the element size, and a zero-sized type is held to
+        // `isize::MAX` elements.
+        assert!(fits_isize_bytes::<u8>(max_f64 + 1));
+        assert!(!fits_isize_bytes::<num_complex::Complex64>(max_f64));
+        assert!(fits_isize_bytes::<()>(isize_max));
+        assert!(!fits_isize_bytes::<()>(isize_max + 1));
+        // The element-count helper behind `try_new` is unchanged.
+        assert_eq!(strided_extent(max_f64 + 1, 1), Some(max_f64 + 1));
+
+        // On the rejected side the constructors return an empty view and never
+        // touch the (dangling) pointer. No view is built over an accepted extent:
+        // one over unallocated memory would itself be undefined behaviour.
+        let ptr = core::ptr::NonNull::<f64>::dangling().as_ptr();
+        for (len, stride) in [(max_f64 + 1, 1), (2, stride + 1), (2, -stride - 1)] {
+            // SAFETY: an extent beyond `isize::MAX` bytes yields an empty view
+            // without reading `ptr`, so the dangling pointer is never dereferenced.
+            let view = unsafe { StridedSlice::from_raw_parts(ptr.cast_const(), len, stride) };
+            assert!(view.is_empty(), "len {len} stride {stride}");
+            assert_eq!(nrm2_strided(view), 0.0, "len {len} stride {stride}");
+            // SAFETY: as above; the empty mutable view never reads or writes
+            // `ptr`, so uniqueness and validity are vacuous.
+            let view_mut = unsafe { StridedSliceMut::from_raw_parts(ptr, len, stride) };
+            assert!(view_mut.is_empty(), "len {len} stride {stride}");
+            scal_strided(2.0, view_mut);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #15: strided ROTM / complex ROT / complex NRM2
+    // ---------------------------------------------------------------------
+
+    /// Increment pairs exercising positive, negative, zero and mixed strides.
+    const INC_PAIRS: [(isize, isize); 9] = [
+        (1, 1),
+        (2, 1),
+        (1, 3),
+        (-1, 2),
+        (-2, -3),
+        (0, 1),
+        (1, 0),
+        (0, 0),
+        (-1, 0),
+    ];
+
+    /// Buffer length a reference-BLAS vector of `n` elements at `inc` needs.
+    fn span(n: usize, inc: isize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (n - 1) * inc.unsigned_abs() + 1
+        }
+    }
+
+    /// Naive reference `DROTM` loop written directly from Netlib `drotm.f`
+    /// (start offsets via `ref_offset`, flag classification as in the
+    /// reference: `flag + 2 == 0` identity, `< 0` full, `== 0`, else).
+    fn ref_rotm(
+        p: &RotmParams<f64>,
+        x: &mut [f64],
+        incx: isize,
+        y: &mut [f64],
+        incy: isize,
+        n: usize,
+    ) {
+        if n == 0 || p.flag + 2.0 == 0.0 {
+            return;
+        }
+        for i in 0..n {
+            let (ox, oy) = (ref_offset(i, n, incx), ref_offset(i, n, incy));
+            let (w, z) = (x[ox], y[oy]);
+            let (nx, ny) = if p.flag < 0.0 {
+                (w * p.h11 + z * p.h12, w * p.h21 + z * p.h22)
+            } else if p.flag == 0.0 {
+                (w + z * p.h12, w * p.h21 + z)
+            } else {
+                (w * p.h11 + z, -w + p.h22 * z)
+            };
+            x[ox] = nx;
+            y[oy] = ny;
+        }
+    }
+
+    #[test]
+    fn test_issue_15_rotm_strided_matches_reference_loop() {
+        let flags = [-1.0, 0.0, 1.0, -0.5, 0.5, f64::NAN, -2.0];
+        for &flag in &flags {
+            let p = RotmParams {
+                flag,
+                h11: 0.75,
+                h12: -1.25,
+                h21: 2.5,
+                h22: -0.5,
+            };
+            for &(incx, incy) in &INC_PAIRS {
+                for n in [0usize, 1, 2, 5] {
+                    let xlen = span(n, incx).max(1);
+                    let ylen = span(n, incy).max(1);
+                    let x0: Vec<f64> = (0..xlen).map(|k| 1.0 + k as f64 * 0.5).collect();
+                    let y0: Vec<f64> = (0..ylen).map(|k| -2.0 + k as f64 * 0.25).collect();
+                    let (mut xr, mut yr) = (x0.clone(), y0.clone());
+                    ref_rotm(&p, &mut xr, incx, &mut yr, incy, n);
+                    let (mut xs, mut ys) = (x0, y0);
+                    rotm_strided(
+                        &p,
+                        slice_view_mut(&mut xs, n, incx),
+                        slice_view_mut(&mut ys, n, incy),
+                    );
+                    assert_eq!(xs, xr, "x: flag={flag}, incx={incx}, incy={incy}, n={n}");
+                    assert_eq!(ys, yr, "y: flag={flag}, incx={incx}, incy={incy}, n={n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_15_rotm_strided_flag_forms_hand_checked() {
+        // flag = 0.5 (non-canonical, > 0): H = [[h11, 1], [-1, h22]].
+        let p = RotmParams {
+            flag: 0.5,
+            h11: 2.0,
+            h12: 100.0,
+            h21: 100.0,
+            h22: 3.0,
+        };
+        let mut x = [1.0, 9.0, 1.0];
+        let mut y = [1.0, 9.0, 1.0];
+        rotm_strided(
+            &p,
+            slice_view_mut(&mut x, 2, 2),
+            slice_view_mut(&mut y, 2, -2),
+        );
+        assert_eq!(x, [3.0, 9.0, 3.0]);
+        assert_eq!(y, [2.0, 9.0, 2.0]);
+
+        // flag = -0.5 (< 0): full H, here a reflection-like [[0, 1], [1, 0]].
+        let p = RotmParams {
+            flag: -0.5,
+            h11: 0.0,
+            h12: 1.0,
+            h21: 1.0,
+            h22: 0.0,
+        };
+        let mut x = [1.0, 0.0, 2.0];
+        let mut y = [5.0, 6.0];
+        rotm_strided(
+            &p,
+            slice_view_mut(&mut x, 2, 2),
+            slice_view_mut(&mut y, 2, 1),
+        );
+        assert_eq!(x, [5.0, 0.0, 6.0]);
+        assert_eq!(y, [1.0, 2.0]);
+
+        // flag = -2: identity, whatever the H entries hold.
+        let p = RotmParams {
+            flag: -2.0,
+            h11: f64::NAN,
+            h12: f64::NAN,
+            h21: f64::NAN,
+            h22: f64::NAN,
+        };
+        let mut x = [1.0, 2.0];
+        let mut y = [3.0, 4.0];
+        rotm_strided(
+            &p,
+            slice_view_mut(&mut x, 2, -1),
+            slice_view_mut(&mut y, 2, 0),
+        );
+        assert_eq!((x, y), ([1.0, 2.0], [3.0, 4.0]));
+    }
+
+    #[test]
+    fn test_issue_15_rotm_strided_zero_increment_reuses_element0() {
+        // incx == 0 with flag == 0: x[0] <- x[0] + h12*y[i] for every i, and
+        // y[i] <- h21*x[0](current) + y[i] -- the reference loop verbatim.
+        let p = RotmParams {
+            flag: 0.0,
+            h11: 0.0,
+            h12: 1.0,
+            h21: 2.0,
+            h22: 0.0,
+        };
+        let mut x = [1.0];
+        let mut y = [1.0, 2.0, 3.0];
+        rotm_strided(
+            &p,
+            slice_view_mut(&mut x, 3, 0),
+            slice_view_mut(&mut y, 3, 1),
+        );
+        // i=0: w=1, z=1 -> x=2, y0=3; i=1: w=2, z=2 -> x=4, y1=6;
+        // i=2: w=4, z=3 -> x=7, y2=11.
+        assert_eq!(x, [7.0]);
+        assert_eq!(y, [3.0, 6.0, 11.0]);
+    }
+
+    #[test]
+    fn test_issue_15_rotm_strided_unit_stride_matches_contiguous() {
+        let p = RotmParams {
+            flag: -1.0,
+            h11: 0.6,
+            h12: 0.8,
+            h21: -0.8,
+            h22: 0.6,
+        };
+        let mut x_legacy = [1.0, 2.0, 3.0];
+        let mut y_legacy = [4.0, 5.0, 6.0];
+        let mut x_strided = x_legacy;
+        let mut y_strided = y_legacy;
+        super::super::rotm(&p, &mut x_legacy, &mut y_legacy);
+        rotm_strided(
+            &p,
+            StridedSliceMut::from_slice(&mut x_strided),
+            StridedSliceMut::from_slice(&mut y_strided),
+        );
+        assert_eq!((x_strided, y_strided), (x_legacy, y_legacy));
+    }
+
+    /// Naive reference `ZDROT` loop (Netlib `zdrot.f`): real `c`, `s` scale
+    /// each component, as gfortran evaluates `C*ZX(IX) + S*ZY(IY)`.
+    fn ref_zdrot(
+        c: f64,
+        s: f64,
+        x: &mut [num_complex::Complex64],
+        incx: isize,
+        y: &mut [num_complex::Complex64],
+        incy: isize,
+        n: usize,
+    ) {
+        use num_complex::Complex64;
+        for i in 0..n {
+            let (ox, oy) = (ref_offset(i, n, incx), ref_offset(i, n, incy));
+            let (xv, yv) = (x[ox], y[oy]);
+            x[ox] = Complex64::new(c * xv.re + s * yv.re, c * xv.im + s * yv.im);
+            y[oy] = Complex64::new(c * yv.re - s * xv.re, c * yv.im - s * xv.im);
+        }
+    }
+
+    #[test]
+    fn test_issue_15_zdrot_strided_matches_reference_loop() {
+        use num_complex::Complex64;
+        let (c, s) = (0.6, 0.8);
+        for &(incx, incy) in &INC_PAIRS {
+            for n in [0usize, 1, 3, 5] {
+                let xlen = span(n, incx).max(1);
+                let ylen = span(n, incy).max(1);
+                let x0: Vec<Complex64> = (0..xlen)
+                    .map(|k| Complex64::new(1.0 + k as f64, -0.5 * k as f64))
+                    .collect();
+                let y0: Vec<Complex64> = (0..ylen)
+                    .map(|k| Complex64::new(-2.0 + 0.25 * k as f64, 3.0 - k as f64))
+                    .collect();
+                let (mut xr, mut yr) = (x0.clone(), y0.clone());
+                ref_zdrot(c, s, &mut xr, incx, &mut yr, incy, n);
+                let (mut xs, mut ys) = (x0, y0);
+                zdrot_strided(
+                    c,
+                    s,
+                    StridedSliceMut::try_new(&mut xs, n, incx).expect("view fits"),
+                    StridedSliceMut::try_new(&mut ys, n, incy).expect("view fits"),
+                );
+                assert_eq!(xs, xr, "x: incx={incx}, incy={incy}, n={n}");
+                assert_eq!(ys, yr, "y: incx={incx}, incy={incy}, n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_15_zdrot_strided_infinite_component_stays_nan_free() {
+        use num_complex::Complex64;
+        // Component-wise scaling: 0.6*(inf + 0i) + 0.8*(1 + 1i) = inf + 0.8i.
+        // A complex multiply by (0.6 + 0i) would fabricate 0*inf = NaN.
+        let mut x = [Complex64::new(f64::INFINITY, 0.0), Complex64::new(7.0, 7.0)];
+        let mut y = [Complex64::new(1.0, 1.0)];
+        zdrot_strided(
+            0.6,
+            0.8,
+            StridedSliceMut::try_new(&mut x, 1, 2).expect("view fits"),
+            StridedSliceMut::try_new(&mut y, 1, -1).expect("view fits"),
+        );
+        assert_eq!(x[0], Complex64::new(f64::INFINITY, 0.8));
+        assert_eq!(x[1], Complex64::new(7.0, 7.0));
+        assert_eq!(y[0], Complex64::new(f64::NEG_INFINITY, 0.6));
+    }
+
+    #[test]
+    fn test_issue_15_zdrot_strided_unit_stride_matches_contiguous() {
+        use num_complex::Complex32;
+        let mut x_legacy = [Complex32::new(1.0, 2.0), Complex32::new(-3.0, 0.5)];
+        let mut y_legacy = [Complex32::new(0.0, -1.0), Complex32::new(4.0, 4.0)];
+        let mut x_strided = x_legacy;
+        let mut y_strided = y_legacy;
+        super::super::zdrot(0.8f32, -0.6f32, &mut x_legacy, &mut y_legacy);
+        zdrot_strided(
+            0.8f32,
+            -0.6f32,
+            StridedSliceMut::from_slice(&mut x_strided),
+            StridedSliceMut::from_slice(&mut y_strided),
+        );
+        assert_eq!((x_strided, y_strided), (x_legacy, y_legacy));
+    }
+
+    #[test]
+    fn test_issue_15_cnrm2_strided_matches_naive_for_every_stride() {
+        use num_complex::Complex64;
+        let buf: Vec<Complex64> = (0..13)
+            .map(|k| Complex64::new(0.5 * k as f64 - 2.0, 1.5 - 0.25 * k as f64))
+            .collect();
+        for inc in [1isize, 2, 3, -1, -2, -4, 0] {
+            for n in [0usize, 1, 2, 4] {
+                if span(n, inc) > buf.len() {
+                    continue;
+                }
+                let view = StridedSlice::try_new(&buf, n, inc).expect("view fits");
+                let naive: f64 = (0..n)
+                    .map(|i| buf[ref_offset(i, n, inc)].norm_sqr())
+                    .sum::<f64>()
+                    .sqrt();
+                let got = cnrm2_strided(view);
+                assert!(
+                    (got - naive).abs() <= 8.0 * f64::EPSILON * naive.max(1.0),
+                    "inc={inc}, n={n}: got {got}, naive {naive}"
+                );
+            }
+        }
+        // Unit stride is forwarded to the contiguous kernel bit-for-bit.
+        let view = StridedSlice::from_slice(&buf);
+        assert_eq!(cnrm2_strided(view), super::super::cnrm2(&buf));
+    }
+
+    #[test]
+    fn test_issue_15_cnrm2_strided_zero_and_negative_increments() {
+        use num_complex::{Complex32, Complex64};
+        // incx == 0: sqrt(n) * |x[0]| = 2 * 5.
+        let x = [Complex64::new(3.0, 4.0), Complex64::new(100.0, 0.0)];
+        assert_eq!(
+            cnrm2_strided(StridedSlice::try_new(&x, 4, 0).expect("view fits")),
+            10.0
+        );
+        let xs = [Complex32::new(3.0, -4.0)];
+        assert_eq!(
+            cnrm2_strided(StridedSlice::try_new(&xs, 4, 0).expect("view fits")),
+            10.0f32
+        );
+        // Negative increment, magnitudes whose squares overflow: no overflow.
+        let big = [
+            Complex64::new(1e300, 0.0),
+            Complex64::new(-5.0, 5.0),
+            Complex64::new(0.0, -1e300),
+        ];
+        let got = cnrm2_strided(StridedSlice::try_new(&big, 2, -2).expect("view fits"));
+        let expected = std::f64::consts::SQRT_2 * 1e300;
+        assert!(
+            (got - expected).abs() <= 4.0 * f64::EPSILON * expected,
+            "got {got}"
+        );
+        // ... and tiny ones whose squares underflow: no flush to zero.
+        let tiny = [Complex64::new(3e-300, 4e-300); 3];
+        let got = cnrm2_strided(StridedSlice::try_new(&tiny, 3, -1).expect("view fits"));
+        let expected = 3.0f64.sqrt() * 5e-300;
+        assert!(
+            (got - expected).abs() <= 8.0 * f64::EPSILON * expected,
+            "got {got}"
+        );
     }
 }

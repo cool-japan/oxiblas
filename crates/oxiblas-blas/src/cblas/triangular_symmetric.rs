@@ -12,9 +12,13 @@
 //!
 //! # Performance
 //!
-//! For unit stride vectors (incx=1, incy=1), this module uses the optimized
-//! internal BLAS implementations with SIMD acceleration. For non-unit strides,
-//! scalar fallbacks are used.
+//! The wrappers validate their arguments (invalid input is a silent no-op), map
+//! row-major requests onto the column-major natives (flipping `side`/`uplo`,
+//! swapping `m`/`n`) and call the native Level 3 kernels of
+//! [`crate::level3`] (`trsm_in_place`, `trmm_in_place`, `syrk`, `syr2k`,
+//! `symm`) on zero-copy views of the caller's buffers. These are matrix
+//! routines, so there are no strided vectors to gather or scatter. `trsm`
+//! scales B by `alpha` in a scalar loop before the in-place solve.
 
 use super::types::*;
 use super::validate::{
@@ -130,10 +134,15 @@ pub unsafe extern "C" fn cblas_dtrsm(
         }
     };
 
-    // Determine A dimensions based on side
-    let k = match side_internal {
-        level3::Side::Left => m,
-        level3::Side::Right => n,
+    // Order of the triangular operand A, taken from the CALLER's side: `m` for a
+    // Left operation, `n` for Right (the same `ka` that `trmm_params_valid`
+    // checks `lda` against). It must not be derived from `side_internal`: in the
+    // row-major case that side is flipped while `m`/`n` are the caller's
+    // unswapped values (only the view of B below is swapped), which picked the
+    // wrong order whenever m != n.
+    let k = match side {
+        CblasSide::Left => m,
+        CblasSide::Right => n,
     };
 
     use oxiblas_matrix::{MatMut, MatRef};
@@ -144,7 +153,14 @@ pub unsafe extern "C" fn cblas_dtrsm(
         CblasLayout::ColMajor => (m, n),
         CblasLayout::RowMajor => (n, m), // Swap for row-major
     };
-    let b_mut = MatMut::<f64>::new(b, bm, bn, ldb);
+    let mut b_mut = MatMut::<f64>::new(b, bm, bn, ldb);
+
+    // Reference ?TRSM: alpha == 0 sets B := 0 without reading A or B. The prescale
+    // below would turn NaN/Inf in B into NaN (x * 0) and the solve would read A.
+    if alpha == 0.0 {
+        b_mut.fill_zero();
+        return;
+    }
 
     // Scale B by alpha first
     for j in 0..bn {
@@ -157,11 +173,12 @@ pub unsafe extern "C" fn cblas_dtrsm(
     // Call internal TRSM
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A void C ABI cannot surface a `Result`, so — matching the
-    // no-op-on-error convention of the wrappers in `basic.rs` (reference BLAS's
-    // xerbla-then-return) — an error leaves B as the internal routine left it
-    // and the routine returns. In practice only a singular triangular factor is
-    // reachable here (the dimensions are correct by construction), which matches
-    // reference (x)TRSM: it likewise makes no guarantee about B for singular A.
+    // no-op-on-error convention of the wrappers in `basic/` (validate-then-
+    // return: a silent no-op, no `cblas_xerbla` call) — an error leaves B as the
+    // internal routine left it and the routine returns. In practice only a
+    // singular triangular factor is reachable here (the dimensions are correct
+    // by construction), which matches reference (x)TRSM: it likewise makes no
+    // guarantee about B for singular A.
     if let Err(_err) = level3::trsm_in_place(
         side_internal,
         uplo_internal,
@@ -271,9 +288,10 @@ pub unsafe extern "C" fn cblas_strsm(
         ),
     };
 
-    let k = match side_internal {
-        level3::Side::Left => m,
-        level3::Side::Right => n,
+    // Order of A from the caller's (unflipped) side; see `cblas_dtrsm`.
+    let k = match side {
+        CblasSide::Left => m,
+        CblasSide::Right => n,
     };
 
     use oxiblas_matrix::{MatMut, MatRef};
@@ -283,7 +301,13 @@ pub unsafe extern "C" fn cblas_strsm(
         CblasLayout::ColMajor => (m, n),
         CblasLayout::RowMajor => (n, m),
     };
-    let b_mut = MatMut::<f32>::new(b, bm, bn, ldb);
+    let mut b_mut = MatMut::<f32>::new(b, bm, bn, ldb);
+
+    // alpha == 0: B := 0 without reading A or B (see `cblas_dtrsm`).
+    if alpha == 0.0 {
+        b_mut.fill_zero();
+        return;
+    }
 
     for j in 0..bn {
         for i in 0..bm {
@@ -294,11 +318,12 @@ pub unsafe extern "C" fn cblas_strsm(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A void C ABI cannot surface a `Result`, so — matching the
-    // no-op-on-error convention of the wrappers in `basic.rs` (reference BLAS's
-    // xerbla-then-return) — an error leaves B as the internal routine left it
-    // and the routine returns. In practice only a singular triangular factor is
-    // reachable here (the dimensions are correct by construction), which matches
-    // reference (x)TRSM: it likewise makes no guarantee about B for singular A.
+    // no-op-on-error convention of the wrappers in `basic/` (validate-then-
+    // return: a silent no-op, no `cblas_xerbla` call) — an error leaves B as the
+    // internal routine left it and the routine returns. In practice only a
+    // singular triangular factor is reachable here (the dimensions are correct
+    // by construction), which matches reference (x)TRSM: it likewise makes no
+    // guarantee about B for singular A.
     if let Err(_err) = level3::trsm_in_place(
         side_internal,
         uplo_internal,
@@ -414,9 +439,10 @@ pub unsafe extern "C" fn cblas_dtrmm(
         ),
     };
 
-    let k = match side_internal {
-        TrmmSide::Left => m,
-        TrmmSide::Right => n,
+    // Order of A from the caller's (unflipped) side; see `cblas_dtrsm`.
+    let k = match side {
+        CblasSide::Left => m,
+        CblasSide::Right => n,
     };
 
     use oxiblas_matrix::{MatMut, MatRef};
@@ -430,7 +456,7 @@ pub unsafe extern "C" fn cblas_dtrmm(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave B untouched.
     if let Err(_err) = level3::trmm_in_place(
         side_internal,
@@ -544,9 +570,10 @@ pub unsafe extern "C" fn cblas_strmm(
         ),
     };
 
-    let k = match side_internal {
-        TrmmSide::Left => m,
-        TrmmSide::Right => n,
+    // Order of A from the caller's (unflipped) side; see `cblas_dtrsm`.
+    let k = match side {
+        CblasSide::Left => m,
+        CblasSide::Right => n,
     };
 
     use oxiblas_matrix::{MatMut, MatRef};
@@ -560,7 +587,7 @@ pub unsafe extern "C" fn cblas_strmm(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave B untouched.
     if let Err(_err) = level3::trmm_in_place(
         side_internal,
@@ -671,7 +698,7 @@ pub unsafe extern "C" fn cblas_dsyrk(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut) {}
 }
@@ -768,7 +795,7 @@ pub unsafe extern "C" fn cblas_ssyrk(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::syrk(uplo_internal, trans_internal, alpha, a_ref, beta, c_mut) {}
 }
@@ -879,7 +906,7 @@ pub unsafe extern "C" fn cblas_dsyr2k(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::syr2k(
         uplo_internal,
@@ -994,7 +1021,7 @@ pub unsafe extern "C" fn cblas_ssyr2k(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::syr2k(
         uplo_internal,
@@ -1119,7 +1146,7 @@ pub unsafe extern "C" fn cblas_dsymm(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::symm(
         side_internal,
@@ -1240,7 +1267,7 @@ pub unsafe extern "C" fn cblas_ssymm(
 
     // Inspect the internal result instead of discarding it with a bare
     // `let _ =`. A dimension error is impossible by construction; if one ever
-    // occurred we mirror `basic.rs`'s no-op-on-error convention (a void C ABI
+    // occurred we mirror the no-op-on-error convention of `basic/` (a void C ABI
     // cannot surface a `Result`) and leave C untouched.
     if let Err(_err) = level3::symm(
         side_internal,
@@ -1254,230 +1281,5 @@ pub unsafe extern "C" fn cblas_ssymm(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cblas::{cblas_daxpy, cblas_ddot, cblas_dgemm, cblas_dnrm2, cblas_zdotc_sub};
-    use num_complex::Complex64;
-
-    #[test]
-    fn test_cblas_ddot() {
-        let x = [1.0f64, 2.0, 3.0, 4.0, 5.0];
-        let y = [2.0f64, 3.0, 4.0, 5.0, 6.0];
-
-        unsafe {
-            let result = cblas_ddot(5, x.as_ptr(), 1, y.as_ptr(), 1);
-            // 1*2 + 2*3 + 3*4 + 4*5 + 5*6 = 2 + 6 + 12 + 20 + 30 = 70
-            assert!((result - 70.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_dnrm2() {
-        let x = [3.0f64, 4.0];
-
-        unsafe {
-            let result = cblas_dnrm2(2, x.as_ptr(), 1);
-            // sqrt(9 + 16) = sqrt(25) = 5
-            assert!((result - 5.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_daxpy() {
-        let x = [1.0f64, 2.0, 3.0];
-        let mut y = [4.0f64, 5.0, 6.0];
-
-        unsafe {
-            cblas_daxpy(3, 2.0, x.as_ptr(), 1, y.as_mut_ptr(), 1);
-            // y = 2*x + y = [2+4, 4+5, 6+6] = [6, 9, 12]
-            assert!((y[0] - 6.0).abs() < 1e-10);
-            assert!((y[1] - 9.0).abs() < 1e-10);
-            assert!((y[2] - 12.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_dgemm_colmajor() {
-        // A = [[1, 2], [3, 4]] in column-major = [1, 3, 2, 4]
-        // B = [[5, 6], [7, 8]] in column-major = [5, 7, 6, 8]
-        // C = A * B = [[19, 22], [43, 50]] in column-major = [19, 43, 22, 50]
-        let a = [1.0f64, 3.0, 2.0, 4.0];
-        let b = [5.0f64, 7.0, 6.0, 8.0];
-        let mut c = [0.0f64; 4];
-
-        unsafe {
-            cblas_dgemm(
-                CblasLayout::ColMajor,
-                CblasTranspose::NoTrans,
-                CblasTranspose::NoTrans,
-                2,
-                2,
-                2,
-                1.0,
-                a.as_ptr(),
-                2,
-                b.as_ptr(),
-                2,
-                0.0,
-                c.as_mut_ptr(),
-                2,
-            );
-
-            assert!((c[0] - 19.0).abs() < 1e-10);
-            assert!((c[1] - 43.0).abs() < 1e-10);
-            assert!((c[2] - 22.0).abs() < 1e-10);
-            assert!((c[3] - 50.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_dgemm_with_beta() {
-        let a = [1.0f64, 2.0, 3.0, 4.0];
-        let b = [1.0f64; 4];
-        let mut c = [1.0f64; 4];
-
-        unsafe {
-            cblas_dgemm(
-                CblasLayout::ColMajor,
-                CblasTranspose::NoTrans,
-                CblasTranspose::NoTrans,
-                2,
-                2,
-                2,
-                1.0,
-                a.as_ptr(),
-                2,
-                b.as_ptr(),
-                2,
-                2.0, // beta = 2
-                c.as_mut_ptr(),
-                2,
-            );
-
-            // C = 1.0 * A * B + 2.0 * C_initial
-            // A * B = [[1+3, 1+3], [2+4, 2+4]] = [[4, 4], [6, 6]]
-            // C = [[4, 4], [6, 6]] + [[2, 2], [2, 2]] = [[6, 6], [8, 8]]
-            assert!((c[0] - 6.0).abs() < 1e-10);
-            assert!((c[1] - 8.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_zdotc() {
-        let x = [Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
-        let y = [Complex64::new(5.0, 6.0), Complex64::new(7.0, 8.0)];
-        let mut result = Complex64::new(0.0, 0.0);
-
-        unsafe {
-            cblas_zdotc_sub(2, x.as_ptr(), 1, y.as_ptr(), 1, &mut result);
-            // conj(x[0]) * y[0] + conj(x[1]) * y[1]
-            // = (1-2i)(5+6i) + (3-4i)(7+8i)
-            // = (5+6i-10i+12) + (21+24i-28i+32)
-            // = (17-4i) + (53-4i)
-            // = 70 - 8i
-            assert!((result.re - 70.0).abs() < 1e-10);
-            assert!((result.im - (-8.0)).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_dtrsm() {
-        // Lower triangular matrix A (column-major):
-        // [2  0]   stored as [2, 3, 0, 4]
-        // [3  4]
-        // B = [6, 11] (column vector stored as 2x1)
-        // Solve A * X = B => X = A^{-1} * B
-        // X[0] = 6/2 = 3
-        // X[1] = (11 - 3*3)/4 = 2/4 = 0.5
-        let a = [2.0f64, 3.0, 0.0, 4.0];
-        let mut b = [6.0f64, 11.0];
-
-        unsafe {
-            cblas_dtrsm(
-                CblasLayout::ColMajor,
-                CblasSide::Left,
-                CblasUplo::Lower,
-                CblasTranspose::NoTrans,
-                CblasDiag::NonUnit,
-                2,
-                1,
-                1.0,
-                a.as_ptr(),
-                2,
-                b.as_mut_ptr(),
-                2,
-            );
-
-            assert!((b[0] - 3.0).abs() < 1e-10);
-            assert!((b[1] - 0.5).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn test_cblas_dsyrk() {
-        // A = [[1, 2], [3, 4]] in column-major = [1, 3, 2, 4]
-        // C = A * A^T (NoTrans case)
-        // C[0,0] = 1*1 + 2*2 = 5
-        // C[1,0] = C[0,1] = 1*3 + 2*4 = 11
-        // C[1,1] = 3*3 + 4*4 = 25
-        let a = [1.0f64, 3.0, 2.0, 4.0];
-        let mut c = [0.0f64; 4];
-
-        unsafe {
-            cblas_dsyrk(
-                CblasLayout::ColMajor,
-                CblasUplo::Lower,
-                CblasTranspose::NoTrans,
-                2,
-                2,
-                1.0,
-                a.as_ptr(),
-                2,
-                0.0,
-                c.as_mut_ptr(),
-                2,
-            );
-
-            // Lower triangle only
-            assert!((c[0] - 5.0).abs() < 1e-10); // C[0,0]
-            assert!((c[1] - 11.0).abs() < 1e-10); // C[1,0]
-            assert!((c[3] - 25.0).abs() < 1e-10); // C[1,1]
-        }
-    }
-
-    #[test]
-    fn test_cblas_dsymm() {
-        // Symmetric matrix A (stored in lower):
-        // [1  2]
-        // [2  3]
-        // B = [[1, 0], [0, 1]] (identity)
-        // C = A * B = A
-        let a = [1.0f64, 2.0, 0.0, 3.0]; // Lower stored
-        let b = [1.0f64, 0.0, 0.0, 1.0];
-        let mut c = [0.0f64; 4];
-
-        unsafe {
-            cblas_dsymm(
-                CblasLayout::ColMajor,
-                CblasSide::Left,
-                CblasUplo::Lower,
-                2,
-                2,
-                1.0,
-                a.as_ptr(),
-                2,
-                b.as_ptr(),
-                2,
-                0.0,
-                c.as_mut_ptr(),
-                2,
-            );
-
-            // Result should be symmetric matrix A
-            assert!((c[0] - 1.0).abs() < 1e-10);
-            assert!((c[1] - 2.0).abs() < 1e-10);
-            assert!((c[2] - 2.0).abs() < 1e-10);
-            assert!((c[3] - 3.0).abs() < 1e-10);
-        }
-    }
-}
+#[path = "triangular_symmetric_tests.rs"]
+mod tests;

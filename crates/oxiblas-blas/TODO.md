@@ -17,6 +17,8 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] sdsdot - scaled dot product with extended precision accumulation
 - [x] dsdot - dot product with extended precision
 - [x] Complex variants optimization (cdotc, zdotc with conjugate) - SIMD optimized with NEON/AVX2, 4-way accumulation
+- [x] Complex Level-1 natives completing the Netlib set (0.2.3, #15) - `cabs1`/`scabs1`/`dcabs1`, `cnrm2`/`scnrm2`/`dznrm2` (+ `cnrm2_strided`), `scal_real`/`csscal`/`zdscal`, `rotm_strided`, `zdrot_strided`
+- [x] Netlib 3.12 increment and quick-return semantics (0.2.3, #10, #11, #12) - `inc == 0` and negative increments in nrm2/dot/axpy/copy/swap, complex scal/axpy quick returns, `cabs1` ranking in `iamax_strided`/`iamin_strided`, `crotg` per `zrotg.f90`; native `rotg`/`rotmg` aligned with `drotg.f90`/`drotmg.f` (#14)
 
 ### Optimizations
 - [x] SIMD optimization for axpy (NEON/AVX2 with FMA, 8-16x unrolling)
@@ -38,6 +40,7 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] hemv - Hermitian matrix-vector multiply
 - [x] syr2 - Symmetric rank-2 update
 - [x] her2 - Hermitian rank-2 update
+- [x] Reference quick returns, zero-column skips and Hermitian diagonal (0.2.3, #13, #14) - gemv/gemv_with_par/gemv_strided leave y untouched for an empty A; her/her2 write a real diagonal; ger/gerc/syr/spr/syr2/spr2/her/her2/hpr/hpr2 skip columns with an exactly-zero scaling element (ger/gerc column-oriented, reference association); hpr/hpr2 are bitwise equal to her/her2 for NaN-free input; her2/hpr2 form the second temp as conj(alpha*x(j)), as ZHER2/ZHPR2 do
 
 ### Banded Operations (Completed)
 - [x] gbmv - General banded matrix-vector
@@ -76,6 +79,7 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] herk (Hermitian rank-k)
 - [x] syr2k (symmetric rank-2k)
 - [x] her2k (Hermitian rank-2k)
+- [x] Reference alpha == 0 / beta == 0 semantics (0.2.3, #9) - A/B are never read for alpha == 0 and C never for beta == 0 in gemm (small, blocked, parallel), gemm3m, Strassen, Winograd, cache-oblivious, batched, symm, hemm, syrk, syr2k, herk, her2k and trsm; herk/her2k quick return
 
 ### Optimizations
 - [x] Larger micro-kernels for AVX-512 - f64: 16×6 (12 zmm accumulators), f32: 16×16 (16 zmm accumulators), with 2-way loop unrolling and FMA
@@ -92,6 +96,10 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] TRMM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular operations
 - [x] TRSM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular solve operations
 - [x] SYMM via GEMM optimization - expands symmetric matrix to full dense and uses optimized GEMM for n >= 32
+- [x] Balanced GEMM blocking (0.2.3, #4) - `balanced_block` fits every MC/KC/NC target to the problem: a dimension that fits is one block, a larger one is split into the fewest near-equal MR/NR/8-aligned blocks (no `[252, 4]`-style tails that re-pack A)
+- [x] 2D (M×N) parallel GEMM driver (0.2.3, #16) - `level3/gemm_parallel.rs` (feature `parallel`), tiles aligned to the micro-tile grid, bitwise equal to `Par::Seq`; gate 128³ total / 80³ per thread
+- [x] NEON small-GEMM dispatch on aarch64 (0.2.3, #16) - `gemm_small` sends f32/f64 problems with m, n >= 4 and column-major operands to the 4×4 NEON kernels
+- [x] Blocked GEMM honours `col_stride` of NoTrans operands (0.2.3) - strided views such as `MatRef::transpose()` were read with a unit column stride by the fast packers
 
 ### Complex Optimizations
 - [x] Optimized complex gemm (3M method) - uses real GEMM kernels for large matrices
@@ -156,6 +164,10 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] Level 2 CBLAS functions (cblas_dgemv, cblas_sgemv)
 - [x] Level 3 CBLAS functions (cblas_dgemm, cblas_sgemm, cblas_zgemm, cblas_cgemm, cblas_dtrsm, cblas_strsm, cblas_dtrmm, cblas_strmm, cblas_dsyrk, cblas_ssyrk, cblas_dsyr2k, cblas_ssyr2k, cblas_dsymm, cblas_ssymm)
 - [x] Complex CBLAS dot products (cblas_zdotu_sub, cblas_zdotc_sub, cblas_cdotu_sub, cblas_cdotc_sub)
+- [x] Reference CBLAS entry-point coverage (0.2.3, #14) - 78 entry points added (16 Level 1, 48 Level 2, 14 Level 3); 152 `cblas_*` symbols exported: every routine declared in reference `cblas.h` 3.12.1 (3.12.0 plus `?gemmtr`) except the `cblas_xerbla` handler, with matching parameter counts and kinds. Not a full drop-in yet: `i?amax` return `i32` (header: `size_t`), the layout/trans/uplo/side/diag parameters are Rust enums (out-of-range values are undefined behaviour), there is no `_64` API, invalid arguments are a silent no-op instead of `cblas_xerbla`, and no C-linkable library is built by this workspace. Open items: root TODO.md, "Release Milestones" (v0.2.4 triangular kernels, v0.3.0 signatures)
+  - Level 1: `cblas_{s,d}rotg`, `rotmg`, `rot`, `rotm`; `cblas_{c,z}rotg`; `cblas_csrot`, `cblas_zdrot`; `cblas_sdsdot`, `cblas_dsdot`; `cblas_scabs1`, `cblas_dcabs1`
+  - Level 2: band (`?gbmv`, `?sbmv`, `?hbmv`, `?tbmv`, `?tbsv`), packed (`?spmv`, `?spr`, `?spr2`, `?hpmv`, `?hpr`, `?hpr2`, `?tpmv`, `?tpsv`) and complex dense (`?geru`, `?gerc`, `?her`, `?her2`, `?trmv`, `?trsv`)
+  - Level 3: `?gemmtr` (all four precisions), `cblas_{c,z}symm`, `cblas_{c,z}syrk`, `cblas_{c,z}syr2k`, `cblas_{c,z}trmm`, `cblas_{c,z}trsm`
 - [x] Fast path optimization for unit stride vectors (uses SIMD-optimized level1 functions)
 - [x] Fast path optimization for NoTrans/NoTrans GEMM (uses SIMD-optimized level3::gemm)
 - [x] Row-major and column-major layout support with proper transpose handling
@@ -164,7 +176,7 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 
 ## Testing Requirements
 
-- [x] BLAS-TESTER compatibility - cblas module with extern "C" functions for Level 1/2/3, complex ops, row/col major support
+- [x] BLAS-TESTER compatibility - cblas module with extern "C" functions for Level 1/2/3, complex ops, row/col major support - 0.2.3: covers the entry points only; netlib's error-exit tests pass out-of-range enum values and expect `cblas_xerbla`, which does not exist here (invalid arguments are a silent no-op, enum values outside the `cblas.h` set are undefined behaviour; see the v0.3.0 milestone in the root TODO.md)
 - [x] Accuracy tests (forward/backward error) - accuracy module with error metrics, reference implementations, DOT/GEMV/GEMM/NRM2 accuracy tests
 - [x] Edge cases (1x1, empty, singular)
 - [x] Stride handling tests
@@ -185,7 +197,7 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 ## Code Organization
 
 - [x] TRSM refactored into 5 modules (level3/trsm/)
-- [x] CBLAS refactored into 3 modules (cblas/)
+- [x] CBLAS refactored into 3 modules (cblas/) - 0.2.3: since split further (the `basic/` directory, plus `level1_rot`, `level3_ext`, `banded`, `packed`, `complex_level2_ext` and `strided` from #14); see the module list in `cblas/mod.rs`
 
 ## Future Enhancements
 

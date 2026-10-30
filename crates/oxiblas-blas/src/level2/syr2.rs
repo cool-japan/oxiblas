@@ -45,7 +45,11 @@ impl std::error::Error for Syr2Error {}
 /// Performs the symmetric rank-2 update: A = alpha * x * y^T + alpha * y * x^T + A
 ///
 /// Only the specified triangle (upper or lower) of A is accessed and modified.
-/// The other triangle is not referenced.
+/// The other triangle is not referenced. As in reference BLAS `?syr2`, column `j`
+/// is updated as `A[i,j] = A[i,j] + x[i] * (alpha * y[j]) + y[i] * (alpha * x[j])`
+/// (evaluated left to right), and a column with `x[j]` and `y[j]` both zero is
+/// skipped entirely, so an infinite or NaN neighbour cannot reach it. If
+/// `n == 0` or `alpha == 0` the matrix is left untouched.
 ///
 /// # Arguments
 ///
@@ -104,12 +108,21 @@ pub fn syr2<T: Real>(
         Syr2Uplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * (x[i]*y[j] + y[i]*x[j]) for i >= j
             for j in 0..n {
-                let alpha_xj = alpha * x[j];
-                let alpha_yj = alpha * y[j];
+                // Reference ?SYR2 skips the column when x(j) == 0 and y(j) == 0, so
+                // an infinite or NaN neighbour cannot reach it as `Inf * 0`.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    continue;
+                }
+                // Reference temps and evaluation order:
+                // A(i,j) + x(i)*temp1 + y(i)*temp2, left to right.
+                let temp1 = alpha * y[j];
+                let temp2 = alpha * x[j];
                 for i in j..n {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i, j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
-                        *ptr = *ptr + alpha_xj * y[i] + alpha_yj * x[i];
+                        *ptr = *ptr + x[i] * temp1 + y[i] * temp2;
                     }
                 }
             }
@@ -117,12 +130,18 @@ pub fn syr2<T: Real>(
         Syr2Uplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * (x[i]*y[j] + y[i]*x[j]) for i <= j
             for j in 0..n {
-                let alpha_xj = alpha * x[j];
-                let alpha_yj = alpha * y[j];
+                // Column skip for x(j) == 0 && y(j) == 0, as in the lower branch.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    continue;
+                }
+                let temp1 = alpha * y[j];
+                let temp2 = alpha * x[j];
                 for i in 0..=j {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i <= j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
-                        *ptr = *ptr + alpha_xj * y[i] + alpha_yj * x[i];
+                        *ptr = *ptr + x[i] * temp1 + y[i] * temp2;
                     }
                 }
             }
@@ -431,5 +450,70 @@ mod tests {
         assert!((a[(0, 1)] - 4.0).abs() < 1e-10);
         assert!((a[(1, 0)] - 4.0).abs() < 1e-10);
         assert!((a[(1, 1)] - 4.0).abs() < 1e-10);
+    }
+
+    /// Issue #14: reference ?SYR2 skips column `j` when `x(j) == 0` and
+    /// `y(j) == 0`, so an infinite neighbour cannot reach it as `Inf * 0 = NaN`. A
+    /// column with only one of the two zero is updated.
+    #[test]
+    fn test_issue_14_syr2_zero_column_skip() {
+        let inf = f64::INFINITY;
+        let lower = [
+            &[1.0f64, 9.0, 9.0][..],
+            &[0.5, 2.0, 9.0],
+            &[0.25, 0.75, 3.0],
+        ];
+
+        // Lower: column 0 (x0 == y0 == 0) holds row 1, where x1 is infinite.
+        let mut a = Mat::from_rows(&lower);
+        let before = a.clone();
+        let (x, y) = ([0.0, inf, 1.0], [-0.0, 2.0, 3.0]);
+        syr2(Syr2Uplo::Lower, 1.5, &x, &y, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 0)].to_bits(),
+                before[(i, 0)].to_bits(),
+                "Lower ({i},0)"
+            );
+        }
+        // Column 1: temp2 = 1.5 * x1 = Inf reaches A11 and A21.
+        assert_eq!((a[(1, 1)], a[(2, 1)]), (inf, inf));
+        // Column 2: A22 = 3 + x2 * (1.5 * y2) + y2 * (1.5 * x2).
+        assert_eq!(a[(2, 2)], 3.0 + 1.0 * 4.5 + 3.0 * 1.5);
+        assert_eq!((a[(0, 1)], a[(0, 2)], a[(1, 2)]), (9.0, 9.0, 9.0));
+
+        // Only x0 == 0: column 0 is updated, A10 = 0.5 + x1 * (1.5 * 5) + y1 * 0.
+        let mut a = Mat::from_rows(&lower);
+        syr2(Syr2Uplo::Lower, 1.5, &x, &[5.0, 2.0, 3.0], a.as_mut()).unwrap();
+        assert_eq!(a[(1, 0)], inf);
+
+        // Upper: column 2 (x2 == y2 == 0) holds row 1, where x1 is infinite.
+        let mut a = Mat::from_rows(&[&[1.0f64, 0.5, 0.25], &[9.0, 2.0, 0.75], &[9.0, 9.0, 3.0]]);
+        let before = a.clone();
+        let (x, y) = ([1.0, inf, 0.0], [3.0, 2.0, -0.0]);
+        syr2(Syr2Uplo::Upper, 1.5, &x, &y, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 2)].to_bits(),
+                before[(i, 2)].to_bits(),
+                "Upper ({i},2)"
+            );
+        }
+        assert_eq!((a[(0, 1)], a[(1, 1)]), (inf, inf));
+        assert_eq!(a[(0, 0)], 1.0 + 1.0 * 4.5 + 3.0 * 1.5);
+        assert_eq!((a[(1, 0)], a[(2, 0)], a[(2, 1)]), (9.0, 9.0, 9.0));
+    }
+
+    /// Issue #14: the element update follows reference ?SYR2,
+    /// `A(i,j) + x(i)*(alpha*y(j)) + y(i)*(alpha*x(j))`, evaluated left to right.
+    /// With `A10 = 1`, `x1*temp1 = 2^-53` rounds away and `y1*temp2 = 2^-52`
+    /// survives, giving `1 + 2^-52`; adding the `y` term first would round the sum
+    /// up to `1 + 2^-51`.
+    #[test]
+    fn test_issue_14_syr2_reference_evaluation_order() {
+        let e = f64::EPSILON;
+        let mut a = Mat::from_rows(&[&[1.0f64, 9.0], &[1.0, 1.0]]);
+        syr2(Syr2Uplo::Lower, 1.0, &[1.0, 1.0], &[e / 2.0, e], a.as_mut()).unwrap();
+        assert_eq!(a[(1, 0)], 1.0 + e);
     }
 }

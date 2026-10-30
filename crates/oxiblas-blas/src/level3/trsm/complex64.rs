@@ -21,6 +21,13 @@ pub fn trsm_c64(
     let m = b.nrows();
     let n = b.ncols();
 
+    // Reference ?TRSM validates the shapes first and, for alpha == 0, sets X := 0 without
+    // reading A or B (a singular A is accepted; NaN/Inf in A or B cannot leak into X).
+    super::check_trsm_dims(side, a.nrows(), a.ncols(), m, n)?;
+    if alpha == Complex64::new(0.0, 0.0) {
+        return Ok(Mat::zeros(m, n));
+    }
+
     let mut x: Mat<Complex64> = Mat::zeros(m, n);
     // Copy B to X and scale by alpha
     for j in 0..n {

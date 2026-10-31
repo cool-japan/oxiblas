@@ -90,7 +90,7 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
     }
 }
 /// Trait for types that have GEMM micro-kernel implementations.
-pub trait GemmKernel: Field {
+pub trait GemmKernel: Field + 'static {
     /// Returns the micro-kernel shape for this type.
     fn micro_kernel_shape() -> MicroKernelShape;
     /// Executes the micro-kernel.
@@ -682,7 +682,7 @@ impl GemmKernel for f32 {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 16 },
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => MicroKernelShape { mr: 8, nr: 8 },
+            GemmKernelKind::Avx2 => MicroKernelShape { mr: 16, nr: 6 },
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Sse42 => MicroKernelShape { mr: 4, nr: 4 },
             #[cfg(target_arch = "aarch64")]
@@ -704,7 +704,7 @@ impl GemmKernel for f32 {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => micro_kernel_f32_avx2(k, alpha, a, b, beta, c, c_stride),
+            GemmKernelKind::Avx2 => micro_kernel_f32_avx2_16x6(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Sse42 => micro_kernel_f32_sse42(k, alpha, a, b, beta, c, c_stride),
             #[cfg(target_arch = "aarch64")]
@@ -754,12 +754,14 @@ unsafe fn micro_kernel_f32_scalar(
         }
     }
 }
-/// AVX2 micro-kernel for f32 (8×8).
+/// AVX2 micro-kernel for f32 (16×6).
 ///
-/// Uses 8 ymm accumulator registers with 4-way loop unrolling and software prefetching.
+/// Uses 12 ymm accumulators: with two FMA pipes of 5-cycle latency (AMD Zen 2,
+/// Intel Haswell and later need 10) the 8×8 kernel's 8 accumulators capped
+/// it at 80 % of peak. Mirrors the f64 8×6 kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn micro_kernel_f32_avx2(
+unsafe fn micro_kernel_f32_avx2_16x6(
     k: usize,
     alpha: f32,
     a: *const f32,
@@ -769,38 +771,45 @@ unsafe fn micro_kernel_f32_avx2(
     c_stride: usize,
 ) {
     use core::arch::x86_64::*;
-    const MR: usize = 8;
-    const NR: usize = 8;
+    const MR: usize = 16;
+    const NR: usize = 6;
     const PREFETCH_DIST: usize = 12;
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut acc2 = _mm256_setzero_ps();
-    let mut acc3 = _mm256_setzero_ps();
-    let mut acc4 = _mm256_setzero_ps();
-    let mut acc5 = _mm256_setzero_ps();
-    let mut acc6 = _mm256_setzero_ps();
-    let mut acc7 = _mm256_setzero_ps();
+    let mut acc0_lo = _mm256_setzero_ps();
+    let mut acc0_hi = _mm256_setzero_ps();
+    let mut acc1_lo = _mm256_setzero_ps();
+    let mut acc1_hi = _mm256_setzero_ps();
+    let mut acc2_lo = _mm256_setzero_ps();
+    let mut acc2_hi = _mm256_setzero_ps();
+    let mut acc3_lo = _mm256_setzero_ps();
+    let mut acc3_hi = _mm256_setzero_ps();
+    let mut acc4_lo = _mm256_setzero_ps();
+    let mut acc4_hi = _mm256_setzero_ps();
+    let mut acc5_lo = _mm256_setzero_ps();
+    let mut acc5_hi = _mm256_setzero_ps();
     macro_rules! fma_iter {
         ($offset:expr) => {{
             let a_ptr = a.add($offset * MR);
             let b_ptr = b.add($offset * NR);
-            let a_vec = _mm256_loadu_ps(a_ptr);
+            let a_lo = _mm256_loadu_ps(a_ptr);
+            let a_hi = _mm256_loadu_ps(a_ptr.add(8));
             let b0 = _mm256_broadcast_ss(&*b_ptr);
-            acc0 = _mm256_fmadd_ps(a_vec, b0, acc0);
+            acc0_lo = _mm256_fmadd_ps(a_lo, b0, acc0_lo);
+            acc0_hi = _mm256_fmadd_ps(a_hi, b0, acc0_hi);
             let b1 = _mm256_broadcast_ss(&*b_ptr.add(1));
-            acc1 = _mm256_fmadd_ps(a_vec, b1, acc1);
+            acc1_lo = _mm256_fmadd_ps(a_lo, b1, acc1_lo);
+            acc1_hi = _mm256_fmadd_ps(a_hi, b1, acc1_hi);
             let b2 = _mm256_broadcast_ss(&*b_ptr.add(2));
-            acc2 = _mm256_fmadd_ps(a_vec, b2, acc2);
+            acc2_lo = _mm256_fmadd_ps(a_lo, b2, acc2_lo);
+            acc2_hi = _mm256_fmadd_ps(a_hi, b2, acc2_hi);
             let b3 = _mm256_broadcast_ss(&*b_ptr.add(3));
-            acc3 = _mm256_fmadd_ps(a_vec, b3, acc3);
+            acc3_lo = _mm256_fmadd_ps(a_lo, b3, acc3_lo);
+            acc3_hi = _mm256_fmadd_ps(a_hi, b3, acc3_hi);
             let b4 = _mm256_broadcast_ss(&*b_ptr.add(4));
-            acc4 = _mm256_fmadd_ps(a_vec, b4, acc4);
+            acc4_lo = _mm256_fmadd_ps(a_lo, b4, acc4_lo);
+            acc4_hi = _mm256_fmadd_ps(a_hi, b4, acc4_hi);
             let b5 = _mm256_broadcast_ss(&*b_ptr.add(5));
-            acc5 = _mm256_fmadd_ps(a_vec, b5, acc5);
-            let b6 = _mm256_broadcast_ss(&*b_ptr.add(6));
-            acc6 = _mm256_fmadd_ps(a_vec, b6, acc6);
-            let b7 = _mm256_broadcast_ss(&*b_ptr.add(7));
-            acc7 = _mm256_fmadd_ps(a_vec, b7, acc7);
+            acc5_lo = _mm256_fmadd_ps(a_lo, b5, acc5_lo);
+            acc5_hi = _mm256_fmadd_ps(a_hi, b5, acc5_hi);
         }};
     }
     let k_unroll = k / 4;
@@ -810,6 +819,7 @@ unsafe fn micro_kernel_f32_avx2(
         if p + PREFETCH_DIST / 4 < k_unroll {
             let pf_base = (p + PREFETCH_DIST / 4) * 4;
             _mm_prefetch(a.add(pf_base * MR) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a.add(pf_base * MR + 8) as *const i8, _MM_HINT_T0);
             _mm_prefetch(b.add(pf_base * NR) as *const i8, _MM_HINT_T0);
         }
         fma_iter!(base);
@@ -823,60 +833,67 @@ unsafe fn micro_kernel_f32_avx2(
     }
     if alpha != 1.0 {
         let alpha_vec = _mm256_set1_ps(alpha);
-        acc0 = _mm256_mul_ps(acc0, alpha_vec);
-        acc1 = _mm256_mul_ps(acc1, alpha_vec);
-        acc2 = _mm256_mul_ps(acc2, alpha_vec);
-        acc3 = _mm256_mul_ps(acc3, alpha_vec);
-        acc4 = _mm256_mul_ps(acc4, alpha_vec);
-        acc5 = _mm256_mul_ps(acc5, alpha_vec);
-        acc6 = _mm256_mul_ps(acc6, alpha_vec);
-        acc7 = _mm256_mul_ps(acc7, alpha_vec);
+        acc0_lo = _mm256_mul_ps(acc0_lo, alpha_vec);
+        acc0_hi = _mm256_mul_ps(acc0_hi, alpha_vec);
+        acc1_lo = _mm256_mul_ps(acc1_lo, alpha_vec);
+        acc1_hi = _mm256_mul_ps(acc1_hi, alpha_vec);
+        acc2_lo = _mm256_mul_ps(acc2_lo, alpha_vec);
+        acc2_hi = _mm256_mul_ps(acc2_hi, alpha_vec);
+        acc3_lo = _mm256_mul_ps(acc3_lo, alpha_vec);
+        acc3_hi = _mm256_mul_ps(acc3_hi, alpha_vec);
+        acc4_lo = _mm256_mul_ps(acc4_lo, alpha_vec);
+        acc4_hi = _mm256_mul_ps(acc4_hi, alpha_vec);
+        acc5_lo = _mm256_mul_ps(acc5_lo, alpha_vec);
+        acc5_hi = _mm256_mul_ps(acc5_hi, alpha_vec);
     }
     if beta == 0.0 {
-        _mm256_storeu_ps(c, acc0);
-        _mm256_storeu_ps(c.add(c_stride), acc1);
-        _mm256_storeu_ps(c.add(2 * c_stride), acc2);
-        _mm256_storeu_ps(c.add(3 * c_stride), acc3);
-        _mm256_storeu_ps(c.add(4 * c_stride), acc4);
-        _mm256_storeu_ps(c.add(5 * c_stride), acc5);
-        _mm256_storeu_ps(c.add(6 * c_stride), acc6);
-        _mm256_storeu_ps(c.add(7 * c_stride), acc7);
-        return;
-    }
-    if beta == 1.0 {
+        _mm256_storeu_ps(c, acc0_lo);
+        _mm256_storeu_ps(c.add(8), acc0_hi);
+        _mm256_storeu_ps(c.add(c_stride), acc1_lo);
+        _mm256_storeu_ps(c.add(c_stride + 8), acc1_hi);
+        _mm256_storeu_ps(c.add(2 * c_stride), acc2_lo);
+        _mm256_storeu_ps(c.add(2 * c_stride + 8), acc2_hi);
+        _mm256_storeu_ps(c.add(3 * c_stride), acc3_lo);
+        _mm256_storeu_ps(c.add(3 * c_stride + 8), acc3_hi);
+        _mm256_storeu_ps(c.add(4 * c_stride), acc4_lo);
+        _mm256_storeu_ps(c.add(4 * c_stride + 8), acc4_hi);
+        _mm256_storeu_ps(c.add(5 * c_stride), acc5_lo);
+        _mm256_storeu_ps(c.add(5 * c_stride + 8), acc5_hi);
+    } else if beta == 1.0 {
         macro_rules! store_add {
-            ($col:expr, $acc:expr) => {{
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
                 let c_col = c.add($col * c_stride);
-                _mm256_storeu_ps(c_col, _mm256_add_ps($acc, _mm256_loadu_ps(c_col)));
+                _mm256_storeu_ps(c_col, _mm256_add_ps($acc_lo, _mm256_loadu_ps(c_col)));
+                _mm256_storeu_ps(
+                    c_col.add(8),
+                    _mm256_add_ps($acc_hi, _mm256_loadu_ps(c_col.add(8))),
+                );
             }};
         }
-        store_add!(0, acc0);
-        store_add!(1, acc1);
-        store_add!(2, acc2);
-        store_add!(3, acc3);
-        store_add!(4, acc4);
-        store_add!(5, acc5);
-        store_add!(6, acc6);
-        store_add!(7, acc7);
-        return;
+        store_add!(0, acc0_lo, acc0_hi);
+        store_add!(1, acc1_lo, acc1_hi);
+        store_add!(2, acc2_lo, acc2_hi);
+        store_add!(3, acc3_lo, acc3_hi);
+        store_add!(4, acc4_lo, acc4_hi);
+        store_add!(5, acc5_lo, acc5_hi);
+    } else {
+        let beta_vec = _mm256_set1_ps(beta);
+        macro_rules! store_fma {
+            ($col:expr, $acc_lo:expr, $acc_hi:expr) => {{
+                let c_col = c.add($col * c_stride);
+                let c_lo = _mm256_loadu_ps(c_col);
+                let c_hi = _mm256_loadu_ps(c_col.add(8));
+                _mm256_storeu_ps(c_col, _mm256_fmadd_ps(c_lo, beta_vec, $acc_lo));
+                _mm256_storeu_ps(c_col.add(8), _mm256_fmadd_ps(c_hi, beta_vec, $acc_hi));
+            }};
+        }
+        store_fma!(0, acc0_lo, acc0_hi);
+        store_fma!(1, acc1_lo, acc1_hi);
+        store_fma!(2, acc2_lo, acc2_hi);
+        store_fma!(3, acc3_lo, acc3_hi);
+        store_fma!(4, acc4_lo, acc4_hi);
+        store_fma!(5, acc5_lo, acc5_hi);
     }
-    let beta_vec = _mm256_set1_ps(beta);
-    macro_rules! store_col {
-        ($col:expr, $acc:expr) => {{
-            let c_col = c.add($col * c_stride);
-            let c_vec = _mm256_loadu_ps(c_col);
-            let res = _mm256_fmadd_ps(c_vec, beta_vec, $acc);
-            _mm256_storeu_ps(c_col, res);
-        }};
-    }
-    store_col!(0, acc0);
-    store_col!(1, acc1);
-    store_col!(2, acc2);
-    store_col!(3, acc3);
-    store_col!(4, acc4);
-    store_col!(5, acc5);
-    store_col!(6, acc6);
-    store_col!(7, acc7);
 }
 /// AVX-512 micro-kernel for f32 (16×16).
 ///

@@ -27,8 +27,12 @@
 //! needs neither raw pointers nor synchronization.
 
 use super::autotune::balanced_block;
-use super::gemm::{GemmBlocking, macro_panel_multiply, op_dims, pack_a_trans_dispatch, read_op};
+use super::gemm::{
+    GemmBlocking, macro_panel_multiply, op_dims, pack_a_trans_dispatch, pack_b_trans_dispatch,
+    read_op,
+};
 use super::gemm_kernel::{GemmKernel, MicroKernelShape};
+use super::gemm_pack_pool;
 use super::trsm::Trans;
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::parallel::Par;
@@ -45,6 +49,58 @@ const TILES_PER_THREAD: usize = 3;
 
 /// Target number of packed-B chunks per worker thread in phase 1.
 const B_CHUNKS_PER_THREAD: usize = 2;
+
+/// Target number of C tiles per worker thread with [`PackScope::PerTile`].
+///
+/// Each tile packs its own panels, so tiles are kept near-square (that
+/// minimises the re-packed `(rows + cols) * k` per tile) and a little more
+/// numerous than in the shared mode, for work stealing. Measured on a
+/// Threadripper PRO 3975WX (f64, n = 4096, 32 threads, prototype of this
+/// driver): 1, 2, 3 and 4 tiles per thread gave 837, 873, 938 and 975
+/// GFLOP/s.
+const PER_TILE_TILES_PER_THREAD: usize = 4;
+
+/// Who packs `op(B)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PackScope {
+    /// One B~ per KC step, packed cooperatively and read by every tile; two
+    /// fork/joins per KC step.
+    Shared,
+    /// Every tile runs the whole KC loop on its own, packing its own slices
+    /// of `op(A)` and `op(B)` into buffers from the worker's own pool; one
+    /// fork/join per NC block.
+    ///
+    /// On multi-die x86 parts (AMD Zen: one L3 per 4- or 8-core CCX) a shared
+    /// B~ is packed by threads on every die and then read by every die
+    /// across the fabric. On a Threadripper PRO 3975WX (f64, n = 4096, 32
+    /// threads) the shared driver reached 582 GFLOP/s and this one 979, with
+    /// OpenBLAS 0.3.29 at 1318.
+    PerTile,
+}
+
+impl PackScope {
+    /// Threads up to which `PerTile` is not used on `x86_64`.
+    ///
+    /// Up to a few threads the shared B~ stays within one L3 (an AMD Zen 2
+    /// CCX has 4 cores) and packing it once wins. Threadripper PRO 3975WX,
+    /// median GFLOP/s, PerTile / Shared: 2 threads 0.78-0.93 (f64 n = 2048:
+    /// 96 vs 110), 4 threads 0.84-1.29, 8 threads 0.97-2.25, 16 threads
+    /// 1.00-1.69.
+    const SHARED_MAX_THREADS: usize = 4;
+
+    /// The scope used by [`try_gemm_blocked_parallel`] for `threads` threads.
+    ///
+    /// `PerTile` on `x86_64` above [`Self::SHARED_MAX_THREADS`], where it was
+    /// measured; `Shared` otherwise and on other targets, where the shared
+    /// driver was tuned (Apple M-series).
+    pub(super) fn for_threads(threads: usize) -> Self {
+        if cfg!(target_arch = "x86_64") && threads > Self::SHARED_MAX_THREADS {
+            Self::PerTile
+        } else {
+            Self::Shared
+        }
+    }
+}
 
 /// Number of tile rows and tile columns for one NC block of C.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +132,39 @@ impl TileGrid {
             }
         }
         best
+    }
+
+    /// Chooses a near-square tile grid for an `m × w` block of C, with about
+    /// [`PER_TILE_TILES_PER_THREAD`] tiles per thread (see
+    /// [`PackScope::PerTile`]).
+    fn choose_square(m: usize, w: usize, shape: &MicroKernelShape, threads: usize) -> Self {
+        let mu = m.div_ceil(shape.mr);
+        let nu = w.div_ceil(shape.nr);
+        let target = (PER_TILE_TILES_PER_THREAD * threads).min(mu * nu).max(1);
+        // rows / cols ≈ m / w makes the tiles near-square in elements.
+        let ideal = (target as f64 * m as f64 / w as f64).sqrt().round() as usize;
+        let rows = ideal.clamp(1, mu.min(target));
+        let cols = target.div_ceil(rows).clamp(1, nu);
+        Self { rows, cols }
+    }
+
+    /// Chooses the grid for `scope`.
+    fn for_scope(
+        scope: PackScope,
+        m: usize,
+        w: usize,
+        shape: &MicroKernelShape,
+        threads: usize,
+    ) -> Self {
+        match scope {
+            PackScope::Shared => Self::choose(m, w, shape, threads),
+            PackScope::PerTile => Self::choose_square(m, w, shape, threads),
+        }
+    }
+
+    /// Widest tile column of a `w`-column block.
+    fn widest_cols(self, w: usize, nr: usize) -> usize {
+        (w.div_ceil(nr).div_ceil(self.cols) * nr).min(w)
     }
 
     /// Total number of tiles.
@@ -253,6 +342,36 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
     shape: &MicroKernelShape,
     par: Par,
 ) -> bool {
+    try_gemm_blocked_parallel_scoped(
+        trans_a,
+        trans_b,
+        alpha,
+        a,
+        b,
+        beta,
+        c,
+        blocking,
+        shape,
+        par,
+        PackScope::for_threads(par.num_threads()),
+    )
+}
+
+/// [`try_gemm_blocked_parallel`] with an explicit [`PackScope`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_gemm_blocked_parallel_scoped<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    shape: &MicroKernelShape,
+    par: Par,
+    scope: PackScope,
+) -> bool {
     // Logical (post-transpose) dimensions.
     let (m, k) = op_dims(a, trans_a);
     let (_, n) = op_dims(b, trans_b);
@@ -268,18 +387,73 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
     let threads = par.num_threads();
 
     // Grids of the full-width NC blocks and of the (possibly narrower) last.
-    let full_grid = TileGrid::choose(m, nc, shape, threads);
+    let full_grid = TileGrid::for_scope(scope, m, nc, shape, threads);
     if full_grid.count() < 2 {
         return false;
     }
     let last_w = n - (n - 1) / nc * nc;
-    let last_grid = TileGrid::choose(m, last_w, shape, threads);
+    let last_grid = TileGrid::for_scope(scope, m, last_w, shape, threads);
 
     // Each tile packs at most `round_up(min(mc, tallest tile), MR) x KC` of A.
     let max_tile_rows = full_grid
         .tallest_rows(m, mr)
         .max(last_grid.tallest_rows(m, mr));
     let a_len = mc.min(max_tile_rows).div_ceil(mr) * mr * kc;
+
+    if scope == PackScope::PerTile {
+        // ... and at most `round_up(widest tile, NR) x KC` of B.
+        let max_tile_cols = full_grid
+            .widest_cols(nc, nr)
+            .max(last_grid.widest_cols(last_w, nr));
+        let b_len = max_tile_cols.div_ceil(nr) * nr * kc;
+        for jc in (0..n).step_by(nc) {
+            let w = nc.min(n - jc);
+            let grid = if w == nc { full_grid } else { last_grid };
+            let mut tiles = split_tiles(c.rb_mut().submatrix(0, jc, m, w), grid, shape);
+            tiles.par_iter_mut().with_max_len(1).for_each(|tile| {
+                // Buffers from the worker's own pool: allocated (and first
+                // touched) by the thread that uses them.
+                let mut a_buf: AlignedVec<T> = gemm_pack_pool::take(a_len);
+                let mut b_buf: AlignedVec<T> = gemm_pack_pool::take(b_len);
+                let rows = tile.view.nrows();
+                let cols = tile.view.ncols();
+                let mc_tile = balanced_block(rows, mc, mr);
+                for pc in (0..k).step_by(kc) {
+                    let pb = kc.min(k - pc);
+                    let beta_eff = if pc == 0 { beta } else { T::one() };
+                    pack_b_trans_dispatch(b, trans_b, pc, jc + tile.col0, pb, cols, &mut b_buf, nr);
+                    for ic in (0..rows).step_by(mc_tile) {
+                        let ib = mc_tile.min(rows - ic);
+                        pack_a_trans_dispatch(
+                            a,
+                            trans_a,
+                            tile.row0 + ic,
+                            pc,
+                            ib,
+                            pb,
+                            &mut a_buf,
+                            mr,
+                        );
+                        macro_panel_multiply(
+                            alpha,
+                            &a_buf,
+                            ib,
+                            pb,
+                            &b_buf,
+                            pb,
+                            cols,
+                            beta_eff,
+                            tile.view.rb_mut().submatrix(ic, 0, ib, cols),
+                            shape,
+                        );
+                    }
+                }
+                gemm_pack_pool::give(a_buf);
+                gemm_pack_pool::give(b_buf);
+            });
+        }
+        return true;
+    }
 
     // One A~ buffer per worker of the current pool, allocated once per call.
     // Tile tasks never re-enter rayon while holding a buffer, so each slot is
@@ -517,21 +691,24 @@ mod tests {
                 "{ctx}: gate, t={t}"
             );
 
-            let mut c_par = c_init.clone();
-            let engaged = try_gemm_blocked_parallel(
-                ta,
-                tb,
-                alpha,
-                &a.as_ref(),
-                &b.as_ref(),
-                beta,
-                &mut c_par.as_mut(),
-                &fitted,
-                &shape,
-                par,
-            );
-            assert!(engaged, "{ctx}: 2D driver declined, t={t}");
-            assert_bits_eq(&c_par, &c_seq, &format!("{ctx} direct t={t}"));
+            for scope in [PackScope::Shared, PackScope::PerTile] {
+                let mut c_par = c_init.clone();
+                let engaged = try_gemm_blocked_parallel_scoped(
+                    ta,
+                    tb,
+                    alpha,
+                    &a.as_ref(),
+                    &b.as_ref(),
+                    beta,
+                    &mut c_par.as_mut(),
+                    &fitted,
+                    &shape,
+                    par,
+                    scope,
+                );
+                assert!(engaged, "{ctx}: 2D driver declined, t={t}, {scope:?}");
+                assert_bits_eq(&c_par, &c_seq, &format!("{ctx} direct t={t} {scope:?}"));
+            }
 
             let mut c_api = c_init.clone();
             gemm_transposed_with_blocking(
@@ -692,6 +869,49 @@ mod tests {
                         assert!(grid.count() < 2 * TILES_PER_THREAD * threads, "{ctx}");
                         if mu * nu >= 8 {
                             assert!(grid.count() >= 2, "{ctx}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pack_scope_for_threads() {
+        for t in 0..=PackScope::SHARED_MAX_THREADS {
+            assert_eq!(PackScope::for_threads(t), PackScope::Shared, "t={t}");
+        }
+        let many = PackScope::for_threads(PackScope::SHARED_MAX_THREADS + 1);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(many, PackScope::PerTile);
+        } else {
+            assert_eq!(many, PackScope::Shared);
+        }
+    }
+
+    #[test]
+    fn test_per_tile_grid_valid_and_near_square() {
+        for &(mr, nr) in &[(8usize, 6usize), (16, 6), (4, 4), (2, 2)] {
+            let shape = MicroKernelShape { mr, nr };
+            for &m in &[1usize, 7, 64, 100, 513, 2048, 4096] {
+                for &w in &[1usize, 6, 64, 517, 2048, 5712] {
+                    for &threads in &[2usize, 3, 4, 8, 12, 32, 64] {
+                        let grid = TileGrid::choose_square(m, w, &shape, threads);
+                        let (mu, nu) = (m.div_ceil(mr), w.div_ceil(nr));
+                        let ctx = format!("{mr}x{nr} m={m} w={w} t={threads}: {grid:?}");
+                        assert!((1..=mu).contains(&grid.rows), "{ctx}");
+                        assert!((1..=nu).contains(&grid.cols), "{ctx}");
+                        let target = PER_TILE_TILES_PER_THREAD * threads;
+                        assert!(grid.count() < 2 * target, "{ctx}");
+                        if mu * nu >= target {
+                            assert!(grid.count() >= target, "{ctx}");
+                        }
+                        // Square problems with room for it get near-square
+                        // tiles (in elements), not thin strips.
+                        if m == w && mu >= target && nu >= target {
+                            let tile_h = m.div_ceil(grid.rows);
+                            let tile_w = w.div_ceil(grid.cols);
+                            assert!(tile_h * 2 >= tile_w && tile_w * 2 >= tile_h, "{ctx}");
                         }
                     }
                 }

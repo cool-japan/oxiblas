@@ -40,6 +40,16 @@
 
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
+#[cfg(all(
+    feature = "parallel",
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+use crate::level3::gemm_kernel::sme2;
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
 use crate::level3::gemm_packing::{pack_a_optimized, pack_b_optimized};
 use crate::level3::gemm_small::{SMALL_THRESHOLD, gemm_small};
@@ -838,6 +848,45 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         // `PARALLEL_GATE`.
         let total_work = m * n * k;
 
+        // SME2 (the only 64-row micro-kernel) runs one thread per SME unit, on its own pool.
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if shape.mr == sme2::MR {
+            let pool = if par.is_sequential() {
+                None
+            } else {
+                sme2::thread_pool(total_work)
+            };
+            if let Some(pool) = pool {
+                let units = pool.current_num_threads();
+                let done = pool.install(|| {
+                    try_gemm_blocked_parallel(
+                        trans_a,
+                        trans_b,
+                        alpha,
+                        a,
+                        b,
+                        beta,
+                        c,
+                        blocking,
+                        shape,
+                        Par::RayonWith(units),
+                    )
+                });
+                if done {
+                    return;
+                }
+            }
+            gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+            return;
+        }
+
         // The 2D driver declines (returns false) when C is too small to form
         // at least two tiles.
         if PARALLEL_GATE.should_parallelize(total_work, par)
@@ -1102,6 +1151,25 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
 ) {
     let mr = shape.mr;
     let nr = shape.nr;
+
+    // SAFETY: `pack_a` and `pack_b` hold the packed panels of this m x n block
+    // (`ceil(m / MR)` and `ceil(n / NR)` panels of depth k), and `c` is an
+    // m x n view with column stride `c.row_stride()`.
+    if unsafe {
+        T::macro_kernel(
+            m,
+            n,
+            k,
+            alpha,
+            pack_a.as_ptr(),
+            pack_b.as_ptr(),
+            beta,
+            c.as_ptr().cast_mut(),
+            c.row_stride(),
+        )
+    } {
+        return;
+    }
 
     // Number of MR×NR blocks
     let m_blocks = m.div_ceil(mr);

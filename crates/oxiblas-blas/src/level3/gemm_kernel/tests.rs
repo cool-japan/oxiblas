@@ -37,7 +37,8 @@ mod tests_2 {
     #[test]
     fn test_shape_matches_selected_kernel_kind() {
         let kind = selected_kernel_kind();
-        let (expected_f64, expected_f32): ((usize, usize), (usize, usize)) = match kind {
+        #[allow(unused_mut)]
+        let (mut expected_f64, mut expected_f32): ((usize, usize), (usize, usize)) = match kind {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => ((16, 6), (16, 16)),
             #[cfg(target_arch = "x86_64")]
@@ -49,6 +50,23 @@ mod tests_2 {
             GemmKernelKind::Scalar => ((4, 4), (4, 4)),
             other => panic!("kernel kind {other:?} cannot be selected on this target"),
         };
+        // SME2, when present, takes precedence over the NEON kernels.
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        {
+            if use_sme2_f64() {
+                expected_f64 = (sme2::MR, sme2::NR_F64);
+            }
+            if use_sme2_f32() {
+                expected_f32 = (sme2::MR, sme2::NR_F32);
+            }
+        }
 
         let s64 = f64::micro_kernel_shape();
         let s32 = f32::micro_kernel_shape();

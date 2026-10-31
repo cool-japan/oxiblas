@@ -19,6 +19,9 @@ num-traits.workspace = true
 bytemuck.workspace = true
 rayon = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
 [features]
 default = ["oxiblas-core/std", "oxiblas-matrix/std"]
 parallel = ["rayon", "oxiblas-core/parallel"]

@@ -89,6 +89,48 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
         kind
     }
 }
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+pub(crate) mod sme2;
+
+/// Returns `true` when f64 GEMM runs on the SME2 micro-kernel.
+///
+/// Like [`selected_kernel_kind`], this is the one source for both
+/// `micro_kernel_shape()` and `micro_kernel()`. The SIMD-control features
+/// switch SME2 off at compile time (its vectors are 512 bits).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[inline]
+fn use_sme2_f64() -> bool {
+    sme2::usable_f64()
+}
+
+/// Returns `true` when f32 GEMM runs on the SME2 micro-kernel (see [`use_sme2_f64`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[inline]
+fn use_sme2_f32() -> bool {
+    sme2::usable_f32()
+}
+
 /// Trait for types that have GEMM micro-kernel implementations.
 pub trait GemmKernel: Field {
     /// Returns the micro-kernel shape for this type.
@@ -122,9 +164,51 @@ pub trait GemmKernel: Field {
         c: *mut Self,
         c_stride: usize,
     );
+    /// Multiplies all micro-panels of a packed `m x n` block in one call, when
+    /// this type has a kernel for that (the SME2 kernels, which enter
+    /// streaming mode once per block); returns `false` otherwise, and the
+    /// caller then runs [`GemmKernel::micro_kernel`] per micro-tile.
+    ///
+    /// `a` holds `ceil(m / MR)` packed A panels of `MR * k` elements, `b`
+    /// holds `ceil(n / NR)` packed B panels of `NR * k` elements, and C is
+    /// `m x n` with column stride `c_stride`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`GemmKernel::micro_kernel`], for the whole block.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        false
+    }
 }
 impl GemmKernel for f64 {
     fn micro_kernel_shape() -> MicroKernelShape {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            return MicroKernelShape {
+                mr: sme2::MR,
+                nr: sme2::NR_F64,
+            };
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 6 },
@@ -147,6 +231,17 @@ impl GemmKernel for f64 {
         c: *mut Self,
         c_stride: usize,
     ) {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            return sme2::micro_kernel_f64_sme2(k, alpha, a, b, beta, c, c_stride);
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => micro_kernel_f64_avx512(k, alpha, a, b, beta, c, c_stride),
@@ -158,6 +253,34 @@ impl GemmKernel for f64 {
             GemmKernelKind::Neon => micro_kernel_f64_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f64_scalar(k, alpha, a, b, beta, c, c_stride),
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() && m > 0 && n > 0 {
+            sme2::macro_kernel_f64_sme2(m, n, k, alpha, a, b, beta, c, c_stride);
+            return true;
+        }
+        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        false
     }
 }
 /// Scalar micro-kernel for f64.
@@ -678,6 +801,20 @@ unsafe fn micro_kernel_f64_neon(
 }
 impl GemmKernel for f32 {
     fn micro_kernel_shape() -> MicroKernelShape {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            return MicroKernelShape {
+                mr: sme2::MR,
+                nr: sme2::NR_F32,
+            };
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 16 },
@@ -700,6 +837,17 @@ impl GemmKernel for f32 {
         c: *mut Self,
         c_stride: usize,
     ) {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            return sme2::micro_kernel_f32_sme2(k, alpha, a, b, beta, c, c_stride);
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride),
@@ -711,6 +859,34 @@ impl GemmKernel for f32 {
             GemmKernelKind::Neon => micro_kernel_f32_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f32_scalar(k, alpha, a, b, beta, c, c_stride),
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() && m > 0 && n > 0 {
+            sme2::macro_kernel_f32_sme2(m, n, k, alpha, a, b, beta, c, c_stride);
+            return true;
+        }
+        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        false
     }
 }
 /// Scalar micro-kernel for f32.

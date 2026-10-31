@@ -57,6 +57,14 @@ changes are listed under Fixed and Changed.
   vector times a real scalar, componentwise, immediate return for `alpha == 1`, no
   zero-fill for `alpha == 0`); `rotm_strided` and `zdrot_strided`. The strided forms
   take positive, negative and zero increments. (#15)
+- SME2 micro-kernels for f32 and f64 GEMM on AArch64 (Apple M4 and later): 64 x 16
+  (f32) and 64 x 8 (f64) tiles in the ZA array, in stable `asm!` (no C, no FFI). They
+  are selected at run time on macOS when `FEAT_SME2` (and `FEAT_SME_F64F64` for f64)
+  is present and the streaming vector length is 512 bits; otherwise the NEON kernels
+  run. With `Par::Rayon`, the SME2 path uses one thread per SME unit (one per
+  performance cluster) on its own thread pool, from 2^22 multiply-adds. The
+  SIMD-control features (`force-scalar`, `max-simd-128`, `max-simd-256`) turn it
+  off. (#16)
 
 #### CBLAS
 

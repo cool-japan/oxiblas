@@ -1,0 +1,1283 @@
+// Copyright 2026 COOLJAPAN OU (Team KitaSan)
+// SPDX-License-Identifier: Apache-2.0
+
+//! SME2 GEMM micro-kernels for AArch64 (Apple M4 and later).
+//!
+//! The kernels use the ZA matrix storage of the Scalable Matrix Extension with
+//! a 512-bit streaming vector length (SVL). A micro-tile of C is 64 x 16 (f32,
+//! four 16 x 16 ZA tiles) or 64 x 8 (f64, eight 8 x 8 ZA tiles). Each K step
+//! takes 64 elements of the packed A panel and NR elements of the packed B
+//! panel, and adds their outer products with `FMOPA`, with B as the row
+//! operand: horizontal slice `j` of ZA tile `t` holds rows `16t..16t + 16`
+//! (f32) of column `j` of C, which is contiguous in column-major storage.
+//! This is the layout of the packed SME2 kernels in OpenBLAS (pull request
+//! OpenMathLib/OpenBLAS#6074, `KERNEL.VORTEXM4`).
+//!
+//! Rust has no SME intrinsics, so each kernel is one `asm!` block that enters
+//! streaming mode (`smstart`), computes the whole micro-tile, writes C and
+//! leaves streaming mode (`smstop`). Nothing runs between `smstart` and
+//! `smstop` except the instructions in the block, so the compiler never sees
+//! streaming mode. `smstart` and `smstop` zero the vector registers, so the
+//! blocks declare all of `v0`-`v31` (and the predicates) as clobbered; this
+//! includes the callee-saved `d8`-`d15`.
+
+use std::sync::OnceLock;
+
+/// Micro-tile rows (MR) of both kernels.
+pub(crate) const MR: usize = 64;
+/// Micro-tile columns (NR) of the f32 kernel.
+pub(super) const NR_F32: usize = 16;
+/// Micro-tile columns (NR) of the f64 kernel.
+pub(super) const NR_F64: usize = 8;
+
+/// Streaming vector length, in bytes, that the kernels are written for.
+const SVL_BYTES: u64 = 64;
+
+/// What the SME2 kernels can use on this CPU.
+#[derive(Debug, Clone, Copy)]
+struct Sme2Support {
+    f32: bool,
+    f64: bool,
+}
+
+/// Detects SME2 once per process (and `FEAT_SME_F64F64` for f64).
+fn support() -> Sme2Support {
+    static SUPPORT: OnceLock<Sme2Support> = OnceLock::new();
+    *SUPPORT.get_or_init(detect)
+}
+
+/// Returns `true` when the f32 SME2 kernel can run on this CPU.
+pub(super) fn usable_f32() -> bool {
+    support().f32
+}
+
+/// Returns `true` when the f64 SME2 kernel can run on this CPU.
+pub(super) fn usable_f64() -> bool {
+    support().f64
+}
+
+#[cfg(target_os = "macos")]
+fn detect() -> Sme2Support {
+    let sme2 = sysctl_flag(c"hw.optional.arm.FEAT_SME2");
+    // RDSVL is undefined without SME, so it runs only after the SME2 check.
+    // SAFETY: SME2 (and hence SME) is implemented when `sme2` is true.
+    let svl_ok = sme2 && unsafe { streaming_vector_bytes() } == SVL_BYTES;
+    Sme2Support {
+        f32: svl_ok,
+        f64: svl_ok && sysctl_flag(c"hw.optional.arm.FEAT_SME_F64F64"),
+    }
+}
+
+/// Untested outside macOS: other systems use the NEON kernels.
+#[cfg(not(target_os = "macos"))]
+fn detect() -> Sme2Support {
+    Sme2Support {
+        f32: false,
+        f64: false,
+    }
+}
+
+/// Reads an integer `sysctl` flag; `false` when it is missing or zero.
+#[cfg(target_os = "macos")]
+fn sysctl_flag(name: &core::ffi::CStr) -> bool {
+    let mut value: libc::c_int = 0;
+    let mut len: libc::size_t = core::mem::size_of::<libc::c_int>();
+    // SAFETY: `name` is NUL-terminated, `value` and `len` describe a valid
+    // `c_int` buffer, and no new value is written.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0 && value != 0
+}
+
+/// Smallest number of multiply-adds that runs on more than one SME unit.
+#[cfg(feature = "parallel")]
+const PAR_MIN_WORK: usize = 1 << 22;
+
+/// Returns a thread pool with one thread per SME unit, when there are at least
+/// two units and the problem has at least [`PAR_MIN_WORK`] multiply-adds.
+///
+/// Threads that share one SME unit only compete for it, so the SME2 path runs
+/// on this pool instead of the global rayon pool. Its threads ask for the
+/// user-interactive QoS class, so that macOS runs them on performance cores.
+#[cfg(feature = "parallel")]
+pub(crate) fn thread_pool(work: usize) -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    if work < PAR_MIN_WORK || sme_units() < 2 {
+        return None;
+    }
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(sme_units())
+            .thread_name(|i| format!("oxiblas-sme2-{i}"))
+            .start_handler(|_| set_interactive_qos())
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Asks for the user-interactive QoS class for the calling thread.
+#[cfg(all(feature = "parallel", target_os = "macos"))]
+fn set_interactive_qos() {
+    // SAFETY: the call only changes the scheduling class of this thread; a
+    // failure leaves the thread at its default class, which is still correct.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+#[cfg(all(feature = "parallel", not(target_os = "macos")))]
+fn set_interactive_qos() {}
+
+/// Returns the number of performance-core clusters, i.e. of SME units on Apple
+/// silicon (one per P-cluster); at least 1.
+#[cfg(all(feature = "parallel", target_os = "macos"))]
+pub(super) fn sme_units() -> usize {
+    static UNITS: OnceLock<usize> = OnceLock::new();
+    *UNITS.get_or_init(|| {
+        let cores = sysctl_int(c"hw.perflevel0.physicalcpu");
+        let per_l2 = sysctl_int(c"hw.perflevel0.cpusperl2");
+        if cores > 0 && per_l2 > 0 {
+            (cores / per_l2).max(1)
+        } else {
+            1
+        }
+    })
+}
+
+/// Returns the number of SME units; 1 outside macOS.
+#[cfg(all(feature = "parallel", not(target_os = "macos")))]
+pub(super) fn sme_units() -> usize {
+    1
+}
+
+/// Reads a non-negative integer `sysctl` value; 0 when it is missing.
+#[cfg(all(feature = "parallel", target_os = "macos"))]
+fn sysctl_int(name: &core::ffi::CStr) -> usize {
+    let mut value: libc::c_int = 0;
+    let mut len: libc::size_t = core::mem::size_of::<libc::c_int>();
+    // SAFETY: as in `sysctl_flag`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        usize::try_from(value).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Returns the streaming vector length in bytes.
+///
+/// # Safety
+///
+/// The CPU must implement SME (`RDSVL` is undefined otherwise).
+#[cfg(target_os = "macos")]
+unsafe fn streaming_vector_bytes() -> u64 {
+    let svl: u64;
+    // SAFETY: the caller guarantees SME; RDSVL reads a system value only.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme",
+            "rdsvl {svl}, #1",
+            svl = out(reg) svl,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    svl
+}
+
+/// SME2 micro-kernel for f32: `C = alpha * A * B + beta * C` on a 64 x 16 tile.
+///
+/// `a` is a packed A panel (`k` steps of 64 elements), `b` a packed B panel
+/// (`k` steps of 16 elements), and C is column-major with column stride
+/// `c_stride`. With `beta == 0`, C is not read.
+///
+/// # Safety
+///
+/// - [`usable_f32`] must have returned `true`.
+/// - `a` must be valid for `64 * k` reads and `b` for `16 * k` reads.
+/// - `c` must be valid for reads and writes of 64 elements in each of 16
+///   columns `c_stride` apart.
+pub(super) unsafe fn micro_kernel_f32_sme2(
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    b: *const f32,
+    beta: f32,
+    c: *mut f32,
+    c_stride: usize,
+) {
+    let ldc_bytes = c_stride * core::mem::size_of::<f32>();
+    let beta_zero = u64::from(beta == 0.0);
+    // SAFETY: the caller guarantees SME2, SVL 512 and the buffer sizes above;
+    // the block enters and leaves streaming mode itself.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "zero {{za}}",
+            "ptrue p0.s",
+            "ptrue pn8.s",
+            // K loop, four steps per iteration: one x4 load of B gives 4 steps.
+            "lsr x9, x0, #2",
+            "cbz x9, 2f",
+            "1:",
+            "ld1w {{z4.s-z7.s}}, pn8/z, [x2]",
+            "ld1w {{z0.s-z3.s}}, pn8/z, [x1]",
+            "ld1w {{z16.s-z19.s}}, pn8/z, [x1, #4, mul vl]",
+            "ld1w {{z20.s-z23.s}}, pn8/z, [x1, #8, mul vl]",
+            "ld1w {{z24.s-z27.s}}, pn8/z, [x1, #12, mul vl]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "fmopa za0.s, p0/m, p0/m, z5.s, z16.s",
+            "fmopa za1.s, p0/m, p0/m, z5.s, z17.s",
+            "fmopa za2.s, p0/m, p0/m, z5.s, z18.s",
+            "fmopa za3.s, p0/m, p0/m, z5.s, z19.s",
+            "fmopa za0.s, p0/m, p0/m, z6.s, z20.s",
+            "fmopa za1.s, p0/m, p0/m, z6.s, z21.s",
+            "fmopa za2.s, p0/m, p0/m, z6.s, z22.s",
+            "fmopa za3.s, p0/m, p0/m, z6.s, z23.s",
+            "fmopa za0.s, p0/m, p0/m, z7.s, z24.s",
+            "fmopa za1.s, p0/m, p0/m, z7.s, z25.s",
+            "fmopa za2.s, p0/m, p0/m, z7.s, z26.s",
+            "fmopa za3.s, p0/m, p0/m, z7.s, z27.s",
+            "addvl x1, x1, #16",
+            "addvl x2, x2, #4",
+            "subs x9, x9, #1",
+            "b.ne 1b",
+            "2:",
+            // Remaining 0-3 K steps.
+            "ands x9, x0, #3",
+            "b.eq 4f",
+            "3:",
+            "ld1w {{z4.s}}, p0/z, [x2]",
+            "ld1w {{z0.s-z3.s}}, pn8/z, [x1]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "addvl x1, x1, #4",
+            "addvl x2, x2, #1",
+            "subs x9, x9, #1",
+            "b.ne 3b",
+            "4:",
+            // C: column j = slice j of the four tiles, 64 contiguous elements.
+            "dup z30.s, w4",
+            "dup z31.s, w5",
+            "mov w12, #0",
+            "5:",
+            "mova z0.s, p0/m, za0h.s[w12, 0]",
+            "mova z1.s, p0/m, za1h.s[w12, 0]",
+            "mova z2.s, p0/m, za2h.s[w12, 0]",
+            "mova z3.s, p0/m, za3h.s[w12, 0]",
+            "fmul z0.s, z0.s, z30.s",
+            "fmul z1.s, z1.s, z30.s",
+            "fmul z2.s, z2.s, z30.s",
+            "fmul z3.s, z3.s, z30.s",
+            "cbnz x6, 6f",
+            "ld1w {{z4.s-z7.s}}, pn8/z, [x3]",
+            "fmla z0.s, p0/m, z4.s, z31.s",
+            "fmla z1.s, p0/m, z5.s, z31.s",
+            "fmla z2.s, p0/m, z6.s, z31.s",
+            "fmla z3.s, p0/m, z7.s, z31.s",
+            "6:",
+            "st1w {{z0.s-z3.s}}, pn8, [x3]",
+            "add x3, x3, x7",
+            "add w12, w12, #1",
+            "cmp w12, #16",
+            "b.ne 5b",
+            "smstop",
+            inout("x0") k => _,
+            inout("x1") a => _,
+            inout("x2") b => _,
+            inout("x3") c => _,
+            in("x4") u64::from(alpha.to_bits()),
+            in("x5") u64::from(beta.to_bits()),
+            in("x6") beta_zero,
+            in("x7") ldc_bytes,
+            out("x9") _,
+            out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// SME2 micro-kernel for f64: `C = alpha * A * B + beta * C` on a 64 x 8 tile.
+///
+/// `a` is a packed A panel (`k` steps of 64 elements), `b` a packed B panel
+/// (`k` steps of 8 elements), and C is column-major with column stride
+/// `c_stride`. With `beta == 0`, C is not read.
+///
+/// # Safety
+///
+/// - [`usable_f64`] must have returned `true`.
+/// - `a` must be valid for `64 * k` reads and `b` for `8 * k` reads.
+/// - `c` must be valid for reads and writes of 64 elements in each of 8
+///   columns `c_stride` apart.
+pub(super) unsafe fn micro_kernel_f64_sme2(
+    k: usize,
+    alpha: f64,
+    a: *const f64,
+    b: *const f64,
+    beta: f64,
+    c: *mut f64,
+    c_stride: usize,
+) {
+    let ldc_bytes = c_stride * core::mem::size_of::<f64>();
+    let beta_zero = u64::from(beta == 0.0);
+    // SAFETY: the caller guarantees SME2, FEAT_SME_F64F64, SVL 512 and the
+    // buffer sizes above; the block enters and leaves streaming mode itself.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            ".arch_extension sme-f64f64",
+            "smstart",
+            "zero {{za}}",
+            "ptrue p0.d",
+            "ptrue pn8.d",
+            // K loop, four steps per iteration: one x4 load of B gives 4 steps.
+            "lsr x9, x0, #2",
+            "cbz x9, 2f",
+            "1:",
+            "ld1d {{z4.d-z7.d}}, pn8/z, [x2]",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x1]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x1, #4, mul vl]",
+            "ld1d {{z20.d-z23.d}}, pn8/z, [x1, #8, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn8/z, [x1, #12, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x1, #16, mul vl]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x1, #20, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z5.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z5.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z5.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z5.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z5.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z5.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z5.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z5.d, z27.d",
+            "ld1d {{z20.d-z23.d}}, pn8/z, [x1, #24, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn8/z, [x1, #28, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z6.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z6.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z6.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z6.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z6.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z6.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z6.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z6.d, z19.d",
+            "fmopa za0.d, p0/m, p0/m, z7.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z7.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z7.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z7.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z7.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z7.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z7.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z7.d, z27.d",
+            "addvl x1, x1, #16",
+            "addvl x1, x1, #16",
+            "addvl x2, x2, #4",
+            "subs x9, x9, #1",
+            "b.ne 1b",
+            "2:",
+            // Remaining 0-3 K steps.
+            "ands x9, x0, #3",
+            "b.eq 4f",
+            "3:",
+            "ld1d {{z4.d}}, p0/z, [x2]",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x1]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x1, #4, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "addvl x1, x1, #8",
+            "addvl x2, x2, #1",
+            "subs x9, x9, #1",
+            "b.ne 3b",
+            "4:",
+            // C: column j = slice j of the eight tiles, 64 contiguous elements.
+            "dup z30.d, x4",
+            "dup z31.d, x5",
+            "mov w12, #0",
+            "5:",
+            "mova z0.d, p0/m, za0h.d[w12, 0]",
+            "mova z1.d, p0/m, za1h.d[w12, 0]",
+            "mova z2.d, p0/m, za2h.d[w12, 0]",
+            "mova z3.d, p0/m, za3h.d[w12, 0]",
+            "mova z16.d, p0/m, za4h.d[w12, 0]",
+            "mova z17.d, p0/m, za5h.d[w12, 0]",
+            "mova z18.d, p0/m, za6h.d[w12, 0]",
+            "mova z19.d, p0/m, za7h.d[w12, 0]",
+            "fmul z0.d, z0.d, z30.d",
+            "fmul z1.d, z1.d, z30.d",
+            "fmul z2.d, z2.d, z30.d",
+            "fmul z3.d, z3.d, z30.d",
+            "fmul z16.d, z16.d, z30.d",
+            "fmul z17.d, z17.d, z30.d",
+            "fmul z18.d, z18.d, z30.d",
+            "fmul z19.d, z19.d, z30.d",
+            "cbnz x6, 6f",
+            "ld1d {{z4.d-z7.d}}, pn8/z, [x3]",
+            "ld1d {{z20.d-z23.d}}, pn8/z, [x3, #4, mul vl]",
+            "fmla z0.d, p0/m, z4.d, z31.d",
+            "fmla z1.d, p0/m, z5.d, z31.d",
+            "fmla z2.d, p0/m, z6.d, z31.d",
+            "fmla z3.d, p0/m, z7.d, z31.d",
+            "fmla z16.d, p0/m, z20.d, z31.d",
+            "fmla z17.d, p0/m, z21.d, z31.d",
+            "fmla z18.d, p0/m, z22.d, z31.d",
+            "fmla z19.d, p0/m, z23.d, z31.d",
+            "6:",
+            "st1d {{z0.d-z3.d}}, pn8, [x3]",
+            "st1d {{z16.d-z19.d}}, pn8, [x3, #4, mul vl]",
+            "add x3, x3, x7",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 5b",
+            "smstop",
+            inout("x0") k => _,
+            inout("x1") a => _,
+            inout("x2") b => _,
+            inout("x3") c => _,
+            in("x4") alpha.to_bits(),
+            in("x5") beta.to_bits(),
+            in("x6") beta_zero,
+            in("x7") ldc_bytes,
+            out("x9") _,
+            out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// SME2 macro-kernel for f32: `C = alpha * A * B + beta * C` on an `m x n`
+/// block, in one streaming-mode region.
+///
+/// `a` holds `ceil(m / 64)` packed A panels of `64 * k` elements and `b`
+/// holds `ceil(n / 16)` packed B panels of `16 * k` elements, in the layout of
+/// [`micro_kernel_f32_sme2`]. Rows and columns of the last panels past `m` and
+/// `n` may hold any values: the stores are predicated to the block. C is
+/// column-major with column stride `c_stride`. With `beta == 0`, C is not read.
+///
+/// # Safety
+///
+/// - [`usable_f32`] must have returned `true`, and `m`, `n` > 0.
+/// - `a` and `b` must be valid for the panel reads above.
+/// - `c` must be valid for reads and writes of `m` elements in each of `n`
+///   columns `c_stride` apart.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn macro_kernel_f32_sme2(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: *const f32,
+    b: *const f32,
+    beta: f32,
+    c: *mut f32,
+    c_stride: usize,
+) {
+    let size = core::mem::size_of::<f32>();
+    let ldc_bytes = c_stride * size;
+    let a_panel_bytes = MR * k * size;
+    let b_panel_bytes = NR_F32 * k * size;
+    let beta_zero = u64::from(beta == 0.0);
+    // SAFETY: the caller guarantees SME2, SVL 512, m, n > 0 and the buffer
+    // sizes above; the block enters and leaves streaming mode itself.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue p0.s",
+            "ptrue pn8.s",
+            "dup z30.s, w4",
+            "dup z31.s, w5",
+            "mov x14, #0",
+            // Column blocks of 16: x14 = j0, x2 = B panel, x3 = C column j0.
+            "2:",
+            "mov x15, #0",
+            "mov x16, x1",
+            "mov x21, x3",
+            // Row blocks of 64: x15 = i0, x16 = A panel, x21 = C(i0, j0).
+            "3:",
+            "zero {{za}}",
+            "mov x22, x16",
+            "mov x23, x2",
+            "lsr x9, x0, #2",
+            "cbz x9, 5f",
+            "4:",
+            "ld1w {{z4.s-z7.s}}, pn8/z, [x23]",
+            "ld1w {{z0.s-z3.s}}, pn8/z, [x22]",
+            "ld1w {{z16.s-z19.s}}, pn8/z, [x22, #4, mul vl]",
+            "ld1w {{z20.s-z23.s}}, pn8/z, [x22, #8, mul vl]",
+            "ld1w {{z24.s-z27.s}}, pn8/z, [x22, #12, mul vl]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "fmopa za0.s, p0/m, p0/m, z5.s, z16.s",
+            "fmopa za1.s, p0/m, p0/m, z5.s, z17.s",
+            "fmopa za2.s, p0/m, p0/m, z5.s, z18.s",
+            "fmopa za3.s, p0/m, p0/m, z5.s, z19.s",
+            "fmopa za0.s, p0/m, p0/m, z6.s, z20.s",
+            "fmopa za1.s, p0/m, p0/m, z6.s, z21.s",
+            "fmopa za2.s, p0/m, p0/m, z6.s, z22.s",
+            "fmopa za3.s, p0/m, p0/m, z6.s, z23.s",
+            "fmopa za0.s, p0/m, p0/m, z7.s, z24.s",
+            "fmopa za1.s, p0/m, p0/m, z7.s, z25.s",
+            "fmopa za2.s, p0/m, p0/m, z7.s, z26.s",
+            "fmopa za3.s, p0/m, p0/m, z7.s, z27.s",
+            "addvl x22, x22, #16",
+            "addvl x23, x23, #4",
+            "subs x9, x9, #1",
+            "b.ne 4b",
+            "5:",
+            "ands x9, x0, #3",
+            "b.eq 7f",
+            "6:",
+            "ld1w {{z4.s}}, p0/z, [x23]",
+            "ld1w {{z0.s-z3.s}}, pn8/z, [x22]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "addvl x22, x22, #4",
+            "addvl x23, x23, #1",
+            "subs x9, x9, #1",
+            "b.ne 6b",
+            "7:",
+            // Store: rows predicated to m - i0, columns min(16, n - j0).
+            "sub x24, x8, x15",
+            "mov x25, #0",
+            "whilelt pn9.s, x25, x24, vlx4",
+            "sub x26, x10, x14",
+            "mov x27, #16",
+            "cmp x26, x27",
+            "csel x26, x26, x27, lo",
+            "mov w12, #0",
+            "mov x25, x21",
+            "8:",
+            "mova z0.s, p0/m, za0h.s[w12, 0]",
+            "mova z1.s, p0/m, za1h.s[w12, 0]",
+            "mova z2.s, p0/m, za2h.s[w12, 0]",
+            "mova z3.s, p0/m, za3h.s[w12, 0]",
+            "fmul z0.s, z0.s, z30.s",
+            "fmul z1.s, z1.s, z30.s",
+            "fmul z2.s, z2.s, z30.s",
+            "fmul z3.s, z3.s, z30.s",
+            "cbnz x6, 9f",
+            "ld1w {{z4.s-z7.s}}, pn9/z, [x25]",
+            "fmla z0.s, p0/m, z4.s, z31.s",
+            "fmla z1.s, p0/m, z5.s, z31.s",
+            "fmla z2.s, p0/m, z6.s, z31.s",
+            "fmla z3.s, p0/m, z7.s, z31.s",
+            "9:",
+            "st1w {{z0.s-z3.s}}, pn9, [x25]",
+            "add x25, x25, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 8b",
+            "add x15, x15, #64",
+            "add x16, x16, x11",
+            "add x21, x21, #256",
+            "cmp x15, x8",
+            "b.lo 3b",
+            "add x14, x14, #16",
+            "add x2, x2, x13",
+            "add x3, x3, x7, lsl #4",
+            "cmp x14, x10",
+            "b.lo 2b",
+            "smstop",
+            in("x0") k,
+            in("x1") a,
+            inout("x2") b => _,
+            inout("x3") c => _,
+            in("x4") u64::from(alpha.to_bits()),
+            in("x5") u64::from(beta.to_bits()),
+            in("x6") beta_zero,
+            in("x7") ldc_bytes,
+            in("x8") m,
+            in("x10") n,
+            in("x11") a_panel_bytes,
+            in("x13") b_panel_bytes,
+            out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
+            out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
+            out("x26") _, out("x27") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _, out("p9") _,
+            options(nostack)
+        );
+    }
+}
+
+/// SME2 macro-kernel for f64: `C = alpha * A * B + beta * C` on an `m x n`
+/// block, in one streaming-mode region.
+///
+/// As [`macro_kernel_f32_sme2`], with packed B panels of `8 * k` elements
+/// and the layout of [`micro_kernel_f64_sme2`].
+///
+/// # Safety
+///
+/// - [`usable_f64`] must have returned `true`, and `m`, `n` > 0.
+/// - `a` and `b` must be valid for `ceil(m / 64) * 64 * k` and
+///   `ceil(n / 8) * 8 * k` reads.
+/// - `c` must be valid for reads and writes of `m` elements in each of `n`
+///   columns `c_stride` apart.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn macro_kernel_f64_sme2(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f64,
+    a: *const f64,
+    b: *const f64,
+    beta: f64,
+    c: *mut f64,
+    c_stride: usize,
+) {
+    let size = core::mem::size_of::<f64>();
+    let ldc_bytes = c_stride * size;
+    let a_panel_bytes = MR * k * size;
+    let b_panel_bytes = NR_F64 * k * size;
+    let beta_zero = u64::from(beta == 0.0);
+    // SAFETY: the caller guarantees SME2, FEAT_SME_F64F64, SVL 512, m, n > 0
+    // and the buffer sizes above; the block enters and leaves streaming mode
+    // itself.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            ".arch_extension sme-f64f64",
+            "smstart",
+            "ptrue p0.d",
+            "ptrue pn8.d",
+            "dup z30.d, x4",
+            "dup z31.d, x5",
+            "mov x14, #0",
+            // Column blocks of 8: x14 = j0, x2 = B panel, x3 = C column j0.
+            "2:",
+            "mov x15, #0",
+            "mov x16, x1",
+            "mov x21, x3",
+            // Row blocks of 64: x15 = i0, x16 = A panel, x21 = C(i0, j0).
+            "3:",
+            "zero {{za}}",
+            "mov x22, x16",
+            "mov x23, x2",
+            "lsr x9, x0, #2",
+            "cbz x9, 5f",
+            "4:",
+            "ld1d {{z4.d-z7.d}}, pn8/z, [x23]",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x22]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #4, mul vl]",
+            "ld1d {{z20.d-z23.d}}, pn8/z, [x22, #8, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn8/z, [x22, #12, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x22, #16, mul vl]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #20, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z5.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z5.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z5.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z5.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z5.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z5.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z5.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z5.d, z27.d",
+            "ld1d {{z20.d-z23.d}}, pn8/z, [x22, #24, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn8/z, [x22, #28, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z6.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z6.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z6.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z6.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z6.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z6.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z6.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z6.d, z19.d",
+            "fmopa za0.d, p0/m, p0/m, z7.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z7.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z7.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z7.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z7.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z7.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z7.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z7.d, z27.d",
+            "addvl x22, x22, #16",
+            "addvl x22, x22, #16",
+            "addvl x23, x23, #4",
+            "subs x9, x9, #1",
+            "b.ne 4b",
+            "5:",
+            "ands x9, x0, #3",
+            "b.eq 7f",
+            "6:",
+            "ld1d {{z4.d}}, p0/z, [x23]",
+            "ld1d {{z0.d-z3.d}}, pn8/z, [x22]",
+            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #4, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "addvl x22, x22, #8",
+            "addvl x23, x23, #1",
+            "subs x9, x9, #1",
+            "b.ne 6b",
+            "7:",
+            // Store: rows predicated to m - i0 (two halves of 32), columns min(8, n - j0).
+            "sub x24, x8, x15",
+            "mov x25, #0",
+            "whilelt pn9.d, x25, x24, vlx4",
+            "mov x25, #32",
+            "whilelt pn10.d, x25, x24, vlx4",
+            "sub x26, x10, x14",
+            "mov x27, #8",
+            "cmp x26, x27",
+            "csel x26, x26, x27, lo",
+            "mov w12, #0",
+            "mov x25, x21",
+            "8:",
+            "mova z0.d, p0/m, za0h.d[w12, 0]",
+            "mova z1.d, p0/m, za1h.d[w12, 0]",
+            "mova z2.d, p0/m, za2h.d[w12, 0]",
+            "mova z3.d, p0/m, za3h.d[w12, 0]",
+            "mova z16.d, p0/m, za4h.d[w12, 0]",
+            "mova z17.d, p0/m, za5h.d[w12, 0]",
+            "mova z18.d, p0/m, za6h.d[w12, 0]",
+            "mova z19.d, p0/m, za7h.d[w12, 0]",
+            "fmul z0.d, z0.d, z30.d",
+            "fmul z1.d, z1.d, z30.d",
+            "fmul z2.d, z2.d, z30.d",
+            "fmul z3.d, z3.d, z30.d",
+            "fmul z16.d, z16.d, z30.d",
+            "fmul z17.d, z17.d, z30.d",
+            "fmul z18.d, z18.d, z30.d",
+            "fmul z19.d, z19.d, z30.d",
+            "cbnz x6, 9f",
+            "ld1d {{z4.d-z7.d}}, pn9/z, [x25]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x25, #4, mul vl]",
+            "fmla z0.d, p0/m, z4.d, z31.d",
+            "fmla z1.d, p0/m, z5.d, z31.d",
+            "fmla z2.d, p0/m, z6.d, z31.d",
+            "fmla z3.d, p0/m, z7.d, z31.d",
+            "fmla z16.d, p0/m, z20.d, z31.d",
+            "fmla z17.d, p0/m, z21.d, z31.d",
+            "fmla z18.d, p0/m, z22.d, z31.d",
+            "fmla z19.d, p0/m, z23.d, z31.d",
+            "9:",
+            "st1d {{z0.d-z3.d}}, pn9, [x25]",
+            "st1d {{z16.d-z19.d}}, pn10, [x25, #4, mul vl]",
+            "add x25, x25, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 8b",
+            "add x15, x15, #64",
+            "add x16, x16, x11",
+            "add x21, x21, #512",
+            "cmp x15, x8",
+            "b.lo 3b",
+            "add x14, x14, #8",
+            "add x2, x2, x13",
+            "add x3, x3, x7, lsl #3",
+            "cmp x14, x10",
+            "b.lo 2b",
+            "smstop",
+            in("x0") k,
+            in("x1") a,
+            inout("x2") b => _,
+            inout("x3") c => _,
+            in("x4") alpha.to_bits(),
+            in("x5") beta.to_bits(),
+            in("x6") beta_zero,
+            in("x7") ldc_bytes,
+            in("x8") m,
+            in("x10") n,
+            in("x11") a_panel_bytes,
+            in("x13") b_panel_bytes,
+            out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
+            out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
+            out("x26") _, out("x27") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _, out("p9") _, out("p10") _,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::level3::gemm::{gemm, gemm_transposed, gemm_with_par};
+    use crate::level3::gemm_kernel::GemmKernel;
+    use crate::level3::trsm::Trans;
+    use oxiblas_core::parallel::Par;
+    use oxiblas_matrix::Mat;
+
+    /// Deterministic values in [-1, 1).
+    fn val(i: usize, seed: usize) -> f64 {
+        let x = (i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97)) % 1999;
+        x as f64 / 999.5 - 1.0
+    }
+
+    /// Checks one micro-kernel call against a scalar reference.
+    fn check_kernel_f64(k: usize, alpha: f64, beta: f64) {
+        let nr = NR_F64;
+        let ldc = MR + 3;
+        let a: Vec<f64> = (0..MR * k).map(|i| val(i, 1)).collect();
+        let b: Vec<f64> = (0..nr * k).map(|i| val(i, 2)).collect();
+        let c0: Vec<f64> = (0..ldc * nr)
+            .map(|i| if beta == 0.0 { f64::NAN } else { val(i, 3) })
+            .collect();
+        let mut c = c0.clone();
+        // SAFETY: SME2 is checked by the caller; the buffers have the sizes
+        // the kernel reads and writes (64 x k, 8 x k, 8 columns of ldc).
+        unsafe {
+            micro_kernel_f64_sme2(k, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), ldc)
+        };
+        for j in 0..nr {
+            for i in 0..ldc {
+                let got = c[i + j * ldc];
+                if i >= MR {
+                    assert!(
+                        got.to_bits() == c0[i + j * ldc].to_bits(),
+                        "k={k}: row {i} below the tile written"
+                    );
+                    continue;
+                }
+                let dot: f64 = (0..k).map(|p| a[p * MR + i] * b[p * nr + j]).sum();
+                let exp = if beta == 0.0 {
+                    alpha * dot
+                } else {
+                    alpha * dot + beta * c0[i + j * ldc]
+                };
+                assert!(
+                    (got - exp).abs() <= 1e-12 * (1.0 + k as f64),
+                    "f64 k={k} ({i},{j}): {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    fn check_kernel_f32(k: usize, alpha: f32, beta: f32) {
+        let nr = NR_F32;
+        let ldc = MR + 5;
+        let a: Vec<f32> = (0..MR * k).map(|i| val(i, 4) as f32).collect();
+        let b: Vec<f32> = (0..nr * k).map(|i| val(i, 5) as f32).collect();
+        let c0: Vec<f32> = (0..ldc * nr)
+            .map(|i| {
+                if beta == 0.0 {
+                    f32::NAN
+                } else {
+                    val(i, 6) as f32
+                }
+            })
+            .collect();
+        let mut c = c0.clone();
+        // SAFETY: as in `check_kernel_f64` (16 columns).
+        unsafe {
+            micro_kernel_f32_sme2(k, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), ldc)
+        };
+        for j in 0..nr {
+            for i in 0..ldc {
+                let got = c[i + j * ldc];
+                if i >= MR {
+                    assert!(
+                        got.to_bits() == c0[i + j * ldc].to_bits(),
+                        "k={k}: row {i} below the tile written"
+                    );
+                    continue;
+                }
+                let dot: f64 = (0..k)
+                    .map(|p| f64::from(a[p * MR + i]) * f64::from(b[p * nr + j]))
+                    .sum();
+                let c_old = f64::from(c0[i + j * ldc]);
+                let exp = if beta == 0.0 {
+                    f64::from(alpha) * dot
+                } else {
+                    f64::from(alpha) * dot + f64::from(beta) * c_old
+                };
+                let tol = 1e-5 * (1.0 + k as f64);
+                assert!(
+                    (f64::from(got) - exp).abs() <= tol,
+                    "f32 k={k} ({i},{j}): {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    /// Checks one macro-kernel call on an `m x n` block; padding of the last
+    /// panels holds NaN, which must not reach C, and C outside the block must
+    /// stay unchanged.
+    fn check_macro_f64(m: usize, n: usize, k: usize, alpha: f64, beta: f64) {
+        let nr = NR_F64;
+        let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
+        let ldc = m + 3;
+        let mut a = vec![f64::NAN; mp * MR * k];
+        for ib in 0..mp {
+            for p in 0..k {
+                for i in 0..MR.min(m - ib * MR) {
+                    a[ib * MR * k + p * MR + i] = val(ib * MR + i + p * m, 21);
+                }
+            }
+        }
+        let mut b = vec![f64::NAN; np * nr * k];
+        for jb in 0..np {
+            for p in 0..k {
+                for j in 0..nr.min(n - jb * nr) {
+                    b[jb * nr * k + p * nr + j] = val(jb * nr + j + p * n, 22);
+                }
+            }
+        }
+        let c0: Vec<f64> = (0..ldc * (n + 1)).map(|i| val(i, 23)).collect();
+        let mut c = c0.clone();
+        // SAFETY: SME2 is checked by the caller; the panels and C have the
+        // sizes the macro-kernel reads and writes.
+        unsafe {
+            macro_kernel_f64_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr(),
+                b.as_ptr(),
+                beta,
+                c.as_mut_ptr(),
+                ldc,
+            )
+        };
+        for j in 0..=n {
+            for i in 0..ldc {
+                let got = c[i + j * ldc];
+                if i >= m || j >= n {
+                    assert!(
+                        got.to_bits() == c0[i + j * ldc].to_bits(),
+                        "{m}x{n}: C({i},{j}) outside the block changed"
+                    );
+                    continue;
+                }
+                let (ib, ii, jb, jj) = (i / MR, i % MR, j / nr, j % nr);
+                let dot: f64 = (0..k)
+                    .map(|p| a[ib * MR * k + p * MR + ii] * b[jb * nr * k + p * nr + jj])
+                    .sum();
+                let exp = alpha * dot + beta * c0[i + j * ldc];
+                assert!(
+                    (got - exp).abs() <= 1e-12 * (1.0 + k as f64),
+                    "{m}x{n}x{k} ({i},{j}): {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    fn check_macro_f32(m: usize, n: usize, k: usize, alpha: f32, beta: f32) {
+        let nr = NR_F32;
+        let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
+        let ldc = m + 5;
+        let mut a = vec![f32::NAN; mp * MR * k];
+        for ib in 0..mp {
+            for p in 0..k {
+                for i in 0..MR.min(m - ib * MR) {
+                    a[ib * MR * k + p * MR + i] = val(ib * MR + i + p * m, 24) as f32;
+                }
+            }
+        }
+        let mut b = vec![f32::NAN; np * nr * k];
+        for jb in 0..np {
+            for p in 0..k {
+                for j in 0..nr.min(n - jb * nr) {
+                    b[jb * nr * k + p * nr + j] = val(jb * nr + j + p * n, 25) as f32;
+                }
+            }
+        }
+        let c0: Vec<f32> = (0..ldc * (n + 1)).map(|i| val(i, 26) as f32).collect();
+        let mut c = c0.clone();
+        // SAFETY: as in `check_macro_f64`.
+        unsafe {
+            macro_kernel_f32_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr(),
+                b.as_ptr(),
+                beta,
+                c.as_mut_ptr(),
+                ldc,
+            )
+        };
+        for j in 0..=n {
+            for i in 0..ldc {
+                let got = c[i + j * ldc];
+                if i >= m || j >= n {
+                    assert!(
+                        got.to_bits() == c0[i + j * ldc].to_bits(),
+                        "{m}x{n}: C({i},{j}) outside the block changed"
+                    );
+                    continue;
+                }
+                let (ib, ii, jb, jj) = (i / MR, i % MR, j / nr, j % nr);
+                let dot: f64 = (0..k)
+                    .map(|p| {
+                        f64::from(a[ib * MR * k + p * MR + ii])
+                            * f64::from(b[jb * nr * k + p * nr + jj])
+                    })
+                    .sum();
+                let exp = f64::from(alpha) * dot + f64::from(beta) * f64::from(c0[i + j * ldc]);
+                let tol = 1e-5 * (1.0 + k as f64);
+                assert!(
+                    (f64::from(got) - exp).abs() <= tol,
+                    "{m}x{n}x{k} ({i},{j}): {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    const BLOCKS: [(usize, usize, usize); 8] = [
+        (1, 1, 1),
+        (63, 7, 5),
+        (64, 8, 4),
+        (64, 16, 9),
+        (65, 17, 3),
+        (130, 9, 33),
+        (200, 47, 70),
+        (37, 100, 0),
+    ];
+
+    #[test]
+    fn test_sme2_macro_kernel_f64() {
+        if !usable_f64() {
+            return;
+        }
+        for (m, n, k) in BLOCKS {
+            check_macro_f64(m, n, k, 1.25, 0.0);
+            check_macro_f64(m, n, k, -0.5, 0.75);
+        }
+    }
+
+    #[test]
+    fn test_sme2_macro_kernel_f32() {
+        if !usable_f32() {
+            return;
+        }
+        for (m, n, k) in BLOCKS {
+            check_macro_f32(m, n, k, 1.25, 0.0);
+            check_macro_f32(m, n, k, -0.5, 0.75);
+        }
+    }
+
+    const DEPTHS: [usize; 10] = [0, 1, 2, 3, 4, 5, 7, 8, 33, 257];
+
+    #[test]
+    fn test_sme2_kernel_f64() {
+        if !usable_f64() {
+            return;
+        }
+        for k in DEPTHS {
+            for (alpha, beta) in [(1.0, 0.0), (2.5, 0.0), (1.0, 1.0), (-0.75, -0.5)] {
+                check_kernel_f64(k, alpha, beta);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sme2_kernel_f32() {
+        if !usable_f32() {
+            return;
+        }
+        for k in DEPTHS {
+            for (alpha, beta) in [(1.0, 0.0), (2.5, 0.0), (1.0, 1.0), (-0.75, -0.5)] {
+                check_kernel_f32(k, alpha, beta);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sme2_shape_is_selected() {
+        if usable_f32() {
+            let s = f32::micro_kernel_shape();
+            assert_eq!((s.mr, s.nr), (MR, NR_F32));
+        }
+        if usable_f64() {
+            let s = f64::micro_kernel_shape();
+            assert_eq!((s.mr, s.nr), (MR, NR_F64));
+        }
+    }
+
+    fn mat(rows: usize, cols: usize, seed: usize) -> Mat<f64> {
+        let mut m = Mat::zeros(rows, cols);
+        for j in 0..cols {
+            for i in 0..rows {
+                m[(i, j)] = val(i + j * rows, seed);
+            }
+        }
+        m
+    }
+
+    /// op(A) op(B) through the public GEMM, against a naive product.
+    fn check_gemm_f64(m: usize, n: usize, k: usize, ta: Trans, tb: Trans, par: Par) {
+        let a = if ta == Trans::NoTrans {
+            mat(m, k, 7)
+        } else {
+            mat(k, m, 7)
+        };
+        let b = if tb == Trans::NoTrans {
+            mat(k, n, 8)
+        } else {
+            mat(n, k, 8)
+        };
+        let c0 = mat(m, n, 9);
+        let mut c = c0.clone();
+        let (alpha, beta) = (1.5, -0.25);
+        if ta == Trans::NoTrans && tb == Trans::NoTrans {
+            gemm_with_par(alpha, a.as_ref(), b.as_ref(), beta, c.as_mut(), par);
+        } else {
+            gemm_transposed(ta, tb, alpha, a.as_ref(), b.as_ref(), beta, c.as_mut());
+        }
+        let at = |i: usize, p: usize| {
+            if ta == Trans::NoTrans {
+                a[(i, p)]
+            } else {
+                a[(p, i)]
+            }
+        };
+        let bt = |p: usize, j: usize| {
+            if tb == Trans::NoTrans {
+                b[(p, j)]
+            } else {
+                b[(j, p)]
+            }
+        };
+        for j in 0..n {
+            for i in 0..m {
+                let dot: f64 = (0..k).map(|p| at(i, p) * bt(p, j)).sum();
+                let exp = alpha * dot + beta * c0[(i, j)];
+                let got = c[(i, j)];
+                assert!(
+                    (got - exp).abs() <= 1e-12 * (1.0 + k as f64),
+                    "{m}x{n}x{k} {ta:?} {tb:?} ({i},{j}): {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sme2_gemm_edges() {
+        // Rows and columns around the 64 x 8 tile, depths around the K unroll.
+        for &(m, n, k) in &[
+            (63, 7, 5),
+            (64, 8, 64),
+            (65, 9, 67),
+            (130, 17, 33),
+            (200, 41, 300),
+            (1, 40, 50),
+            (70, 1, 50),
+        ] {
+            check_gemm_f64(m, n, k, Trans::NoTrans, Trans::NoTrans, Par::Seq);
+        }
+        check_gemm_f64(97, 23, 71, Trans::Trans, Trans::NoTrans, Par::Seq);
+        check_gemm_f64(97, 23, 71, Trans::NoTrans, Trans::Trans, Par::Seq);
+        check_gemm_f64(97, 23, 71, Trans::Trans, Trans::Trans, Par::Seq);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_sme2_gemm_parallel() {
+        // Above the SME2 parallel minimum (2^22 multiply-adds).
+        check_gemm_f64(300, 230, 70, Trans::NoTrans, Trans::NoTrans, Par::Rayon);
+    }
+
+    #[test]
+    fn test_sme2_gemm_f32_matches_f64() {
+        let (m, n, k) = (131, 45, 97);
+        let a64 = mat(m, k, 11);
+        let b64 = mat(k, n, 12);
+        let mut a: Mat<f32> = Mat::zeros(m, k);
+        let mut b: Mat<f32> = Mat::zeros(k, n);
+        for j in 0..k {
+            for i in 0..m {
+                a[(i, j)] = a64[(i, j)] as f32;
+            }
+        }
+        for j in 0..n {
+            for i in 0..k {
+                b[(i, j)] = b64[(i, j)] as f32;
+            }
+        }
+        let mut c: Mat<f32> = Mat::zeros(m, n);
+        gemm(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut());
+        for j in 0..n {
+            for i in 0..m {
+                let exp: f64 = (0..k)
+                    .map(|p| f64::from(a[(i, p)]) * f64::from(b[(p, j)]))
+                    .sum();
+                assert!((f64::from(c[(i, j)]) - exp).abs() <= 1e-4, "({i},{j})");
+            }
+        }
+    }
+}

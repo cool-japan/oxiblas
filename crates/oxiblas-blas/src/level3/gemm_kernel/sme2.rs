@@ -1678,6 +1678,11 @@ mod tests {
             (200, 41, 300),
             (1, 40, 50),
             (70, 1, 50),
+            // Below SMALL_THRESHOLD, routed to SME2 by `sme2_small`.
+            (32, 8, 8),
+            (33, 9, 11),
+            (16, 16, 64),
+            (31, 31, 31),
         ] {
             check_gemm_f64(m, n, k, Trans::NoTrans, Trans::NoTrans, Par::Seq);
         }

@@ -658,7 +658,7 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     // Small matrix fast path. The NoTrans/NoTrans case keeps using the
     // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
     // use the transpose-aware naive kernel.
-    if m * n * k <= SMALL_THRESHOLD {
+    if m * n * k <= SMALL_THRESHOLD && !sme2_small(&shape, m, n, k) {
         if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
             gemm_small(alpha, &a, &b, beta, &mut c);
         } else {
@@ -898,6 +898,37 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Sequential fallback
     gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+}
+
+/// Returns `true` when a problem below [`SMALL_THRESHOLD`] runs faster on the
+/// SME2 kernels than on the small-matrix path. Measured on Apple M4: a
+/// 64-row tile must be at least half used (m >= 32), or a quarter used with
+/// a deep product (m, n >= 16, k >= 64).
+#[inline]
+fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    ))]
+    {
+        shape.mr == sme2::MR && ((m >= 32 && n >= 8 && k >= 8) || (m >= 16 && n >= 16 && k >= 64))
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    )))]
+    {
+        let _ = (shape, m, n, k);
+        false
+    }
 }
 
 /// Largest span of one KC block of a column-major A (column stride times KC)

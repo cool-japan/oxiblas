@@ -1000,9 +1000,12 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     .min(n);
     // In place only while one KC block of A spans few pages: each depth step
     // is a column, and many columns cost more TLB misses than packing does.
-    let a_in_place = trans_a == Trans::NoTrans
-        && a.col_stride() == 1
-        && a.row_stride() * kc * core::mem::size_of::<T>() <= SME2_IN_PLACE_A_BYTES;
+    // Larger column-major blocks are packed by the macro-kernel while it reads
+    // them for the first NR columns (first-pass online packing, as MTGEMM-A
+    // does for its B), other layouts by `pack_a_trans_dispatch`.
+    let a_column_major = trans_a == Trans::NoTrans && a.col_stride() == 1;
+    let a_in_place =
+        a_column_major && a.row_stride() * kc * core::mem::size_of::<T>() <= SME2_IN_PLACE_A_BYTES;
     let mut pack_a: Option<AlignedVec<T>> =
         (!a_in_place).then(|| AlignedVec::zeros(mc.div_ceil(mr) * mr * kc));
     let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
@@ -1029,12 +1032,14 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                 debug_assert!(packed, "the SME2 shape implies the SME2 B packer");
                 for i in (0..m).step_by(mc) {
                     let ib = mc.min(m - i);
-                    let (a_ptr, a_panel, a_step) = match pack_a.as_mut() {
-                        // SAFETY: (i, p) is inside A.
-                        None => (unsafe { a.as_ptr().add(i + p * lda) }, mr, lda),
+                    // SAFETY: (i, p) is inside A.
+                    let a_at = || unsafe { a.as_ptr().add(i + p * lda) };
+                    let (a_ptr, a_panel, a_step, a_pack) = match pack_a.as_mut() {
+                        None => (a_at(), mr, lda, core::ptr::null_mut()),
+                        Some(buf) if a_column_major => (a_at(), mr, lda, buf.as_mut_ptr()),
                         Some(buf) => {
                             pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
-                            (buf.as_ptr(), mr * pb, mr)
+                            (buf.as_ptr(), mr * pb, mr, core::ptr::null_mut())
                         }
                     };
                     // SAFETY: A rows i..i + ib of depth steps p..p + pb (in
@@ -1049,6 +1054,7 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                             a_ptr,
                             a_panel,
                             a_step,
+                            a_pack,
                             pack_b.as_ptr(),
                             beta_eff,
                             c_ptr.add(i + j * ldc),
@@ -1452,6 +1458,7 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
             pack_a.as_ptr(),
             mr * k,
             mr,
+            core::ptr::null_mut(),
             pack_b.as_ptr(),
             beta,
             c.as_ptr().cast_mut(),

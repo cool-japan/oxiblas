@@ -716,6 +716,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
     a: *const f32,
     a_panel_stride: usize,
     a_step: usize,
+    a_pack: *mut f32,
     b: *const f32,
     beta: f32,
     c: *mut f32,
@@ -738,7 +739,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "smstart",
             "ptrue p0.s",
             "ptrue pn8.s",
-            "dup z30.s, w4",
+            "dup z30.s, w9",
             "dup z31.s, w5",
             "mov x14, #0",
             // Column blocks of 16: x14 = j0, x2 = B panel, x3 = C column j0.
@@ -798,6 +799,66 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
+            // First column block with a pack buffer (x4): read A, keep a packed copy.
+            "cbnz x14, 29f",
+            "cbz x4, 29f",
+            "mul x5, x15, x0",
+            "add x5, x4, x5, lsl #2",
+            "cbz x9, 31f",
+            "30:",
+            "add x24, x22, x17",
+            "add x25, x24, x17",
+            "add x26, x25, x17",
+            "ld1w {{z4.s-z7.s}}, pn8/z, [x23]",
+            "ld1w {{z0.s-z3.s}}, pn9/z, [x22]",
+            "st1w {{z0.s-z3.s}}, pn8, [x5, #0, mul vl]",
+            "ld1w {{z16.s-z19.s}}, pn9/z, [x24]",
+            "st1w {{z16.s-z19.s}}, pn8, [x5, #4, mul vl]",
+            "ld1w {{z20.s-z23.s}}, pn9/z, [x25]",
+            "st1w {{z20.s-z23.s}}, pn8, [x5, #8, mul vl]",
+            "ld1w {{z24.s-z27.s}}, pn9/z, [x26]",
+            "st1w {{z24.s-z27.s}}, pn8, [x5, #12, mul vl]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "fmopa za0.s, p0/m, p0/m, z5.s, z16.s",
+            "fmopa za1.s, p0/m, p0/m, z5.s, z17.s",
+            "fmopa za2.s, p0/m, p0/m, z5.s, z18.s",
+            "fmopa za3.s, p0/m, p0/m, z5.s, z19.s",
+            "fmopa za0.s, p0/m, p0/m, z6.s, z20.s",
+            "fmopa za1.s, p0/m, p0/m, z6.s, z21.s",
+            "fmopa za2.s, p0/m, p0/m, z6.s, z22.s",
+            "fmopa za3.s, p0/m, p0/m, z6.s, z23.s",
+            "fmopa za0.s, p0/m, p0/m, z7.s, z24.s",
+            "fmopa za1.s, p0/m, p0/m, z7.s, z25.s",
+            "fmopa za2.s, p0/m, p0/m, z7.s, z26.s",
+            "fmopa za3.s, p0/m, p0/m, z7.s, z27.s",
+            "add x22, x26, x17",
+            "addvl x23, x23, #4",
+            "addvl x5, x5, #16",
+            "subs x9, x9, #1",
+            "b.ne 30b",
+
+            "31:",
+            "ands x9, x0, #3",
+            "b.eq 7f",
+            "32:",
+            "ld1w {{z4.s}}, p0/z, [x23]",
+            "ld1w {{z0.s-z3.s}}, pn9/z, [x22]",
+            "st1w {{z0.s-z3.s}}, pn8, [x5, #0, mul vl]",
+            "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
+            "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
+            "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
+            "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
+            "add x22, x22, x17",
+            "addvl x23, x23, #1",
+            "addvl x5, x5, #4",
+            "subs x9, x9, #1",
+            "b.ne 32b",
+
+            "b 7f",
+            "29:",
             "cbz x9, 5f",
             "4:",
             "add x24, x22, x17",
@@ -894,6 +955,13 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "add x21, x21, #256",
             "cmp x15, x8",
             "b.lo 3b",
+            // After the first column block, read A from the packed copy.
+            "cbnz x14, 33f",
+            "cbz x4, 33f",
+            "mov x1, x4",
+            "lsl x11, x0, #8",
+            "mov x17, #256",
+            "33:",
             "add x14, x14, #16",
             "add x2, x2, x13",
             "add x3, x3, x7, lsl #4",
@@ -901,19 +969,20 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "b.lo 2b",
             "smstop",
             in("x0") k,
-            in("x1") a,
+            inout("x1") a => _,
             inout("x2") b => _,
             inout("x3") c => _,
-            in("x4") u64::from(alpha.to_bits()),
-            in("x5") u64::from(beta.to_bits()),
+            inout("x4") a_pack => _,
+            inout("x9") u64::from(alpha.to_bits()) => _,
+            inout("x5") u64::from(beta.to_bits()) => _,
             in("x6") mode,
             in("x7") ldc_bytes,
             in("x8") m,
             in("x10") n,
-            in("x11") a_panel_bytes,
+            inout("x11") a_panel_bytes => _,
             in("x13") b_panel_bytes,
-            in("x17") a_step_bytes,
-            out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
+            inout("x17") a_step_bytes => _,
+            out("x12") _, out("x14") _, out("x15") _, out("x16") _,
             out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
@@ -953,6 +1022,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
     a: *const f64,
     a_panel_stride: usize,
     a_step: usize,
+    a_pack: *mut f64,
     b: *const f64,
     beta: f64,
     c: *mut f64,
@@ -977,7 +1047,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "smstart",
             "ptrue p0.d",
             "ptrue pn8.d",
-            "dup z30.d, x4",
+            "dup z30.d, x9",
             "dup z31.d, x5",
             "mov x14, #0",
             // Column blocks of 8: x14 = j0, x2 = B panel, x3 = C column j0.
@@ -1047,6 +1117,97 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
+            // First column block with a pack buffer (x4): read A, keep a packed copy.
+            "cbnz x14, 29f",
+            "cbz x4, 29f",
+            "mul x5, x15, x0",
+            "add x5, x4, x5, lsl #3",
+            "cbz x9, 31f",
+            "30:",
+            "add x24, x22, x17",
+            "add x25, x24, x17",
+            "add x26, x25, x17",
+            "ld1d {{z4.d-z7.d}}, pn8/z, [x23]",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x22]",
+            "st1d {{z0.d-z3.d}}, pn8, [x5, #0, mul vl]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x22, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x5, #4, mul vl]",
+            "ld1d {{z20.d-z23.d}}, pn9/z, [x24]",
+            "st1d {{z20.d-z23.d}}, pn8, [x5, #8, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn10/z, [x24, #4, mul vl]",
+            "st1d {{z24.d-z27.d}}, pn8, [x5, #12, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x25]",
+            "st1d {{z0.d-z3.d}}, pn8, [x5, #16, mul vl]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x25, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x5, #20, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z5.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z5.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z5.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z5.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z5.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z5.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z5.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z5.d, z27.d",
+            "ld1d {{z20.d-z23.d}}, pn9/z, [x26]",
+            "st1d {{z20.d-z23.d}}, pn8, [x5, #24, mul vl]",
+            "ld1d {{z24.d-z27.d}}, pn10/z, [x26, #4, mul vl]",
+            "st1d {{z24.d-z27.d}}, pn8, [x5, #28, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z6.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z6.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z6.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z6.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z6.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z6.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z6.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z6.d, z19.d",
+            "fmopa za0.d, p0/m, p0/m, z7.d, z20.d",
+            "fmopa za1.d, p0/m, p0/m, z7.d, z21.d",
+            "fmopa za2.d, p0/m, p0/m, z7.d, z22.d",
+            "fmopa za3.d, p0/m, p0/m, z7.d, z23.d",
+            "fmopa za4.d, p0/m, p0/m, z7.d, z24.d",
+            "fmopa za5.d, p0/m, p0/m, z7.d, z25.d",
+            "fmopa za6.d, p0/m, p0/m, z7.d, z26.d",
+            "fmopa za7.d, p0/m, p0/m, z7.d, z27.d",
+            "add x22, x26, x17",
+            "addvl x23, x23, #4",
+            "addvl x5, x5, #16",
+            "addvl x5, x5, #16",
+            "subs x9, x9, #1",
+            "b.ne 30b",
+
+            "31:",
+            "ands x9, x0, #3",
+            "b.eq 7f",
+            "32:",
+            "ld1d {{z4.d}}, p0/z, [x23]",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x22]",
+            "st1d {{z0.d-z3.d}}, pn8, [x5, #0, mul vl]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x22, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x5, #4, mul vl]",
+            "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z4.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z4.d, z16.d",
+            "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
+            "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
+            "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
+            "add x22, x22, x17",
+            "addvl x23, x23, #1",
+            "addvl x5, x5, #8",
+            "subs x9, x9, #1",
+            "b.ne 32b",
+
+            "b 7f",
+            "29:",
             "cbz x9, 5f",
             "4:",
             "add x24, x22, x17",
@@ -1192,6 +1353,13 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "add x21, x21, #512",
             "cmp x15, x8",
             "b.lo 3b",
+            // After the first column block, read A from the packed copy.
+            "cbnz x14, 33f",
+            "cbz x4, 33f",
+            "mov x1, x4",
+            "lsl x11, x0, #9",
+            "mov x17, #512",
+            "33:",
             "add x14, x14, #8",
             "add x2, x2, x13",
             "add x3, x3, x7, lsl #3",
@@ -1199,19 +1367,20 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "b.lo 2b",
             "smstop",
             in("x0") k,
-            in("x1") a,
+            inout("x1") a => _,
             inout("x2") b => _,
             inout("x3") c => _,
-            in("x4") alpha.to_bits(),
-            in("x5") beta.to_bits(),
+            inout("x4") a_pack => _,
+            inout("x9") alpha.to_bits() => _,
+            inout("x5") beta.to_bits() => _,
             in("x6") mode,
             in("x7") ldc_bytes,
             in("x8") m,
             in("x10") n,
-            in("x11") a_panel_bytes,
+            inout("x11") a_panel_bytes => _,
             in("x13") b_panel_bytes,
-            in("x17") a_step_bytes,
-            out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
+            inout("x17") a_step_bytes => _,
+            out("x12") _, out("x14") _, out("x15") _, out("x16") _,
             out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
@@ -1852,7 +2021,7 @@ mod tests {
     /// Checks one macro-kernel call on an `m x n` block; padding of the last
     /// panels holds NaN, which must not reach C, and C outside the block must
     /// stay unchanged.
-    fn check_macro_f64(m: usize, n: usize, k: usize, alpha: f64, beta: f64, direct: bool) {
+    fn check_macro_f64(m: usize, n: usize, k: usize, alpha: f64, beta: f64, mode: u8) {
         let nr = NR_F64;
         let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
         let ldc = m + 3;
@@ -1879,10 +2048,12 @@ mod tests {
                 }
             }
         }
-        let (a_ptr, a_panel, a_step) = if direct {
-            (a_cm.as_ptr(), MR, lda)
-        } else {
-            (a.as_ptr(), MR * k, MR)
+        // 0: packed A; 1: column-major A in place; 2: in place with online packing.
+        let mut a_pack = vec![f64::NAN; mp * MR * k];
+        let (a_ptr, a_panel, a_step, a_pack_ptr) = match mode {
+            0 => (a.as_ptr(), MR * k, MR, core::ptr::null_mut()),
+            1 => (a_cm.as_ptr(), MR, lda, core::ptr::null_mut()),
+            _ => (a_cm.as_ptr(), MR, lda, a_pack.as_mut_ptr()),
         };
         let mut b = vec![f64::NAN; np * nr * k];
         for jb in 0..np {
@@ -1905,6 +2076,7 @@ mod tests {
                 a_ptr,
                 a_panel,
                 a_step,
+                a_pack_ptr,
                 b.as_ptr(),
                 beta,
                 c.as_mut_ptr(),
@@ -1934,7 +2106,7 @@ mod tests {
         }
     }
 
-    fn check_macro_f32(m: usize, n: usize, k: usize, alpha: f32, beta: f32, direct: bool) {
+    fn check_macro_f32(m: usize, n: usize, k: usize, alpha: f32, beta: f32, mode: u8) {
         let nr = NR_F32;
         let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
         let ldc = m + 5;
@@ -1961,10 +2133,12 @@ mod tests {
                 }
             }
         }
-        let (a_ptr, a_panel, a_step) = if direct {
-            (a_cm.as_ptr(), MR, lda)
-        } else {
-            (a.as_ptr(), MR * k, MR)
+        // 0: packed A; 1: column-major A in place; 2: in place with online packing.
+        let mut a_pack = vec![f32::NAN; mp * MR * k];
+        let (a_ptr, a_panel, a_step, a_pack_ptr) = match mode {
+            0 => (a.as_ptr(), MR * k, MR, core::ptr::null_mut()),
+            1 => (a_cm.as_ptr(), MR, lda, core::ptr::null_mut()),
+            _ => (a_cm.as_ptr(), MR, lda, a_pack.as_mut_ptr()),
         };
         let mut b = vec![f32::NAN; np * nr * k];
         for jb in 0..np {
@@ -1986,6 +2160,7 @@ mod tests {
                 a_ptr,
                 a_panel,
                 a_step,
+                a_pack_ptr,
                 b.as_ptr(),
                 beta,
                 c.as_mut_ptr(),
@@ -2036,11 +2211,11 @@ mod tests {
             return;
         }
         for (m, n, k) in BLOCKS {
-            for direct in [false, true] {
-                check_macro_f64(m, n, k, 1.25, 0.0, direct);
-                check_macro_f64(m, n, k, -0.5, 0.75, direct);
-                check_macro_f64(m, n, k, 1.0, 0.0, direct);
-                check_macro_f64(m, n, k, 1.0, 1.0, direct);
+            for mode in 0..3 {
+                check_macro_f64(m, n, k, 1.25, 0.0, mode);
+                check_macro_f64(m, n, k, -0.5, 0.75, mode);
+                check_macro_f64(m, n, k, 1.0, 0.0, mode);
+                check_macro_f64(m, n, k, 1.0, 1.0, mode);
             }
         }
     }
@@ -2051,11 +2226,11 @@ mod tests {
             return;
         }
         for (m, n, k) in BLOCKS {
-            for direct in [false, true] {
-                check_macro_f32(m, n, k, 1.25, 0.0, direct);
-                check_macro_f32(m, n, k, -0.5, 0.75, direct);
-                check_macro_f32(m, n, k, 1.0, 0.0, direct);
-                check_macro_f32(m, n, k, 1.0, 1.0, direct);
+            for mode in 0..3 {
+                check_macro_f32(m, n, k, 1.25, 0.0, mode);
+                check_macro_f32(m, n, k, -0.5, 0.75, mode);
+                check_macro_f32(m, n, k, 1.0, 0.0, mode);
+                check_macro_f32(m, n, k, 1.0, 1.0, mode);
             }
         }
     }

@@ -173,8 +173,12 @@ pub trait GemmKernel: Field {
     /// depth steps are `a_step` elements apart: packed panels have
     /// `a_panel_stride = MR * k` and `a_step = MR`, and a column-major A can be
     /// read in place with `a_panel_stride = MR` and `a_step` = its column
-    /// stride. `b` holds `ceil(n / NR)` packed B panels of `NR * k` elements,
-    /// and C is `m x n` with column stride `c_stride`.
+    /// stride. When `a_pack` is not null, the first NR columns read A as given
+    /// and also write it, packed (`MR * k` per panel), to `a_pack`, and the
+    /// other columns read that copy (first-pass online packing; `a_pack` must
+    /// hold `ceil(m / MR) * MR * k` elements). `b` holds `ceil(n / NR)` packed
+    /// B panels of `NR * k` elements, and C is `m x n` with column stride
+    /// `c_stride`.
     ///
     /// # Safety
     ///
@@ -189,6 +193,7 @@ pub trait GemmKernel: Field {
         a: *const Self,
         a_panel_stride: usize,
         a_step: usize,
+        a_pack: *mut Self,
         b: *const Self,
         beta: Self,
         c: *mut Self,
@@ -202,6 +207,7 @@ pub trait GemmKernel: Field {
             a,
             a_panel_stride,
             a_step,
+            a_pack,
             b,
             beta,
             c,
@@ -295,6 +301,7 @@ impl GemmKernel for f64 {
         a: *const Self,
         a_panel_stride: usize,
         a_step: usize,
+        a_pack: *mut Self,
         b: *const Self,
         beta: Self,
         c: *mut Self,
@@ -317,6 +324,7 @@ impl GemmKernel for f64 {
                 a,
                 a_panel_stride,
                 a_step,
+                a_pack,
                 b,
                 beta,
                 c,
@@ -332,6 +340,7 @@ impl GemmKernel for f64 {
             a,
             a_panel_stride,
             a_step,
+            a_pack,
             b,
             beta,
             c,
@@ -944,6 +953,7 @@ impl GemmKernel for f32 {
         a: *const Self,
         a_panel_stride: usize,
         a_step: usize,
+        a_pack: *mut Self,
         b: *const Self,
         beta: Self,
         c: *mut Self,
@@ -966,6 +976,7 @@ impl GemmKernel for f32 {
                 a,
                 a_panel_stride,
                 a_step,
+                a_pack,
                 b,
                 beta,
                 c,
@@ -981,6 +992,7 @@ impl GemmKernel for f32 {
             a,
             a_panel_stride,
             a_step,
+            a_pack,
             b,
             beta,
             c,

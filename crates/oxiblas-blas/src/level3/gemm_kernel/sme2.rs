@@ -999,6 +999,12 @@ pub(super) unsafe fn pack_b_f32_sme2(
             unsafe { transpose_chunks_f32(col, ldb * 4, panel, chunks) };
             p0 = chunks * 64;
         }
+        if jb == nr && p0 < k {
+            // SAFETY: rows p0..k (fewer than 64) of the 16 columns, and their
+            // packed rows inside panel j0 / nr.
+            unsafe { transpose_tail_f32(col.add(p0), ldb * 4, panel.add(p0 * nr), k - p0) };
+            p0 = k;
+        }
         for p in p0..k {
             for jj in 0..nr {
                 // SAFETY: p < k and j0 + jj < n for the reads; the write is
@@ -1118,6 +1124,12 @@ pub(super) unsafe fn pack_b_f64_sme2(
             unsafe { transpose_chunks_f64(col, ldb * 8, panel, chunks) };
             p0 = chunks * 64;
         }
+        if jb == nr && p0 < k {
+            // SAFETY: rows p0..k (fewer than 64) of the 8 columns, and their
+            // packed rows inside panel j0 / nr.
+            unsafe { transpose_tail_f64(col.add(p0), ldb * 8, panel.add(p0 * nr), k - p0) };
+            p0 = k;
+        }
         for p in p0..k {
             for jj in 0..nr {
                 // SAFETY: as in `pack_b_f32_sme2`.
@@ -1216,6 +1228,256 @@ unsafe fn transpose_chunks_f64(col: *const f64, ldb_bytes: usize, panel: *mut f6
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Transposes the last `rows` (< 64) rows of one full B panel through ZA, as
+/// in `transpose_chunks_f32`, with the loads predicated to the rows.
+///
+/// # Safety
+///
+/// SME2 must be present, `rows` in 1..64; `col` must be valid for `rows`
+/// reads in each of 16 columns `ldb_bytes` apart, and `panel` for `rows * 16`
+/// writes.
+unsafe fn transpose_tail_f32(col: *const f32, ldb_bytes: usize, panel: *mut f32, rows: usize) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "zero {{za}}",
+            "ptrue p0.s",
+            "mov x9, #0",
+            "whilelt pn9.s, x9, x3, vlx4",
+            "mov x4, x0",
+            "mov w12, #0",
+            "3:",
+            "add x5, x4, x1",
+            "add x6, x5, x1",
+            "add x7, x6, x1",
+            "ld1w {{z16.s, z20.s, z24.s, z28.s}}, pn9/z, [x4]",
+            "ld1w {{z17.s, z21.s, z25.s, z29.s}}, pn9/z, [x5]",
+            "ld1w {{z18.s, z22.s, z26.s, z30.s}}, pn9/z, [x6]",
+            "ld1w {{z19.s, z23.s, z27.s, z31.s}}, pn9/z, [x7]",
+            "mova za0h.s[w12, 0:3], {{z16.s-z19.s}}",
+            "mova za1h.s[w12, 0:3], {{z20.s-z23.s}}",
+            "mova za2h.s[w12, 0:3], {{z24.s-z27.s}}",
+            "mova za3h.s[w12, 0:3], {{z28.s-z31.s}}",
+            "add x4, x7, x1",
+            "add w12, w12, #4",
+            "cmp w12, #16",
+            "b.ne 3b",
+            "mov x8, x2",
+            "mov x10, x3",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "20:",
+            "st1w {{za0v.s[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #16",
+            "b.ne 20b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "21:",
+            "st1w {{za1v.s[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #16",
+            "b.ne 21b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "22:",
+            "st1w {{za2v.s[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #16",
+            "b.ne 22b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "23:",
+            "st1w {{za3v.s[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #16",
+            "b.ne 23b",
+            "9:",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ldb_bytes,
+            inout("x2") panel => _,
+            in("x3") rows,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p9") _, out("p10") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Transposes the last `rows` (< 64) rows of one full B panel through ZA, as
+/// in `transpose_chunks_f64`, with the loads predicated to the rows.
+///
+/// # Safety
+///
+/// SME2 must be present, `rows` in 1..64; `col` must be valid for `rows`
+/// reads in each of 8 columns `ldb_bytes` apart, and `panel` for `rows * 8`
+/// writes.
+unsafe fn transpose_tail_f64(col: *const f64, ldb_bytes: usize, panel: *mut f64, rows: usize) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "zero {{za}}",
+            "ptrue p0.d",
+            "mov x9, #0",
+            "whilelt pn9.d, x9, x3, vlx4",
+            "mov x9, #32",
+            "whilelt pn10.d, x9, x3, vlx4",
+            "mov x4, x0",
+            "mov w12, #0",
+            "3:",
+            "add x5, x4, x1",
+            "add x6, x5, x1",
+            "add x7, x6, x1",
+            "ld1d {{z16.d, z20.d, z24.d, z28.d}}, pn9/z, [x4]",
+            "ld1d {{z17.d, z21.d, z25.d, z29.d}}, pn9/z, [x5]",
+            "ld1d {{z18.d, z22.d, z26.d, z30.d}}, pn9/z, [x6]",
+            "ld1d {{z19.d, z23.d, z27.d, z31.d}}, pn9/z, [x7]",
+            "mova za0h.d[w12, 0:3], {{z16.d-z19.d}}",
+            "mova za1h.d[w12, 0:3], {{z20.d-z23.d}}",
+            "mova za2h.d[w12, 0:3], {{z24.d-z27.d}}",
+            "mova za3h.d[w12, 0:3], {{z28.d-z31.d}}",
+            "ld1d {{z16.d, z20.d, z24.d, z28.d}}, pn10/z, [x4, #4, mul vl]",
+            "ld1d {{z17.d, z21.d, z25.d, z29.d}}, pn10/z, [x5, #4, mul vl]",
+            "ld1d {{z18.d, z22.d, z26.d, z30.d}}, pn10/z, [x6, #4, mul vl]",
+            "ld1d {{z19.d, z23.d, z27.d, z31.d}}, pn10/z, [x7, #4, mul vl]",
+            "mova za4h.d[w12, 0:3], {{z16.d-z19.d}}",
+            "mova za5h.d[w12, 0:3], {{z20.d-z23.d}}",
+            "mova za6h.d[w12, 0:3], {{z24.d-z27.d}}",
+            "mova za7h.d[w12, 0:3], {{z28.d-z31.d}}",
+            "add x4, x7, x1",
+            "add w12, w12, #4",
+            "cmp w12, #8",
+            "b.ne 3b",
+            "mov x8, x2",
+            "mov x10, x3",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "20:",
+            "st1d {{za0v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 20b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "21:",
+            "st1d {{za1v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 21b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "22:",
+            "st1d {{za2v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 22b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "23:",
+            "st1d {{za3v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 23b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "24:",
+            "st1d {{za4v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 24b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "25:",
+            "st1d {{za5v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 25b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "26:",
+            "st1d {{za6v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 26b",
+            "cbz x10, 9f",
+            "mov w12, #0",
+            "27:",
+            "st1d {{za7v.d[w12, 0]}}, p0, [x8]",
+            "add x8, x8, #64",
+            "add w12, w12, #1",
+            "sub x10, x10, #1",
+            "cbz x10, 9f",
+            "cmp w12, #8",
+            "b.ne 27b",
+            "9:",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ldb_bytes,
+            inout("x2") panel => _,
+            in("x3") rows,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p9") _, out("p10") _,
             options(nostack)
         );
     }

@@ -1977,6 +1977,87 @@ unsafe fn transpose_tail_f64(col: *const f64, ldb_bytes: usize, panel: *mut f64,
     }
 }
 
+/// Copies packed rows of 64 bytes (16 f32 or 8 f64, one B panel row) from a
+/// row-ordered source: for each of `panels` panels and each row `p` of the
+/// first `rows` rows (a multiple of 16), the 64 bytes at
+/// `src + p * ld_bytes + panel * 64` go to `dst + panel * dst_panel_bytes + p * 64`.
+/// Sixteen rows of all panels at a time, so the reads stay within 16 source rows.
+///
+/// # Safety
+///
+/// SME2 must be present; `src` and `dst` must be valid for those reads and writes.
+pub(crate) unsafe fn copy_rows_64b(
+    src: *const u8,
+    ld_bytes: usize,
+    rows: usize,
+    panels: usize,
+    dst: *mut u8,
+    dst_panel_bytes: usize,
+) {
+    if rows < 16 || panels == 0 {
+        return;
+    }
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue p0.s",
+            "ptrue pn8.s",
+            "mov x9, #0",
+            "2:",
+            "mul x11, x9, x1",
+            "add x11, x0, x11",
+            "add x12, x2, x9, lsl #6",
+            "mov x10, #0",
+            "3:",
+            "mov x14, x11",
+            "mov x15, x12",
+            "mov x16, #4",
+            "4:",
+            "ld1w {{z0.s}}, p0/z, [x14]",
+            "add x14, x14, x1",
+            "ld1w {{z1.s}}, p0/z, [x14]",
+            "add x14, x14, x1",
+            "ld1w {{z2.s}}, p0/z, [x14]",
+            "add x14, x14, x1",
+            "ld1w {{z3.s}}, p0/z, [x14]",
+            "add x14, x14, x1",
+            "st1w {{z0.s-z3.s}}, pn8, [x15]",
+            "addvl x15, x15, #4",
+            "subs x16, x16, #1",
+            "b.ne 4b",
+            "add x11, x11, #64",
+            "add x12, x12, x5",
+            "add x10, x10, #1",
+            "cmp x10, x4",
+            "b.ne 3b",
+            "add x9, x9, #16",
+            "cmp x9, x3",
+            "b.lo 2b",
+            "smstop",
+            in("x0") src,
+            in("x1") ld_bytes,
+            in("x2") dst,
+            in("x3") rows,
+            in("x4") panels,
+            in("x5") dst_panel_bytes,
+            out("x9") _, out("x10") _, out("x11") _, out("x12") _,
+            out("x14") _, out("x15") _, out("x16") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

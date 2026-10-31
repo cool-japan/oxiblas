@@ -965,6 +965,80 @@ const SME2_ONE_PASS_B_BYTES: usize = 2 << 20;
 ))]
 const SME2_B_BLOCK_BYTES: usize = 8 << 20;
 
+/// Packs `k` rows of a transposed B into NR-column panels: `src` points at
+/// `op(B)[0, 0]` of a column-major `B^T` (column stride `ld`), so packed row `p`
+/// of panel `j0 / nr` is the contiguous run `src[j0 + p * ld..][..nr]`, zero-padded
+/// past `n`.
+///
+/// # Safety
+///
+/// `src` must be valid for reads of `n` elements in each of `k` columns `ld`
+/// apart, and `dst` must hold `ceil(n / nr) * nr * k` elements.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+unsafe fn pack_b_rows<T: Field>(
+    src: *const T,
+    ld: usize,
+    k: usize,
+    n: usize,
+    nr: usize,
+    dst: &mut [T],
+) {
+    // Full panels of full 16-row chunks in streaming mode, the rest below.
+    let full = if nr * core::mem::size_of::<T>() == 64 {
+        n / nr
+    } else {
+        0
+    };
+    let rows16 = k / 16 * 16;
+    // SAFETY: the reads are rows 0..rows16, columns 0..full * nr of op(B), and
+    // the writes the first rows16 packed rows of the first `full` panels.
+    unsafe {
+        sme2::copy_rows_64b(
+            src.cast(),
+            ld * core::mem::size_of::<T>(),
+            rows16,
+            full,
+            dst.as_mut_ptr().cast(),
+            nr * k * core::mem::size_of::<T>(),
+        )
+    };
+    // 16 rows of op(B) at a time across all panels: the reads stay within 16
+    // columns of B^T, the writes are 16 contiguous packed rows per panel.
+    for p0 in (0..k).step_by(16) {
+        let pe = (p0 + 16).min(k);
+        for (panel, j0) in (0..n).step_by(nr).enumerate() {
+            let jb = nr.min(n - j0);
+            if panel < full && pe <= rows16 {
+                continue;
+            }
+            for p in p0..pe {
+                let row = &mut dst[(panel * k + p) * nr..][..nr];
+                if jb == nr && core::mem::size_of_val(row) == 64 {
+                    // SAFETY: row p, columns j0..j0 + nr of op(B) are inside B^T,
+                    // and `row` is the 64 bytes they go to; a fixed-size copy
+                    // compiles to plain loads and stores (no memcpy call).
+                    unsafe {
+                        let v = src.add(j0 + p * ld).cast::<[u8; 64]>().read_unaligned();
+                        row.as_mut_ptr().cast::<[u8; 64]>().write_unaligned(v);
+                    }
+                } else {
+                    // SAFETY: row p, columns j0..j0 + jb of op(B) are inside B^T.
+                    let from = unsafe { core::slice::from_raw_parts(src.add(j0 + p * ld), jb) };
+                    row[..jb].copy_from_slice(from);
+                    row[jb..].fill(T::zero());
+                }
+            }
+        }
+    }
+}
+
 /// Sequential SME2 GEMM: the loop nest of [`gemm_blocked_sequential`] with
 /// the packed B block in a per-thread scratch buffer (no allocation and no
 /// zeroing per call) and a small column-major A read in place by the
@@ -989,7 +1063,11 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     blocking: &GemmBlocking,
     shape: &MicroKernelShape,
 ) {
-    if trans_b != Trans::NoTrans || b.col_stride() != 1 {
+    // B is column-major (NoTrans), or a column-major B^T (Trans / ConjTrans of a
+    // real type: its rows are the packed rows already); other layouts take
+    // the general driver.
+    let b_rows = trans_b != Trans::NoTrans;
+    if b.col_stride() != 1 {
         gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
         return;
     }
@@ -1037,16 +1115,22 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                 // SAFETY: B is column-major (checked above) and the block
                 // `p..p + pb` x `j..j + jb` is inside it; `pack_b` holds
                 // `ceil(nc / NR) * NR * kc >= ceil(jb / NR) * NR * pb` elements.
-                let packed = unsafe {
-                    T::pack_b(
-                        b.as_ptr().add(p + j * ldb),
-                        ldb,
-                        pb,
-                        jb,
-                        pack_b.as_mut_ptr(),
-                    )
-                };
-                debug_assert!(packed, "the SME2 shape implies the SME2 B packer");
+                if b_rows {
+                    // SAFETY: B^T is column-major and the block `j..j + jb` x
+                    // `p..p + pb` is inside it.
+                    unsafe { pack_b_rows(b.as_ptr().add(j + p * ldb), ldb, pb, jb, nr, pack_b) };
+                } else {
+                    let packed = unsafe {
+                        T::pack_b(
+                            b.as_ptr().add(p + j * ldb),
+                            ldb,
+                            pb,
+                            jb,
+                            pack_b.as_mut_ptr(),
+                        )
+                    };
+                    debug_assert!(packed, "the SME2 shape implies the SME2 B packer");
+                }
                 for i in (0..m).step_by(mc) {
                     let ib = mc.min(m - i);
                     // SAFETY: (i, p) is inside A.

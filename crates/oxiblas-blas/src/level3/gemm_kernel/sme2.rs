@@ -137,6 +137,42 @@ fn set_interactive_qos() {
 #[cfg(all(feature = "parallel", not(target_os = "macos")))]
 fn set_interactive_qos() {}
 
+/// Runs `f` on a per-thread scratch buffer of `len` elements of `T`, kept
+/// between calls (as MTGEMM-A keeps its packing buffers): no allocation and
+/// no zeroing per GEMM call. The contents are whatever an earlier call left;
+/// `T` must be `f32` or `f64`, for which every bit pattern is a value.
+pub(crate) fn with_scratch<T: Copy, R>(len: usize, f: impl FnOnce(&mut [T]) -> R) -> R {
+    use oxiblas_core::memory::AlignedVec;
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<AlignedVec<u64>> = RefCell::new(AlignedVec::zeros(0));
+    }
+    assert!(
+        matches!(core::mem::size_of::<T>(), 4 | 8) && core::mem::align_of::<T>() <= 8,
+        "SME2 scratch is for f32 and f64"
+    );
+    let words = (len * core::mem::size_of::<T>()).div_ceil(8);
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buf) => {
+            if buf.len() < words {
+                *buf = AlignedVec::zeros(words);
+            }
+            // SAFETY: the buffer holds at least `len` elements of `T` (4 or 8
+            // bytes, alignment <= 8), and every bit pattern is an f32 or f64.
+            let slice =
+                unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<T>(), len) };
+            f(slice)
+        }
+        Err(_) => {
+            let mut buf: AlignedVec<u64> = AlignedVec::zeros(words);
+            // SAFETY: as above, for a fresh buffer.
+            let slice =
+                unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<T>(), len) };
+            f(slice)
+        }
+    })
+}
+
 /// Returns the number of performance-core clusters, i.e. of SME units on Apple
 /// silicon (one per P-cluster); at least 1.
 #[cfg(all(feature = "parallel", target_os = "macos"))]
@@ -499,16 +535,20 @@ pub(super) unsafe fn micro_kernel_f64_sme2(
 /// SME2 macro-kernel for f32: `C = alpha * A * B + beta * C` on an `m x n`
 /// block, in one streaming-mode region.
 ///
-/// `a` holds `ceil(m / 64)` packed A panels of `64 * k` elements and `b`
-/// holds `ceil(n / 16)` packed B panels of `16 * k` elements, in the layout of
-/// [`micro_kernel_f32_sme2`]. Rows and columns of the last panels past `m` and
-/// `n` may hold any values: the stores are predicated to the block. C is
-/// column-major with column stride `c_stride`. With `beta == 0`, C is not read.
+/// A panel `i` (rows `64i..`) starts at `a + i * a_panel_stride`, and its
+/// depth steps are `a_step` elements apart (packed panels: `64 * k` and 64;
+/// a column-major A read in place: 64 and its column stride). `b` holds
+/// `ceil(n / 16)` packed B panels of `16 * k` elements, in the layout of
+/// [`micro_kernel_f32_sme2`]. A loads and C stores are predicated to the
+/// block, so rows past `m` are not read and columns of the last B panel past
+/// `n` may hold any values. C is column-major with column stride `c_stride`.
+/// With `beta == 0`, C is not read.
 ///
 /// # Safety
 ///
 /// - [`usable_f32`] must have returned `true`, and `m`, `n` > 0.
-/// - `a` and `b` must be valid for the panel reads above.
+/// - `a` must be valid for reads of rows `0..m` of each depth step of each
+///   panel, and `b` for the B panel reads above.
 /// - `c` must be valid for reads and writes of `m` elements in each of `n`
 ///   columns `c_stride` apart.
 #[allow(clippy::too_many_arguments)]
@@ -518,6 +558,8 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
     k: usize,
     alpha: f32,
     a: *const f32,
+    a_panel_stride: usize,
+    a_step: usize,
     b: *const f32,
     beta: f32,
     c: *mut f32,
@@ -525,7 +567,8 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
 ) {
     let size = core::mem::size_of::<f32>();
     let ldc_bytes = c_stride * size;
-    let a_panel_bytes = MR * k * size;
+    let a_panel_bytes = a_panel_stride * size;
+    let a_step_bytes = a_step * size;
     let b_panel_bytes = NR_F32 * k * size;
     let beta_zero = u64::from(beta == 0.0);
     // SAFETY: the caller guarantees SME2, SVL 512, m, n > 0 and the buffer
@@ -560,16 +603,23 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "subs x9, x9, #1",
             "b.ne 12b",
             "13:",
+            // Rows of this tile: A loads and C stores are predicated to m - i0.
+            "sub x24, x8, x15",
+            "mov x25, #0",
+            "whilelt pn9.s, x25, x24, vlx4",
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
             "cbz x9, 5f",
             "4:",
+            "add x24, x22, x17",
+            "add x25, x24, x17",
+            "add x26, x25, x17",
             "ld1w {{z4.s-z7.s}}, pn8/z, [x23]",
-            "ld1w {{z0.s-z3.s}}, pn8/z, [x22]",
-            "ld1w {{z16.s-z19.s}}, pn8/z, [x22, #4, mul vl]",
-            "ld1w {{z20.s-z23.s}}, pn8/z, [x22, #8, mul vl]",
-            "ld1w {{z24.s-z27.s}}, pn8/z, [x22, #12, mul vl]",
+            "ld1w {{z0.s-z3.s}}, pn9/z, [x22]",
+            "ld1w {{z16.s-z19.s}}, pn9/z, [x24]",
+            "ld1w {{z20.s-z23.s}}, pn9/z, [x25]",
+            "ld1w {{z24.s-z27.s}}, pn9/z, [x26]",
             "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
             "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
             "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
@@ -586,7 +636,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "fmopa za1.s, p0/m, p0/m, z7.s, z25.s",
             "fmopa za2.s, p0/m, p0/m, z7.s, z26.s",
             "fmopa za3.s, p0/m, p0/m, z7.s, z27.s",
-            "addvl x22, x22, #16",
+            "add x22, x26, x17",
             "addvl x23, x23, #4",
             "subs x9, x9, #1",
             "b.ne 4b",
@@ -595,12 +645,12 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "b.eq 7f",
             "6:",
             "ld1w {{z4.s}}, p0/z, [x23]",
-            "ld1w {{z0.s-z3.s}}, pn8/z, [x22]",
+            "ld1w {{z0.s-z3.s}}, pn9/z, [x22]",
             "fmopa za0.s, p0/m, p0/m, z4.s, z0.s",
             "fmopa za1.s, p0/m, p0/m, z4.s, z1.s",
             "fmopa za2.s, p0/m, p0/m, z4.s, z2.s",
             "fmopa za3.s, p0/m, p0/m, z4.s, z3.s",
-            "addvl x22, x22, #4",
+            "add x22, x22, x17",
             "addvl x23, x23, #1",
             "subs x9, x9, #1",
             "b.ne 6b",
@@ -659,6 +709,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             in("x10") n,
             in("x11") a_panel_bytes,
             in("x13") b_panel_bytes,
+            in("x17") a_step_bytes,
             out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
             out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
@@ -685,8 +736,8 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
 /// # Safety
 ///
 /// - [`usable_f64`] must have returned `true`, and `m`, `n` > 0.
-/// - `a` and `b` must be valid for `ceil(m / 64) * 64 * k` and
-///   `ceil(n / 8) * 8 * k` reads.
+/// - `a` must be valid for reads of rows `0..m` of each depth step of each
+///   panel, and `b` for `ceil(n / 8) * 8 * k` reads.
 /// - `c` must be valid for reads and writes of `m` elements in each of `n`
 ///   columns `c_stride` apart.
 #[allow(clippy::too_many_arguments)]
@@ -696,6 +747,8 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
     k: usize,
     alpha: f64,
     a: *const f64,
+    a_panel_stride: usize,
+    a_step: usize,
     b: *const f64,
     beta: f64,
     c: *mut f64,
@@ -703,7 +756,8 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
 ) {
     let size = core::mem::size_of::<f64>();
     let ldc_bytes = c_stride * size;
-    let a_panel_bytes = MR * k * size;
+    let a_panel_bytes = a_panel_stride * size;
+    let a_step_bytes = a_step * size;
     let b_panel_bytes = NR_F64 * k * size;
     let beta_zero = u64::from(beta == 0.0);
     // SAFETY: the caller guarantees SME2, FEAT_SME_F64F64, SVL 512, m, n > 0
@@ -742,16 +796,25 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "subs x9, x9, #1",
             "b.ne 12b",
             "13:",
+            // Rows of this tile: A loads and C stores are predicated to m - i0.
+            "sub x24, x8, x15",
+            "mov x25, #0",
+            "whilelt pn9.d, x25, x24, vlx4",
+            "mov x25, #32",
+            "whilelt pn10.d, x25, x24, vlx4",
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
             "cbz x9, 5f",
             "4:",
+            "add x24, x22, x17",
+            "add x25, x24, x17",
+            "add x26, x25, x17",
             "ld1d {{z4.d-z7.d}}, pn8/z, [x23]",
-            "ld1d {{z0.d-z3.d}}, pn8/z, [x22]",
-            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #4, mul vl]",
-            "ld1d {{z20.d-z23.d}}, pn8/z, [x22, #8, mul vl]",
-            "ld1d {{z24.d-z27.d}}, pn8/z, [x22, #12, mul vl]",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x22]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x22, #4, mul vl]",
+            "ld1d {{z20.d-z23.d}}, pn9/z, [x24]",
+            "ld1d {{z24.d-z27.d}}, pn10/z, [x24, #4, mul vl]",
             "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
             "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
             "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
@@ -760,8 +823,8 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
             "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
             "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
-            "ld1d {{z0.d-z3.d}}, pn8/z, [x22, #16, mul vl]",
-            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #20, mul vl]",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x25]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x25, #4, mul vl]",
             "fmopa za0.d, p0/m, p0/m, z5.d, z20.d",
             "fmopa za1.d, p0/m, p0/m, z5.d, z21.d",
             "fmopa za2.d, p0/m, p0/m, z5.d, z22.d",
@@ -770,8 +833,8 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "fmopa za5.d, p0/m, p0/m, z5.d, z25.d",
             "fmopa za6.d, p0/m, p0/m, z5.d, z26.d",
             "fmopa za7.d, p0/m, p0/m, z5.d, z27.d",
-            "ld1d {{z20.d-z23.d}}, pn8/z, [x22, #24, mul vl]",
-            "ld1d {{z24.d-z27.d}}, pn8/z, [x22, #28, mul vl]",
+            "ld1d {{z20.d-z23.d}}, pn9/z, [x26]",
+            "ld1d {{z24.d-z27.d}}, pn10/z, [x26, #4, mul vl]",
             "fmopa za0.d, p0/m, p0/m, z6.d, z0.d",
             "fmopa za1.d, p0/m, p0/m, z6.d, z1.d",
             "fmopa za2.d, p0/m, p0/m, z6.d, z2.d",
@@ -788,8 +851,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "fmopa za5.d, p0/m, p0/m, z7.d, z25.d",
             "fmopa za6.d, p0/m, p0/m, z7.d, z26.d",
             "fmopa za7.d, p0/m, p0/m, z7.d, z27.d",
-            "addvl x22, x22, #16",
-            "addvl x22, x22, #16",
+            "add x22, x26, x17",
             "addvl x23, x23, #4",
             "subs x9, x9, #1",
             "b.ne 4b",
@@ -798,8 +860,8 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "b.eq 7f",
             "6:",
             "ld1d {{z4.d}}, p0/z, [x23]",
-            "ld1d {{z0.d-z3.d}}, pn8/z, [x22]",
-            "ld1d {{z16.d-z19.d}}, pn8/z, [x22, #4, mul vl]",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x22]",
+            "ld1d {{z16.d-z19.d}}, pn10/z, [x22, #4, mul vl]",
             "fmopa za0.d, p0/m, p0/m, z4.d, z0.d",
             "fmopa za1.d, p0/m, p0/m, z4.d, z1.d",
             "fmopa za2.d, p0/m, p0/m, z4.d, z2.d",
@@ -808,7 +870,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "fmopa za5.d, p0/m, p0/m, z4.d, z17.d",
             "fmopa za6.d, p0/m, p0/m, z4.d, z18.d",
             "fmopa za7.d, p0/m, p0/m, z4.d, z19.d",
-            "addvl x22, x22, #8",
+            "add x22, x22, x17",
             "addvl x23, x23, #1",
             "subs x9, x9, #1",
             "b.ne 6b",
@@ -883,6 +945,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             in("x10") n,
             in("x11") a_panel_bytes,
             in("x13") b_panel_bytes,
+            in("x17") a_step_bytes,
             out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
             out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
@@ -1262,7 +1325,7 @@ mod tests {
     /// Checks one macro-kernel call on an `m x n` block; padding of the last
     /// panels holds NaN, which must not reach C, and C outside the block must
     /// stay unchanged.
-    fn check_macro_f64(m: usize, n: usize, k: usize, alpha: f64, beta: f64) {
+    fn check_macro_f64(m: usize, n: usize, k: usize, alpha: f64, beta: f64, direct: bool) {
         let nr = NR_F64;
         let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
         let ldc = m + 3;
@@ -1274,6 +1337,26 @@ mod tests {
                 }
             }
         }
+        // In place: column-major A with column stride lda > m, NaN past row m.
+        let lda = m + 2;
+        let mut a_cm = vec![f64::NAN; lda * k];
+        for p in 0..k {
+            for i in 0..m {
+                a_cm[i + p * lda] = val(i + p * m, 21);
+            }
+        }
+        for ib in 0..mp {
+            for p in 0..k {
+                for i in 0..MR.min(m - ib * MR) {
+                    a[ib * MR * k + p * MR + i] = a_cm[ib * MR + i + p * lda];
+                }
+            }
+        }
+        let (a_ptr, a_panel, a_step) = if direct {
+            (a_cm.as_ptr(), MR, lda)
+        } else {
+            (a.as_ptr(), MR * k, MR)
+        };
         let mut b = vec![f64::NAN; np * nr * k];
         for jb in 0..np {
             for p in 0..k {
@@ -1292,7 +1375,9 @@ mod tests {
                 n,
                 k,
                 alpha,
-                a.as_ptr(),
+                a_ptr,
+                a_panel,
+                a_step,
                 b.as_ptr(),
                 beta,
                 c.as_mut_ptr(),
@@ -1322,7 +1407,7 @@ mod tests {
         }
     }
 
-    fn check_macro_f32(m: usize, n: usize, k: usize, alpha: f32, beta: f32) {
+    fn check_macro_f32(m: usize, n: usize, k: usize, alpha: f32, beta: f32, direct: bool) {
         let nr = NR_F32;
         let (mp, np) = (m.div_ceil(MR), n.div_ceil(nr));
         let ldc = m + 5;
@@ -1334,6 +1419,26 @@ mod tests {
                 }
             }
         }
+        // In place: column-major A with column stride lda > m, NaN past row m.
+        let lda = m + 2;
+        let mut a_cm = vec![f32::NAN; lda * k];
+        for p in 0..k {
+            for i in 0..m {
+                a_cm[i + p * lda] = val(i + p * m, 24) as f32;
+            }
+        }
+        for ib in 0..mp {
+            for p in 0..k {
+                for i in 0..MR.min(m - ib * MR) {
+                    a[ib * MR * k + p * MR + i] = a_cm[ib * MR + i + p * lda];
+                }
+            }
+        }
+        let (a_ptr, a_panel, a_step) = if direct {
+            (a_cm.as_ptr(), MR, lda)
+        } else {
+            (a.as_ptr(), MR * k, MR)
+        };
         let mut b = vec![f32::NAN; np * nr * k];
         for jb in 0..np {
             for p in 0..k {
@@ -1351,7 +1456,9 @@ mod tests {
                 n,
                 k,
                 alpha,
-                a.as_ptr(),
+                a_ptr,
+                a_panel,
+                a_step,
                 b.as_ptr(),
                 beta,
                 c.as_mut_ptr(),
@@ -1402,8 +1509,10 @@ mod tests {
             return;
         }
         for (m, n, k) in BLOCKS {
-            check_macro_f64(m, n, k, 1.25, 0.0);
-            check_macro_f64(m, n, k, -0.5, 0.75);
+            for direct in [false, true] {
+                check_macro_f64(m, n, k, 1.25, 0.0, direct);
+                check_macro_f64(m, n, k, -0.5, 0.75, direct);
+            }
         }
     }
 
@@ -1413,8 +1522,10 @@ mod tests {
             return;
         }
         for (m, n, k) in BLOCKS {
-            check_macro_f32(m, n, k, 1.25, 0.0);
-            check_macro_f32(m, n, k, -0.5, 0.75);
+            for direct in [false, true] {
+                check_macro_f32(m, n, k, 1.25, 0.0, direct);
+                check_macro_f32(m, n, k, -0.5, 0.75, direct);
+            }
         }
     }
 

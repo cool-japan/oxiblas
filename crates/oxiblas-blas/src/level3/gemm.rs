@@ -41,7 +41,6 @@
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
 #[cfg(all(
-    feature = "parallel",
     target_arch = "aarch64",
     not(any(
         feature = "force-scalar",
@@ -869,7 +868,7 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
                 );
                 return;
             }
-            gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+            sme2_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
             return;
         }
 
@@ -884,8 +883,131 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         }
     }
 
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    ))]
+    if shape.mr == sme2::MR {
+        sme2_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+        return;
+    }
+
     // Sequential fallback
     gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+}
+
+/// Largest span of one KC block of a column-major A (column stride times KC)
+/// that the SME2 macro-kernel reads in place instead of packing.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_IN_PLACE_A_BYTES: usize = 1 << 20;
+
+/// Sequential SME2 GEMM: the loop nest of [`gemm_blocked_sequential`] with
+/// the packed B block in a per-thread scratch buffer (no allocation and no
+/// zeroing per call) and a small column-major A read in place by the
+/// macro-kernel (no A packing). Other B layouts take [`gemm_blocked_sequential`].
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[allow(clippy::too_many_arguments)]
+fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    shape: &MicroKernelShape,
+) {
+    if trans_b != Trans::NoTrans || b.col_stride() != 1 {
+        gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+        return;
+    }
+    let (m, k) = op_dims(a, trans_a);
+    let n = c.ncols();
+    let nc = blocking.nc.min(n);
+    let kc = blocking.kc.min(k);
+    let mc = blocking.mc.min(m);
+    let (mr, nr) = (shape.mr, shape.nr);
+    // In place only while one KC block of A spans few pages: each depth step
+    // is a column, and many columns cost more TLB misses than packing does.
+    let a_in_place = trans_a == Trans::NoTrans
+        && a.col_stride() == 1
+        && a.row_stride() * kc * core::mem::size_of::<T>() <= SME2_IN_PLACE_A_BYTES;
+    let mut pack_a: Option<AlignedVec<T>> =
+        (!a_in_place).then(|| AlignedVec::zeros(mc.div_ceil(mr) * mr * kc));
+    let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
+    let c_ptr = c.as_ptr().cast_mut();
+
+    sme2::with_scratch::<T, _>(kc * nc.div_ceil(nr) * nr, |pack_b| {
+        for p in (0..k).step_by(kc) {
+            let pb = kc.min(k - p);
+            let beta_eff = if p == 0 { beta } else { T::one() };
+            for j in (0..n).step_by(nc) {
+                let jb = nc.min(n - j);
+                // SAFETY: B is column-major (checked above) and the block
+                // `p..p + pb` x `j..j + jb` is inside it; `pack_b` holds
+                // `ceil(nc / NR) * NR * kc >= ceil(jb / NR) * NR * pb` elements.
+                let packed = unsafe {
+                    T::pack_b(
+                        b.as_ptr().add(p + j * ldb),
+                        ldb,
+                        pb,
+                        jb,
+                        pack_b.as_mut_ptr(),
+                    )
+                };
+                debug_assert!(packed, "the SME2 shape implies the SME2 B packer");
+                for i in (0..m).step_by(mc) {
+                    let ib = mc.min(m - i);
+                    let (a_ptr, a_panel, a_step) = match pack_a.as_mut() {
+                        // SAFETY: (i, p) is inside A.
+                        None => (unsafe { a.as_ptr().add(i + p * lda) }, mr, lda),
+                        Some(buf) => {
+                            pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
+                            (buf.as_ptr(), mr * pb, mr)
+                        }
+                    };
+                    // SAFETY: A rows i..i + ib of depth steps p..p + pb (in
+                    // place or packed), the packed B block, and the ib x jb block
+                    // of C at (i, j) are all valid for the macro-kernel.
+                    let done = unsafe {
+                        T::macro_kernel(
+                            ib,
+                            jb,
+                            pb,
+                            alpha,
+                            a_ptr,
+                            a_panel,
+                            a_step,
+                            pack_b.as_ptr(),
+                            beta_eff,
+                            c_ptr.add(i + j * ldc),
+                            ldc,
+                        )
+                    };
+                    debug_assert!(done, "the SME2 shape implies the SME2 macro-kernel");
+                }
+            }
+        }
+    });
 }
 
 /// Runs the SME2 GEMM on the calling thread and `pool`: C is split into one
@@ -967,7 +1089,7 @@ fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
             };
             (*a, b_part)
         };
-        gemm_blocked_sequential(
+        sme2_sequential(
             trans_a, trans_b, alpha, &a_part, &b_part, beta, &mut view, blocking, shape,
         );
     };
@@ -1258,6 +1380,8 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
             k,
             alpha,
             pack_a.as_ptr(),
+            mr * k,
+            mr,
             pack_b.as_ptr(),
             beta,
             c.as_ptr().cast_mut(),

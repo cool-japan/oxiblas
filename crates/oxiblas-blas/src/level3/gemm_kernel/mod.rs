@@ -169,9 +169,12 @@ pub trait GemmKernel: Field {
     /// streaming mode once per block); returns `false` otherwise, and the
     /// caller then runs [`GemmKernel::micro_kernel`] per micro-tile.
     ///
-    /// `a` holds `ceil(m / MR)` packed A panels of `MR * k` elements, `b`
-    /// holds `ceil(n / NR)` packed B panels of `NR * k` elements, and C is
-    /// `m x n` with column stride `c_stride`.
+    /// A panel `i` (rows `i * MR..`) starts at `a + i * a_panel_stride` and its
+    /// depth steps are `a_step` elements apart: packed panels have
+    /// `a_panel_stride = MR * k` and `a_step = MR`, and a column-major A can be
+    /// read in place with `a_panel_stride = MR` and `a_step` = its column
+    /// stride. `b` holds `ceil(n / NR)` packed B panels of `NR * k` elements,
+    /// and C is `m x n` with column stride `c_stride`.
     ///
     /// # Safety
     ///
@@ -184,12 +187,26 @@ pub trait GemmKernel: Field {
         k: usize,
         alpha: Self,
         a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
         b: *const Self,
         beta: Self,
         c: *mut Self,
         c_stride: usize,
     ) -> bool {
-        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
         false
     }
     /// Packs `k` rows of `n` columns of a column-major B (column stride
@@ -276,6 +293,8 @@ impl GemmKernel for f64 {
         k: usize,
         alpha: Self,
         a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
         b: *const Self,
         beta: Self,
         c: *mut Self,
@@ -290,10 +309,34 @@ impl GemmKernel for f64 {
             ))
         ))]
         if use_sme2_f64() && m > 0 && n > 0 {
-            sme2::macro_kernel_f64_sme2(m, n, k, alpha, a, b, beta, c, c_stride);
+            sme2::macro_kernel_f64_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a,
+                a_panel_stride,
+                a_step,
+                b,
+                beta,
+                c,
+                c_stride,
+            );
             return true;
         }
-        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
         false
     }
     #[inline]
@@ -899,6 +942,8 @@ impl GemmKernel for f32 {
         k: usize,
         alpha: Self,
         a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
         b: *const Self,
         beta: Self,
         c: *mut Self,
@@ -913,10 +958,34 @@ impl GemmKernel for f32 {
             ))
         ))]
         if use_sme2_f32() && m > 0 && n > 0 {
-            sme2::macro_kernel_f32_sme2(m, n, k, alpha, a, b, beta, c, c_stride);
+            sme2::macro_kernel_f32_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a,
+                a_panel_stride,
+                a_step,
+                b,
+                beta,
+                c,
+                c_stride,
+            );
             return true;
         }
-        let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
         false
     }
     #[inline]

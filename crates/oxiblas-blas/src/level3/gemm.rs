@@ -857,14 +857,14 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
             ))
         ))]
         if shape.mr == sme2::MR {
-            let pool = if par.is_sequential() {
+            let workers = if par.is_sequential() {
                 None
             } else {
-                sme2::thread_pool(total_work)
+                sme2::workers(total_work)
             };
-            if let Some(pool) = pool {
+            if let Some(workers) = workers {
                 sme2_split(
-                    pool, trans_a, trans_b, alpha, a, b, beta, c, blocking, shape,
+                    workers, trans_a, trans_b, alpha, a, b, beta, c, blocking, shape,
                 );
                 return;
             }
@@ -1081,7 +1081,7 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
-    pool: &rayon::ThreadPool,
+    workers: &sme2::Workers,
     trans_a: Trans,
     trans_b: Trans,
     alpha: T,
@@ -1099,9 +1099,7 @@ fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
     } else {
         (n, shape.nr)
     };
-    let parts = (pool.current_num_threads() + 1)
-        .min(len.div_ceil(unit))
-        .max(1);
+    let parts = (workers.count() + 1).min(len.div_ceil(unit)).max(1);
 
     // Part boundaries: near-equal runs of whole MR (or NR) units.
     let bound = |i: usize| (len.div_ceil(unit) * i / parts * unit).min(len);
@@ -1145,17 +1143,37 @@ fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
             trans_a, trans_b, alpha, &a_part, &b_part, beta, &mut view, blocking, shape,
         );
     };
-    // The calling thread takes the first part, the pool threads the others.
+    // The calling thread takes the first part, the workers the others.
     let mut views = views.into_iter();
-    let first = views.next();
-    pool.in_place_scope(|scope| {
-        for (start, view) in views {
-            scope.spawn(move |_| run(start, view));
+    let Some((start0, view0)) = views.next() else {
+        return;
+    };
+    let mut rest: Vec<_> = views.map(|(start, view)| (start, Some(view))).collect();
+    let mut jobs: Vec<Box<dyn FnMut() + Send + '_>> = rest
+        .iter_mut()
+        .map(|(start, view)| {
+            let start = *start;
+            Box::new(move || {
+                if let Some(view) = view.take() {
+                    run(start, view);
+                }
+            }) as Box<dyn FnMut() + Send + '_>
+        })
+        .collect();
+    let mut first = Some(view0);
+    let mut main = || {
+        if let Some(view) = first.take() {
+            run(start0, view);
         }
-        if let Some((start, view)) = first {
-            run(start, view);
+    };
+    let mut refs: Vec<&mut (dyn FnMut() + Send)> = jobs.iter_mut().map(|j| &mut **j as _).collect();
+    if !workers.run(&mut refs, &mut main) {
+        // Workers busy with another call: run every part here.
+        main();
+        for job in &mut refs {
+            job();
         }
-    });
+    }
 }
 
 /// Packs a panel of `op(A)` into the A packing buffer, transpose-aware.

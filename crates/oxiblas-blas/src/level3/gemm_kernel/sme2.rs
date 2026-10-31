@@ -100,28 +100,178 @@ fn sysctl_flag(name: &core::ffi::CStr) -> bool {
 #[cfg(feature = "parallel")]
 const PAR_MIN_WORK: usize = 1 << 22;
 
-/// Returns a thread pool with one thread less than there are SME units (the
-/// calling thread uses one unit), when there are at least two units and the
-/// problem has at least [`PAR_MIN_WORK`] multiply-adds.
-///
-/// Threads that share one SME unit only compete for it, so the SME2 path runs
-/// on this pool instead of the global rayon pool. Its threads ask for the
-/// user-interactive QoS class, so that macOS runs them on performance cores.
+/// Persistent worker threads for the SME units beyond the first (the calling
+/// thread uses one unit), as in MTGEMM-A: each worker spins on an atomic for
+/// [`SPIN`] after a job before it sleeps, so back-to-back GEMM calls pay no
+/// wake-up, and asks for the user-interactive QoS class, so that macOS runs it
+/// on a performance core.
 #[cfg(feature = "parallel")]
-pub(crate) fn thread_pool(work: usize) -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+pub(crate) struct Workers {
+    slots: Vec<std::sync::Arc<Slot>>,
+    call: std::sync::Mutex<()>,
+}
+
+/// How long a worker spins for the next job before it sleeps.
+#[cfg(feature = "parallel")]
+const SPIN: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// One worker's mailbox. `job` is written only by the thread that holds
+/// `Workers::call`, before it bumps `posted`, and read by the worker after it
+/// sees the new `posted`; the caller waits for `done` before it returns.
+#[cfg(feature = "parallel")]
+struct Slot {
+    job: core::cell::UnsafeCell<Option<*mut (dyn FnMut() + Send + 'static)>>,
+    posted: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicU64,
+    panicked: std::sync::atomic::AtomicBool,
+    sleeping: std::sync::atomic::AtomicBool,
+    lock: std::sync::Mutex<()>,
+    wake: std::sync::Condvar,
+}
+
+// SAFETY: `job` is only accessed under the posted/done handshake described on
+// `Slot`, so the caller and the worker never touch it at the same time.
+#[cfg(feature = "parallel")]
+unsafe impl Sync for Slot {}
+// SAFETY: as above; the raw job pointer is only dereferenced by the worker
+// while the caller keeps the job alive.
+#[cfg(feature = "parallel")]
+unsafe impl Send for Slot {}
+
+#[cfg(feature = "parallel")]
+impl Slot {
+    fn work(&self) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        set_interactive_qos();
+        let mut seen = 0u64;
+        loop {
+            let t0 = std::time::Instant::now();
+            while self.posted.load(Acquire) == seen && t0.elapsed() < SPIN {
+                core::hint::spin_loop();
+            }
+            if self.posted.load(Acquire) == seen {
+                let mut guard = self
+                    .lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.sleeping.store(true, Release);
+                while self.posted.load(Acquire) == seen {
+                    guard = self
+                        .wake
+                        .wait(guard)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                self.sleeping.store(false, Release);
+            }
+            seen = self.posted.load(Acquire);
+            // SAFETY: the caller wrote `job` before bumping `posted` and keeps
+            // the job alive until it sees `done == seen`.
+            if let Some(job) = unsafe { *self.job.get() } {
+                let ok =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*job)() }));
+                if ok.is_err() {
+                    self.panicked.store(true, Release);
+                }
+            }
+            self.done.store(seen, Release);
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Workers {
+    /// Number of worker threads.
+    pub(crate) fn count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Runs `jobs[i]` on worker `i` and `main` on the calling thread, and
+    /// returns when all have finished; `false` (nothing run) when another call
+    /// holds the workers. Panics if a job panicked.
+    pub(crate) fn run(
+        &self,
+        jobs: &mut [&mut (dyn FnMut() + Send)],
+        main: &mut dyn FnMut(),
+    ) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let Ok(_call) = self.call.try_lock() else {
+            return false;
+        };
+        let mut tickets = Vec::with_capacity(jobs.len());
+        for (slot, job) in self.slots.iter().zip(jobs.iter_mut()) {
+            let ptr: *mut (dyn FnMut() + Send + '_) = &mut **job;
+            // SAFETY: only the lifetime is erased; this call waits below until
+            // the worker has finished the job.
+            let ptr: *mut (dyn FnMut() + Send + 'static) = unsafe { core::mem::transmute(ptr) };
+            // SAFETY: the worker reads `job` only after it sees the new
+            // `posted`, and it has finished the previous job (`done` was waited for).
+            unsafe { *slot.job.get() = Some(ptr) };
+            let ticket = {
+                let _guard = slot
+                    .lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let t = slot.posted.load(Acquire) + 1;
+                slot.posted.store(t, Release);
+                t
+            };
+            if slot.sleeping.load(Acquire) {
+                slot.wake.notify_one();
+            }
+            tickets.push(ticket);
+        }
+        main();
+        let mut panicked = false;
+        for (slot, ticket) in self.slots.iter().zip(tickets) {
+            while slot.done.load(Acquire) != ticket {
+                core::hint::spin_loop();
+            }
+            // SAFETY: the worker has finished; clear the pointer to the job.
+            unsafe { *slot.job.get() = None };
+            panicked |= slot.panicked.swap(false, Acquire);
+        }
+        assert!(!panicked, "an SME2 worker job panicked");
+        true
+    }
+}
+
+/// Returns the SME2 worker threads (one less than there are SME units), when
+/// there are at least two units and the problem has at least [`PAR_MIN_WORK`]
+/// multiply-adds.
+#[cfg(feature = "parallel")]
+pub(crate) fn workers(work: usize) -> Option<&'static Workers> {
+    static WORKERS: OnceLock<Option<Workers>> = OnceLock::new();
     if work < PAR_MIN_WORK || sme_units() < 2 {
         return None;
     }
-    POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(sme_units() - 1)
-            .thread_name(|i| format!("oxiblas-sme2-{i}"))
-            .start_handler(|_| set_interactive_qos())
-            .build()
-            .ok()
-    })
-    .as_ref()
+    WORKERS
+        .get_or_init(|| {
+            let mut slots = Vec::new();
+            for i in 1..sme_units() {
+                let slot = std::sync::Arc::new(Slot {
+                    job: core::cell::UnsafeCell::new(None),
+                    posted: std::sync::atomic::AtomicU64::new(0),
+                    done: std::sync::atomic::AtomicU64::new(0),
+                    panicked: std::sync::atomic::AtomicBool::new(false),
+                    sleeping: std::sync::atomic::AtomicBool::new(false),
+                    lock: std::sync::Mutex::new(()),
+                    wake: std::sync::Condvar::new(),
+                });
+                let worker = std::sync::Arc::clone(&slot);
+                let spawned = std::thread::Builder::new()
+                    .name(format!("oxiblas-sme2-{i}"))
+                    .spawn(move || worker.work());
+                if spawned.is_err() {
+                    break;
+                }
+                slots.push(slot);
+            }
+            (!slots.is_empty()).then(|| Workers {
+                slots,
+                call: std::sync::Mutex::new(()),
+            })
+        })
+        .as_ref()
 }
 
 /// Asks for the user-interactive QoS class for the calling thread.
@@ -2064,6 +2214,19 @@ mod tests {
         check_gemm_f64(97, 23, 71, Trans::Trans, Trans::NoTrans, Par::Seq);
         check_gemm_f64(97, 23, 71, Trans::NoTrans, Trans::Trans, Par::Seq);
         check_gemm_f64(97, 23, 71, Trans::Trans, Trans::Trans, Par::Seq);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_sme2_gemm_parallel_concurrent_callers() {
+        // Several threads at once: one holds the workers, the others run in place.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    check_gemm_f64(260, 210, 90, Trans::NoTrans, Trans::NoTrans, Par::Rayon)
+                });
+            }
+        });
     }
 
     #[cfg(feature = "parallel")]

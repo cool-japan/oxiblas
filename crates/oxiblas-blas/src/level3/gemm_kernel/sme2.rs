@@ -2295,6 +2295,7 @@ pub(super) unsafe fn pack_a_t_chunks_f32(
     ld_bytes: usize,
     panel: *mut f32,
     chunks: usize,
+    cols: usize,
 ) {
     // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
     unsafe {
@@ -2304,35 +2305,50 @@ pub(super) unsafe fn pack_a_t_chunks_f32(
             "ptrue p0.s",
             "ptrue pn8.s",
             "2:",
+            "zero {{za}}",
             "mov x4, x0",
+            "mov x6, x5",
             "mov w12, #0",
+            "cbz x6, 39f",
             "20:",
             "ld1w {{za0h.s[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #16",
             "b.ne 20b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "21:",
             "ld1w {{za1h.s[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #16",
             "b.ne 21b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "12:",
             "ld1w {{za2h.s[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #16",
             "b.ne 12b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "13:",
             "ld1w {{za3h.s[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #16",
             "b.ne 13b",
+            "39:",
             "mov w12, #0",
             "mov x8, x2",
             "3:",
@@ -2357,7 +2373,8 @@ pub(super) unsafe fn pack_a_t_chunks_f32(
             in("x1") ld_bytes,
             inout("x2") panel => _,
             inout("x3") chunks => _,
-            out("x4") _, out("x8") _, out("x12") _,
+            in("x5") cols,
+            out("x4") _, out("x6") _, out("x8") _, out("x12") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
             out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -2387,6 +2404,7 @@ pub(super) unsafe fn pack_a_t_chunks_f64(
     ld_bytes: usize,
     panel: *mut f64,
     chunks: usize,
+    cols: usize,
 ) {
     // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
     unsafe {
@@ -2396,63 +2414,90 @@ pub(super) unsafe fn pack_a_t_chunks_f64(
             "ptrue p0.d",
             "ptrue pn8.d",
             "2:",
+            "zero {{za}}",
             "mov x4, x0",
+            "mov x6, x5",
             "mov w12, #0",
+            "cbz x6, 39f",
             "20:",
             "ld1d {{za0h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 20b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "21:",
             "ld1d {{za1h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 21b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "12:",
             "ld1d {{za2h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 12b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "13:",
             "ld1d {{za3h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 13b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "14:",
             "ld1d {{za4h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 14b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "15:",
             "ld1d {{za5h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 15b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "16:",
             "ld1d {{za6h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 16b",
             "mov w12, #0",
+            "cbz x6, 39f",
             "17:",
             "ld1d {{za7h.d[w12, 0]}}, p0/z, [x4]",
             "add x4, x4, x1",
             "add w12, w12, #1",
+            "sub x6, x6, #1",
+            "cbz x6, 39f",
             "cmp w12, #8",
             "b.ne 17b",
+            "39:",
             "mov w12, #0",
             "mov x8, x2",
             "3:",
@@ -2486,7 +2531,8 @@ pub(super) unsafe fn pack_a_t_chunks_f64(
             in("x1") ld_bytes,
             inout("x2") panel => _,
             inout("x3") chunks => _,
-            out("x4") _, out("x8") _, out("x12") _,
+            in("x5") cols,
+            out("x4") _, out("x6") _, out("x8") _, out("x12") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
             out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -2523,9 +2569,12 @@ pub(super) unsafe fn pack_a_t_f32_sme2(
         // SAFETY: panel i0 / 64 starts inside `dst`, column i0 inside `src`.
         let (panel, col) = unsafe { (dst.add(i0 * k), src.add(i0 * ld)) };
         let mut p0 = 0;
-        if ib == MR && chunks > 0 {
-            // SAFETY: the caller guarantees SME2; 64 columns of `chunks * 16` rows.
-            unsafe { pack_a_t_chunks_f32(col, ld * core::mem::size_of::<f32>(), panel, chunks) };
+        if chunks > 0 {
+            // SAFETY: the caller guarantees SME2; `ib` columns of `chunks * 16`
+            // rows (rows of the panel past `ib` are written as zeros).
+            unsafe {
+                pack_a_t_chunks_f32(col, ld * core::mem::size_of::<f32>(), panel, chunks, ib)
+            };
             p0 = chunks * 16;
         }
         for p in p0..k {
@@ -2560,9 +2609,12 @@ pub(super) unsafe fn pack_a_t_f64_sme2(
         // SAFETY: panel i0 / 64 starts inside `dst`, column i0 inside `src`.
         let (panel, col) = unsafe { (dst.add(i0 * k), src.add(i0 * ld)) };
         let mut p0 = 0;
-        if ib == MR && chunks > 0 {
-            // SAFETY: the caller guarantees SME2; 64 columns of `chunks * 8` rows.
-            unsafe { pack_a_t_chunks_f64(col, ld * core::mem::size_of::<f64>(), panel, chunks) };
+        if chunks > 0 {
+            // SAFETY: the caller guarantees SME2; `ib` columns of `chunks * 8`
+            // rows (rows of the panel past `ib` are written as zeros).
+            unsafe {
+                pack_a_t_chunks_f64(col, ld * core::mem::size_of::<f64>(), panel, chunks, ib)
+            };
             p0 = chunks * 8;
         }
         for p in p0..k {

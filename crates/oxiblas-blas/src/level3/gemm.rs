@@ -688,6 +688,14 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     if m * n * k <= SMALL_THRESHOLD && !sme2_small(&shape, m, n, k) {
         if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
             gemm_small(alpha, &a, &b, beta, &mut c);
+        } else if m * n * k >= SMALL_TRANS_COPY_MIN {
+            // Transposed operands: copy op(A) and op(B) to column-major once,
+            // so that the small-matrix kernels can run (the copies are small).
+            let a_cm = (trans_a != Trans::NoTrans).then(|| materialize_op(&a, trans_a));
+            let b_cm = (trans_b != Trans::NoTrans).then(|| materialize_op(&b, trans_b));
+            let a_op = a_cm.as_ref().map_or(a, |x| x.as_ref());
+            let b_op = b_cm.as_ref().map_or(b, |x| x.as_ref());
+            gemm_small(alpha, &a_op, &b_op, beta, &mut c);
         } else {
             gemm_small_trans(trans_a, trans_b, alpha, &a, &b, beta, &mut c);
         }
@@ -796,6 +804,22 @@ pub(super) fn read_op<T: Scalar>(mat: &MatRef<'_, T>, trans: Trans, row: usize, 
 fn materialize_op<T: Scalar + bytemuck::Zeroable>(src: &MatRef<'_, T>, trans: Trans) -> Mat<T> {
     let (rows, cols) = op_dims(src, trans);
     let mut out: Mat<T> = Mat::zeros(rows, cols);
+    if trans == Trans::Trans && src.col_stride() == 1 {
+        // Column-major source: column i of the source is row i of op(src).
+        let (ld, ldo) = (src.row_stride(), out.row_stride());
+        let dst = out.as_mut_ptr();
+        for i in 0..rows {
+            // SAFETY: column i of `src` has `cols` elements, and (i, j) is
+            // inside `out` (rows x cols, column stride ldo).
+            unsafe {
+                let col = src.as_ptr().add(i * ld);
+                for j in 0..cols {
+                    *dst.add(i + j * ldo) = *col.add(j);
+                }
+            }
+        }
+        return out;
+    }
     for j in 0..cols {
         for i in 0..rows {
             out[(i, j)] = read_op(src, trans, i, j);
@@ -929,7 +953,7 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
 
 /// Returns `true` when a problem below [`SMALL_THRESHOLD`] runs faster on the
 /// SME2 kernels than on the small-matrix path. Measured on Apple M4: a
-/// 64-row tile must be at least half used (m >= 32), or a quarter used with
+/// 64-row tile must be at least three-eighths used (m >= 24), or a quarter used with
 /// a deep product (m, n >= 16, k >= 64).
 #[inline]
 fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
@@ -942,7 +966,7 @@ fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
         ))
     ))]
     {
-        shape.mr == sme2::MR && ((m >= 32 && n >= 8 && k >= 8) || (m >= 16 && n >= 16 && k >= 64))
+        shape.mr == sme2::MR && ((m >= 24 && n >= 8 && k >= 8) || (m >= 16 && n >= 16 && k >= 64))
     }
     #[cfg(not(all(
         target_arch = "aarch64",
@@ -957,6 +981,10 @@ fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
         false
     }
 }
+
+/// Smallest `m * n * k` of a small product with transposed operands that
+/// copies them to column-major for `gemm_small`.
+const SMALL_TRANS_COPY_MIN: usize = 8 * 8 * 8;
 
 /// Smallest `m * n * k` for the direct thin-shape kernels.
 const THIN_MIN_WORK: usize = 1;

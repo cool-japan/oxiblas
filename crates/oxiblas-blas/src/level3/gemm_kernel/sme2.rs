@@ -871,6 +871,264 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
     }
 }
 
+/// Packs `k` rows of `n` columns of a column-major B (column stride `ldb`)
+/// into B panels of `NR` columns, `NR` elements per row (the layout the
+/// kernels read), zero-padding the last panel to `NR` columns.
+///
+/// Full 64-row chunks of full panels are transposed through the ZA array:
+/// four columns are loaded with four-vector loads and moved into four ZA
+/// tiles with one four-slice `MOVA` per tile, and the vertical slices (the
+/// packed rows) come out four at a time. This is the four-row ZA transposition
+/// of MTGEMM-A's packing of A, applied to B, which is the transposed operand in
+/// column-major order. The rest is copied element by element.
+///
+/// # Safety
+///
+/// - [`usable_f32`] must have returned `true`.
+/// - `src` must be valid for reads of `k` elements in each of `n` columns
+///   `ldb` apart, and `dst` for writes of `ceil(n / 16) * 16 * k` elements.
+pub(super) unsafe fn pack_b_f32_sme2(
+    src: *const f32,
+    ldb: usize,
+    k: usize,
+    n: usize,
+    dst: *mut f32,
+) {
+    let nr = NR_F32;
+    let chunks = k / 64;
+    for j0 in (0..n).step_by(nr) {
+        let jb = nr.min(n - j0);
+        // SAFETY: panel j0 / nr starts inside `dst`; columns j0.. inside `src`.
+        let (panel, col) = unsafe { (dst.add(j0 * k), src.add(j0 * ldb)) };
+        let mut p0 = 0;
+        if jb == nr && chunks > 0 {
+            // SAFETY: the caller guarantees SME2; the block reads 64 * chunks
+            // rows of 16 columns and writes the same number of packed rows.
+            unsafe { transpose_chunks_f32(col, ldb * 4, panel, chunks) };
+            p0 = chunks * 64;
+        }
+        for p in p0..k {
+            for jj in 0..nr {
+                // SAFETY: p < k and j0 + jj < n for the reads; the write is
+                // inside panel j0 / nr.
+                unsafe {
+                    *panel.add(p * nr + jj) = if jj < jb { *col.add(p + jj * ldb) } else { 0.0 };
+                }
+            }
+        }
+    }
+}
+
+/// Transposes `chunks` chunks of 64 rows x 16 columns through ZA.
+///
+/// # Safety
+///
+/// SME2 must be present; `col` must be valid for 64 * `chunks` reads in each of
+/// 16 columns `ldb_bytes` apart, and `panel` for 1024 * `chunks` writes.
+unsafe fn transpose_chunks_f32(col: *const f32, ldb_bytes: usize, panel: *mut f32, chunks: usize) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue pn8.s",
+            "2:",
+            "mov x4, x0",
+            "mov w12, #0",
+            // Four columns per step into slices w12..w12+3 of the four tiles.
+            "3:",
+            "add x5, x4, x1",
+            "add x6, x5, x1",
+            "add x7, x6, x1",
+            "ld1w {{z16.s, z20.s, z24.s, z28.s}}, pn8/z, [x4]",
+            "ld1w {{z17.s, z21.s, z25.s, z29.s}}, pn8/z, [x5]",
+            "ld1w {{z18.s, z22.s, z26.s, z30.s}}, pn8/z, [x6]",
+            "ld1w {{z19.s, z23.s, z27.s, z31.s}}, pn8/z, [x7]",
+            "mova za0h.s[w12, 0:3], {{z16.s-z19.s}}",
+            "mova za1h.s[w12, 0:3], {{z20.s-z23.s}}",
+            "mova za2h.s[w12, 0:3], {{z24.s-z27.s}}",
+            "mova za3h.s[w12, 0:3], {{z28.s-z31.s}}",
+            "add x4, x7, x1",
+            "add w12, w12, #4",
+            "cmp w12, #16",
+            "b.ne 3b",
+            // Vertical slice p of tile t is packed row 16t + p.
+            "mov w12, #0",
+            "mov x8, x2",
+            "add x9, x2, #1024",
+            "add x10, x2, #2048",
+            "add x11, x2, #3072",
+            "4:",
+            "mova {{z0.s-z3.s}}, za0v.s[w12, 0:3]",
+            "mova {{z4.s-z7.s}}, za1v.s[w12, 0:3]",
+            "mova {{z8.s-z11.s}}, za2v.s[w12, 0:3]",
+            "mova {{z12.s-z15.s}}, za3v.s[w12, 0:3]",
+            "st1w {{z0.s-z3.s}}, pn8, [x8]",
+            "st1w {{z4.s-z7.s}}, pn8, [x9]",
+            "st1w {{z8.s-z11.s}}, pn8, [x10]",
+            "st1w {{z12.s-z15.s}}, pn8, [x11]",
+            "addvl x8, x8, #4",
+            "addvl x9, x9, #4",
+            "addvl x10, x10, #4",
+            "addvl x11, x11, #4",
+            "add w12, w12, #4",
+            "cmp w12, #16",
+            "b.ne 4b",
+            "add x0, x0, #256",
+            "add x2, x2, #4096",
+            "subs x3, x3, #1",
+            "b.ne 2b",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ldb_bytes,
+            inout("x2") panel => _,
+            inout("x3") chunks => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Packs B for the f64 kernels; as [`pack_b_f32_sme2`] with `NR` = 8.
+///
+/// # Safety
+///
+/// - [`usable_f64`] must have returned `true`.
+/// - `src` must be valid for reads of `k` elements in each of `n` columns
+///   `ldb` apart, and `dst` for writes of `ceil(n / 8) * 8 * k` elements.
+pub(super) unsafe fn pack_b_f64_sme2(
+    src: *const f64,
+    ldb: usize,
+    k: usize,
+    n: usize,
+    dst: *mut f64,
+) {
+    let nr = NR_F64;
+    let chunks = k / 64;
+    for j0 in (0..n).step_by(nr) {
+        let jb = nr.min(n - j0);
+        // SAFETY: panel j0 / nr starts inside `dst`; columns j0.. inside `src`.
+        let (panel, col) = unsafe { (dst.add(j0 * k), src.add(j0 * ldb)) };
+        let mut p0 = 0;
+        if jb == nr && chunks > 0 {
+            // SAFETY: the caller guarantees SME2; the block reads 64 * chunks
+            // rows of 8 columns and writes the same number of packed rows.
+            unsafe { transpose_chunks_f64(col, ldb * 8, panel, chunks) };
+            p0 = chunks * 64;
+        }
+        for p in p0..k {
+            for jj in 0..nr {
+                // SAFETY: as in `pack_b_f32_sme2`.
+                unsafe {
+                    *panel.add(p * nr + jj) = if jj < jb { *col.add(p + jj * ldb) } else { 0.0 };
+                }
+            }
+        }
+    }
+}
+
+/// Transposes `chunks` chunks of 64 rows x 8 columns through ZA (8 tiles of 8 x 8).
+///
+/// # Safety
+///
+/// SME2 must be present; `col` must be valid for 64 * `chunks` reads in each of
+/// 8 columns `ldb_bytes` apart, and `panel` for 512 * `chunks` writes.
+unsafe fn transpose_chunks_f64(col: *const f64, ldb_bytes: usize, panel: *mut f64, chunks: usize) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue pn8.d",
+            "2:",
+            "mov x4, x0",
+            "mov w12, #0",
+            // Four columns per step: rows 0-31 into tiles 0-3, rows 32-63 into tiles 4-7.
+            "3:",
+            "add x5, x4, x1",
+            "add x6, x5, x1",
+            "add x7, x6, x1",
+            "ld1d {{z16.d, z20.d, z24.d, z28.d}}, pn8/z, [x4]",
+            "ld1d {{z17.d, z21.d, z25.d, z29.d}}, pn8/z, [x5]",
+            "ld1d {{z18.d, z22.d, z26.d, z30.d}}, pn8/z, [x6]",
+            "ld1d {{z19.d, z23.d, z27.d, z31.d}}, pn8/z, [x7]",
+            "mova za0h.d[w12, 0:3], {{z16.d-z19.d}}",
+            "mova za1h.d[w12, 0:3], {{z20.d-z23.d}}",
+            "mova za2h.d[w12, 0:3], {{z24.d-z27.d}}",
+            "mova za3h.d[w12, 0:3], {{z28.d-z31.d}}",
+            "ld1d {{z16.d, z20.d, z24.d, z28.d}}, pn8/z, [x4, #4, mul vl]",
+            "ld1d {{z17.d, z21.d, z25.d, z29.d}}, pn8/z, [x5, #4, mul vl]",
+            "ld1d {{z18.d, z22.d, z26.d, z30.d}}, pn8/z, [x6, #4, mul vl]",
+            "ld1d {{z19.d, z23.d, z27.d, z31.d}}, pn8/z, [x7, #4, mul vl]",
+            "mova za4h.d[w12, 0:3], {{z16.d-z19.d}}",
+            "mova za5h.d[w12, 0:3], {{z20.d-z23.d}}",
+            "mova za6h.d[w12, 0:3], {{z24.d-z27.d}}",
+            "mova za7h.d[w12, 0:3], {{z28.d-z31.d}}",
+            "add x4, x7, x1",
+            "add w12, w12, #4",
+            "cmp w12, #8",
+            "b.ne 3b",
+            // Vertical slice p of tile t is packed row 8t + p.
+            "mov w12, #0",
+            "mov x8, x2",
+            "add x9, x2, #2048",
+            "4:",
+            "mova {{z0.d-z3.d}}, za0v.d[w12, 0:3]",
+            "mova {{z4.d-z7.d}}, za1v.d[w12, 0:3]",
+            "mova {{z8.d-z11.d}}, za2v.d[w12, 0:3]",
+            "mova {{z12.d-z15.d}}, za3v.d[w12, 0:3]",
+            "st1d {{z0.d-z3.d}}, pn8, [x8]",
+            "st1d {{z4.d-z7.d}}, pn8, [x8, #8, mul vl]",
+            "st1d {{z8.d-z11.d}}, pn8, [x8, #16, mul vl]",
+            "st1d {{z12.d-z15.d}}, pn8, [x8, #24, mul vl]",
+            "mova {{z0.d-z3.d}}, za4v.d[w12, 0:3]",
+            "mova {{z4.d-z7.d}}, za5v.d[w12, 0:3]",
+            "mova {{z8.d-z11.d}}, za6v.d[w12, 0:3]",
+            "mova {{z12.d-z15.d}}, za7v.d[w12, 0:3]",
+            "st1d {{z0.d-z3.d}}, pn8, [x9]",
+            "st1d {{z4.d-z7.d}}, pn8, [x9, #8, mul vl]",
+            "st1d {{z8.d-z11.d}}, pn8, [x9, #16, mul vl]",
+            "st1d {{z12.d-z15.d}}, pn8, [x9, #24, mul vl]",
+            "addvl x8, x8, #4",
+            "addvl x9, x9, #4",
+            "add w12, w12, #4",
+            "cmp w12, #8",
+            "b.ne 4b",
+            "add x0, x0, #512",
+            "add x2, x2, #4096",
+            "subs x3, x3, #1",
+            "b.ne 2b",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ldb_bytes,
+            inout("x2") panel => _,
+            inout("x3") chunks => _,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,6 +1386,49 @@ mod tests {
         for (m, n, k) in BLOCKS {
             check_macro_f32(m, n, k, 1.25, 0.0);
             check_macro_f32(m, n, k, -0.5, 0.75);
+        }
+    }
+
+    #[test]
+    fn test_sme2_pack_b() {
+        for &(k, n) in &[
+            (1, 1),
+            (63, 15),
+            (64, 16),
+            (65, 17),
+            (130, 40),
+            (200, 8),
+            (256, 33),
+        ] {
+            let ldb = k + 3;
+            let src: Vec<f64> = (0..ldb * n).map(|i| val(i, 31)).collect();
+            if usable_f64() {
+                let len = n.div_ceil(NR_F64) * NR_F64 * k;
+                let mut dst = vec![f64::NAN; len];
+                // SAFETY: SME2 checked; src holds n columns of ldb >= k, dst holds len.
+                unsafe { pack_b_f64_sme2(src.as_ptr(), ldb, k, n, dst.as_mut_ptr()) };
+                for (idx, &got) in dst.iter().enumerate() {
+                    let (panel, rest) = (idx / (NR_F64 * k), idx % (NR_F64 * k));
+                    let (p, jj) = (rest / NR_F64, rest % NR_F64);
+                    let j = panel * NR_F64 + jj;
+                    let exp = if j < n { src[p + j * ldb] } else { 0.0 };
+                    assert!(got.to_bits() == exp.to_bits(), "f64 k={k} n={n}: ({p},{j})");
+                }
+            }
+            if usable_f32() {
+                let src32: Vec<f32> = src.iter().map(|&x| x as f32).collect();
+                let len = n.div_ceil(NR_F32) * NR_F32 * k;
+                let mut dst = vec![f32::NAN; len];
+                // SAFETY: as above.
+                unsafe { pack_b_f32_sme2(src32.as_ptr(), ldb, k, n, dst.as_mut_ptr()) };
+                for (idx, &got) in dst.iter().enumerate() {
+                    let (panel, rest) = (idx / (NR_F32 * k), idx % (NR_F32 * k));
+                    let (p, jj) = (rest / NR_F32, rest % NR_F32);
+                    let j = panel * NR_F32 + jj;
+                    let exp = if j < n { src32[p + j * ldb] } else { 0.0 };
+                    assert!(got.to_bits() == exp.to_bits(), "f32 k={k} n={n}: ({p},{j})");
+                }
+            }
         }
     }
 

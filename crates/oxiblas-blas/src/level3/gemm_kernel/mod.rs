@@ -192,6 +192,20 @@ pub trait GemmKernel: Field {
         let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
         false
     }
+    /// Packs `k` rows of `n` columns of a column-major B (column stride
+    /// `ldb`) into the NR-column panels the micro-kernel reads, zero-padded
+    /// to NR, when this type has its own packer for that (the SME2 kernels);
+    /// returns `false` otherwise, and the caller packs.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `k` elements in each of `n` columns
+    /// `ldb` apart, and `dst` for writes of `ceil(n / NR) * NR * k` elements.
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        let _ = (src, ldb, k, n, dst);
+        false
+    }
 }
 impl GemmKernel for f64 {
     fn micro_kernel_shape() -> MicroKernelShape {
@@ -280,6 +294,23 @@ impl GemmKernel for f64 {
             return true;
         }
         let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        false
+    }
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            sme2::pack_b_f64_sme2(src, ldb, k, n, dst);
+            return true;
+        }
+        let _ = (src, ldb, k, n, dst);
         false
     }
 }
@@ -886,6 +917,23 @@ impl GemmKernel for f32 {
             return true;
         }
         let _ = (m, n, k, alpha, a, b, beta, c, c_stride);
+        false
+    }
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            sme2::pack_b_f32_sme2(src, ldb, k, n, dst);
+            return true;
+        }
+        let _ = (src, ldb, k, n, dst);
         false
     }
 }

@@ -161,7 +161,7 @@ fn split_tiles<'a, T: Field>(
 /// zero-padded past `w`) — the layout the micro-kernels consume — with the
 /// panels split across tasks.
 #[allow(clippy::too_many_arguments)]
-fn pack_b_shared<T: Field>(
+fn pack_b_shared<T: Field + GemmKernel>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row0: usize,
@@ -193,7 +193,7 @@ fn pack_b_shared<T: Field>(
 /// operand (transposed modes, strided views) is read through [`read_op`],
 /// which honours both strides and conjugates for `ConjTrans`.
 #[allow(clippy::too_many_arguments)]
-fn pack_b_panel<T: Field>(
+fn pack_b_panel<T: Field + GemmKernel>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row0: usize,
@@ -204,6 +204,20 @@ fn pack_b_panel<T: Field>(
     nr: usize,
 ) {
     if trans_b == Trans::NoTrans && b.col_stride() == 1 {
+        assert!(dst.len() >= pb * nr, "B panel buffer too small");
+        // SAFETY: column-major B (unit row step, column stride `row_stride()`),
+        // the block is inside B, and `dst` holds one `pb x NR` panel.
+        if unsafe {
+            T::pack_b(
+                b.as_ptr().add(row0 + col0 * b.row_stride()),
+                b.row_stride(),
+                pb,
+                cols,
+                dst.as_mut_ptr(),
+            )
+        } {
+            return;
+        }
         for jj in 0..cols {
             let col = col0 + jj;
             match b.col_as_slice(col) {

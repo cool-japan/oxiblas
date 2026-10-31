@@ -967,7 +967,7 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
 /// `row_start`/`col_start` and `nrows`/`ncols` are all in `op(B)` coordinates.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pack_b_trans_dispatch<T: Field>(
+fn pack_b_trans_dispatch<T: Field + GemmKernel>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row_start: usize,
@@ -982,7 +982,21 @@ fn pack_b_trans_dispatch<T: Field>(
         "B packing buffer too small"
     );
     if trans_b == Trans::NoTrans && b.col_stride() == 1 {
-        pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+        // SAFETY: column-major B (unit row step, column stride
+        // `row_stride()`); the block is inside B, and `pack` holds
+        // `ceil(ncols / nr) * nr * nrows` elements (asserted above).
+        let packed = unsafe {
+            T::pack_b(
+                b.as_ptr().add(row_start + col_start * b.row_stride()),
+                b.row_stride(),
+                nrows,
+                ncols,
+                pack.as_mut_ptr(),
+            )
+        };
+        if !packed {
+            pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+        }
         return;
     }
 

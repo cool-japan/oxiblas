@@ -941,7 +941,18 @@ fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
         feature = "max-simd-256"
     ))
 ))]
-const SME2_IN_PLACE_A_BYTES: usize = 1 << 20;
+const SME2_IN_PLACE_A_BYTES: usize = 2 << 20;
+
+/// Largest packed B block of the SME2 path when all rows of C are one block.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_ONE_PASS_B_BYTES: usize = 2 << 20;
 
 /// Sequential SME2 GEMM: the loop nest of [`gemm_blocked_sequential`] with
 /// the packed B block in a per-thread scratch buffer (no allocation and no
@@ -973,10 +984,20 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
     let (m, k) = op_dims(a, trans_a);
     let n = c.ncols();
-    let nc = blocking.nc.min(n);
     let kc = blocking.kc.min(k);
     let mc = blocking.mc.min(m);
     let (mr, nr) = (shape.mr, shape.nr);
+    // With one row block, each packed B block is used once: a large one is
+    // split so that it stays in L2.
+    let size = core::mem::size_of::<T>();
+    let nc = if mc == m && kc * n * size > 2 * SME2_ONE_PASS_B_BYTES {
+        blocking
+            .nc
+            .min((SME2_ONE_PASS_B_BYTES / (kc * size)).next_multiple_of(nr))
+    } else {
+        blocking.nc
+    }
+    .min(n);
     // In place only while one KC block of A spans few pages: each depth step
     // is a column, and many columns cost more TLB misses than packing does.
     let a_in_place = trans_a == Trans::NoTrans

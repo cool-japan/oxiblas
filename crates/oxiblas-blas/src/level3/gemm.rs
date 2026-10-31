@@ -860,7 +860,7 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
             let workers = if par.is_sequential() {
                 None
             } else {
-                sme2::workers(total_work)
+                sme2::workers(total_work, core::mem::size_of::<T>())
             };
             if let Some(workers) = workers {
                 sme2_split(

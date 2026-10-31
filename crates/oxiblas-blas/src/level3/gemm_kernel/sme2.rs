@@ -96,9 +96,10 @@ fn sysctl_flag(name: &core::ffi::CStr) -> bool {
     rc == 0 && value != 0
 }
 
-/// Smallest number of multiply-adds that runs on more than one SME unit.
+/// Smallest number of multiply-adds that runs on more than one SME unit, for
+/// f32; f64 (a quarter of the f32 rate) gains from a quarter of that.
 #[cfg(feature = "parallel")]
-const PAR_MIN_WORK: usize = 1 << 22;
+const PAR_MIN_WORK: usize = 3 << 20;
 
 /// Persistent worker threads for the SME units beyond the first (the calling
 /// thread uses one unit), as in MTGEMM-A: each worker spins on an atomic for
@@ -237,11 +238,16 @@ impl Workers {
 
 /// Returns the SME2 worker threads (one less than there are SME units), when
 /// there are at least two units and the problem has at least [`PAR_MIN_WORK`]
-/// multiply-adds.
+/// multiply-adds (f32; a quarter of that for 8-byte `elem_size`).
 #[cfg(feature = "parallel")]
-pub(crate) fn workers(work: usize) -> Option<&'static Workers> {
+pub(crate) fn workers(work: usize, elem_size: usize) -> Option<&'static Workers> {
     static WORKERS: OnceLock<Option<Workers>> = OnceLock::new();
-    if work < PAR_MIN_WORK || sme_units() < 2 {
+    let min_work = if elem_size == 8 {
+        PAR_MIN_WORK / 4
+    } else {
+        PAR_MIN_WORK
+    };
+    if work < min_work || sme_units() < 2 {
         return None;
     }
     WORKERS

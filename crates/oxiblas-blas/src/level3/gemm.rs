@@ -924,7 +924,7 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
 /// `row_start`/`col_start` and `nrows`/`ncols` are all in `op(B)` coordinates.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pack_b_trans_dispatch<T: Field>(
+pub(super) fn pack_b_trans_dispatch<T: Field>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row_start: usize,

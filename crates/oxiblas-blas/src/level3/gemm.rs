@@ -954,6 +954,17 @@ const SME2_IN_PLACE_A_BYTES: usize = 2 << 20;
 ))]
 const SME2_ONE_PASS_B_BYTES: usize = 2 << 20;
 
+/// Largest packed B block of the SME2 path when the depth is at most two KC blocks.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_B_BLOCK_BYTES: usize = 8 << 20;
+
 /// Sequential SME2 GEMM: the loop nest of [`gemm_blocked_sequential`] with
 /// the packed B block in a per-thread scratch buffer (no allocation and no
 /// zeroing per call) and a small column-major A read in place by the
@@ -994,6 +1005,12 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
         blocking
             .nc
             .min((SME2_ONE_PASS_B_BYTES / (kc * size)).next_multiple_of(nr))
+    } else if k <= 2 * kc {
+        // One or two KC blocks (a short depth): a B block past L2 costs more than the
+        // extra passes over A.
+        blocking
+            .nc
+            .min((SME2_B_BLOCK_BYTES / (kc * size)).next_multiple_of(nr))
     } else {
         blocking.nc
     }

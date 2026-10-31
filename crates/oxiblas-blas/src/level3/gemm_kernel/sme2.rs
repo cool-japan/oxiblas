@@ -1430,7 +1430,11 @@ pub(super) unsafe fn pack_b_f32_sme2(
         if jb == nr && chunks > 0 {
             // SAFETY: the caller guarantees SME2; the block reads 64 * chunks
             // rows of 16 columns and writes the same number of packed rows.
-            unsafe { transpose_chunks_f32(col, ldb * 4, panel, chunks) };
+            unsafe {
+                // Prefetch the next panel only while one follows (zero: none).
+                let next = if j0 + 2 * nr <= n { nr * ldb * 4 } else { 0 };
+                transpose_chunks_f32(col, ldb * 4, panel, chunks, next)
+            };
             p0 = chunks * 64;
         }
         if jb == nr && p0 < k {
@@ -1457,7 +1461,13 @@ pub(super) unsafe fn pack_b_f32_sme2(
 ///
 /// SME2 must be present; `col` must be valid for 64 * `chunks` reads in each of
 /// 16 columns `ldb_bytes` apart, and `panel` for 1024 * `chunks` writes.
-unsafe fn transpose_chunks_f32(col: *const f32, ldb_bytes: usize, panel: *mut f32, chunks: usize) {
+unsafe fn transpose_chunks_f32(
+    col: *const f32,
+    ldb_bytes: usize,
+    panel: *mut f32,
+    chunks: usize,
+    prefetch_offset: usize,
+) {
     // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
     unsafe {
         core::arch::asm!(
@@ -1472,6 +1482,21 @@ unsafe fn transpose_chunks_f32(col: *const f32, ldb_bytes: usize, panel: *mut f3
             "add x5, x4, x1",
             "add x6, x5, x1",
             "add x7, x6, x1",
+            // Core-side L2 prefetch of the same rows of the next panel's columns.
+            "cbz x13, 41f",
+            "add x9, x4, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "add x9, x5, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "add x9, x6, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "add x9, x7, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "41:",
             "ld1w {{z16.s, z20.s, z24.s, z28.s}}, pn8/z, [x4]",
             "ld1w {{z17.s, z21.s, z25.s, z29.s}}, pn8/z, [x5]",
             "ld1w {{z18.s, z22.s, z26.s, z30.s}}, pn8/z, [x6]",
@@ -1515,6 +1540,7 @@ unsafe fn transpose_chunks_f32(col: *const f32, ldb_bytes: usize, panel: *mut f3
             in("x1") ldb_bytes,
             inout("x2") panel => _,
             inout("x3") chunks => _,
+            in("x13") prefetch_offset,
             out("x4") _, out("x5") _, out("x6") _, out("x7") _,
             out("x8") _, out("x9") _, out("x10") _, out("x11") _, out("x12") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
@@ -1555,7 +1581,11 @@ pub(super) unsafe fn pack_b_f64_sme2(
         if jb == nr && chunks > 0 {
             // SAFETY: the caller guarantees SME2; the block reads 64 * chunks
             // rows of 8 columns and writes the same number of packed rows.
-            unsafe { transpose_chunks_f64(col, ldb * 8, panel, chunks) };
+            unsafe {
+                // Prefetch the next panel only while one follows (zero: none).
+                let next = if j0 + 2 * nr <= n { nr * ldb * 8 } else { 0 };
+                transpose_chunks_f64(col, ldb * 8, panel, chunks, next)
+            };
             p0 = chunks * 64;
         }
         if jb == nr && p0 < k {
@@ -1581,7 +1611,13 @@ pub(super) unsafe fn pack_b_f64_sme2(
 ///
 /// SME2 must be present; `col` must be valid for 64 * `chunks` reads in each of
 /// 8 columns `ldb_bytes` apart, and `panel` for 512 * `chunks` writes.
-unsafe fn transpose_chunks_f64(col: *const f64, ldb_bytes: usize, panel: *mut f64, chunks: usize) {
+unsafe fn transpose_chunks_f64(
+    col: *const f64,
+    ldb_bytes: usize,
+    panel: *mut f64,
+    chunks: usize,
+    prefetch_offset: usize,
+) {
     // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
     unsafe {
         core::arch::asm!(
@@ -1596,6 +1632,29 @@ unsafe fn transpose_chunks_f64(col: *const f64, ldb_bytes: usize, panel: *mut f6
             "add x5, x4, x1",
             "add x6, x5, x1",
             "add x7, x6, x1",
+            // Core-side L2 prefetch of the same rows of the next panel's columns.
+            "cbz x13, 41f",
+            "add x9, x4, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "prfm pldl2keep, [x9, #256]",
+            "prfm pldl2keep, [x9, #384]",
+            "add x9, x5, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "prfm pldl2keep, [x9, #256]",
+            "prfm pldl2keep, [x9, #384]",
+            "add x9, x6, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "prfm pldl2keep, [x9, #256]",
+            "prfm pldl2keep, [x9, #384]",
+            "add x9, x7, x13",
+            "prfm pldl2keep, [x9]",
+            "prfm pldl2keep, [x9, #128]",
+            "prfm pldl2keep, [x9, #256]",
+            "prfm pldl2keep, [x9, #384]",
+            "41:",
             "ld1d {{z16.d, z20.d, z24.d, z28.d}}, pn8/z, [x4]",
             "ld1d {{z17.d, z21.d, z25.d, z29.d}}, pn8/z, [x5]",
             "ld1d {{z18.d, z22.d, z26.d, z30.d}}, pn8/z, [x6]",
@@ -1651,6 +1710,7 @@ unsafe fn transpose_chunks_f64(col: *const f64, ldb_bytes: usize, panel: *mut f6
             in("x1") ldb_bytes,
             inout("x2") panel => _,
             inout("x3") chunks => _,
+            in("x13") prefetch_offset,
             out("x4") _, out("x5") _, out("x6") _, out("x7") _,
             out("x8") _, out("x9") _, out("x12") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,

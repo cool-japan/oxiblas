@@ -90,7 +90,7 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
     }
 }
 /// Trait for types that have GEMM micro-kernel implementations.
-pub trait GemmKernel: Field {
+pub trait GemmKernel: Field + 'static {
     /// Returns the micro-kernel shape for this type.
     fn micro_kernel_shape() -> MicroKernelShape;
     /// Executes the micro-kernel.

@@ -41,6 +41,7 @@
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
+use crate::level3::gemm_pack_pool;
 use crate::level3::gemm_packing::{pack_a_optimized, pack_b_optimized};
 use crate::level3::gemm_small::{SMALL_THRESHOLD, gemm_small};
 use crate::level3::trsm::Trans;
@@ -986,8 +987,8 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Allocate packing buffers with padding for micro-kernel alignment
     let padded_mc = mc.div_ceil(mr) * mr;
     let padded_nc = nc.div_ceil(nr) * nr;
-    let mut pack_a: AlignedVec<T> = AlignedVec::zeros(padded_mc * kc);
-    let mut pack_b: AlignedVec<T> = AlignedVec::zeros(kc * padded_nc);
+    let mut pack_a: AlignedVec<T> = gemm_pack_pool::take(padded_mc * kc);
+    let mut pack_b: AlignedVec<T> = gemm_pack_pool::take(kc * padded_nc);
 
     // Track if this is the first k-iteration (need to apply beta)
     let mut first_k = true;
@@ -1033,6 +1034,9 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
 
         first_k = false;
     }
+
+    gemm_pack_pool::give(pack_a);
+    gemm_pack_pool::give(pack_b);
 }
 
 /// Software prefetch hint for reading.

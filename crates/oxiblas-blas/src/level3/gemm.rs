@@ -864,24 +864,10 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
                 sme2::thread_pool(total_work)
             };
             if let Some(pool) = pool {
-                let units = pool.current_num_threads();
-                let done = pool.install(|| {
-                    try_gemm_blocked_parallel(
-                        trans_a,
-                        trans_b,
-                        alpha,
-                        a,
-                        b,
-                        beta,
-                        c,
-                        blocking,
-                        shape,
-                        Par::RayonWith(units),
-                    )
-                });
-                if done {
-                    return;
-                }
+                sme2_split(
+                    pool, trans_a, trans_b, alpha, a, b, beta, c, blocking, shape,
+                );
+                return;
             }
             gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
             return;
@@ -900,6 +886,102 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Sequential fallback
     gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+}
+
+/// Runs the SME2 GEMM on the calling thread and `pool`: C is split into one
+/// part per SME unit along its longer side (at MR / NR boundaries), and each
+/// thread runs the sequential driver on its own part, with its own packed
+/// buffers. The pool has one thread less than there are SME units.
+///
+/// The threads share nothing and never wait for each other, as in MTGEMM-A's
+/// two-unit mode; the 2D driver's shared B packing needs two barriers per KC
+/// step, which cost more than they save with only two threads.
+#[cfg(all(
+    feature = "parallel",
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[allow(clippy::too_many_arguments)]
+fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
+    pool: &rayon::ThreadPool,
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    shape: &MicroKernelShape,
+) {
+    let (m, n) = (c.nrows(), c.ncols());
+    let by_rows = m.div_ceil(shape.mr) >= n.div_ceil(shape.nr);
+    let (len, unit) = if by_rows {
+        (m, shape.mr)
+    } else {
+        (n, shape.nr)
+    };
+    let parts = (pool.current_num_threads() + 1)
+        .min(len.div_ceil(unit))
+        .max(1);
+
+    // Part boundaries: near-equal runs of whole MR (or NR) units.
+    let bound = |i: usize| (len.div_ceil(unit) * i / parts * unit).min(len);
+    let mut views = Vec::with_capacity(parts);
+    let mut rest = Some(c.rb_mut());
+    for i in 0..parts {
+        let Some(view) = rest.take() else { break };
+        let size = bound(i + 1) - bound(i);
+        if i + 1 == parts {
+            views.push((bound(i), view));
+        } else if by_rows {
+            let (head, tail) = view.split_rows(size);
+            views.push((bound(i), head));
+            rest = Some(tail);
+        } else {
+            let (head, tail) = view.split_cols(size);
+            views.push((bound(i), head));
+            rest = Some(tail);
+        }
+    }
+
+    let k = op_dims(a, trans_a).1;
+    let run = |start: usize, mut view: MatMut<'_, T>| {
+        let (rows, cols) = (view.nrows(), view.ncols());
+        let (a_part, b_part) = if by_rows {
+            let a_part = if trans_a == Trans::NoTrans {
+                a.submatrix(start, 0, rows, k)
+            } else {
+                a.submatrix(0, start, k, rows)
+            };
+            (a_part, *b)
+        } else {
+            let b_part = if trans_b == Trans::NoTrans {
+                b.submatrix(0, start, k, cols)
+            } else {
+                b.submatrix(start, 0, cols, k)
+            };
+            (*a, b_part)
+        };
+        gemm_blocked_sequential(
+            trans_a, trans_b, alpha, &a_part, &b_part, beta, &mut view, blocking, shape,
+        );
+    };
+    // The calling thread takes the first part, the pool threads the others.
+    let mut views = views.into_iter();
+    let first = views.next();
+    pool.in_place_scope(|scope| {
+        for (start, view) in views {
+            scope.spawn(move |_| run(start, view));
+        }
+        if let Some((start, view)) = first {
+            run(start, view);
+        }
+    });
 }
 
 /// Packs a panel of `op(A)` into the A packing buffer, transpose-aware.

@@ -100,8 +100,9 @@ fn sysctl_flag(name: &core::ffi::CStr) -> bool {
 #[cfg(feature = "parallel")]
 const PAR_MIN_WORK: usize = 1 << 22;
 
-/// Returns a thread pool with one thread per SME unit, when there are at least
-/// two units and the problem has at least [`PAR_MIN_WORK`] multiply-adds.
+/// Returns a thread pool with one thread less than there are SME units (the
+/// calling thread uses one unit), when there are at least two units and the
+/// problem has at least [`PAR_MIN_WORK`] multiply-adds.
 ///
 /// Threads that share one SME unit only compete for it, so the SME2 path runs
 /// on this pool instead of the global rayon pool. Its threads ask for the
@@ -114,7 +115,7 @@ pub(crate) fn thread_pool(work: usize) -> Option<&'static rayon::ThreadPool> {
     }
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(sme_units())
+            .num_threads(sme_units() - 1)
             .thread_name(|i| format!("oxiblas-sme2-{i}"))
             .start_handler(|_| set_interactive_qos())
             .build()

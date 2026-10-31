@@ -19,6 +19,48 @@ use oxiblas_matrix::{MatMut, MatRef};
 /// When m * n * k is at most this threshold, small matrix kernels are used.
 pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 
+/// Threshold of the AVX2 small kernels (x86_64).
+///
+/// `NoTrans`/`NoTrans` problems that the AVX2 kernels take (see
+/// [`gemm_small_simd_eligible`]) stay on the small path up to this many
+/// multiply-adds: without packing they beat the blocked path up to about
+/// 80³ on a Zen 2 core (f64 n = 64: 42.6 vs 36.6 GFLOP/s; f32 n = 64: 88.4
+/// vs 66.9; at n = 96 the two are within 5 %).
+pub const SMALL_THRESHOLD_SIMD: usize = 80 * 80 * 80;
+
+/// Whether `gemm_small` runs `C += alpha * A * B` on a SIMD kernel without
+/// packing (the AVX2 kernels on x86_64); always `false` elsewhere.
+#[inline]
+pub fn gemm_small_simd_eligible<T: Field>(
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    c: &MatMut<'_, T>,
+) -> bool {
+    #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+    {
+        use core::any::TypeId;
+        let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
+        // As for the NEON path, but from 5 rows: the unrolled 4x4 scalar loop
+        // beats a half-masked AVX2 tile (Zen 2, f64 4x4x4: 5.6 vs 2.6
+        // GFLOP/s). Column-major A and B and consistent shapes are required
+        // because the kernels address the operands through raw pointers.
+        (TypeId::of::<T>() == TypeId::of::<f64>() || TypeId::of::<T>() == TypeId::of::<f32>())
+            && m >= 5
+            && n >= 4
+            && a.col_stride() == 1
+            && b.col_stride() == 1
+            && b.nrows() == k
+            && c.nrows() == m
+            && c.ncols() == n
+            && super::gemm_small_x86::available()
+    }
+    #[cfg(not(all(target_arch = "x86_64", not(feature = "force-scalar"))))]
+    {
+        let _ = (a, b, c);
+        false
+    }
+}
+
 /// Performs small matrix GEMM with unrolled loops.
 ///
 /// C = alpha * A * B + beta * C
@@ -29,7 +71,8 @@ pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 ///
 /// On aarch64, `f64`/`f32` problems with `m, n >= 4` and column-major operands
 /// (`col_stride() == 1`) run on the NEON kernels (`gemm_small_f64_simd` /
-/// `gemm_small_f32_simd`); all other cases use the portable loops.
+/// `gemm_small_f32_simd`), and on x86_64 with AVX2 + FMA on the kernels of
+/// `gemm_small_x86`; all other cases use the portable loops.
 pub fn gemm_small<T: Field>(
     alpha: T,
     a: &MatRef<'_, T>,
@@ -51,6 +94,13 @@ pub fn gemm_small<T: Field>(
     #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
     {
         if gemm_small_simd_dispatch(alpha, a, b, c) {
+            return;
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+    {
+        if gemm_small_avx2_dispatch(alpha, a, b, c) {
             return;
         }
     }
@@ -118,6 +168,73 @@ fn gemm_small_simd_dispatch<T: Field>(
         return true;
     }
 
+    false
+}
+
+/// Routes `C += alpha * A * B` to the AVX2 kernels of `gemm_small_x86` when
+/// `T` is `f64`/`f32`, the CPU has AVX2 + FMA and the operands qualify;
+/// returns `false` (having done nothing) otherwise.
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+#[inline]
+fn gemm_small_avx2_dispatch<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    c: &mut MatMut<'_, T>,
+) -> bool {
+    use super::gemm_small_x86 as x86;
+    use core::any::TypeId;
+
+    let m = a.nrows();
+    let k = a.ncols();
+    let n = b.ncols();
+
+    if !gemm_small_simd_eligible(a, b, c) {
+        return false;
+    }
+
+    let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
+    if TypeId::of::<T>() == TypeId::of::<f64>() {
+        // SAFETY: `T` is `f64` (identical `TypeId`s), so the casts only
+        // rename the type. AVX2 + FMA were detected; the views give
+        // consistent m x k, k x n and m x n column-major matrices with the
+        // leading dimensions passed, and C is exclusively borrowed.
+        unsafe {
+            let alpha = *(&raw const alpha).cast::<f64>();
+            x86::gemm_small_f64_avx2(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr().cast(),
+                lda,
+                b.as_ptr().cast(),
+                ldb,
+                c.as_mut_ptr().cast(),
+                ldc,
+            );
+        }
+        return true;
+    }
+    if TypeId::of::<T>() == TypeId::of::<f32>() {
+        // SAFETY: as above, with `T` being `f32`.
+        unsafe {
+            let alpha = *(&raw const alpha).cast::<f32>();
+            x86::gemm_small_f32_avx2(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr().cast(),
+                lda,
+                b.as_ptr().cast(),
+                ldb,
+                c.as_mut_ptr().cast(),
+                ldc,
+            );
+        }
+        return true;
+    }
     false
 }
 

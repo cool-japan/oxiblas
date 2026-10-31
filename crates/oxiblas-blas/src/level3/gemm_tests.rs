@@ -406,9 +406,9 @@ fn op_read_c32(mat: &Mat<Complex32>, trans: Trans, r: usize, c: usize) -> Comple
 
 #[test]
 fn test_gemm_blocked_nonconstant() {
-    // m*n*k > SMALL_THRESHOLD forces the blocked (not small) path.
-    let (m, k, n) = (80usize, 64usize, 72usize);
-    assert!(m * n * k > SMALL_THRESHOLD);
+    // m*n*k > SMALL_THRESHOLD_SIMD forces the blocked (not small) path.
+    let (m, k, n) = (96usize, 64usize, 88usize);
+    assert!(m * n * k > SMALL_THRESHOLD_SIMD);
     let a = pattern_f64(m, k, 1);
     let b = pattern_f64(k, n, 2);
     let c_init = pattern_f64(m, n, 3);
@@ -688,8 +688,8 @@ fn test_gemm_blocking_custom_clamps_and_runs() {
 
     // A real GEMM driven by the degenerate blocking must neither panic nor
     // produce a wrong result (it is merely inefficient).
-    let (m, k, n) = (40usize, 40usize, 40usize);
-    assert!(m * n * k > SMALL_THRESHOLD);
+    let (m, k, n) = (88usize, 80usize, 80usize);
+    assert!(m * n * k > SMALL_THRESHOLD_SIMD);
     let a = pattern_f64(m, k, 1);
     let b = pattern_f64(k, n, 2);
     let c_init = pattern_f64(m, n, 3);
@@ -727,8 +727,9 @@ fn test_gemm_blocking_custom_clamps_and_runs() {
 // =====================================================================
 // Issue #9: reference BLAS reads neither A nor B when `alpha == 0`, and
 // never reads C when `beta == 0`, so NaN/Inf in an ignored operand must
-// not leak into the result. `n = 5` takes the small-matrix path, 40 and
-// 100 the blocked path (40^3 > SMALL_THRESHOLD).
+// not leak into the result. `n = 5` takes the small-matrix path, 40 the
+// blocked path except where the SIMD small kernels take it (x86_64:
+// 40^3 <= SMALL_THRESHOLD_SIMD), and 100 the blocked path.
 // =====================================================================
 
 /// Sizes covering the small-matrix path and the blocked path.
@@ -979,8 +980,11 @@ fn copy_view_f64(view: MatRef<'_, f64>) -> Mat<f64> {
 
 #[test]
 fn test_gemm_blocked_transposed_view_operands() {
-    for &(m, k, n) in &[(64usize, 64usize, 64usize), (80, 72, 96), (37, 129, 50)] {
-        assert!(m * n * k > SMALL_THRESHOLD, "must take the blocked path");
+    for &(m, k, n) in &[(96usize, 64usize, 96usize), (80, 72, 96), (37, 301, 50)] {
+        assert!(
+            m * n * k > SMALL_THRESHOLD_SIMD,
+            "must take the blocked path"
+        );
         let a_store = pattern_f64(k, m, 1); // A = a_store^T is m x k
         let b_store = pattern_f64(n, k, 2); // B = b_store^T is k x n
         let a_view = a_store.as_ref().transpose();

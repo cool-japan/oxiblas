@@ -27,6 +27,8 @@ pub mod gemm_packing;
 #[cfg(feature = "parallel")]
 mod gemm_parallel;
 pub mod gemm_small;
+#[cfg(target_arch = "x86_64")]
+mod gemm_small_x86;
 pub mod gemm_winograd;
 pub mod gemmt;
 pub mod hemm;
@@ -63,7 +65,7 @@ pub use gemm_kernel::{GemmKernel, MicroKernelShape};
 pub use gemm_packing::{
     PackingConfig, pack_a_contiguous, pack_a_optimized, pack_b_optimized, pack_b_streaming,
 };
-pub use gemm_small::{SMALL_THRESHOLD, gemm_small};
+pub use gemm_small::{SMALL_THRESHOLD, SMALL_THRESHOLD_SIMD, gemm_small, gemm_small_simd_eligible};
 pub use gemm_winograd::{gemm_winograd, gemm_winograd_blocked};
 pub use gemmt::{GemmtError, gemmt, gemmt_new, gemmt_symmetric};
 pub use hemm::{HemmError, hemm, hemm_c32, hemm_c64, hemm_new};

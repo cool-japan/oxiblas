@@ -43,7 +43,9 @@ use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
 use crate::level3::gemm_pack_pool;
 use crate::level3::gemm_packing::{pack_a_optimized, pack_b_optimized};
-use crate::level3::gemm_small::{SMALL_THRESHOLD, gemm_small};
+use crate::level3::gemm_small::{
+    SMALL_THRESHOLD, SMALL_THRESHOLD_SIMD, gemm_small, gemm_small_simd_eligible,
+};
 use crate::level3::trsm::Trans;
 use num_complex::{Complex32, Complex64};
 use oxiblas_core::memory::{AlignedVec, StackReq};
@@ -650,8 +652,11 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     // Small matrix fast path. The NoTrans/NoTrans case keeps using the
     // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
     // use the transpose-aware naive kernel.
-    if m * n * k <= SMALL_THRESHOLD {
-        if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
+    let no_trans = trans_a == Trans::NoTrans && trans_b == Trans::NoTrans;
+    if m * n * k <= SMALL_THRESHOLD
+        || (no_trans && m * n * k <= SMALL_THRESHOLD_SIMD && gemm_small_simd_eligible(&a, &b, &c))
+    {
+        if no_trans {
             gemm_small(alpha, &a, &b, beta, &mut c);
         } else {
             gemm_small_trans(trans_a, trans_b, alpha, &a, &b, beta, &mut c);

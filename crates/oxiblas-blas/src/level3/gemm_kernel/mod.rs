@@ -98,6 +98,15 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
     ))
 ))]
 pub(crate) mod sme2;
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+mod thin;
 
 /// Returns `true` when f64 GEMM runs on the SME2 micro-kernel.
 ///
@@ -241,6 +250,33 @@ pub trait GemmKernel: Field {
     #[inline]
     unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
         let _ = (src, lda, k, m, dst);
+        false
+    }
+    /// Computes `C = alpha * A * B + beta * C` for column-major A, B and C
+    /// directly, when this type has a kernel for the shape (on SME2 machines:
+    /// one row or one column, which a 64-row tile cannot use well); returns
+    /// `false` otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must be valid for column-major `m x k`, `k x n` and
+    /// `m x n` matrices with the given column strides.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
         false
     }
 }
@@ -394,6 +430,42 @@ impl GemmKernel for f64 {
             return true;
         }
         let _ = (src, lda, k, m, dst);
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            if n == 1 {
+                thin::f64k::one_col(m, k, alpha, a, lda, b, beta, c);
+                return true;
+            }
+            if m == 1 {
+                thin::f64k::one_row(n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+                return true;
+            }
+        }
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
         false
     }
 }
@@ -1063,6 +1135,42 @@ impl GemmKernel for f32 {
             return true;
         }
         let _ = (src, lda, k, m, dst);
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            if n == 1 {
+                thin::f32k::one_col(m, k, alpha, a, lda, b, beta, c);
+                return true;
+            }
+            if m == 1 {
+                thin::f32k::one_row(n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+                return true;
+            }
+        }
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
         false
     }
 }

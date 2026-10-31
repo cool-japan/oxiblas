@@ -3077,7 +3077,12 @@ mod tests {
 
     #[test]
     fn test_sme2_gemm_f32_matches_f64() {
-        let (m, n, k) = (131, 45, 97);
+        for (m, n, k) in [(131, 45, 97), (1, 300, 77), (300, 1, 77), (1, 1, 5)] {
+            gemm_f32_matches_f64(m, n, k);
+        }
+    }
+
+    fn gemm_f32_matches_f64(m: usize, n: usize, k: usize) {
         let a64 = mat(m, k, 11);
         let b64 = mat(k, n, 12);
         let mut a: Mat<f32> = Mat::zeros(m, k);

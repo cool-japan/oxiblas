@@ -658,6 +658,33 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     // Small matrix fast path. The NoTrans/NoTrans case keeps using the
     // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
     // use the transpose-aware naive kernel.
+    // Few rows or one column: a direct kernel streams the large operand once.
+    if trans_a == Trans::NoTrans
+        && trans_b == Trans::NoTrans
+        && a.col_stride() == 1
+        && b.col_stride() == 1
+        && m * n * k >= THIN_MIN_WORK
+        // SAFETY: column-major A, B and C (unit row steps checked; MatMut is
+        // column-major) of the logical shapes, with their column strides.
+        && unsafe {
+            T::gemm_thin(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr(),
+                a.row_stride(),
+                b.as_ptr(),
+                b.row_stride(),
+                beta,
+                c.as_mut_ptr(),
+                c.row_stride(),
+            )
+        }
+    {
+        return;
+    }
+
     if m * n * k <= SMALL_THRESHOLD && !sme2_small(&shape, m, n, k) {
         if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
             gemm_small(alpha, &a, &b, beta, &mut c);
@@ -930,6 +957,9 @@ fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
         false
     }
 }
+
+/// Smallest `m * n * k` for the direct thin-shape kernels.
+const THIN_MIN_WORK: usize = 1;
 
 /// Largest span of one KC block of a column-major A (column stride times KC)
 /// that the SME2 macro-kernel reads in place instead of packing.

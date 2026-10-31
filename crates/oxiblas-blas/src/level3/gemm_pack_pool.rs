@@ -111,10 +111,13 @@ mod tests {
 
     #[test]
     fn oversized_buffers_are_not_kept() {
+        // Check the pool itself: the allocator may hand the freed block's
+        // address to the next allocation of the same size (macOS does), so
+        // comparing pointers would not show whether it was kept.
+        let pooled = || POOL.with(|pool| pool.borrow().len());
         let big: AlignedVec<f64> = take((MAX_POOLED_BYTES / 8) + 1);
-        let ptr = big.as_ptr();
+        let before = pooled();
         give(big);
-        let again: AlignedVec<f64> = take((MAX_POOLED_BYTES / 8) + 1);
-        assert_ne!(again.as_ptr(), ptr);
+        assert_eq!(pooled(), before);
     }
 }

@@ -570,7 +570,10 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
     let a_panel_bytes = a_panel_stride * size;
     let a_step_bytes = a_step * size;
     let b_panel_bytes = NR_F32 * k * size;
-    let beta_zero = u64::from(beta == 0.0);
+    // Bit 0: beta == 0 (C is not read); bit 1: alpha == 1 and beta 0 or 1, so
+    // C is loaded into ZA before the depth loop and ZA is stored as it is.
+    let direct = alpha == 1.0 && (beta == 0.0 || beta == 1.0);
+    let mode = u64::from(beta == 0.0) | (u64::from(direct) << 1);
     // SAFETY: the caller guarantees SME2, SVL 512, m, n > 0 and the buffer
     // sizes above; the block enters and leaves streaming mode itself.
     unsafe {
@@ -607,6 +610,35 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "sub x24, x8, x15",
             "mov x25, #0",
             "whilelt pn9.s, x25, x24, vlx4",
+            // Direct mode (alpha == 1, beta 0 or 1): C moves between memory and ZA slices.
+            "tbz x6, #1, 14f",
+            "whilelt p1.s, x25, x24",
+            "mov x27, #16",
+            "whilelt p2.s, x27, x24",
+            "mov x27, #32",
+            "whilelt p3.s, x27, x24",
+            "mov x27, #48",
+            "whilelt p4.s, x27, x24",
+            "tbnz x6, #0, 14f",
+            "sub x26, x10, x14",
+            "mov x27, #16",
+            "cmp x26, x27",
+            "csel x26, x26, x27, lo",
+            "mov w12, #0",
+            "mov x27, x21",
+            "15:",
+            "ld1w {{za0h.s[w12, 0]}}, p1/z, [x27]",
+            "add x9, x27, #64",
+            "ld1w {{za1h.s[w12, 0]}}, p2/z, [x9]",
+            "add x20, x27, #128",
+            "ld1w {{za2h.s[w12, 0]}}, p3/z, [x20]",
+            "add x28, x27, #192",
+            "ld1w {{za3h.s[w12, 0]}}, p4/z, [x28]",
+            "add x27, x27, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 15b",
+            "14:",
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
@@ -665,6 +697,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "csel x26, x26, x27, lo",
             "mov w12, #0",
             "mov x25, x21",
+            "tbnz x6, #1, 16f",
             "8:",
             "mova z0.s, p0/m, za0h.s[w12, 0]",
             "mova z1.s, p0/m, za1h.s[w12, 0]",
@@ -674,7 +707,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "fmul z1.s, z1.s, z30.s",
             "fmul z2.s, z2.s, z30.s",
             "fmul z3.s, z3.s, z30.s",
-            "cbnz x6, 9f",
+            "tbnz x6, #0, 9f",
             "ld1w {{z4.s-z7.s}}, pn9/z, [x25]",
             "fmla z0.s, p0/m, z4.s, z31.s",
             "fmla z1.s, p0/m, z5.s, z31.s",
@@ -686,6 +719,20 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             "add w12, w12, #1",
             "cmp w12, w26",
             "b.ne 8b",
+            "b 18f",
+            "16:",
+            "st1w {{za0h.s[w12, 0]}}, p1, [x25]",
+            "add x9, x25, #64",
+            "st1w {{za1h.s[w12, 0]}}, p2, [x9]",
+            "add x20, x25, #128",
+            "st1w {{za2h.s[w12, 0]}}, p3, [x20]",
+            "add x28, x25, #192",
+            "st1w {{za3h.s[w12, 0]}}, p4, [x28]",
+            "add x25, x25, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 16b",
+            "18:",
             "add x15, x15, #64",
             "add x16, x16, x11",
             "add x21, x21, #256",
@@ -703,7 +750,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             inout("x3") c => _,
             in("x4") u64::from(alpha.to_bits()),
             in("x5") u64::from(beta.to_bits()),
-            in("x6") beta_zero,
+            in("x6") mode,
             in("x7") ldc_bytes,
             in("x8") m,
             in("x10") n,
@@ -711,7 +758,7 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             in("x13") b_panel_bytes,
             in("x17") a_step_bytes,
             out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
-            out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
+            out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
@@ -721,7 +768,8 @@ pub(super) unsafe fn macro_kernel_f32_sme2(
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-            out("p0") _, out("p8") _, out("p9") _,
+            out("p0") _, out("p1") _, out("p2") _, out("p3") _, out("p4") _,
+            out("p8") _, out("p9") _,
             options(nostack)
         );
     }
@@ -759,7 +807,10 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
     let a_panel_bytes = a_panel_stride * size;
     let a_step_bytes = a_step * size;
     let b_panel_bytes = NR_F64 * k * size;
-    let beta_zero = u64::from(beta == 0.0);
+    // Bit 0: beta == 0 (C is not read); bit 1: alpha == 1 and beta 0 or 1, so
+    // a full tile loads C into ZA before the depth loop and stores ZA as it is.
+    let direct = alpha == 1.0 && (beta == 0.0 || beta == 1.0);
+    let mode = u64::from(beta == 0.0) | (u64::from(direct) << 1);
     // SAFETY: the caller guarantees SME2, FEAT_SME_F64F64, SVL 512, m, n > 0
     // and the buffer sizes above; the block enters and leaves streaming mode
     // itself.
@@ -802,6 +853,41 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "whilelt pn9.d, x25, x24, vlx4",
             "mov x25, #32",
             "whilelt pn10.d, x25, x24, vlx4",
+            // Direct mode (alpha == 1, beta 0 or 1, full 64-row tile): C moves between memory and ZA slices.
+            "mov x20, x6",
+            "cmp x24, #64",
+            "b.hs 19f",
+            "and x20, x20, #1",
+            "19:",
+            "tbz x20, #1, 14f",
+            "tbnz x20, #0, 14f",
+            "sub x26, x10, x14",
+            "mov x27, #8",
+            "cmp x26, x27",
+            "csel x26, x26, x27, lo",
+            "mov w12, #0",
+            "mov x27, x21",
+            "15:",
+            "ld1d {{za0h.d[w12, 0]}}, p0/z, [x27]",
+            "add x9, x27, #64",
+            "ld1d {{za1h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #128",
+            "ld1d {{za2h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #192",
+            "ld1d {{za3h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #256",
+            "ld1d {{za4h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #320",
+            "ld1d {{za5h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #384",
+            "ld1d {{za6h.d[w12, 0]}}, p0/z, [x9]",
+            "add x9, x27, #448",
+            "ld1d {{za7h.d[w12, 0]}}, p0/z, [x9]",
+            "add x27, x27, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 15b",
+            "14:",
             "mov x22, x16",
             "mov x23, x2",
             "lsr x9, x0, #2",
@@ -887,6 +973,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "csel x26, x26, x27, lo",
             "mov w12, #0",
             "mov x25, x21",
+            "tbnz x20, #1, 16f",
             "8:",
             "mova z0.d, p0/m, za0h.d[w12, 0]",
             "mova z1.d, p0/m, za1h.d[w12, 0]",
@@ -904,7 +991,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "fmul z17.d, z17.d, z30.d",
             "fmul z18.d, z18.d, z30.d",
             "fmul z19.d, z19.d, z30.d",
-            "cbnz x6, 9f",
+            "tbnz x20, #0, 9f",
             "ld1d {{z4.d-z7.d}}, pn9/z, [x25]",
             "ld1d {{z20.d-z23.d}}, pn10/z, [x25, #4, mul vl]",
             "fmla z0.d, p0/m, z4.d, z31.d",
@@ -922,6 +1009,28 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             "add w12, w12, #1",
             "cmp w12, w26",
             "b.ne 8b",
+            "b 18f",
+            "16:",
+            "st1d {{za0h.d[w12, 0]}}, p0, [x25]",
+            "add x9, x25, #64",
+            "st1d {{za1h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #128",
+            "st1d {{za2h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #192",
+            "st1d {{za3h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #256",
+            "st1d {{za4h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #320",
+            "st1d {{za5h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #384",
+            "st1d {{za6h.d[w12, 0]}}, p0, [x9]",
+            "add x9, x25, #448",
+            "st1d {{za7h.d[w12, 0]}}, p0, [x9]",
+            "add x25, x25, x7",
+            "add w12, w12, #1",
+            "cmp w12, w26",
+            "b.ne 16b",
+            "18:",
             "add x15, x15, #64",
             "add x16, x16, x11",
             "add x21, x21, #512",
@@ -939,7 +1048,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             inout("x3") c => _,
             in("x4") alpha.to_bits(),
             in("x5") beta.to_bits(),
-            in("x6") beta_zero,
+            in("x6") mode,
             in("x7") ldc_bytes,
             in("x8") m,
             in("x10") n,
@@ -947,7 +1056,7 @@ pub(super) unsafe fn macro_kernel_f64_sme2(
             in("x13") b_panel_bytes,
             in("x17") a_step_bytes,
             out("x9") _, out("x12") _, out("x14") _, out("x15") _, out("x16") _,
-            out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
+            out("x20") _, out("x21") _, out("x22") _, out("x23") _, out("x24") _, out("x25") _,
             out("x26") _, out("x27") _, out("x28") _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
@@ -1774,6 +1883,8 @@ mod tests {
             for direct in [false, true] {
                 check_macro_f64(m, n, k, 1.25, 0.0, direct);
                 check_macro_f64(m, n, k, -0.5, 0.75, direct);
+                check_macro_f64(m, n, k, 1.0, 0.0, direct);
+                check_macro_f64(m, n, k, 1.0, 1.0, direct);
             }
         }
     }
@@ -1787,6 +1898,8 @@ mod tests {
             for direct in [false, true] {
                 check_macro_f32(m, n, k, 1.25, 0.0, direct);
                 check_macro_f32(m, n, k, -0.5, 0.75, direct);
+                check_macro_f32(m, n, k, 1.0, 0.0, direct);
+                check_macro_f32(m, n, k, 1.0, 1.0, direct);
             }
         }
     }

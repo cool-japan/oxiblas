@@ -1159,12 +1159,22 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     let a_column_major = trans_a == Trans::NoTrans && a.col_stride() == 1;
     let a_in_place =
         a_column_major && a.row_stride() * kc * core::mem::size_of::<T>() <= SME2_IN_PLACE_A_BYTES;
-    let mut pack_a: Option<AlignedVec<T>> =
-        (!a_in_place).then(|| AlignedVec::zeros(mc.div_ceil(mr) * mr * kc));
+    // Packed A (unless read in place) and packed B share the per-thread scratch;
+    // only layouts without an SME2 packer use a buffer of their own.
+    let a_len = if a_in_place {
+        0
+    } else {
+        mc.div_ceil(mr) * mr * kc
+    };
+    let b_len = kc * nc.div_ceil(nr) * nr;
+    let a_own =
+        !a_in_place && !a_column_major && !(trans_a != Trans::NoTrans && a.col_stride() == 1);
+    let mut pack_a_own: Option<AlignedVec<T>> = a_own.then(|| AlignedVec::zeros(a_len));
     let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
     let c_ptr = c.as_ptr().cast_mut();
 
-    sme2::with_scratch::<T, _>(kc * nc.div_ceil(nr) * nr, |pack_b| {
+    sme2::with_scratch::<T, _>(b_len + a_len, |scratch| {
+        let (pack_b, pack_a_s) = scratch.split_at_mut(b_len);
         for p in (0..k).step_by(kc) {
             let pb = kc.min(k - p);
             let beta_eff = if p == 0 { beta } else { T::one() };
@@ -1193,29 +1203,28 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                     let ib = mc.min(m - i);
                     // SAFETY: (i, p) is inside A.
                     let a_at = || unsafe { a.as_ptr().add(i + p * lda) };
-                    let (a_ptr, a_panel, a_step, a_pack) = match pack_a.as_mut() {
-                        None => (a_at(), mr, lda, core::ptr::null_mut()),
-                        Some(buf) if a_column_major => (a_at(), mr, lda, buf.as_mut_ptr()),
-                        Some(buf) => {
-                            // SAFETY: when A^T is column-major, rows i..i + ib and
-                            // depth p..p + pb of op(A) are inside it, and `buf`
-                            // holds `ceil(mc / MR) * MR * kc` elements.
-                            let packed = trans_a != Trans::NoTrans
-                                && a.col_stride() == 1
-                                && unsafe {
-                                    T::pack_a_t(
-                                        a.as_ptr().add(p + i * lda),
-                                        lda,
-                                        pb,
-                                        ib,
-                                        buf.as_mut_ptr(),
-                                    )
-                                };
-                            if !packed {
-                                pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
-                            }
-                            (buf.as_ptr(), mr * pb, mr, core::ptr::null_mut())
-                        }
+                    let (a_ptr, a_panel, a_step, a_pack) = if a_in_place {
+                        (a_at(), mr, lda, core::ptr::null_mut())
+                    } else if a_column_major {
+                        (a_at(), mr, lda, pack_a_s.as_mut_ptr())
+                    } else if let Some(buf) = pack_a_own.as_mut() {
+                        pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
+                        (buf.as_ptr(), mr * pb, mr, core::ptr::null_mut())
+                    } else {
+                        // SAFETY: A^T is column-major; rows i..i + ib and depth
+                        // p..p + pb of op(A) are inside it, and `pack_a_s` holds
+                        // `ceil(mc / MR) * MR * kc` elements.
+                        let packed = unsafe {
+                            T::pack_a_t(
+                                a.as_ptr().add(p + i * lda),
+                                lda,
+                                pb,
+                                ib,
+                                pack_a_s.as_mut_ptr(),
+                            )
+                        };
+                        debug_assert!(packed, "the SME2 shape implies the SME2 A^T packer");
+                        (pack_a_s.as_ptr(), mr * pb, mr, core::ptr::null_mut())
                     };
                     // SAFETY: A rows i..i + ib of depth steps p..p + pb (in
                     // place or packed), the packed B block, and the ib x jb block

@@ -1139,7 +1139,23 @@ fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                         None => (a_at(), mr, lda, core::ptr::null_mut()),
                         Some(buf) if a_column_major => (a_at(), mr, lda, buf.as_mut_ptr()),
                         Some(buf) => {
-                            pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
+                            // SAFETY: when A^T is column-major, rows i..i + ib and
+                            // depth p..p + pb of op(A) are inside it, and `buf`
+                            // holds `ceil(mc / MR) * MR * kc` elements.
+                            let packed = trans_a != Trans::NoTrans
+                                && a.col_stride() == 1
+                                && unsafe {
+                                    T::pack_a_t(
+                                        a.as_ptr().add(p + i * lda),
+                                        lda,
+                                        pb,
+                                        ib,
+                                        buf.as_mut_ptr(),
+                                    )
+                                };
+                            if !packed {
+                                pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
+                            }
                             (buf.as_ptr(), mr * pb, mr, core::ptr::null_mut())
                         }
                     };

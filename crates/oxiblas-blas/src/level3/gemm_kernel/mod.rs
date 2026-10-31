@@ -229,6 +229,20 @@ pub trait GemmKernel: Field {
         let _ = (src, ldb, k, n, dst);
         false
     }
+    /// Packs rows `0..m` of `op(A) = A^T`, depth `k`, from a column-major
+    /// `A^T` (`src` = `A^T[0, 0]`, column stride `lda`) into the MR-row panels
+    /// the micro-kernel reads, when this type has its own packer for that (the
+    /// SME2 kernels); returns `false` otherwise, and the caller packs.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `k` elements in each of `m` columns
+    /// `lda` apart, and `dst` for writes of `ceil(m / MR) * MR * k` elements.
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        let _ = (src, lda, k, m, dst);
+        false
+    }
 }
 impl GemmKernel for f64 {
     fn micro_kernel_shape() -> MicroKernelShape {
@@ -363,6 +377,23 @@ impl GemmKernel for f64 {
             return true;
         }
         let _ = (src, ldb, k, n, dst);
+        false
+    }
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            sme2::pack_a_t_f64_sme2(src, lda, k, m, dst);
+            return true;
+        }
+        let _ = (src, lda, k, m, dst);
         false
     }
 }
@@ -1015,6 +1046,23 @@ impl GemmKernel for f32 {
             return true;
         }
         let _ = (src, ldb, k, n, dst);
+        false
+    }
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            sme2::pack_a_t_f32_sme2(src, lda, k, m, dst);
+            return true;
+        }
+        let _ = (src, lda, k, m, dst);
         false
     }
 }

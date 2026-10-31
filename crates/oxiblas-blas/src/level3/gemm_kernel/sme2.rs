@@ -2058,6 +2058,301 @@ pub(crate) unsafe fn copy_rows_64b(
     }
 }
 
+/// Packs `chunks * 16` depth steps of one 64-row A panel from a column-major
+/// `A^T` (`op(A) = A^T`): `col` points at `A^T[p0, i0]`, so row `i0 + r` of
+/// op(A) is column `i0 + r` of `A^T`, `ld_bytes` apart. Each chunk loads 16
+/// columns per ZA tile into its horizontal slices and stores the vertical
+/// slices (depth steps) as packed panel rows of 64 elements.
+///
+/// # Safety
+///
+/// SME2 must be present; `col` must be valid for `chunks * 16` reads in each
+/// of 64 columns `ld_bytes` apart, and `panel` for `chunks * 16 * 64` writes.
+pub(super) unsafe fn pack_a_t_chunks_f32(
+    col: *const f32,
+    ld_bytes: usize,
+    panel: *mut f32,
+    chunks: usize,
+) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue p0.s",
+            "ptrue pn8.s",
+            "2:",
+            "mov x4, x0",
+            "mov w12, #0",
+            "20:",
+            "ld1w {{za0h.s[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #16",
+            "b.ne 20b",
+            "mov w12, #0",
+            "21:",
+            "ld1w {{za1h.s[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #16",
+            "b.ne 21b",
+            "mov w12, #0",
+            "12:",
+            "ld1w {{za2h.s[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #16",
+            "b.ne 12b",
+            "mov w12, #0",
+            "13:",
+            "ld1w {{za3h.s[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #16",
+            "b.ne 13b",
+            "mov w12, #0",
+            "mov x8, x2",
+            "3:",
+            "mova {{z0.s-z3.s}}, za0v.s[w12, 0:3]",
+            "mova {{z4.s-z7.s}}, za1v.s[w12, 0:3]",
+            "mova {{z8.s-z11.s}}, za2v.s[w12, 0:3]",
+            "mova {{z12.s-z15.s}}, za3v.s[w12, 0:3]",
+            "st1w {{z0.s, z4.s, z8.s, z12.s}}, pn8, [x8, #0, mul vl]",
+            "st1w {{z1.s, z5.s, z9.s, z13.s}}, pn8, [x8, #4, mul vl]",
+            "st1w {{z2.s, z6.s, z10.s, z14.s}}, pn8, [x8, #8, mul vl]",
+            "st1w {{z3.s, z7.s, z11.s, z15.s}}, pn8, [x8, #12, mul vl]",
+            "addvl x8, x8, #16",
+            "add w12, w12, #4",
+            "cmp w12, #16",
+            "b.ne 3b",
+            "add x0, x0, #64",
+            "add x2, x2, #4096",
+            "subs x3, x3, #1",
+            "b.ne 2b",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ld_bytes,
+            inout("x2") panel => _,
+            inout("x3") chunks => _,
+            out("x4") _, out("x8") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Packs `chunks * 8` depth steps of one 64-row A panel from a column-major
+/// `A^T` (`op(A) = A^T`): `col` points at `A^T[p0, i0]`, so row `i0 + r` of
+/// op(A) is column `i0 + r` of `A^T`, `ld_bytes` apart. Each chunk loads 8
+/// columns per ZA tile into its horizontal slices and stores the vertical
+/// slices (depth steps) as packed panel rows of 64 elements.
+///
+/// # Safety
+///
+/// SME2 must be present; `col` must be valid for `chunks * 8` reads in each
+/// of 64 columns `ld_bytes` apart, and `panel` for `chunks * 8 * 64` writes.
+pub(super) unsafe fn pack_a_t_chunks_f64(
+    col: *const f64,
+    ld_bytes: usize,
+    panel: *mut f64,
+    chunks: usize,
+) {
+    // SAFETY: guaranteed by the caller; streaming mode starts and ends here.
+    unsafe {
+        core::arch::asm!(
+            ".arch_extension sme2",
+            "smstart",
+            "ptrue p0.d",
+            "ptrue pn8.d",
+            "2:",
+            "mov x4, x0",
+            "mov w12, #0",
+            "20:",
+            "ld1d {{za0h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 20b",
+            "mov w12, #0",
+            "21:",
+            "ld1d {{za1h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 21b",
+            "mov w12, #0",
+            "12:",
+            "ld1d {{za2h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 12b",
+            "mov w12, #0",
+            "13:",
+            "ld1d {{za3h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 13b",
+            "mov w12, #0",
+            "14:",
+            "ld1d {{za4h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 14b",
+            "mov w12, #0",
+            "15:",
+            "ld1d {{za5h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 15b",
+            "mov w12, #0",
+            "16:",
+            "ld1d {{za6h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 16b",
+            "mov w12, #0",
+            "17:",
+            "ld1d {{za7h.d[w12, 0]}}, p0/z, [x4]",
+            "add x4, x4, x1",
+            "add w12, w12, #1",
+            "cmp w12, #8",
+            "b.ne 17b",
+            "mov w12, #0",
+            "mov x8, x2",
+            "3:",
+            "mova {{z0.d-z3.d}}, za0v.d[w12, 0:3]",
+            "mova {{z4.d-z7.d}}, za1v.d[w12, 0:3]",
+            "mova {{z8.d-z11.d}}, za2v.d[w12, 0:3]",
+            "mova {{z12.d-z15.d}}, za3v.d[w12, 0:3]",
+            "mova {{z16.d-z19.d}}, za4v.d[w12, 0:3]",
+            "mova {{z20.d-z23.d}}, za5v.d[w12, 0:3]",
+            "mova {{z24.d-z27.d}}, za6v.d[w12, 0:3]",
+            "mova {{z28.d-z31.d}}, za7v.d[w12, 0:3]",
+            "st1d {{z0.d, z4.d, z8.d, z12.d}}, pn8, [x8, #0, mul vl]",
+            "st1d {{z16.d, z20.d, z24.d, z28.d}}, pn8, [x8, #4, mul vl]",
+            "st1d {{z1.d, z5.d, z9.d, z13.d}}, pn8, [x8, #8, mul vl]",
+            "st1d {{z17.d, z21.d, z25.d, z29.d}}, pn8, [x8, #12, mul vl]",
+            "st1d {{z2.d, z6.d, z10.d, z14.d}}, pn8, [x8, #16, mul vl]",
+            "st1d {{z18.d, z22.d, z26.d, z30.d}}, pn8, [x8, #20, mul vl]",
+            "st1d {{z3.d, z7.d, z11.d, z15.d}}, pn8, [x8, #24, mul vl]",
+            "st1d {{z19.d, z23.d, z27.d, z31.d}}, pn8, [x8, #28, mul vl]",
+            "addvl x8, x8, #16",
+            "addvl x8, x8, #16",
+            "add w12, w12, #4",
+            "cmp w12, #8",
+            "b.ne 3b",
+            "add x0, x0, #64",
+            "add x2, x2, #4096",
+            "subs x3, x3, #1",
+            "b.ne 2b",
+            "smstop",
+            inout("x0") col => _,
+            in("x1") ld_bytes,
+            inout("x2") panel => _,
+            inout("x3") chunks => _,
+            out("x4") _, out("x8") _, out("x12") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            out("p0") _, out("p8") _,
+            options(nostack)
+        );
+    }
+}
+
+/// Packs rows `0..m` of `op(A) = A^T`, depth `k`, from a column-major `A^T`
+/// (`src` = `A^T[0, 0]`, column stride `ld`) into 64-row panels of `64 * k`
+/// elements (the layout of the packed A panels), zero-padding past `m`.
+///
+/// # Safety
+///
+/// - [`usable_f32`] must have returned `true`.
+/// - `src` must be valid for reads of `k` elements in each of `m` columns `ld`
+///   apart, and `dst` for writes of `ceil(m / 64) * 64 * k` elements.
+pub(super) unsafe fn pack_a_t_f32_sme2(
+    src: *const f32,
+    ld: usize,
+    k: usize,
+    m: usize,
+    dst: *mut f32,
+) {
+    let chunks = k / 16;
+    for i0 in (0..m).step_by(MR) {
+        let ib = MR.min(m - i0);
+        // SAFETY: panel i0 / 64 starts inside `dst`, column i0 inside `src`.
+        let (panel, col) = unsafe { (dst.add(i0 * k), src.add(i0 * ld)) };
+        let mut p0 = 0;
+        if ib == MR && chunks > 0 {
+            // SAFETY: the caller guarantees SME2; 64 columns of `chunks * 16` rows.
+            unsafe { pack_a_t_chunks_f32(col, ld * core::mem::size_of::<f32>(), panel, chunks) };
+            p0 = chunks * 16;
+        }
+        for p in p0..k {
+            for r in 0..MR {
+                // SAFETY: p < k and r < ib for the reads; the write is inside
+                // panel i0 / 64.
+                unsafe { *panel.add(p * MR + r) = if r < ib { *col.add(p + r * ld) } else { 0.0 } };
+            }
+        }
+    }
+}
+
+/// Packs rows `0..m` of `op(A) = A^T`, depth `k`, from a column-major `A^T`
+/// (`src` = `A^T[0, 0]`, column stride `ld`) into 64-row panels of `64 * k`
+/// elements (the layout of the packed A panels), zero-padding past `m`.
+///
+/// # Safety
+///
+/// - [`usable_f64`] must have returned `true`.
+/// - `src` must be valid for reads of `k` elements in each of `m` columns `ld`
+///   apart, and `dst` for writes of `ceil(m / 64) * 64 * k` elements.
+pub(super) unsafe fn pack_a_t_f64_sme2(
+    src: *const f64,
+    ld: usize,
+    k: usize,
+    m: usize,
+    dst: *mut f64,
+) {
+    let chunks = k / 8;
+    for i0 in (0..m).step_by(MR) {
+        let ib = MR.min(m - i0);
+        // SAFETY: panel i0 / 64 starts inside `dst`, column i0 inside `src`.
+        let (panel, col) = unsafe { (dst.add(i0 * k), src.add(i0 * ld)) };
+        let mut p0 = 0;
+        if ib == MR && chunks > 0 {
+            // SAFETY: the caller guarantees SME2; 64 columns of `chunks * 8` rows.
+            unsafe { pack_a_t_chunks_f64(col, ld * core::mem::size_of::<f64>(), panel, chunks) };
+            p0 = chunks * 8;
+        }
+        for p in p0..k {
+            for r in 0..MR {
+                // SAFETY: p < k and r < ib for the reads; the write is inside
+                // panel i0 / 64.
+                unsafe { *panel.add(p * MR + r) = if r < ib { *col.add(p + r * ld) } else { 0.0 } };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

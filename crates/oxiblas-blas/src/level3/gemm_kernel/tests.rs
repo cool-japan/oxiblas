@@ -41,7 +41,7 @@ mod tests_2 {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => ((16, 6), (16, 16)),
             #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => ((8, 6), (8, 8)),
+            GemmKernelKind::Avx2 => ((8, 6), (16, 6)),
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Sse42 => ((4, 2), (4, 4)),
             #[cfg(target_arch = "aarch64")]

@@ -40,6 +40,15 @@
 
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+use crate::level3::gemm_kernel::sme2;
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
 use crate::level3::gemm_packing::{pack_a_optimized, pack_b_optimized};
 use crate::level3::gemm_small::{SMALL_THRESHOLD, gemm_small};
@@ -649,9 +658,44 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     // Small matrix fast path. The NoTrans/NoTrans case keeps using the
     // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
     // use the transpose-aware naive kernel.
-    if m * n * k <= SMALL_THRESHOLD {
+    // Few rows or one column: a direct kernel streams the large operand once.
+    if trans_a == Trans::NoTrans
+        && trans_b == Trans::NoTrans
+        && a.col_stride() == 1
+        && b.col_stride() == 1
+        && m * n * k >= THIN_MIN_WORK
+        // SAFETY: column-major A, B and C (unit row steps checked; MatMut is
+        // column-major) of the logical shapes, with their column strides.
+        && unsafe {
+            T::gemm_thin(
+                m,
+                n,
+                k,
+                alpha,
+                a.as_ptr(),
+                a.row_stride(),
+                b.as_ptr(),
+                b.row_stride(),
+                beta,
+                c.as_mut_ptr(),
+                c.row_stride(),
+            )
+        }
+    {
+        return;
+    }
+
+    if m * n * k <= SMALL_THRESHOLD && !sme2_small(&shape, m, n, k) {
         if trans_a == Trans::NoTrans && trans_b == Trans::NoTrans {
             gemm_small(alpha, &a, &b, beta, &mut c);
+        } else if m * n * k >= SMALL_TRANS_COPY_MIN {
+            // Transposed operands: copy op(A) and op(B) to column-major once,
+            // so that the small-matrix kernels can run (the copies are small).
+            let a_cm = (trans_a != Trans::NoTrans).then(|| materialize_op(&a, trans_a));
+            let b_cm = (trans_b != Trans::NoTrans).then(|| materialize_op(&b, trans_b));
+            let a_op = a_cm.as_ref().map_or(a, |x| x.as_ref());
+            let b_op = b_cm.as_ref().map_or(b, |x| x.as_ref());
+            gemm_small(alpha, &a_op, &b_op, beta, &mut c);
         } else {
             gemm_small_trans(trans_a, trans_b, alpha, &a, &b, beta, &mut c);
         }
@@ -760,6 +804,22 @@ pub(super) fn read_op<T: Scalar>(mat: &MatRef<'_, T>, trans: Trans, row: usize, 
 fn materialize_op<T: Scalar + bytemuck::Zeroable>(src: &MatRef<'_, T>, trans: Trans) -> Mat<T> {
     let (rows, cols) = op_dims(src, trans);
     let mut out: Mat<T> = Mat::zeros(rows, cols);
+    if trans == Trans::Trans && src.col_stride() == 1 {
+        // Column-major source: column i of the source is row i of op(src).
+        let (ld, ldo) = (src.row_stride(), out.row_stride());
+        let dst = out.as_mut_ptr();
+        for i in 0..rows {
+            // SAFETY: column i of `src` has `cols` elements, and (i, j) is
+            // inside `out` (rows x cols, column stride ldo).
+            unsafe {
+                let col = src.as_ptr().add(i * ld);
+                for j in 0..cols {
+                    *dst.add(i + j * ldo) = *col.add(j);
+                }
+            }
+        }
+        return out;
+    }
     for j in 0..cols {
         for i in 0..rows {
             out[(i, j)] = read_op(src, trans, i, j);
@@ -838,6 +898,31 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         // `PARALLEL_GATE`.
         let total_work = m * n * k;
 
+        // SME2 (the only 64-row micro-kernel) runs one thread per SME unit, on its own pool.
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if shape.mr == sme2::MR {
+            let workers = if par.is_sequential() {
+                None
+            } else {
+                sme2::workers(total_work, core::mem::size_of::<T>())
+            };
+            if let Some(workers) = workers {
+                sme2_split(
+                    workers, trans_a, trans_b, alpha, a, b, beta, c, blocking, shape,
+                );
+                return;
+            }
+            sme2_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+            return;
+        }
+
         // The 2D driver declines (returns false) when C is too small to form
         // at least two tiles.
         if PARALLEL_GATE.should_parallelize(total_work, par)
@@ -849,8 +934,436 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         }
     }
 
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    ))]
+    if shape.mr == sme2::MR {
+        sme2_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+        return;
+    }
+
     // Sequential fallback
     gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+}
+
+/// Returns `true` when a problem below [`SMALL_THRESHOLD`] runs faster on the
+/// SME2 kernels than on the small-matrix path. Measured on Apple M4: a
+/// 64-row tile must be at least three-eighths used (m >= 24), or a quarter used with
+/// a deep product (m, n >= 16, k >= 64).
+#[inline]
+fn sme2_small(shape: &MicroKernelShape, m: usize, n: usize, k: usize) -> bool {
+    #[cfg(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    ))]
+    {
+        shape.mr == sme2::MR && ((m >= 24 && n >= 8 && k >= 8) || (m >= 16 && n >= 16 && k >= 64))
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        not(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        ))
+    )))]
+    {
+        let _ = (shape, m, n, k);
+        false
+    }
+}
+
+/// Smallest `m * n * k` of a small product with transposed operands that
+/// copies them to column-major for `gemm_small`.
+const SMALL_TRANS_COPY_MIN: usize = 8 * 8 * 8;
+
+/// Smallest `m * n * k` for the direct thin-shape kernels.
+const THIN_MIN_WORK: usize = 1;
+
+/// Largest span of one KC block of a column-major A (column stride times KC)
+/// that the SME2 macro-kernel reads in place instead of packing.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_IN_PLACE_A_BYTES: usize = 2 << 20;
+
+/// Largest packed B block of the SME2 path when all rows of C are one block.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_ONE_PASS_B_BYTES: usize = 2 << 20;
+
+/// Largest packed B block of the SME2 path when the depth is at most two KC blocks.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+const SME2_B_BLOCK_BYTES: usize = 8 << 20;
+
+/// Packs `k` rows of a transposed B into NR-column panels: `src` points at
+/// `op(B)[0, 0]` of a column-major `B^T` (column stride `ld`), so packed row `p`
+/// of panel `j0 / nr` is the contiguous run `src[j0 + p * ld..][..nr]`, zero-padded
+/// past `n`.
+///
+/// # Safety
+///
+/// `src` must be valid for reads of `n` elements in each of `k` columns `ld`
+/// apart, and `dst` must hold `ceil(n / nr) * nr * k` elements.
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+unsafe fn pack_b_rows<T: Field>(
+    src: *const T,
+    ld: usize,
+    k: usize,
+    n: usize,
+    nr: usize,
+    dst: &mut [T],
+) {
+    // Full panels of full 16-row chunks in streaming mode, the rest below.
+    let full = if nr * core::mem::size_of::<T>() == 64 {
+        n / nr
+    } else {
+        0
+    };
+    let rows16 = k / 16 * 16;
+    // SAFETY: the reads are rows 0..rows16, columns 0..full * nr of op(B), and
+    // the writes the first rows16 packed rows of the first `full` panels.
+    unsafe {
+        sme2::copy_rows_64b(
+            src.cast(),
+            ld * core::mem::size_of::<T>(),
+            rows16,
+            full,
+            dst.as_mut_ptr().cast(),
+            nr * k * core::mem::size_of::<T>(),
+        )
+    };
+    // 16 rows of op(B) at a time across all panels: the reads stay within 16
+    // columns of B^T, the writes are 16 contiguous packed rows per panel.
+    for p0 in (0..k).step_by(16) {
+        let pe = (p0 + 16).min(k);
+        for (panel, j0) in (0..n).step_by(nr).enumerate() {
+            let jb = nr.min(n - j0);
+            if panel < full && pe <= rows16 {
+                continue;
+            }
+            for p in p0..pe {
+                let row = &mut dst[(panel * k + p) * nr..][..nr];
+                if jb == nr && core::mem::size_of_val(row) == 64 {
+                    // SAFETY: row p, columns j0..j0 + nr of op(B) are inside B^T,
+                    // and `row` is the 64 bytes they go to; a fixed-size copy
+                    // compiles to plain loads and stores (no memcpy call).
+                    unsafe {
+                        let v = src.add(j0 + p * ld).cast::<[u8; 64]>().read_unaligned();
+                        row.as_mut_ptr().cast::<[u8; 64]>().write_unaligned(v);
+                    }
+                } else {
+                    // SAFETY: row p, columns j0..j0 + jb of op(B) are inside B^T.
+                    let from = unsafe { core::slice::from_raw_parts(src.add(j0 + p * ld), jb) };
+                    row[..jb].copy_from_slice(from);
+                    row[jb..].fill(T::zero());
+                }
+            }
+        }
+    }
+}
+
+/// Sequential SME2 GEMM: the loop nest of [`gemm_blocked_sequential`] with
+/// the packed B block in a per-thread scratch buffer (no allocation and no
+/// zeroing per call) and a small column-major A read in place by the
+/// macro-kernel (no A packing). Other B layouts take [`gemm_blocked_sequential`].
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[allow(clippy::too_many_arguments)]
+fn sme2_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    shape: &MicroKernelShape,
+) {
+    // B is column-major (NoTrans), or a column-major B^T (Trans / ConjTrans of a
+    // real type: its rows are the packed rows already); other layouts take
+    // the general driver.
+    let b_rows = trans_b != Trans::NoTrans;
+    if b.col_stride() != 1 {
+        gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+        return;
+    }
+    let (m, k) = op_dims(a, trans_a);
+    let n = c.ncols();
+    let kc = blocking.kc.min(k);
+    let mc = blocking.mc.min(m);
+    let (mr, nr) = (shape.mr, shape.nr);
+    // With one row block, each packed B block is used once: a large one is
+    // split so that it stays in L2.
+    let size = core::mem::size_of::<T>();
+    let nc = if mc == m && kc * n * size > 2 * SME2_ONE_PASS_B_BYTES {
+        blocking
+            .nc
+            .min((SME2_ONE_PASS_B_BYTES / (kc * size)).next_multiple_of(nr))
+    } else if k <= 2 * kc {
+        // One or two KC blocks (a short depth): a B block past L2 costs more than the
+        // extra passes over A.
+        blocking
+            .nc
+            .min((SME2_B_BLOCK_BYTES / (kc * size)).next_multiple_of(nr))
+    } else {
+        blocking.nc
+    }
+    .min(n);
+    // In place only while one KC block of A spans few pages: each depth step
+    // is a column, and many columns cost more TLB misses than packing does.
+    // Larger column-major blocks are packed by the macro-kernel while it reads
+    // them for the first NR columns (first-pass online packing, as MTGEMM-A
+    // does for its B), other layouts by `pack_a_trans_dispatch`.
+    let a_column_major = trans_a == Trans::NoTrans && a.col_stride() == 1;
+    let a_in_place =
+        a_column_major && a.row_stride() * kc * core::mem::size_of::<T>() <= SME2_IN_PLACE_A_BYTES;
+    // Packed A (unless read in place) and packed B share the per-thread scratch;
+    // only layouts without an SME2 packer use a buffer of their own.
+    let a_len = if a_in_place {
+        0
+    } else {
+        mc.div_ceil(mr) * mr * kc
+    };
+    let b_len = kc * nc.div_ceil(nr) * nr;
+    let a_own =
+        !a_in_place && !a_column_major && !(trans_a != Trans::NoTrans && a.col_stride() == 1);
+    let mut pack_a_own: Option<AlignedVec<T>> = a_own.then(|| AlignedVec::zeros(a_len));
+    let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
+    let c_ptr = c.as_ptr().cast_mut();
+
+    sme2::with_scratch::<T, _>(b_len + a_len, |scratch| {
+        let (pack_b, pack_a_s) = scratch.split_at_mut(b_len);
+        for p in (0..k).step_by(kc) {
+            let pb = kc.min(k - p);
+            let beta_eff = if p == 0 { beta } else { T::one() };
+            for j in (0..n).step_by(nc) {
+                let jb = nc.min(n - j);
+                // SAFETY: B is column-major (checked above) and the block
+                // `p..p + pb` x `j..j + jb` is inside it; `pack_b` holds
+                // `ceil(nc / NR) * NR * kc >= ceil(jb / NR) * NR * pb` elements.
+                if b_rows {
+                    // SAFETY: B^T is column-major and the block `j..j + jb` x
+                    // `p..p + pb` is inside it.
+                    unsafe { pack_b_rows(b.as_ptr().add(j + p * ldb), ldb, pb, jb, nr, pack_b) };
+                } else {
+                    let packed = unsafe {
+                        T::pack_b(
+                            b.as_ptr().add(p + j * ldb),
+                            ldb,
+                            pb,
+                            jb,
+                            pack_b.as_mut_ptr(),
+                        )
+                    };
+                    debug_assert!(packed, "the SME2 shape implies the SME2 B packer");
+                }
+                for i in (0..m).step_by(mc) {
+                    let ib = mc.min(m - i);
+                    // SAFETY: (i, p) is inside A.
+                    let a_at = || unsafe { a.as_ptr().add(i + p * lda) };
+                    let (a_ptr, a_panel, a_step, a_pack) = if a_in_place {
+                        (a_at(), mr, lda, core::ptr::null_mut())
+                    } else if a_column_major {
+                        (a_at(), mr, lda, pack_a_s.as_mut_ptr())
+                    } else if let Some(buf) = pack_a_own.as_mut() {
+                        pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, buf, mr);
+                        (buf.as_ptr(), mr * pb, mr, core::ptr::null_mut())
+                    } else {
+                        // SAFETY: A^T is column-major; rows i..i + ib and depth
+                        // p..p + pb of op(A) are inside it, and `pack_a_s` holds
+                        // `ceil(mc / MR) * MR * kc` elements.
+                        let packed = unsafe {
+                            T::pack_a_t(
+                                a.as_ptr().add(p + i * lda),
+                                lda,
+                                pb,
+                                ib,
+                                pack_a_s.as_mut_ptr(),
+                            )
+                        };
+                        debug_assert!(packed, "the SME2 shape implies the SME2 A^T packer");
+                        (pack_a_s.as_ptr(), mr * pb, mr, core::ptr::null_mut())
+                    };
+                    // SAFETY: A rows i..i + ib of depth steps p..p + pb (in
+                    // place or packed), the packed B block, and the ib x jb block
+                    // of C at (i, j) are all valid for the macro-kernel.
+                    let done = unsafe {
+                        T::macro_kernel(
+                            ib,
+                            jb,
+                            pb,
+                            alpha,
+                            a_ptr,
+                            a_panel,
+                            a_step,
+                            a_pack,
+                            pack_b.as_ptr(),
+                            beta_eff,
+                            c_ptr.add(i + j * ldc),
+                            ldc,
+                        )
+                    };
+                    debug_assert!(done, "the SME2 shape implies the SME2 macro-kernel");
+                }
+            }
+        }
+    });
+}
+
+/// Runs the SME2 GEMM on the calling thread and `pool`: C is split into one
+/// part per SME unit along its longer side (at MR / NR boundaries), and each
+/// thread runs the sequential driver on its own part, with its own packed
+/// buffers. The pool has one thread less than there are SME units.
+///
+/// The threads share nothing and never wait for each other, as in MTGEMM-A's
+/// two-unit mode; the 2D driver's shared B packing needs two barriers per KC
+/// step, which cost more than they save with only two threads.
+#[cfg(all(
+    feature = "parallel",
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[allow(clippy::too_many_arguments)]
+fn sme2_split<T: Field + GemmKernel + bytemuck::Zeroable>(
+    workers: &sme2::Workers,
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    shape: &MicroKernelShape,
+) {
+    let (m, n) = (c.nrows(), c.ncols());
+    let by_rows = m.div_ceil(shape.mr) >= n.div_ceil(shape.nr);
+    let (len, unit) = if by_rows {
+        (m, shape.mr)
+    } else {
+        (n, shape.nr)
+    };
+    let parts = (workers.count() + 1).min(len.div_ceil(unit)).max(1);
+
+    // Part boundaries: near-equal runs of whole MR (or NR) units.
+    let bound = |i: usize| (len.div_ceil(unit) * i / parts * unit).min(len);
+    let mut views = Vec::with_capacity(parts);
+    let mut rest = Some(c.rb_mut());
+    for i in 0..parts {
+        let Some(view) = rest.take() else { break };
+        let size = bound(i + 1) - bound(i);
+        if i + 1 == parts {
+            views.push((bound(i), view));
+        } else if by_rows {
+            let (head, tail) = view.split_rows(size);
+            views.push((bound(i), head));
+            rest = Some(tail);
+        } else {
+            let (head, tail) = view.split_cols(size);
+            views.push((bound(i), head));
+            rest = Some(tail);
+        }
+    }
+
+    let k = op_dims(a, trans_a).1;
+    let run = |start: usize, mut view: MatMut<'_, T>| {
+        let (rows, cols) = (view.nrows(), view.ncols());
+        let (a_part, b_part) = if by_rows {
+            let a_part = if trans_a == Trans::NoTrans {
+                a.submatrix(start, 0, rows, k)
+            } else {
+                a.submatrix(0, start, k, rows)
+            };
+            (a_part, *b)
+        } else {
+            let b_part = if trans_b == Trans::NoTrans {
+                b.submatrix(0, start, k, cols)
+            } else {
+                b.submatrix(start, 0, cols, k)
+            };
+            (*a, b_part)
+        };
+        sme2_sequential(
+            trans_a, trans_b, alpha, &a_part, &b_part, beta, &mut view, blocking, shape,
+        );
+    };
+    // The calling thread takes the first part, the workers the others.
+    let mut views = views.into_iter();
+    let Some((start0, view0)) = views.next() else {
+        return;
+    };
+    let mut rest: Vec<_> = views.map(|(start, view)| (start, Some(view))).collect();
+    let mut jobs: Vec<Box<dyn FnMut() + Send + '_>> = rest
+        .iter_mut()
+        .map(|(start, view)| {
+            let start = *start;
+            Box::new(move || {
+                if let Some(view) = view.take() {
+                    run(start, view);
+                }
+            }) as Box<dyn FnMut() + Send + '_>
+        })
+        .collect();
+    let mut first = Some(view0);
+    let mut main = || {
+        if let Some(view) = first.take() {
+            run(start0, view);
+        }
+    };
+    let mut refs: Vec<&mut (dyn FnMut() + Send)> = jobs.iter_mut().map(|j| &mut **j as _).collect();
+    if !workers.run(&mut refs, &mut main) {
+        // Workers busy with another call: run every part here.
+        main();
+        for job in &mut refs {
+            job();
+        }
+    }
 }
 
 /// Packs a panel of `op(A)` into the A packing buffer, transpose-aware.
@@ -918,7 +1431,7 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
 /// `row_start`/`col_start` and `nrows`/`ncols` are all in `op(B)` coordinates.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pack_b_trans_dispatch<T: Field>(
+fn pack_b_trans_dispatch<T: Field + GemmKernel>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row_start: usize,
@@ -933,7 +1446,21 @@ fn pack_b_trans_dispatch<T: Field>(
         "B packing buffer too small"
     );
     if trans_b == Trans::NoTrans && b.col_stride() == 1 {
-        pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+        // SAFETY: column-major B (unit row step, column stride
+        // `row_stride()`); the block is inside B, and `pack` holds
+        // `ceil(ncols / nr) * nr * nrows` elements (asserted above).
+        let packed = unsafe {
+            T::pack_b(
+                b.as_ptr().add(row_start + col_start * b.row_stride()),
+                b.row_stride(),
+                nrows,
+                ncols,
+                pack.as_mut_ptr(),
+            )
+        };
+        if !packed {
+            pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+        }
         return;
     }
 
@@ -1102,6 +1629,28 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
 ) {
     let mr = shape.mr;
     let nr = shape.nr;
+
+    // SAFETY: `pack_a` and `pack_b` hold the packed panels of this m x n block
+    // (`ceil(m / MR)` and `ceil(n / NR)` panels of depth k), and `c` is an
+    // m x n view with column stride `c.row_stride()`.
+    if unsafe {
+        T::macro_kernel(
+            m,
+            n,
+            k,
+            alpha,
+            pack_a.as_ptr(),
+            mr * k,
+            mr,
+            core::ptr::null_mut(),
+            pack_b.as_ptr(),
+            beta,
+            c.as_ptr().cast_mut(),
+            c.row_stride(),
+        )
+    } {
+        return;
+    }
 
     // Number of MR×NR blocks
     let m_blocks = m.div_ceil(mr);

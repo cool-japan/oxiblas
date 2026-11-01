@@ -89,6 +89,57 @@ fn cap_kernel_kind(kind: GemmKernelKind) -> GemmKernelKind {
         kind
     }
 }
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+pub(crate) mod sme2;
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+mod thin;
+
+/// Returns `true` when f64 GEMM runs on the SME2 micro-kernel.
+///
+/// Like [`selected_kernel_kind`], this is the one source for both
+/// `micro_kernel_shape()` and `micro_kernel()`. The SIMD-control features
+/// switch SME2 off at compile time (its vectors are 512 bits).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[inline]
+fn use_sme2_f64() -> bool {
+    sme2::usable_f64()
+}
+
+/// Returns `true` when f32 GEMM runs on the SME2 micro-kernel (see [`use_sme2_f64`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    not(any(
+        feature = "force-scalar",
+        feature = "max-simd-128",
+        feature = "max-simd-256"
+    ))
+))]
+#[inline]
+fn use_sme2_f32() -> bool {
+    sme2::usable_f32()
+}
+
 /// Trait for types that have GEMM micro-kernel implementations.
 pub trait GemmKernel: Field {
     /// Returns the micro-kernel shape for this type.
@@ -122,9 +173,129 @@ pub trait GemmKernel: Field {
         c: *mut Self,
         c_stride: usize,
     );
+    /// Multiplies all micro-panels of a packed `m x n` block in one call, when
+    /// this type has a kernel for that (the SME2 kernels, which enter
+    /// streaming mode once per block); returns `false` otherwise, and the
+    /// caller then runs [`GemmKernel::micro_kernel`] per micro-tile.
+    ///
+    /// A panel `i` (rows `i * MR..`) starts at `a + i * a_panel_stride` and its
+    /// depth steps are `a_step` elements apart: packed panels have
+    /// `a_panel_stride = MR * k` and `a_step = MR`, and a column-major A can be
+    /// read in place with `a_panel_stride = MR` and `a_step` = its column
+    /// stride. When `a_pack` is not null, the first NR columns read A as given
+    /// and also write it, packed (`MR * k` per panel), to `a_pack`, and the
+    /// other columns read that copy (first-pass online packing; `a_pack` must
+    /// hold `ceil(m / MR) * MR * k` elements). `b` holds `ceil(n / NR)` packed
+    /// B panels of `NR * k` elements, and C is `m x n` with column stride
+    /// `c_stride`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`GemmKernel::micro_kernel`], for the whole block.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
+        a_pack: *mut Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            a_pack,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
+        false
+    }
+    /// Packs `k` rows of `n` columns of a column-major B (column stride
+    /// `ldb`) into the NR-column panels the micro-kernel reads, zero-padded
+    /// to NR, when this type has its own packer for that (the SME2 kernels);
+    /// returns `false` otherwise, and the caller packs.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `k` elements in each of `n` columns
+    /// `ldb` apart, and `dst` for writes of `ceil(n / NR) * NR * k` elements.
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        let _ = (src, ldb, k, n, dst);
+        false
+    }
+    /// Packs rows `0..m` of `op(A) = A^T`, depth `k`, from a column-major
+    /// `A^T` (`src` = `A^T[0, 0]`, column stride `lda`) into the MR-row panels
+    /// the micro-kernel reads, when this type has its own packer for that (the
+    /// SME2 kernels); returns `false` otherwise, and the caller packs.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be valid for reads of `k` elements in each of `m` columns
+    /// `lda` apart, and `dst` for writes of `ceil(m / MR) * MR * k` elements.
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        let _ = (src, lda, k, m, dst);
+        false
+    }
+    /// Computes `C = alpha * A * B + beta * C` for column-major A, B and C
+    /// directly, when this type has a kernel for the shape (on SME2 machines:
+    /// one row or one column, which a 64-row tile cannot use well); returns
+    /// `false` otherwise.
+    ///
+    /// # Safety
+    ///
+    /// The pointers must be valid for column-major `m x k`, `k x n` and
+    /// `m x n` matrices with the given column strides.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+        false
+    }
 }
 impl GemmKernel for f64 {
     fn micro_kernel_shape() -> MicroKernelShape {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            return MicroKernelShape {
+                mr: sme2::MR,
+                nr: sme2::NR_F64,
+            };
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 6 },
@@ -147,6 +318,17 @@ impl GemmKernel for f64 {
         c: *mut Self,
         c_stride: usize,
     ) {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            return sme2::micro_kernel_f64_sme2(k, alpha, a, b, beta, c, c_stride);
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => micro_kernel_f64_avx512(k, alpha, a, b, beta, c, c_stride),
@@ -158,6 +340,133 @@ impl GemmKernel for f64 {
             GemmKernelKind::Neon => micro_kernel_f64_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f64_scalar(k, alpha, a, b, beta, c, c_stride),
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
+        a_pack: *mut Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() && m > 0 && n > 0 {
+            sme2::macro_kernel_f64_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a,
+                a_panel_stride,
+                a_step,
+                a_pack,
+                b,
+                beta,
+                c,
+                c_stride,
+            );
+            return true;
+        }
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            a_pack,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
+        false
+    }
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            sme2::pack_b_f64_sme2(src, ldb, k, n, dst);
+            return true;
+        }
+        let _ = (src, ldb, k, n, dst);
+        false
+    }
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            sme2::pack_a_t_f64_sme2(src, lda, k, m, dst);
+            return true;
+        }
+        let _ = (src, lda, k, m, dst);
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f64() {
+            if n == 1 {
+                thin::f64k::one_col(m, k, alpha, a, lda, b, beta, c);
+                return true;
+            }
+            if m == 1 {
+                thin::f64k::one_row(n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+                return true;
+            }
+        }
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+        false
     }
 }
 /// Scalar micro-kernel for f64.
@@ -678,6 +987,20 @@ unsafe fn micro_kernel_f64_neon(
 }
 impl GemmKernel for f32 {
     fn micro_kernel_shape() -> MicroKernelShape {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            return MicroKernelShape {
+                mr: sme2::MR,
+                nr: sme2::NR_F32,
+            };
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 16 },
@@ -700,6 +1023,17 @@ impl GemmKernel for f32 {
         c: *mut Self,
         c_stride: usize,
     ) {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            return sme2::micro_kernel_f32_sme2(k, alpha, a, b, beta, c, c_stride);
+        }
         match selected_kernel_kind() {
             #[cfg(target_arch = "x86_64")]
             GemmKernelKind::Avx512 => micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride),
@@ -711,6 +1045,133 @@ impl GemmKernel for f32 {
             GemmKernelKind::Neon => micro_kernel_f32_neon(k, alpha, a, b, beta, c, c_stride),
             _ => micro_kernel_f32_scalar(k, alpha, a, b, beta, c, c_stride),
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn macro_kernel(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        a_panel_stride: usize,
+        a_step: usize,
+        a_pack: *mut Self,
+        b: *const Self,
+        beta: Self,
+        c: *mut Self,
+        c_stride: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() && m > 0 && n > 0 {
+            sme2::macro_kernel_f32_sme2(
+                m,
+                n,
+                k,
+                alpha,
+                a,
+                a_panel_stride,
+                a_step,
+                a_pack,
+                b,
+                beta,
+                c,
+                c_stride,
+            );
+            return true;
+        }
+        let _ = (
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            a_panel_stride,
+            a_step,
+            a_pack,
+            b,
+            beta,
+            c,
+            c_stride,
+        );
+        false
+    }
+    #[inline]
+    unsafe fn pack_b(src: *const Self, ldb: usize, k: usize, n: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            sme2::pack_b_f32_sme2(src, ldb, k, n, dst);
+            return true;
+        }
+        let _ = (src, ldb, k, n, dst);
+        false
+    }
+    #[inline]
+    unsafe fn pack_a_t(src: *const Self, lda: usize, k: usize, m: usize, dst: *mut Self) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            sme2::pack_a_t_f32_sme2(src, lda, k, m, dst);
+            return true;
+        }
+        let _ = (src, lda, k, m, dst);
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn gemm_thin(
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: Self,
+        a: *const Self,
+        lda: usize,
+        b: *const Self,
+        ldb: usize,
+        beta: Self,
+        c: *mut Self,
+        ldc: usize,
+    ) -> bool {
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(any(
+                feature = "force-scalar",
+                feature = "max-simd-128",
+                feature = "max-simd-256"
+            ))
+        ))]
+        if use_sme2_f32() {
+            if n == 1 {
+                thin::f32k::one_col(m, k, alpha, a, lda, b, beta, c);
+                return true;
+            }
+            if m == 1 {
+                thin::f32k::one_row(n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+                return true;
+            }
+        }
+        let _ = (m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+        false
     }
 }
 /// Scalar micro-kernel for f32.

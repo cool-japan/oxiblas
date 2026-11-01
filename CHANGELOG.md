@@ -57,6 +57,27 @@ changes are listed under Fixed and Changed.
   vector times a real scalar, componentwise, immediate return for `alpha == 1`, no
   zero-fill for `alpha == 0`); `rotm_strided` and `zdrot_strided`. The strided forms
   take positive, negative and zero increments. (#15)
+- SME2 GEMM path for f32 and f64 on AArch64 (Apple M4 and later), in stable `asm!` (no
+  C, no FFI). It is selected at run time on macOS when `FEAT_SME2` (and
+  `FEAT_SME_F64F64` for f64) is present and the streaming vector length is 512 bits;
+  otherwise the NEON kernels run, and the SIMD-control features (`force-scalar`,
+  `max-simd-128`, `max-simd-256`) turn it off. It covers all four transpose
+  combinations of column-major operands and all sizes from 24^3 up (smaller problems
+  with fewer than 24 rows keep `gemm_small`), plus direct NEON kernels for `m == 1`
+  and `n == 1`. Design: 64 x 16 (f32) and 64 x 8 (f64) ZA tiles; one streaming-mode
+  region per packed block; a column-major A read in place, or packed while it is read
+  for the first columns; B (or a transposed A) transposed through ZA with a core-side
+  L2 prefetch; C moved directly between memory and ZA; per-thread scratch buffers kept
+  between calls; and with `Par::Rayon`, C split into one part per SME unit (one per
+  performance cluster) run by persistent spinning workers. On an Apple M4 Pro this
+  is about 15x (f32) and 7x (f64) the NEON path, and level with or ahead of
+  Accelerate on squares and the 24 workloads of arXiv:2512.21473. `GemmKernel` gains
+  four defaulted methods for this (`macro_kernel`, `pack_b`, `pack_a_t`,
+  `gemm_thin`), which other implementations need not override. `oxiblas-blas` now
+  depends on `libc` on macOS. (#16)
+- `materialize_op` (internal) copies a column-major source directly for `Trans`, and
+  small products with transposed operands copy them to column-major for the
+  small-matrix kernels instead of the element-wise loop. (#16)
 
 #### CBLAS
 

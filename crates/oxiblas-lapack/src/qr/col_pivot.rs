@@ -59,7 +59,7 @@ pub struct QrPivot<T: Scalar> {
     qr: Mat<T>,
     /// Householder scalars
     tau: Vec<T>,
-    /// Column permutation (col_perm[i] = original column index at position i)
+    /// Column permutation (`col_perm[i]` = original column index at position i)
     col_perm: Vec<usize>,
     /// Number of rows
     m: usize,

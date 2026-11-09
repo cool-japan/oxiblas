@@ -17,8 +17,8 @@ use super::error::EigenvalueError;
 /// Compute Givens rotation parameters.
 ///
 /// Returns (c, s, r) such that:
-/// [c  s][a] = [r]
-/// [-s c][b]   [0]
+/// \[c  s\]\[a\] = \[r\]
+/// \[-s c\]\[b\]   \[0\]
 pub fn givens_rotation<T: Scalar<Real = T> + Clone + Field + Real>(a: T, b: T) -> (T, T, T) {
     if Scalar::abs(b.clone()) <= <T as Scalar>::epsilon() {
         return (T::one(), T::zero(), a);

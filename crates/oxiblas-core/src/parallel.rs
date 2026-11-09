@@ -697,10 +697,12 @@ where
 
 /// Configuration for the OxiBLAS thread pool.
 ///
-/// `OxiblasThreadConfig` gathers all knobs that influence how OxiBLAS
-/// chooses threads for parallel operations.  Build one with the fluent
-/// builder methods, then apply it via [`set_global_thread_pool`] or
-/// [`with_thread_count`].
+/// `OxiblasThreadConfig` gathers the settings for building a rayon thread pool
+/// (thread count, stack size, thread-name prefix).  Build one with the fluent
+/// builder methods, then build a pool from it with `build_pool` (feature
+/// `parallel`) and register that pool with [`set_global_thread_pool`], whose
+/// docs say which code honours the registered pool.  [`with_thread_count`]
+/// takes a plain thread count, not a configuration.
 ///
 /// # Example
 ///
@@ -794,8 +796,10 @@ impl OxiblasThreadConfig {
 /// are not object-safe), which is exactly the operation needed to make a
 /// registered pool *actually execute* work. Storing the concrete
 /// [`CustomRayonPool`] lets [`run_in_pool`] call its properly `Send`-bounded
-/// `install`, so `Par::Rayon` work runs on the registered pool instead of the
-/// registry being an inert store (the pre-fix behaviour).
+/// `install`, so `Par::Rayon` work dispatched by this module's helpers runs on
+/// the registered pool instead of the registry being an inert store (the
+/// pre-fix behaviour). The `oxiblas-blas` and `oxiblas-lapack` drivers do not
+/// consult the registry.
 #[cfg(feature = "parallel")]
 static GLOBAL_POOL: std::sync::OnceLock<CustomRayonPool> = std::sync::OnceLock::new();
 
@@ -870,6 +874,9 @@ fn cached_pool(n: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
 /// * Otherwise a pool registered via [`set_global_thread_pool`] is installed if
 ///   present; failing that, `op` runs on rayon's ambient global pool.
 ///
+/// It is called by [`for_each_range`], [`map_reduce`] and [`for_each_indexed`];
+/// the `oxiblas-blas` and `oxiblas-lapack` drivers do not use it.
+///
 /// If a fixed-size pool cannot be built, `op` is run directly rather than
 /// failing the caller's computation (correctness is preserved; only the
 /// requested thread count is not honoured in that degraded case).
@@ -896,10 +903,26 @@ where
 /// The pool is stored in a `OnceLock` so it can only be set **once** per
 /// process.  Subsequent calls are silently ignored (the first writer wins).
 ///
+/// # Scope
+///
+/// The registered pool is honoured by the helpers in this module that dispatch
+/// through the internal `run_in_pool` ([`for_each_range`], [`map_reduce`] and
+/// [`for_each_indexed`]), and only for [`Par::Rayon`]: they install the pool
+/// for the duration of the call (`for_each_range` and `map_reduce` also size
+/// their chunks for its thread count).  [`Par::RayonWith`] bypasses it (it
+/// installs a cached pool of exactly `n` threads), and [`global_num_threads`]
+/// reports its size.  [`Par::num_threads`] still reports the thread count of
+/// rayon's ambient pool.
+///
+/// The `oxiblas-blas` and `oxiblas-lapack` drivers do not use these helpers, so
+/// they ignore the registered pool: their parallel work runs on rayon's ambient
+/// pool, also for [`Par::Rayon`].  To bound the threads of such a call, run it
+/// inside `rayon::ThreadPool::install` (or [`with_thread_count`], which
+/// installs a temporary `n`-thread pool) or set `RAYON_NUM_THREADS`.
+///
 /// # Arguments
 ///
-/// * `pool` – Any value that implements [`ThreadPool`] and is
-///   `'static + Send + Sync`.  Typically a [`CustomRayonPool`] built via
+/// * `pool` – A [`CustomRayonPool`], typically built via
 ///   [`OxiblasThreadConfig::build_pool`] or
 ///   [`CustomRayonPool::with_num_threads`].
 ///
@@ -920,6 +943,10 @@ pub fn set_global_thread_pool(pool: CustomRayonPool) {
 
 /// Sets the global OxiBLAS thread pool to a sequential (single-threaded)
 /// pool (available without the `parallel` feature).
+///
+/// Only the first call has an effect.  Without the `parallel` feature nothing
+/// runs on the registered pool: the helpers in this module execute
+/// sequentially, and [`global_num_threads`] returns `1` either way.
 #[cfg(all(feature = "std", not(feature = "parallel")))]
 pub fn set_global_thread_pool(pool: SequentialPool) {
     let _ = GLOBAL_POOL.set(pool);
@@ -927,6 +954,10 @@ pub fn set_global_thread_pool(pool: SequentialPool) {
 
 /// Returns the number of threads in the global pool, or `1` if no pool has
 /// been registered.
+///
+/// This is the size of the pool registered with [`set_global_thread_pool`]. It
+/// is not the number of threads the `oxiblas-blas` and `oxiblas-lapack` drivers
+/// use: they run on rayon's ambient pool.
 #[cfg(feature = "parallel")]
 pub fn global_num_threads() -> usize {
     GLOBAL_POOL.get().map(|p| p.num_threads()).unwrap_or(1)
@@ -995,28 +1026,43 @@ pub fn with_thread_count(_n: usize, f: impl FnOnce()) {
 /// [`reduce`]: ThreadLocalAccum::reduce
 #[cfg(feature = "parallel")]
 pub struct ThreadLocalAccum<T> {
-    values: Vec<std::sync::Mutex<T>>,
+    /// Shard 0. Kept outside `rest` so the accumulator is non-empty by its
+    /// very type, which lets [`reduce`](Self::reduce) fold without a
+    /// fallible "first shard" step.
+    first: std::sync::Mutex<T>,
+    /// Shards `1..num_shards` (empty when there is a single worker).
+    rest: Vec<std::sync::Mutex<T>>,
 }
 
 #[cfg(feature = "parallel")]
 impl<T: Clone + Send> ThreadLocalAccum<T> {
     /// Creates a new sharded accumulator with one shard per rayon worker.
     pub fn new(identity: T) -> Self {
-        // At least one shard is always allocated. `rayon::current_num_threads`
-        // is documented to return `>= 1`, but the explicit `.max(1)` makes the
-        // non-empty invariant that `reduce` relies on hold *by construction*,
-        // independent of that external guarantee.
+        // `rayon::current_num_threads` is documented to return `>= 1`; the
+        // `.max(1)` keeps the shard count meaningful without relying on that.
+        // Shard 0 is stored separately (see `first`), so `rest` holds the
+        // remaining `num_threads - 1` shards.
         let num_threads = rayon::current_num_threads().max(1);
-        let values = (0..num_threads)
+        let rest = (1..num_threads)
             .map(|_| std::sync::Mutex::new(identity.clone()))
             .collect();
-        ThreadLocalAccum { values }
+        ThreadLocalAccum {
+            first: std::sync::Mutex::new(identity),
+            rest,
+        }
     }
 
     /// Gets or initializes the accumulator for the current thread.
     pub fn get(&self) -> std::sync::MutexGuard<'_, T> {
-        let thread_idx = rayon::current_thread_index().unwrap_or(0) % self.values.len();
-        self.values[thread_idx]
+        let num_shards = self.rest.len() + 1;
+        let thread_idx = rayon::current_thread_index().unwrap_or(0) % num_shards;
+        // Shard `k >= 1` lives at `rest[k - 1]`; `thread_idx < num_shards`
+        // keeps that index in bounds.
+        let shard = match thread_idx.checked_sub(1) {
+            Some(rest_idx) => &self.rest[rest_idx],
+            None => &self.first,
+        };
+        shard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1030,21 +1076,15 @@ impl<T: Clone + Send> ThreadLocalAccum<T> {
     where
         F: Fn(T, T) -> T,
     {
-        let mut acc: Option<T> = None;
-        for shard in self.values {
-            let value = shard
+        let into_value = |shard: std::sync::Mutex<T>| {
+            shard
                 .into_inner()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            acc = Some(match acc {
-                Some(previous) => f(previous, value),
-                None => value,
-            });
-        }
-        // Infallible by construction: `new` allocates `num_threads.max(1) >= 1`
-        // shards, so the loop above runs at least once and `acc` is always
-        // `Some` here. This `.expect` therefore cannot panic; it documents the
-        // invariant rather than guarding a reachable failure.
-        acc.expect("ThreadLocalAccum always holds at least one shard")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        // Infallible by construction: shard 0 always exists, so the fold
+        // starts from its value and combines the remaining shards in order.
+        let first = into_value(self.first);
+        self.rest.into_iter().map(into_value).fold(first, f)
     }
 }
 
@@ -1442,8 +1482,9 @@ mod tests {
     }
 
     /// Finding 6: `ThreadLocalAccum::reduce` must be infallible by construction
-    /// (never the pre-fix `.expect` on a possibly-empty iterator) and must
-    /// recombine the per-worker shards correctly.
+    /// (shard 0 is stored outside the shard vector, so there is no fallible
+    /// "first element" step at all) and must recombine the per-worker shards
+    /// correctly.
     #[cfg(feature = "parallel")]
     #[test]
     fn test_thread_local_accum_reduce_infallible() {
@@ -1459,5 +1500,46 @@ mod tests {
             *shard += x;
         });
         assert_eq!(accum.reduce(|a, b| a + b), (0..1_000i64).sum::<i64>());
+    }
+
+    /// Shard 0 lives outside the shard vector: a single-worker pool has no
+    /// other shards, `get` routes worker `k` to shard `k`, and `reduce` folds
+    /// every shard left-to-right starting from shard 0.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_thread_local_accum_shard_layout() {
+        for threads in [1usize, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("thread pool");
+            pool.install(|| {
+                let accum = ThreadLocalAccum::new(Vec::<usize>::new());
+                assert_eq!(accum.rest.len(), threads - 1);
+                // Tag every shard with its index so the fold order is visible.
+                for (k, shard) in core::iter::once(&accum.first)
+                    .chain(accum.rest.iter())
+                    .enumerate()
+                {
+                    shard.lock().expect("unpoisoned").push(k);
+                }
+                // `install` runs this closure on a pool worker; `get` must
+                // hand out that worker's own shard.
+                let me = rayon::current_thread_index().unwrap_or(0) % threads;
+                accum.get().push(100);
+                let order = accum.reduce(|mut a, b| {
+                    a.extend(b);
+                    a
+                });
+                let mut expected = Vec::new();
+                for k in 0..threads {
+                    expected.push(k);
+                    if k == me {
+                        expected.push(100);
+                    }
+                }
+                assert_eq!(order, expected);
+            });
+        }
     }
 }

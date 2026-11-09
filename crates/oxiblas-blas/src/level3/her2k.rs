@@ -51,6 +51,17 @@ impl core::fmt::Display for Her2kError {
 
 impl std::error::Error for Her2kError {}
 
+/// The two operations HER2K performs, decoded once from the public [`Trans`]
+/// argument (whose third variant, `Trans::Trans`, HER2K rejects), so the
+/// private helpers can never be handed the invalid one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Her2kOp {
+    /// `C = α·A·Bᴴ + conj(α)·B·Aᴴ + β·C` (`Trans::NoTrans`), A and B are n×k.
+    NoTrans,
+    /// `C = α·Aᴴ·B + conj(α)·Bᴴ·A + β·C` (`Trans::ConjTrans`), A and B are k×n.
+    ConjTrans,
+}
+
 /// Performs the Hermitian rank-2k update.
 ///
 /// C = α·A·B^H + conj(α)·B·A^H + β·C (when trans = `NoTrans`)
@@ -103,9 +114,11 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
 ) -> Result<(), Her2kError> {
     // Validate transpose option - only NoTrans and ConjTrans are valid for HER2K
-    if trans == Trans::Trans {
-        return Err(Her2kError::InvalidTrans);
-    }
+    let op = match trans {
+        Trans::NoTrans => Her2kOp::NoTrans,
+        Trans::ConjTrans => Her2kOp::ConjTrans,
+        Trans::Trans => return Err(Her2kError::InvalidTrans),
+    };
 
     // Reference (Z/C)HER2K declare β as a REAL scalar (unlike α, which MAY be
     // complex). The update C = α·A·Bᴴ + conj(α)·B·Aᴴ + β·C is Hermitian only when β
@@ -120,8 +133,8 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 
     // Determine k and validate A, B dimensions
-    let k = match trans {
-        Trans::NoTrans => {
+    let k = match op {
+        Her2kOp::NoTrans => {
             if a.nrows() != n || b.nrows() != n {
                 return Err(Her2kError::DimensionMismatch);
             }
@@ -130,7 +143,7 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             a.ncols()
         }
-        Trans::ConjTrans => {
+        Her2kOp::ConjTrans => {
             if a.ncols() != n || b.ncols() != n {
                 return Err(Her2kError::DimensionMismatch);
             }
@@ -139,7 +152,6 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             a.nrows()
         }
-        Trans::Trans => unreachable!(), // Already checked above
     };
 
     // Handle empty cases
@@ -159,9 +171,9 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     // alpha == 0 never reads A or B (C := beta * C), so it stays on the naive path.
     const GEMM_THRESHOLD: usize = 32;
     if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
-        her2k_via_gemm(uplo, trans, alpha, a, b, beta, c, n, k)
+        her2k_via_gemm(uplo, op, alpha, a, b, beta, c, n, k)
     } else {
-        her2k_naive(uplo, trans, alpha, a, b, beta, c, n, k)
+        her2k_naive(uplo, op, alpha, a, b, beta, c, n, k)
     }
 }
 
@@ -212,7 +224,7 @@ fn write_her2k_triangle<T: Field>(
 /// has no effect on real numbers. This uses the same optimization as SYR2K.
 fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     uplo: Uplo,
-    trans: Trans,
+    op: Her2kOp,
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
@@ -225,8 +237,8 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Compute `temp = α·A·Bᴴ + conj(α)·B·Aᴴ` (or the ConjTrans variant) via two GEMMs.
     let mut temp: Mat<T> = Mat::zeros(n, n);
-    match trans {
-        Trans::NoTrans => {
+    match op {
+        Her2kOp::NoTrans => {
             // A is n×k, B is n×k. Build B^H (k×n) and A^H (k×n).
             let mut b_h: Mat<T> = Mat::zeros(k, n);
             for i in 0..n {
@@ -243,7 +255,7 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a, b_h.as_ref(), T::zero(), temp.as_mut()); // temp = α·A·B^H
             gemm(alpha_conj, b, a_h.as_ref(), T::one(), temp.as_mut()); // temp += conj(α)·B·A^H
         }
-        Trans::ConjTrans => {
+        Her2kOp::ConjTrans => {
             // A is k×n, B is k×n. Build A^H (n×k) and B^H (n×k).
             let mut a_h: Mat<T> = Mat::zeros(n, k);
             for i in 0..k {
@@ -260,7 +272,6 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a_h.as_ref(), b, T::zero(), temp.as_mut()); // temp = α·A^H·B
             gemm(alpha_conj, b_h.as_ref(), a, T::one(), temp.as_mut()); // temp += conj(α)·B^H·A
         }
-        Trans::Trans => unreachable!(),
     }
 
     // Copy triangle with beta scaling, honouring the β==0 / real-diagonal invariants.
@@ -272,7 +283,7 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// Naive HER2K implementation for small matrices.
 fn her2k_naive<T: Field>(
     uplo: Uplo,
-    trans: Trans,
+    op: Her2kOp,
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
@@ -323,8 +334,8 @@ fn her2k_naive<T: Field>(
     if alpha != T::zero() {
         let alpha_conj = alpha.conj();
 
-        match trans {
-            Trans::NoTrans => {
+        match op {
+            Her2kOp::NoTrans => {
                 // C += alpha * A * B^H + conj(alpha) * B * A^H
                 // C[i,j] += alpha * sum_l A[i,l] * conj(B[j,l]) + conj(alpha) * sum_l B[i,l] * conj(A[j,l])
                 match uplo {
@@ -354,7 +365,7 @@ fn her2k_naive<T: Field>(
                     }
                 }
             }
-            Trans::ConjTrans => {
+            Her2kOp::ConjTrans => {
                 // C += alpha * A^H * B + conj(alpha) * B^H * A
                 // C[i,j] += alpha * sum_l conj(A[l,i]) * B[l,j] + conj(alpha) * sum_l conj(B[l,i]) * A[l,j]
                 match uplo {
@@ -388,7 +399,6 @@ fn her2k_naive<T: Field>(
                     }
                 }
             }
-            Trans::Trans => unreachable!(),
         }
     }
 

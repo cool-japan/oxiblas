@@ -8,7 +8,11 @@
 //! For an m×n matrix with nnz non-zeros:
 //! - `values` has length nnz
 //! - `col_indices` has length nnz
-//! - `row_ptrs` has length m+1
+//! - `row_ptrs` has length m+1, starts at 0, never decreases and ends at nnz
+//!
+//! Row `i` owns the entries `row_ptrs[i]..row_ptrs[i + 1]`. Within a row the
+//! column indices are distinct but need not be sorted; see
+//! [`CsrMatrix::new_unchecked`] for the full contract.
 
 use oxiblas_core::scalar::{Field, Scalar};
 use std::collections::HashSet;
@@ -16,11 +20,14 @@ use std::collections::HashSet;
 /// Error type for CSR matrix operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsrError {
-    /// Invalid row pointer array length.
+    /// Invalid row pointer array: its length is not `nrows + 1` (then
+    /// `expected` is `nrows + 1`, saturating at `usize::MAX`), its first entry
+    /// is not 0 (`expected` is 0), or its last entry is not the number of
+    /// stored entries (`expected` is that number).
     InvalidRowPtrs {
-        /// Expected length.
+        /// Expected length or value.
         expected: usize,
-        /// Actual length.
+        /// Actual length or value.
         actual: usize,
     },
     /// Mismatched array lengths.
@@ -69,7 +76,8 @@ impl core::fmt::Display for CsrError {
             Self::InvalidRowPtrs { expected, actual } => {
                 write!(
                     f,
-                    "Invalid row_ptrs length: expected {expected}, got {actual}"
+                    "Invalid row_ptrs (length must be nrows + 1, first entry 0, last entry nnz): \
+                     expected {expected}, got {actual}"
                 )
             }
             Self::LengthMismatch {
@@ -95,6 +103,49 @@ impl core::fmt::Display for CsrError {
 }
 
 impl std::error::Error for CsrError {}
+
+/// Returns the first index in `indices` (in storage order) that repeats an
+/// earlier one, or `None` if all are distinct.
+///
+/// Order-independent: strictly increasing runs (the common, sorted case) are
+/// accepted without hashing; anything else is checked with `seen`, which is
+/// cleared first and only used as scratch space.
+pub(crate) fn first_duplicate_index(indices: &[usize], seen: &mut HashSet<usize>) -> Option<usize> {
+    if indices.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    seen.clear();
+    indices.iter().copied().find(|&index| !seen.insert(index))
+}
+
+/// Appends one compressed row (or column) built from `entries`, which are
+/// `(index, value)` pairs in any order, to `out_indices` / `out_values`.
+///
+/// The entries are sorted by index (stably) and entries that share an index
+/// are combined into one entry holding their sum, so the appended run is
+/// strictly ascending and duplicate-free. `entries` is left empty.
+///
+/// The format conversions use this to uphold the no-duplicate part of the
+/// CSR/CSC contract even when the source format stores one position twice
+/// (which the source format's own `matvec` treats as a sum).
+pub(crate) fn push_summed_run<T: Scalar>(
+    entries: &mut Vec<(usize, T)>,
+    out_indices: &mut Vec<usize>,
+    out_values: &mut Vec<T>,
+) {
+    entries.sort_by_key(|&(index, _)| index);
+    let run_start = out_indices.len();
+    for (index, value) in entries.drain(..) {
+        let repeats_last = out_indices.len() > run_start && out_indices.last() == Some(&index);
+        match out_values.last_mut() {
+            Some(last) if repeats_last => *last = *last + value,
+            _ => {
+                out_indices.push(index);
+                out_values.push(value);
+            }
+        }
+    }
+}
 
 /// Compressed Sparse Row matrix.
 ///
@@ -129,7 +180,15 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the input is invalid.
+    /// Returns an error unless the input satisfies the whole contract
+    /// documented on [`CsrMatrix::new_unchecked`]:
+    /// - [`CsrError::InvalidRowPtrs`] if `row_ptrs.len() != nrows + 1`,
+    ///   `row_ptrs[0] != 0` or `row_ptrs[nrows] != values.len()`
+    /// - [`CsrError::LengthMismatch`] if `values` and `col_indices` differ in
+    ///   length
+    /// - [`CsrError::InvalidRowPtrOrder`] if `row_ptrs` decreases somewhere
+    /// - [`CsrError::InvalidColumnIndex`] if a column index is `>= ncols`
+    /// - [`CsrError::DuplicateEntry`] if a row lists a column twice
     pub fn new(
         nrows: usize,
         ncols: usize,
@@ -137,10 +196,11 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
         col_indices: Vec<usize>,
         values: Vec<T>,
     ) -> Result<Self, CsrError> {
-        // Validate row_ptrs length
-        if row_ptrs.len() != nrows + 1 {
+        // Validate row_ptrs length (`nrows + 1` itself must not overflow).
+        let expected_len = nrows.checked_add(1);
+        if expected_len != Some(row_ptrs.len()) {
             return Err(CsrError::InvalidRowPtrs {
-                expected: nrows + 1,
+                expected: expected_len.unwrap_or(usize::MAX),
                 actual: row_ptrs.len(),
             });
         }
@@ -158,6 +218,16 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
             if row_ptrs[i] < row_ptrs[i - 1] {
                 return Err(CsrError::InvalidRowPtrOrder);
             }
+        }
+
+        // Validate row_ptrs[0] == 0: otherwise the entries before it belong to
+        // no row (and with `nrows == 0`, `row_ptrs == [nnz]` would smuggle in
+        // `nnz` such entries).
+        if row_ptrs[0] != 0 {
+            return Err(CsrError::InvalidRowPtrs {
+                expected: 0,
+                actual: row_ptrs[0],
+            });
         }
 
         // Validate row_ptrs[nrows] equals nnz
@@ -183,19 +253,16 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
         // structurally invalid (it makes the stored value at that
         // position ambiguous, see `CsrError::DuplicateEntry`).
         //
-        // Detection is order-independent (a `HashSet` per row) rather than
-        // "check adjacent pairs", precisely because rows are not required
-        // to be pre-sorted.
+        // Detection is order-independent (see `first_duplicate_index`) rather
+        // than "check adjacent pairs", precisely because rows are not
+        // required to be pre-sorted.
         let mut seen_cols = HashSet::new();
         for row in 0..nrows {
             let start = row_ptrs[row];
             let end = row_ptrs[row + 1];
 
-            seen_cols.clear();
-            for &col in &col_indices[start..end] {
-                if !seen_cols.insert(col) {
-                    return Err(CsrError::DuplicateEntry { row, col });
-                }
+            if let Some(col) = first_duplicate_index(&col_indices[start..end], &mut seen_cols) {
+                return Err(CsrError::DuplicateEntry { row, col });
             }
         }
 
@@ -212,11 +279,28 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure:
+    /// The caller must ensure the CSR contract that [`CsrMatrix::new`]
+    /// checks. Structurally, with `nnz = values.len()`:
     /// - `row_ptrs.len() == nrows + 1`
-    /// - `values.len() == col_indices.len()`
-    /// - `row_ptrs` is monotonically increasing
-    /// - All column indices are < ncols
+    /// - `row_ptrs[0] == 0` and `row_ptrs[nrows] == nnz`
+    /// - `row_ptrs` never decreases (`row_ptrs[i] <= row_ptrs[i + 1]`)
+    /// - `col_indices.len() == nnz`
+    /// - every column index is `< ncols`
+    ///
+    /// Logically:
+    /// - no row lists the same column twice (each `(row, col)` position has
+    ///   at most one entry)
+    ///
+    /// Column indices within a row need **not** be sorted: the methods of this
+    /// type, the format conversions and the [`crate::ops`] functions all
+    /// accept unsorted rows (the latter return sorted rows where they build a
+    /// new pattern).
+    ///
+    /// Every method of `CsrMatrix` and every function in this crate relies on
+    /// this contract: row `i` is read as `row_ptrs[i]..row_ptrs[i + 1]` and
+    /// column indices are used to index vectors of length `ncols`. Violating
+    /// it can therefore cause panics or silently wrong results here, and
+    /// `unsafe` code elsewhere may rely on it for memory safety.
     #[inline]
     pub unsafe fn new_unchecked(
         nrows: usize,
@@ -447,8 +531,14 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
 
         let csc = self.to_csc();
 
-        // Reinterpret CSC of A as CSR of A^T
-        // Safety: CSC arrays form valid CSR when dimensions are swapped
+        // Reinterpret CSC of A as CSR of A^T.
+        // SAFETY: `self` satisfies the CSR contract, so `csr_to_csc` returns
+        // `col_ptrs` of length `ncols + 1` that start at 0, never decrease and
+        // end at nnz, with every one of the nnz slots filled by exactly one
+        // entry of `self` (row index `< nrows`, no `(row, col)` repeated). Read
+        // as the CSR of the `ncols x nrows` transpose, these are row pointers
+        // of length `new_nrows + 1` with the same bounds, column indices
+        // `< new_ncols`, and no repeated column within a row.
         unsafe {
             Self::new_unchecked(
                 csc.ncols(),                // new nrows = original ncols
@@ -473,6 +563,24 @@ impl<T: Scalar + Clone> CsrMatrix<T> {
         result.scale(alpha);
         result
     }
+}
+
+/// Test helper: asserts that `m`'s raw parts satisfy the CSR contract, by
+/// re-validating them with [`CsrMatrix::new`].
+#[cfg(test)]
+pub(crate) fn assert_valid_csr<T: Scalar + Clone>(m: &CsrMatrix<T>) {
+    let rebuilt = CsrMatrix::new(
+        m.nrows(),
+        m.ncols(),
+        m.row_ptrs().to_vec(),
+        m.col_indices().to_vec(),
+        m.values().to_vec(),
+    );
+    assert!(
+        rebuilt.is_ok(),
+        "matrix violates the CSR contract: {:?}",
+        rebuilt.err()
+    );
 }
 
 // Note: `CsrMatrix` deliberately does not implement `std::ops::Index`.
@@ -705,5 +813,81 @@ mod tests {
         assert_eq!(csr.get(0, 1), None);
         assert_eq!(csr.get_or_zero(0, 1), 0.0);
         assert_eq!(csr.get_or_zero(0, 0), 1.0);
+    }
+
+    // --- Regression: `new` must enforce the whole row-pointer contract -------
+    //
+    // `new` never checked `row_ptrs[0] == 0`. With `nrows == 0` it therefore
+    // accepted `row_ptrs == [nnz]` with `nnz > 0` stored entries that belong to
+    // no row, and `transpose_csr` / `csr_to_csc` turned such a matrix into one
+    // with an out-of-range index via `new_unchecked`.
+
+    #[test]
+    fn test_csr_zero_rows_with_entries_rejected() {
+        let result = CsrMatrix::new(0, 3, vec![2], vec![0, 1], vec![1.0f64, 2.0]);
+        assert_eq!(
+            result.unwrap_err(),
+            CsrError::InvalidRowPtrs {
+                expected: 0,
+                actual: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_csr_first_row_ptr_must_be_zero() {
+        // Entry 0 would belong to no row.
+        let result = CsrMatrix::new(2, 3, vec![1, 2, 2], vec![0, 1], vec![1.0f64, 2.0]);
+        assert_eq!(
+            result.unwrap_err(),
+            CsrError::InvalidRowPtrs {
+                expected: 0,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_csr_row_ptrs_length_overflow_is_an_error() {
+        // `nrows + 1` overflows `usize`: an error, not a panic.
+        let result = CsrMatrix::<f64>::new(usize::MAX, 1, vec![], vec![], vec![]);
+        assert!(matches!(result, Err(CsrError::InvalidRowPtrs { .. })));
+    }
+
+    #[test]
+    fn test_csr_empty_shapes_accepted() {
+        assert!(CsrMatrix::<f64>::new(0, 0, vec![0], vec![], vec![]).is_ok());
+        assert!(CsrMatrix::<f64>::new(0, 5, vec![0], vec![], vec![]).is_ok());
+        assert!(CsrMatrix::<f64>::new(3, 0, vec![0, 0, 0, 0], vec![], vec![]).is_ok());
+    }
+
+    /// Re-validates a matrix's raw parts with the checking constructor.
+    fn revalidate(csr: &CsrMatrix<f64>) -> Result<CsrMatrix<f64>, CsrError> {
+        CsrMatrix::new(
+            csr.nrows(),
+            csr.ncols(),
+            csr.row_ptrs().to_vec(),
+            csr.col_indices().to_vec(),
+            csr.values().to_vec(),
+        )
+    }
+
+    #[test]
+    fn test_csr_transpose_and_round_trip_satisfy_contract() {
+        // [2 0 1]
+        // [0 3 0], row 0 stored unsorted as columns [2, 0].
+        let csr = CsrMatrix::new(2, 3, vec![0, 2, 3], vec![2, 0, 1], vec![1.0f64, 2.0, 3.0])
+            .expect("valid CSR");
+        let t = csr.transpose();
+        assert!(revalidate(&t).is_ok());
+        assert_eq!(t.shape(), (3, 2));
+        assert_eq!(t.get(0, 0), Some(&2.0));
+        assert_eq!(t.get(2, 0), Some(&1.0));
+        assert_eq!(t.get(1, 1), Some(&3.0));
+
+        let round_trip = csr.to_csc().to_csr();
+        assert!(revalidate(&round_trip).is_ok());
+        assert_eq!(round_trip.get(0, 2), Some(&1.0));
+        assert_eq!(round_trip.get(0, 0), Some(&2.0));
     }
 }

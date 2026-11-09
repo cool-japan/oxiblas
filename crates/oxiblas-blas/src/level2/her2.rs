@@ -194,6 +194,23 @@ pub fn her2<T: Field>(
 ///
 /// Returns alpha * x * y^H + conj(alpha) * y * x^H as a fully Hermitian matrix.
 ///
+/// The lower triangle is computed by [`her2`] with [`Her2Uplo::Lower`] on a zero
+/// matrix, so it has the reference `?her2` semantics
+/// (`A[i,j] = 0 + x[i] * temp1 + y[i] * temp2`, evaluated left to right, with
+/// `temp1 = alpha * conj(y[j])` and `temp2 = conj(alpha * x[j])`), and the
+/// strictly upper triangle is its conjugated mirror, `A[j,i] = conj(A[i,j])`. In
+/// particular:
+///
+/// * A column with `x[j] == 0` and `y[j] == 0` is skipped and stays zero, so an
+///   infinite or NaN neighbour cannot reach it. Like the reference this is order
+///   dependent: `x = [0, Inf]`, `y = [0, 1]` gives `A[1,0] = A[0,1] = 0`, but
+///   `x = [Inf, 0]`, `y = [1, 0]` gives `A[1,0] = NaN` (from
+///   `y[1] * conj(alpha * x[0]) = 0 * Inf`), mirrored into `A[0,1]`.
+/// * The diagonal is exactly real.
+/// * Every lower entry is accumulated onto `+0`, so a `-0` result (a sum of `-0`
+///   products) is stored as `+0`. The upper entries are exact conjugates, so a
+///   zero imaginary part there has the opposite sign.
+///
 /// # Arguments
 ///
 /// * `alpha` - The complex scalar alpha
@@ -223,20 +240,14 @@ pub fn her2_new<T: Field + bytemuck::Zeroable>(
         return Ok(a);
     }
 
-    let alpha_conj = alpha.conj();
+    // Reference-semantics lower triangle. `a` is `n x n` and both vectors have
+    // length `n`, so this cannot fail; an error would be propagated as is.
+    her2(Her2Uplo::Lower, alpha, x, y, a.as_mut())?;
 
-    // Create full Hermitian matrix
-    for i in 0..n {
-        for j in 0..=i {
-            // A[i,j] = alpha*x[i]*conj(y[j]) + conj(alpha)*y[i]*conj(x[j])
-            let val = alpha * x[i] * y[j].conj() + alpha_conj * y[i] * x[j].conj();
-            if i == j {
-                // Diagonal must be real
-                a[(i, j)] = T::from_real(val.real());
-            } else {
-                a[(i, j)] = val;
-                a[(j, i)] = val.conj();
-            }
+    // Mirror the strictly lower triangle into the upper one, conjugated.
+    for j in 0..n {
+        for i in (j + 1)..n {
+            a[(j, i)] = a[(i, j)].conj();
         }
     }
 
@@ -709,5 +720,72 @@ mod tests {
         let mut ap = [d0, aij, d1];
         hpr2(Hpr2Uplo::Upper, 2, alpha, &x, &y, &mut ap).unwrap();
         assert_eq!(bits(ap[1]), bits(want), "hpr2 Upper");
+    }
+
+    /// `her2_new` builds its lower triangle with `her2(Lower, ..)` on a zero matrix,
+    /// so the reference zero-column skip applies: for `x = [0, Inf]`, `y = [0, 1]`
+    /// column 0 is skipped, `A[1,0]` stays `0` and is mirrored into `A[0,1]`. (The
+    /// old direct products `alpha * x[1] * conj(y[0]) = Inf * 0` made both NaN.)
+    #[test]
+    fn test_her2_new_skips_zero_column() {
+        let inf = f64::INFINITY;
+
+        let a = her2_new(1.0, &[0.0f64, inf], &[0.0, 1.0]).unwrap();
+        assert_eq!((a[(0, 0)], a[(1, 0)], a[(0, 1)]), (0.0, 0.0, 0.0));
+        assert_eq!(a[(1, 1)], inf);
+
+        let x = [c(0.0, 0.0), c(inf, 0.0)];
+        let y = [c(0.0, 0.0), c(1.0, 0.0)];
+        let a = her2_new(c(1.0, 0.0), &x, &y).unwrap();
+        assert_eq!(a[(0, 0)], c(0.0, 0.0));
+        assert_eq!(a[(1, 0)], c(0.0, 0.0));
+        assert_eq!(a[(0, 1)], c(0.0, 0.0));
+        assert_eq!(a[(1, 1)].im.to_bits(), 0.0f64.to_bits());
+
+        // The lower-triangle semantics are order dependent, as in the reference:
+        // with x = [Inf, 0], y = [1, 0] column 0 is not skipped and A[1,0] picks up
+        // `y[1] * conj(alpha * x[0]) = 0 * Inf` (NaN, mirrored), while the skipped
+        // column 1 stays zero.
+        let a = her2_new(1.0, &[inf, 0.0f64], &[1.0, 0.0]).unwrap();
+        assert_eq!(a[(0, 0)], inf);
+        assert!(a[(1, 0)].is_nan() && a[(0, 1)].is_nan());
+        assert_eq!(a[(1, 1)], 0.0);
+    }
+
+    /// Every lower entry of `her2_new` is `(0 + p1) + p2` (a skipped column stays
+    /// `+0`), so a `-0` sum of products is stored as `+0`. The old direct sums kept
+    /// the `-0`.
+    #[test]
+    fn test_her2_new_negative_zero_product_is_positive_zero() {
+        let a = her2_new(-1.0, &[1.0f64, 0.0], &[1.0, 0.0]).unwrap();
+        assert_eq!(a[(0, 0)], -2.0);
+        for (i, j) in [(1, 0), (0, 1), (1, 1)] {
+            assert_eq!(a[(i, j)].to_bits(), 0.0f64.to_bits(), "({i},{j})");
+        }
+    }
+
+    /// `her2_new` equals `her2(Lower, ..)` on a zero matrix bit for bit (reference
+    /// temps and evaluation order), with the strictly lower triangle mirrored,
+    /// conjugated, into the upper one; mismatched lengths still report
+    /// `DimensionMismatchY`.
+    #[test]
+    fn test_her2_new_matches_lower_her2_on_zero_matrix() {
+        let x = [c(1.0, 0.5), c(-0.3, 2.0), c(0.0, 0.0), c(0.7, -1.1)];
+        let y = [c(0.2, -0.4), c(0.0, 0.0), c(0.0, 0.0), c(-1.5, 0.25)];
+        let alpha = c(0.37, -1.2);
+        let a = her2_new(alpha, &x, &y).unwrap();
+        let mut lower: Mat<Complex64> = Mat::zeros(4, 4);
+        her2(Her2Uplo::Lower, alpha, &x, &y, lower.as_mut()).unwrap();
+        for j in 0..4 {
+            assert_eq!(bits(a[(j, j)]), bits(lower[(j, j)]), "({j},{j})");
+            for i in (j + 1)..4 {
+                assert_eq!(bits(a[(i, j)]), bits(lower[(i, j)]), "({i},{j})");
+                assert_eq!(bits(a[(j, i)]), bits(lower[(i, j)].conj()), "({j},{i})");
+            }
+        }
+        assert_eq!(
+            her2_new(alpha, &x, &y[..3]).map(|m| m.nrows()),
+            Err(Her2Error::DimensionMismatchY)
+        );
     }
 }

@@ -315,7 +315,7 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     /// # Arguments
     ///
     /// * `a` - The matrix to factor
-    /// * `nb` - Block size (number of columns per panel)
+    /// * `nb` - Block size (number of columns per panel); 0 is treated as 1
     ///
     /// # Returns
     ///
@@ -341,6 +341,8 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     pub fn compute_blocked(a: MatRef<'_, T>, nb: usize) -> Result<Self, QrError> {
         use oxiblas_blas::level3::gemm::gemm;
 
+        // A zero-width panel would never advance the blocked loop.
+        let nb = nb.max(1);
         let m = a.nrows();
         let n = a.ncols();
 

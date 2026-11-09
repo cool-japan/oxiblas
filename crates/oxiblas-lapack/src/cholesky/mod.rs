@@ -17,6 +17,39 @@
 //! - **Band Cholesky**: Efficient factorization for SPD band matrices.
 //!   O(n·k²) complexity where k is the bandwidth.
 //!
+//! # Tolerances
+//!
+//! Each pivot is tested against a threshold relative to its own column of the
+//! input. The references of all columns are computed once, from the finite
+//! entries, before factorizing; a NaN, infinite or (for LLᵀ) negative entry
+//! never raises a reference.
+//!
+//! - [`Cholesky`] (every variant), [`HermitianCholesky`], [`BandCholesky`] and
+//!   [`PackedCholesky`] report `NotPositiveDefinite` when the radicand
+//!   `a_jj - Σ |l_jk|²` of column `j` is at or below `eps · n · a_jj`, the
+//!   original diagonal entry (its real part for a Hermitian matrix). A
+//!   symmetric scaling `D · A · D` by powers of two changes neither the outcome
+//!   nor the reported index, since radicand and `a_jj` both scale by `d_j²`.
+//!   A NaN radicand propagates into L instead of being reported, as NaN
+//!   pivots do in this crate's LU factorizations; LAPACK `dpotrf` reports it
+//!   as `INFO = j` instead.
+//! - [`Ldlt`] and [`PackedLdlt`] report `Singular` when `|d_j|` is at or below
+//!   `eps · n · s_j`, with `s_j = max_i |a_ij|` over the whole symmetric column
+//!   `j` (its stored entries and the mirrored entries of row `j`), unless
+//!   [`Ldlt::compute_with_tol`] is given an explicit tolerance;
+//!   [`Ldlt::inertia`] counts `|d_j| <= eps · s_j` as zero. Off-diagonal
+//!   entries count because LDLᵀ does not pivot: a pivot that is tiny next to
+//!   its column produces huge multipliers. A symmetric scaling `D · A · D`
+//!   keeps the outcome while each column's maximum stays on its diagonal.
+//! - Every one of these is invariant under scaling the matrix by a power of
+//!   two (as long as no entry or intermediate value overflows or underflows),
+//!   and badly scaled positive definite matrices such as `diag(1e20, 1)` or a
+//!   stiffness matrix with a penalty term `K + 1e20 · e_i e_iᵀ` factor, as
+//!   with LAPACK.
+//! - [`BunchKaufman`] tests for exact zero pivots and [`Aasen`] for exact zeros
+//!   of T when solving, while [`Aasen::inertia`] uses `8 · eps · ‖T‖∞`; all of
+//!   these are already scale-invariant.
+//!
 //! # Example
 //!
 //! ```
@@ -72,6 +105,10 @@ pub use packed::{
     dense_to_packed_upper, packed_lower_index, packed_lower_to_dense, packed_upper_index,
     packed_upper_to_dense, ppsv, spsv,
 };
+
+#[cfg(test)]
+#[path = "tolerance_tests.rs"]
+mod tolerance_tests;
 
 #[cfg(test)]
 mod tests {

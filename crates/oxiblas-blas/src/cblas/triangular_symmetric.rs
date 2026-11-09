@@ -1,8 +1,9 @@
-//! CBLAS-compatible interface for BLAS-TESTER compatibility.
+//! CBLAS-compatible C ABI: triangular and symmetric Level 3 routines.
 //!
-//! This module provides a C-compatible interface that follows the standard
-//! CBLAS specification, enabling interoperability with BLAS test suites
-//! like BLAS-TESTER.
+//! The `extern "C"` entry points in this module follow the semantics of
+//! reference CBLAS for valid calls. Invalid arguments are a silent no-op:
+//! there is no `cblas_xerbla` (see [`crate::cblas`] for the other deviations
+//! from reference CBLAS).
 //!
 //! # Layout
 //!
@@ -18,7 +19,9 @@
 //! [`crate::level3`] (`trsm_in_place`, `trmm_in_place`, `syrk`, `syr2k`,
 //! `symm`) on zero-copy views of the caller's buffers. These are matrix
 //! routines, so there are no strided vectors to gather or scatter. `trsm`
-//! scales B by `alpha` in a scalar loop before the in-place solve.
+//! scales B by `alpha` (one pass over B, skipped for `alpha == 1`) before the
+//! in-place solve; `trmm` passes `alpha` to the native, which folds it into
+//! its kernels. Both natives are sequential, like `cblas_?gemm`.
 
 use super::types::*;
 use super::validate::{
@@ -73,10 +76,11 @@ pub unsafe extern "C" fn cblas_dtrsm(
     ldb: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !trmm_params_valid(layout, side, m, n, lda, ldb) {
         return;
     }
@@ -162,11 +166,15 @@ pub unsafe extern "C" fn cblas_dtrsm(
         return;
     }
 
-    // Scale B by alpha first
-    for j in 0..bn {
-        for i in 0..bm {
-            let bp = b.add(i + j * ldb);
-            *bp *= alpha;
+    // X := alpha·B first. As in reference ?TRSM, alpha == 1 skips this pass
+    // (for real types it would be an exact identity anyway).
+    if alpha != 1.0 {
+        for j in 0..bn {
+            if let Some(col) = b_mut.col_as_slice_mut(j) {
+                for v in col.iter_mut() {
+                    *v *= alpha;
+                }
+            }
         }
     }
 
@@ -231,10 +239,11 @@ pub unsafe extern "C" fn cblas_strsm(
     ldb: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !trmm_params_valid(layout, side, m, n, lda, ldb) {
         return;
     }
@@ -309,10 +318,14 @@ pub unsafe extern "C" fn cblas_strsm(
         return;
     }
 
-    for j in 0..bn {
-        for i in 0..bm {
-            let bp = b.add(i + j * ldb);
-            *bp *= alpha;
+    // X := alpha·B, skipped for alpha == 1 (see `cblas_dtrsm`).
+    if alpha != 1.0 {
+        for j in 0..bn {
+            if let Some(col) = b_mut.col_as_slice_mut(j) {
+                for v in col.iter_mut() {
+                    *v *= alpha;
+                }
+            }
         }
     }
 
@@ -382,10 +395,11 @@ pub unsafe extern "C" fn cblas_dtrmm(
     use crate::level3::{TrmmDiag, TrmmSide, TrmmTrans, TrmmUplo};
 
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !trmm_params_valid(layout, side, m, n, lda, ldb) {
         return;
     }
@@ -513,10 +527,11 @@ pub unsafe extern "C" fn cblas_strmm(
     use crate::level3::{TrmmDiag, TrmmSide, TrmmTrans, TrmmUplo};
 
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !trmm_params_valid(layout, side, m, n, lda, ldb) {
         return;
     }
@@ -645,10 +660,11 @@ pub unsafe extern "C" fn cblas_dsyrk(
     ldc: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if n <= 0 || !syrk_params_valid(layout, trans, n, k, lda, ldc) {
         return;
     }
@@ -744,10 +760,11 @@ pub unsafe extern "C" fn cblas_ssyrk(
     ldc: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if n <= 0 || !syrk_params_valid(layout, trans, n, k, lda, ldc) {
         return;
     }
@@ -853,10 +870,11 @@ pub unsafe extern "C" fn cblas_dsyr2k(
     ldc: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if n <= 0 || !syr2k_params_valid(layout, trans, n, k, lda, ldb, ldc) {
         return;
     }
@@ -968,10 +986,11 @@ pub unsafe extern "C" fn cblas_ssyr2k(
     ldc: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if n <= 0 || !syr2k_params_valid(layout, trans, n, k, lda, ldb, ldc) {
         return;
     }
@@ -1089,10 +1108,11 @@ pub unsafe extern "C" fn cblas_dsymm(
     use crate::level3::{Side, Uplo};
 
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
         return;
     }
@@ -1210,10 +1230,11 @@ pub unsafe extern "C" fn cblas_ssymm(
     use crate::level3::{Side, Uplo};
 
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` below turns a negative `lda`
-    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
-    // making the internal `a.add(row + col * lda)` indexing run out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` below turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the internal `a.add(row + col * lda)` indexing
+    // run out of bounds.
     if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
         return;
     }

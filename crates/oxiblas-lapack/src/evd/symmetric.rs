@@ -33,8 +33,16 @@
 //! let qc = ormtr(&factors, TridiagSide::Left, TridiagTrans::NoTrans, c.as_ref()).unwrap();
 //! ```
 
+use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
+
+use super::sym_kernels::{
+    MatMul, Pipeline, argsort, lower_from_upper, permute_columns, scale_into_safe_range,
+    with_gemm_backend,
+};
+use super::sym_steqr::{Deflation, RotTarget, RotationLog, steqr};
+use super::sym_tridiag::{apply_q, reduce};
 
 /// Error type for symmetric eigendecomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +70,11 @@ impl std::error::Error for SymmetricEvdError {}
 /// Symmetric eigenvalue decomposition.
 ///
 /// Computes A = V·D·V^T where V contains eigenvectors and D is diagonal.
+///
+/// [`compute`](Self::compute) runs on the calling thread. With the `parallel`
+/// feature, `compute_with_par` runs the GEMMs of the tridiagonal reduction
+/// and of the back-transformation with a given [`Par`] and returns bitwise
+/// the same result.
 #[derive(Debug, Clone)]
 pub struct SymmetricEvd<T: Scalar> {
     /// Eigenvalues (sorted in ascending order).
@@ -101,6 +114,26 @@ impl<T: Field + Real + bytemuck::Zeroable> SymmetricEvd<T> {
     /// assert!((eigs[1] - 3.0).abs() < 1e-10);
     /// ```
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, SymmetricEvdError> {
+        Self::compute_impl(a, Par::Seq)
+    }
+
+    /// Same as [`Self::compute`], with the GEMMs of the tridiagonal reduction
+    /// and of the back-transformation run with `par`.
+    ///
+    /// The result is bitwise identical to [`Self::compute`] for every `Par`:
+    /// the parallel GEMM only partitions its output, and every other stage
+    /// runs on the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::compute`].
+    #[cfg(feature = "parallel")]
+    pub fn compute_with_par(a: MatRef<'_, T>, par: Par) -> Result<Self, SymmetricEvdError> {
+        Self::compute_impl(a, par)
+    }
+
+    /// [`Self::compute`] with the GEMMs run with `par`.
+    fn compute_impl(a: MatRef<'_, T>, par: Par) -> Result<Self, SymmetricEvdError> {
         let n = a.nrows();
 
         if n == 0 {
@@ -122,31 +155,24 @@ impl<T: Field + Real + bytemuck::Zeroable> SymmetricEvd<T> {
             });
         }
 
-        // Copy symmetric matrix (use upper triangle)
-        let mut work = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in i..n {
-                let val = a[(i, j)];
-                work[(i, j)] = val;
-                work[(j, i)] = val;
-            }
-        }
-
-        // Initialize eigenvector matrix to identity
-        let mut v = Mat::zeros(n, n);
-        for i in 0..n {
-            v[(i, i)] = T::one();
-        }
-
-        // Tridiagonalize: A = Q * T * Q^T
-        let (diag, off_diag) = tridiagonalize(&mut work, &mut v, n);
-
-        // Apply QR algorithm to tridiagonal matrix
-        let eigenvalues = qr_algorithm(diag, off_diag, &mut v, n, Self::MAX_ITERATIONS)?;
+        // The upper triangle of `a` becomes the lower triangle of the work
+        // matrix, which the reduction overwrites with its reflectors.
+        let mut work = lower_from_upper(a);
+        let mut eigenvalues = Vec::new();
+        let mut eigenvectors = Mat::zeros(n, n);
+        with_gemm_backend(
+            &mut work,
+            &mut eigenvalues,
+            &mut eigenvectors,
+            QrPipeline {
+                max_iter: Self::MAX_ITERATIONS,
+                par,
+            },
+        )?;
 
         Ok(Self {
             eigenvalues,
-            eigenvectors: v,
+            eigenvectors,
             n,
         })
     }
@@ -981,236 +1007,74 @@ fn sign_of_real<T: Field + Real>(x: T) -> T {
     if x >= T::zero() { T::one() } else { -T::one() }
 }
 
-/// Tridiagonalizes a symmetric matrix using Householder reflections.
-/// Returns (diagonal, off-diagonal) vectors.
-fn tridiagonalize<T: Field + Real>(a: &mut Mat<T>, v: &mut Mat<T>, n: usize) -> (Vec<T>, Vec<T>) {
-    let mut diag = vec![T::zero(); n];
-    let mut off_diag = vec![T::zero(); n.saturating_sub(1)];
-
-    for k in 0..(n.saturating_sub(2)) {
-        // Compute Householder vector for column k (rows k+1 to n-1)
-        let mut norm_sq = T::zero();
-        for i in (k + 1)..n {
-            norm_sq = norm_sq + a[(i, k)] * a[(i, k)];
-        }
-        let norm = Real::sqrt(norm_sq);
-
-        if norm > T::zero() {
-            let x_k1 = a[(k + 1, k)];
-            let beta = if x_k1 >= T::zero() { -norm } else { norm };
-
-            // Compute tau
-            let tau = (beta - x_k1) / beta;
-
-            // Scale Householder vector
-            let scale = T::one() / (x_k1 - beta);
-            for i in (k + 2)..n {
-                a[(i, k)] = a[(i, k)] * scale;
-            }
-
-            // Apply Householder from left and right
-            // p = tau * A * v
-            let mut p = vec![T::zero(); n];
-            for i in (k + 1)..n {
-                for j in (k + 1)..n {
-                    let v_j = if j == k + 1 { T::one() } else { a[(j, k)] };
-                    p[i] = p[i] + a[(i, j)] * v_j;
-                }
-                p[i] = tau * p[i];
-            }
-
-            // w = p - (tau/2) * (p^T * v) * v
-            let mut ptv = T::zero();
-            for i in (k + 1)..n {
-                let v_i = if i == k + 1 { T::one() } else { a[(i, k)] };
-                ptv = ptv + p[i] * v_i;
-            }
-            let half_tau = tau / (T::one() + T::one());
-
-            let mut w = vec![T::zero(); n];
-            for i in (k + 1)..n {
-                let v_i = if i == k + 1 { T::one() } else { a[(i, k)] };
-                w[i] = p[i] - half_tau * ptv * v_i;
-            }
-
-            // Update A: A = A - v*w^T - w*v^T
-            for i in (k + 1)..n {
-                let v_i = if i == k + 1 { T::one() } else { a[(i, k)] };
-                for j in (k + 1)..n {
-                    let v_j = if j == k + 1 { T::one() } else { a[(j, k)] };
-                    a[(i, j)] = a[(i, j)] - v_i * w[j] - w[i] * v_j;
-                }
-            }
-
-            // Update V: V = V * (I - tau * v * v^T)
-            for i in 0..n {
-                let mut vv = T::zero();
-                for j in (k + 1)..n {
-                    let v_j = if j == k + 1 { T::one() } else { a[(j, k)] };
-                    vv = vv + v[(i, j)] * v_j;
-                }
-                let tau_vv = tau * vv;
-                for j in (k + 1)..n {
-                    let v_j = if j == k + 1 { T::one() } else { a[(j, k)] };
-                    v[(i, j)] = v[(i, j)] - tau_vv * v_j;
-                }
-            }
-
-            // Store off-diagonal element
-            off_diag[k] = beta;
-        }
-    }
-
-    // Extract diagonal and remaining off-diagonal
-    for i in 0..n {
-        diag[i] = a[(i, i)];
-    }
-    if n >= 2 {
-        off_diag[n - 2] = a[(n - 1, n - 2)];
-    }
-
-    (diag, off_diag)
-}
-
-/// QR algorithm for symmetric tridiagonal matrices.
-fn qr_algorithm<T: Field + Real>(
-    mut diag: Vec<T>,
-    mut off_diag: Vec<T>,
-    v: &mut Mat<T>,
-    n: usize,
+/// Tridiagonal reduction, implicit QR on the tridiagonal, eigenvector
+/// assembly (LAPACK `DSTEQR` with `COMPZ = 'I'` followed by `DORMTR`).
+///
+/// The rotations are accumulated into the identity rather than into an
+/// explicitly formed `Q`: the batched application then skips the rows each
+/// column has not filled in yet, and the final `Q·Z` is GEMM-rich.
+#[derive(Debug, Clone, Copy)]
+struct QrPipeline {
+    /// Iteration limit per row of the QR iteration.
     max_iter: usize,
-) -> Result<Vec<T>, SymmetricEvdError> {
-    if n <= 1 {
-        return Ok(diag);
-    }
-
-    let eps = <T as Scalar>::epsilon() * T::from_f64(100.0).unwrap_or(T::one());
-
-    // QR iterations with implicit shifts
-    let mut m = n - 1;
-    let mut iter = 0;
-
-    while m > 0 && iter < max_iter * n {
-        iter += 1;
-
-        // Find largest m such that off_diag[m-1] is not negligible
-        let mut l = m;
-        while l > 0 {
-            let test = Scalar::abs(diag[l - 1]) + Scalar::abs(diag[l]);
-            if Scalar::abs(off_diag[l - 1]) <= eps * test {
-                off_diag[l - 1] = T::zero();
-                break;
-            }
-            l -= 1;
-        }
-
-        if l == m {
-            // Eigenvalue found
-            m -= 1;
-            continue;
-        }
-
-        // Wilkinson shift
-        let d = (diag[m - 1] - diag[m]) / (T::one() + T::one());
-        let e = off_diag[m - 1];
-        let mu = diag[m] - e * e / (d + Real::signum(d) * Real::hypot(d, e));
-
-        // Implicit QR step
-        let mut x = diag[l] - mu;
-        let mut z = off_diag[l];
-
-        for k in l..m {
-            // Givens rotation to annihilate z
-            let (c, s) = givens_rotation(x, z);
-
-            if k > l {
-                // The off-diagonal element is r = c*x - s*z from the Givens rotation
-                // Using hypot loses the sign, which affects eigenvectors (not eigenvalues)
-                off_diag[k - 1] = c * x - s * z;
-            }
-
-            // Update tridiagonal matrix
-            let d1 = diag[k];
-            let d2 = diag[k + 1];
-            let e = off_diag[k];
-
-            diag[k] = c * c * d1 + s * s * d2 - (c + c) * s * e;
-            diag[k + 1] = s * s * d1 + c * c * d2 + (c + c) * s * e;
-            off_diag[k] = c * s * (d1 - d2) + (c * c - s * s) * e;
-
-            if k < m - 1 {
-                x = off_diag[k];
-                z = -s * off_diag[k + 1];
-                off_diag[k + 1] = c * off_diag[k + 1];
-            }
-
-            // Update eigenvectors
-            for i in 0..n {
-                let t1 = v[(i, k)];
-                let t2 = v[(i, k + 1)];
-                v[(i, k)] = c * t1 - s * t2;
-                v[(i, k + 1)] = s * t1 + c * t2;
-            }
-        }
-    }
-
-    if iter >= max_iter * n {
-        return Err(SymmetricEvdError::NotConverged);
-    }
-
-    // Sort eigenvalues and eigenvectors
-    sort_eigenvalues(&mut diag, v, n);
-
-    Ok(diag)
+    /// Parallelism of the GEMMs.
+    par: Par,
 }
 
-/// Computes Givens rotation coefficients for implicit QR.
-///
-/// Returns (c, s) such that:
-///   [[c, -s], [s, c]] * [a; b] = [r; 0]
-/// i.e., G^T * [a; b] = [r; 0] where G = [[c, s], [-s, c]]
-///
-/// This means: c*a - s*b = r, s*a + c*b = 0
-/// So: s/c = -b/a, meaning c = a/r, s = -b/r (up to sign of r)
-fn givens_rotation<T: Field + Real>(a: T, b: T) -> (T, T) {
-    if b == T::zero() {
-        (T::one(), T::zero())
-    } else if Scalar::abs(b) > Scalar::abs(a) {
-        let t = -a / b;
-        let s = T::one() / Real::sqrt(T::one() + t * t);
-        (s * t, s)
-    } else {
-        let t = -b / a;
-        let c = T::one() / Real::sqrt(T::one() + t * t);
-        (c, c * t)
-    }
-}
+impl Pipeline for QrPipeline {
+    type Output = Result<(), SymmetricEvdError>;
 
-/// Sorts eigenvalues in ascending order and rearranges eigenvectors accordingly.
-fn sort_eigenvalues<T: Field + Real>(eigenvalues: &mut [T], v: &mut Mat<T>, n: usize) {
-    // Simple insertion sort (stable and efficient for small n)
-    for i in 1..n {
-        let key = eigenvalues[i];
-        // Save the eigenvector column for the key eigenvalue
-        let mut key_vec = vec![T::zero(); n];
-        for row in 0..n {
-            key_vec[row] = v[(row, i)];
+    fn run<T, G>(self, work: &mut Mat<T>, values: &mut Vec<T>, vectors: &mut Mat<T>) -> Self::Output
+    where
+        T: Field + Real + bytemuck::Zeroable,
+        G: MatMul<T>,
+    {
+        let n = work.nrows();
+        let sigma = scale_into_safe_range(work);
+        let tri = reduce::<T, G>(work, self.par);
+        let mut d = tri.d;
+        let mut e = tri.e;
+        for i in 0..n {
+            vectors[(i, i)] = T::one();
         }
 
-        let mut j = i;
-        while j > 0 && eigenvalues[j - 1] > key {
-            eigenvalues[j] = eigenvalues[j - 1];
-            // Move eigenvector column j-1 to position j
-            for row in 0..n {
-                v[(row, j)] = v[(row, j - 1)];
-            }
-            j -= 1;
-        }
-        eigenvalues[j] = key;
-        // Place the saved eigenvector at the correct position
-        for row in 0..n {
-            v[(row, j)] = key_vec[row];
-        }
+        let ld = vectors.row_stride();
+        let mut log = RotationLog::new();
+        let target = RotTarget {
+            data: vectors.raw_data_mut(),
+            off: 0,
+            ld,
+            nrows: n,
+            identity: true,
+        };
+        steqr(
+            &mut d,
+            &mut e,
+            Some(target),
+            self.max_iter,
+            Deflation::Relaxed,
+            &mut log,
+        )
+        .map_err(|_| SymmetricEvdError::NotConverged)?;
+
+        // Ascending order: sort indices, then one in-place column permutation.
+        let mut perm = Vec::with_capacity(n);
+        argsort(&d, &mut perm);
+        values.clear();
+        values.extend(perm.iter().map(|&p| d[p] / sigma));
+        let (mut saved, mut visited) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        permute_columns(
+            vectors.raw_data_mut(),
+            0,
+            ld,
+            n,
+            &perm,
+            &mut saved,
+            &mut visited,
+        );
+
+        apply_q::<T, G>(work, &tri.tau, vectors, self.par);
+        Ok(())
     }
 }
 
@@ -1799,6 +1663,78 @@ mod tests {
                         sum,
                         a[(i, j)],
                         uplo
+                    );
+                }
+            }
+        }
+    }
+
+    /// The generic (plain-loop) pipeline used for scalar types without a GEMM
+    /// kernel agrees with the GEMM pipeline, including the blocked paths.
+    #[test]
+    fn test_generic_pipeline_matches_gemm_pipeline() {
+        use super::super::sym_kernels::{BlasMatMul, NaiveMatMul, lower_from_upper};
+
+        for (idx, &n) in [2usize, 9, 70, 190].iter().enumerate() {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ (idx as u64 + 1);
+            let mut a = Mat::zeros(n, n);
+            for j in 0..n {
+                for i in 0..=j {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let v = ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
+                    a[(i, j)] = v;
+                    a[(j, i)] = v;
+                }
+            }
+            let run = |naive: bool| {
+                let mut work = lower_from_upper(a.as_ref());
+                let mut vals = Vec::new();
+                let mut vecs = Mat::zeros(n, n);
+                let p = QrPipeline {
+                    max_iter: 100,
+                    par: Par::Seq,
+                };
+                let r = if naive {
+                    p.run::<f64, NaiveMatMul>(&mut work, &mut vals, &mut vecs)
+                } else {
+                    p.run::<f64, BlasMatMul>(&mut work, &mut vals, &mut vecs)
+                };
+                r.unwrap();
+                (vals, vecs)
+            };
+            let (v_blas, z_blas) = run(false);
+            let (v_gen, z_gen) = run(true);
+            let scale = v_blas.iter().fold(1.0f64, |m, &x| m.max(x.abs()));
+            for i in 0..n {
+                assert!(
+                    approx_eq(v_blas[i], v_gen[i], 1e-12 * scale),
+                    "n={}: eigenvalue {} differs: {} vs {}",
+                    n,
+                    i,
+                    v_blas[i],
+                    v_gen[i]
+                );
+                let dot: f64 = (0..n).map(|r| z_blas[(r, i)] * z_gen[(r, i)]).sum();
+                assert!(
+                    approx_eq(dot.abs(), 1.0, 1e-10),
+                    "n={}: eigenvector {} differs (|dot| = {})",
+                    n,
+                    i,
+                    dot
+                );
+            }
+            // Residual of the generic result.
+            for col in 0..n {
+                for row in 0..n {
+                    let av: f64 = (0..n).map(|k| a[(row, k)] * z_gen[(k, col)]).sum();
+                    assert!(
+                        approx_eq(av, v_gen[col] * z_gen[(row, col)], 1e-11 * scale),
+                        "n={}: residual at ({}, {})",
+                        n,
+                        row,
+                        col
                     );
                 }
             }

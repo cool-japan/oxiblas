@@ -215,7 +215,7 @@ pub fn split_to_interleaved<T: InterleavedComplex>(
 pub fn interleaved_to_split<T: InterleavedComplex>(
     interleaved: &[T],
 ) -> Result<(Vec<T>, Vec<T>), InterleavedComplexError> {
-    if interleaved.len() % 2 != 0 {
+    if !interleaved.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength {
             len: interleaved.len(),
         });
@@ -337,7 +337,7 @@ pub fn complex_to_interleaved_f32(complex: &[Complex32]) -> Vec<f32> {
 pub fn interleaved_to_complex_f64(
     interleaved: &[f64],
 ) -> Result<Vec<Complex64>, InterleavedComplexError> {
-    if interleaved.len() % 2 != 0 {
+    if !interleaved.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength {
             len: interleaved.len(),
         });
@@ -374,7 +374,7 @@ pub fn interleaved_to_complex_f64(
 pub fn interleaved_to_complex_f32(
     interleaved: &[f32],
 ) -> Result<Vec<Complex32>, InterleavedComplexError> {
-    if interleaved.len() % 2 != 0 {
+    if !interleaved.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength {
             len: interleaved.len(),
         });
@@ -486,7 +486,7 @@ fn permute_in_place<T: Copy>(data: &mut [T], dest: impl Fn(usize) -> usize) {
 pub fn interleaved_to_split_inplace<T: InterleavedComplex>(
     data: &mut [T],
 ) -> Result<(), InterleavedComplexError> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: data.len() });
     }
 
@@ -520,7 +520,7 @@ pub fn interleaved_to_split_inplace<T: InterleavedComplex>(
 pub fn split_to_interleaved_inplace<T: InterleavedComplex>(
     data: &mut [T],
 ) -> Result<(), InterleavedComplexError> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: data.len() });
     }
 
@@ -560,7 +560,7 @@ pub fn split_to_interleaved_inplace<T: InterleavedComplex>(
 /// different lengths.
 #[inline]
 pub fn dotc_interleaved_f64(x: &[f64], y: &[f64]) -> Result<(f64, f64), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
     if x.len() != y.len() {
@@ -646,7 +646,7 @@ pub fn dotc_interleaved_f64(x: &[f64], y: &[f64]) -> Result<(f64, f64), Interlea
 /// different lengths.
 #[inline]
 pub fn dotc_interleaved_f32(x: &[f32], y: &[f32]) -> Result<(f32, f32), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
     if x.len() != y.len() {
@@ -739,7 +739,7 @@ pub fn axpy_interleaved_f64(
     x: &[f64],
     y: &mut [f64],
 ) -> Result<(), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
     if x.len() != y.len() {
@@ -816,7 +816,7 @@ pub fn axpy_interleaved_f32(
     x: &[f32],
     y: &mut [f32],
 ) -> Result<(), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
     if x.len() != y.len() {
@@ -886,7 +886,7 @@ pub fn scal_interleaved_f64(
     alpha_im: f64,
     x: &mut [f64],
 ) -> Result<(), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
 
@@ -950,7 +950,7 @@ pub fn scal_interleaved_f32(
     alpha_im: f32,
     x: &mut [f32],
 ) -> Result<(), InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
 
@@ -1014,7 +1014,7 @@ pub fn scal_interleaved_f32(
 /// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
 #[inline]
 pub fn nrm2_interleaved_f64(x: &[f64]) -> Result<f64, InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
 
@@ -1031,7 +1031,7 @@ pub fn nrm2_interleaved_f64(x: &[f64]) -> Result<f64, InterleavedComplexError> {
 /// Returns [`InterleavedComplexError::OddLength`] if `x.len()` is odd.
 #[inline]
 pub fn nrm2_interleaved_f32(x: &[f32]) -> Result<f32, InterleavedComplexError> {
-    if x.len() % 2 != 0 {
+    if !x.len().is_multiple_of(2) {
         return Err(InterleavedComplexError::OddLength { len: x.len() });
     }
 

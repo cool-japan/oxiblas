@@ -125,7 +125,21 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or setup fails.
+    /// Returns error if matrix is not square or setup fails, in particular
+    /// [`PreconditionerError::ZeroDiagonal`] when a diagonal entry of the
+    /// matrix of some level (the input or a Galerkin coarse-grid operator) is
+    /// missing or exactly zero, since the Jacobi smoothers divide by it, and
+    /// [`PreconditionerError::MatrixConstruction`] if an internally built
+    /// prolongator, restriction or coarse-grid operator is not a valid CSR
+    /// matrix (an internal invariant violation; it is reported instead of
+    /// being replaced by a zero operator).
+    ///
+    /// The setup is scale-invariant: the strength of connection
+    /// `|a_ij|² >= θ²·|a_ii|·|a_jj|` and the smoothed prolongator
+    /// `(I − ω·D⁻¹A)·P` do not change when `A` is scaled, and only exact zero
+    /// diagonals are rejected. So `s·A` builds whenever `A` does, with the
+    /// same hierarchy, and its preconditioner is exactly `1/s` times that of
+    /// `A` for a power-of-two `s`.
     pub fn new(a: &CsrMatrix<T>, config: SAMGConfig<T>) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -195,7 +209,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             }
 
             // Build tentative prolongator
-            let p_tent = Self::build_tentative_prolongator(&aggregates, n, num_aggregates);
+            let p_tent = Self::build_tentative_prolongator(&aggregates, n, num_aggregates)?;
 
             // Smooth the prolongator: P = (I - omega * D^{-1} * A) * P_tent
             let mut prolongation = p_tent;
@@ -205,15 +219,15 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
                     &diag_inv,
                     &prolongation,
                     config.prolongation_omega.clone(),
-                );
+                )?;
             }
 
             // Build restriction (transpose of prolongation)
-            let restriction = Self::transpose_csr(&prolongation);
+            let restriction = Self::transpose_csr(&prolongation)?;
 
             // Build coarse grid operator: A_c = R * A * P = P^T * A * P
-            let ap = Self::spmm_csr(&current_matrix, &prolongation);
-            let coarse_matrix = Self::spmm_csr(&restriction, &ap);
+            let ap = Self::spmm_csr(&current_matrix, &prolongation)?;
+            let coarse_matrix = Self::spmm_csr(&restriction, &ap)?;
 
             levels.push(SAMGLevel {
                 matrix: current_matrix,
@@ -235,6 +249,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
     }
 
     /// Compute inverse of diagonal elements.
+    ///
+    /// Only a missing or exactly zero diagonal entry is an error (scale-free).
     fn compute_diag_inv(a: &CsrMatrix<T>) -> Result<Vec<T>, PreconditionerError> {
         let n = a.nrows();
         let mut diag_inv = vec![T::zero(); n];
@@ -247,7 +263,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let val = a.values()[k].clone();
-                    if Scalar::abs(val.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     diag_inv[i] = T::one() / val;
@@ -412,7 +428,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
         aggregates: &[AggregateState],
         n_fine: usize,
         n_coarse: usize,
-    ) -> CsrMatrix<T> {
+    ) -> Result<CsrMatrix<T>, PreconditionerError> {
         let mut row_ptrs = vec![0usize; n_fine + 1];
         let mut col_indices = Vec::with_capacity(n_fine);
         let mut values = Vec::with_capacity(n_fine);
@@ -425,9 +441,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             row_ptrs[i + 1] = col_indices.len();
         }
 
-        CsrMatrix::new(n_fine, n_coarse, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(n_fine, n_coarse, vec![0; n_fine + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(n_fine, n_coarse, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "SA-AMG tentative prolongator construction failed: {e}"
+            ))
         })
     }
 
@@ -438,12 +455,12 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
         diag_inv: &[T],
         p: &CsrMatrix<T>,
         omega: T,
-    ) -> CsrMatrix<T> {
+    ) -> Result<CsrMatrix<T>, PreconditionerError> {
         let n_fine = a.nrows();
         let n_coarse = p.ncols();
 
         // Compute A * P
-        let ap = Self::spmm_csr(a, p);
+        let ap = Self::spmm_csr(a, p)?;
 
         // Build P_new = P - omega * D^{-1} * (A * P)
         // This is done row by row
@@ -486,7 +503,11 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             sorted.sort_by_key(|(c, _)| *c);
 
             for (c, v) in sorted {
-                // Only keep non-tiny entries
+                // Only keep non-tiny entries. Prolongator entries are
+                // dimensionless (P is built from 0/1 aggregates and D⁻¹A does
+                // not change when A is scaled), so this fixed threshold is
+                // relative to the unit entries of the tentative prolongator
+                // and keeps the setup scale-invariant.
                 if Scalar::abs(v.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
                     all_col_indices.push(c);
                     all_values.push(v);
@@ -495,16 +516,15 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             row_ptrs[i + 1] = all_col_indices.len();
         }
 
-        CsrMatrix::new(n_fine, n_coarse, row_ptrs, all_col_indices, all_values).unwrap_or_else(
-            |_| {
-                CsrMatrix::new(n_fine, n_coarse, vec![0; n_fine + 1], vec![], vec![])
-                    .expect("CSR matrix construction with valid parameters")
-            },
-        )
+        CsrMatrix::new(n_fine, n_coarse, row_ptrs, all_col_indices, all_values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "SA-AMG smoothed prolongator construction failed: {e}"
+            ))
+        })
     }
 
     /// Transpose a CSR matrix.
-    fn transpose_csr(a: &CsrMatrix<T>) -> CsrMatrix<T> {
+    fn transpose_csr(a: &CsrMatrix<T>) -> Result<CsrMatrix<T>, PreconditionerError> {
         let nrows = a.nrows();
         let ncols = a.ncols();
 
@@ -539,20 +559,21 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             }
         }
 
-        CsrMatrix::new(ncols, nrows, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(ncols, nrows, vec![0; ncols + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(ncols, nrows, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "SA-AMG restriction operator (transpose) construction failed: {e}"
+            ))
         })
     }
 
     /// Sparse matrix-matrix multiplication: C = A * B
-    fn spmm_csr(a: &CsrMatrix<T>, b: &CsrMatrix<T>) -> CsrMatrix<T> {
+    fn spmm_csr(a: &CsrMatrix<T>, b: &CsrMatrix<T>) -> Result<CsrMatrix<T>, PreconditionerError> {
         let m = a.nrows();
         let n = b.ncols();
 
         if n == 0 || m == 0 {
-            return CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters");
+            // The empty product: `zeros` cannot fail.
+            return Ok(CsrMatrix::zeros(m, n));
         }
 
         let mut row_ptrs = vec![0usize; m + 1];
@@ -607,9 +628,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
             row_ptrs[i + 1] = col_indices.len();
         }
 
-        CsrMatrix::new(m, n, row_ptrs, col_indices, values).unwrap_or_else(|_| {
-            CsrMatrix::new(m, n, vec![0; m + 1], vec![], vec![])
-                .expect("CSR matrix construction with valid parameters")
+        CsrMatrix::new(m, n, row_ptrs, col_indices, values).map_err(|e| {
+            PreconditionerError::MatrixConstruction(format!(
+                "SA-AMG Galerkin coarse-grid operator construction failed: {e}"
+            ))
         })
     }
 
@@ -883,5 +905,50 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SAMG<T> {
         } else {
             1.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The internal builders return their operators (no fallback, no panic),
+    /// and the product with an empty dimension is the empty matrix.
+    #[test]
+    fn test_builders_return_valid_operators() {
+        // A = [[2, -1, 0], [-1, 2, -1], [0, -1, 2]], aggregates {0, 1}, {2}.
+        let a = CsrMatrix::new(
+            3,
+            3,
+            vec![0, 2, 5, 7],
+            vec![0, 1, 0, 1, 2, 1, 2],
+            vec![2.0, -1.0, -1.0, 2.0, -1.0, -1.0, 2.0],
+        )
+        .expect("valid test matrix");
+        let aggregates = [
+            AggregateState::Assigned(0),
+            AggregateState::Assigned(0),
+            AggregateState::Assigned(1),
+        ];
+        let p = SAMG::<f64>::build_tentative_prolongator(&aggregates, 3, 2)
+            .expect("tentative prolongator");
+        assert_eq!(p.shape(), (3, 2));
+        assert_eq!(p.col_indices(), &[0, 0, 1]);
+
+        let diag_inv = vec![0.5; 3];
+        let smoothed =
+            SAMG::smooth_prolongator(&a, &diag_inv, &p, 0.5).expect("smoothed prolongator");
+        assert_eq!(smoothed.shape(), (3, 2));
+
+        let r = SAMG::transpose_csr(&smoothed).expect("restriction");
+        assert_eq!(r.shape(), (2, 3));
+        let ap = SAMG::spmm_csr(&a, &smoothed).expect("A P");
+        let coarse = SAMG::spmm_csr(&r, &ap).expect("R A P");
+        assert_eq!(coarse.shape(), (2, 2));
+
+        let empty = CsrMatrix::<f64>::zeros(3, 0);
+        let product = SAMG::spmm_csr(&a, &empty).expect("empty product");
+        assert_eq!(product.shape(), (3, 0));
+        assert_eq!(product.nnz(), 0);
     }
 }

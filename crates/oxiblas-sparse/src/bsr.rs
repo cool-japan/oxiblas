@@ -396,7 +396,17 @@ impl<T: Scalar + Clone> BsrMatrix<T> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure all invariants hold.
+    /// The caller must ensure the invariants that [`BsrMatrix::new`] checks,
+    /// with `mb = nrows.div_ceil(block_rows)` and
+    /// `nb = ncols.div_ceil(block_cols)`:
+    /// - `block_rows > 0` and `block_cols > 0`
+    /// - `indptr.len() == mb + 1`, `indptr` never decreases and
+    ///   `indptr[mb] == data.len()`
+    /// - `indices.len() == data.len()` and every block column index is `< nb`
+    /// - every block in `data` is `block_rows x block_cols`
+    ///
+    /// A block row may list the same block column more than once; such
+    /// blocks are summed (by `matvec` and by the conversions).
     #[inline]
     pub unsafe fn new_unchecked(
         nrows: usize,
@@ -705,6 +715,11 @@ impl<T: Scalar + Clone> BsrMatrix<T> {
     }
 
     /// Converts to CSR format.
+    ///
+    /// Entries whose magnitude is at most `T::epsilon()` are dropped. A block
+    /// row that lists the same block column more than once (which
+    /// [`BsrMatrix::new`] accepts, and `matvec` treats as a sum) yields single
+    /// CSR entries holding the sums. The CSR rows are sorted by column.
     pub fn to_csr(&self) -> crate::csr::CsrMatrix<T>
     where
         T: Field,
@@ -714,6 +729,7 @@ impl<T: Scalar + Clone> BsrMatrix<T> {
         let mut row_ptrs = vec![0usize; self.nrows + 1];
         let mut col_indices = Vec::new();
         let mut values = Vec::new();
+        let mut row_entries: Vec<(usize, T)> = Vec::new();
 
         for row in 0..self.nrows {
             let bi = row / self.block_rows;
@@ -721,8 +737,6 @@ impl<T: Scalar + Clone> BsrMatrix<T> {
 
             let block_start = self.indptr[bi];
             let block_end = self.indptr[bi + 1];
-
-            let mut row_entries: Vec<(usize, T)> = Vec::new();
 
             for k in block_start..block_end {
                 let bj = self.indices[k];
@@ -739,17 +753,16 @@ impl<T: Scalar + Clone> BsrMatrix<T> {
                 }
             }
 
-            // Sort by column
-            row_entries.sort_by_key(|(col, _)| *col);
-
-            for (col, val) in row_entries {
-                col_indices.push(col);
-                values.push(val);
-            }
+            // Sort by column, summing repeated columns.
+            crate::csr::push_summed_run(&mut row_entries, &mut col_indices, &mut values);
             row_ptrs[row + 1] = values.len();
         }
 
-        // Safety: we constructed valid CSR data
+        // SAFETY: `row_ptrs` starts as `nrows + 1` zeros and `row_ptrs[row +
+        // 1]` is set to the running `values.len()` after each row, so it starts
+        // at 0, never decreases and ends at nnz. Columns and values are pushed
+        // together; every column is checked `< ncols` above; `push_summed_run`
+        // makes each row strictly ascending, so no row repeats a column.
         unsafe {
             crate::csr::CsrMatrix::new_unchecked(
                 self.nrows,
@@ -1272,5 +1285,24 @@ mod tests {
 
         *block.get_mut(1, 1) = 10.0;
         assert_eq!(*block.get(1, 1), 10.0);
+    }
+
+    /// Regression: `BsrMatrix::new` accepts a block row that lists one block
+    /// column twice (which `matvec` treats as a sum), and `to_csr` used to copy
+    /// both blocks' entries into the CSR via `new_unchecked`, violating its
+    /// no-duplicate contract.
+    #[test]
+    fn test_bsr_to_csr_sums_duplicate_blocks() {
+        let b1 = DenseBlock::new(1, 2, vec![1.0f64, 2.0]);
+        let b2 = DenseBlock::new(1, 2, vec![10.0, 0.0]);
+        // 1x4 matrix, 1x2 blocks: block column 1 listed twice in block row 0.
+        let bsr = BsrMatrix::new(1, 4, 1, 2, vec![0, 2], vec![1, 1], vec![b1, b2]).expect("valid");
+
+        let csr = bsr.to_csr();
+        crate::csr::assert_valid_csr(&csr);
+        assert_eq!(csr.get(0, 2), Some(&11.0));
+        assert_eq!(csr.get(0, 3), Some(&2.0));
+        assert_eq!(csr.nnz(), 2);
+        assert_eq!(bsr.mul_vec(&[1.0, 1.0, 1.0, 1.0]), vec![13.0]);
     }
 }

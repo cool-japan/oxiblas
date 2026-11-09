@@ -37,6 +37,7 @@ use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
 use super::hessenberg::{Side, Trans};
+use super::schur::ladiv;
 
 /// Error type for complex Hessenberg reduction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,7 +643,7 @@ where
 }
 
 /// Computes the complex Householder vector for zeroing elements.
-/// Returns (v, tau) where P = I - tau * v * v^H zeros x[1:] and v[0] = 1 (LAPACK convention).
+/// Returns (v, tau) where P = I - tau * v * v^H zeros `x[1:]` and `v[0]` = 1 (LAPACK convention).
 fn complex_householder_vector<T: Field + ComplexScalar>(x: &[T]) -> (Vec<T>, T)
 where
     T::Real: Real,
@@ -652,22 +653,25 @@ where
         return (Vec::new(), T::zero());
     }
 
-    // Compute ||x||
-    let mut norm_sq = T::Real::zero();
-    for i in 0..n {
-        norm_sq = norm_sq + x[i].abs_sq();
+    // Compute ||x|| without destructive underflow/overflow. Every test below
+    // is against exact zero: an absolute threshold such as `epsilon` would
+    // skip (or mis-phase) the reflection of a column that is merely small in
+    // magnitude, breaking the similarity A = Q H Q^H for small-norm inputs.
+    let mut norm = T::Real::zero();
+    for xi in x {
+        norm = <T::Real as Real>::hypot(norm, xi.abs());
     }
-    let norm = <T::Real as Real>::sqrt(norm_sq);
 
-    if norm < T::Real::epsilon() {
+    if norm == T::Real::zero() {
         return (vec![T::zero(); n], T::zero());
     }
 
     let x0 = x[0];
     let x0_abs = x0.abs();
 
-    // Compute alpha = -sign(x0) * ||x||
-    let alpha = if x0_abs > T::Real::epsilon() {
+    // Compute alpha = -sign(x0) * ||x||, where sign(x0) = x0 / |x0| keeps tau
+    // real so that P = I - tau * v * v^H is Hermitian and unitary.
+    let alpha = if x0_abs > T::Real::zero() {
         let sign = T::from_real_imag(x0.real() / x0_abs, x0.imag() / x0_abs);
         T::zero() - sign * T::from_real(norm)
     } else {
@@ -678,18 +682,25 @@ where
     // v = [1, x[1:]/(x0 - alpha)]
     let v0_unscaled = x0 - alpha;
 
-    if v0_unscaled.abs() < T::Real::epsilon() {
+    if v0_unscaled.abs() == T::Real::zero() {
         return (vec![T::zero(); n], T::zero());
     }
+
+    // Smith's division: the textbook complex quotient forms |divisor|^2,
+    // which underflows to zero (and yields NaN) for a tiny but non-zero column.
+    let divide = |num: T, den: T| -> T {
+        let (re, im) = ladiv(num.real(), num.imag(), den.real(), den.imag());
+        T::from_real_imag(re, im)
+    };
 
     let mut v: Vec<T> = vec![T::zero(); n];
     v[0] = T::one();
     for i in 1..n {
-        v[i] = x[i] / v0_unscaled;
+        v[i] = divide(x[i], v0_unscaled);
     }
 
     // tau = (alpha - x0) / alpha = -v0_unscaled / alpha
-    let tau = (T::zero() - v0_unscaled) / alpha;
+    let tau = divide(T::zero() - v0_unscaled, alpha);
 
     (v, tau)
 }

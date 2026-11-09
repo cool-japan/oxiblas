@@ -3,7 +3,8 @@
 //! For Hermitian positive definite complex matrices, computes L such that A = LL^H,
 //! where L is lower triangular and L^H is the conjugate transpose of L.
 
-use num_traits::{FromPrimitive, One, Zero};
+use crate::lu::tolerance::llt_pivot_tolerances;
+use num_traits::{One, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -56,6 +57,11 @@ impl std::error::Error for HermitianCholeskyError {}
 ///
 /// For a Hermitian positive definite matrix A, computes L such that A = LL^H,
 /// where L is lower triangular with positive real diagonal entries.
+///
+/// [`HermitianCholeskyError::NotPositiveDefinite`] is reported when the
+/// radicand `Re(a_jj) - Σ |l_jk|²` of column `j` is at or below
+/// `eps · n · Re(a_jj)`, the real part of the original diagonal entry (a NaN,
+/// infinite or negative one counts as 0); a NaN radicand propagates.
 #[derive(Clone, Debug)]
 pub struct HermitianCholesky<T: Scalar> {
     /// The L factor (lower triangular).
@@ -99,6 +105,10 @@ where
 
         let mut l: Mat<T> = Mat::zeros(n, n);
 
+        // Per-column positive-definiteness thresholds `eps · n · Re(a_jj)`,
+        // from the finite diagonal entries of A.
+        let col_tol = llt_pivot_tolerances(a);
+
         // Cholesky-Banachiewicz algorithm for Hermitian matrices
         // For A = LL^H:
         //   L[j,j] = sqrt(A[j,j] - sum_k |L[j,k]|^2)  (diagonal is real and positive)
@@ -115,10 +125,8 @@ where
             let a_jj_real = a[(j, j)].real();
             let diag_val = a_jj_real - sum_diag;
 
-            // Check for positive definiteness
-            let tol = <T::Real as Scalar>::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if diag_val <= tol {
+            // Check for positive definiteness (a NaN radicand propagates)
+            if diag_val <= col_tol[j] {
                 return Err(HermitianCholeskyError::NotPositiveDefinite { index: j });
             }
 

@@ -28,8 +28,27 @@ use oxiblas_core::scalar::Field;
 /// let result = dot(&x, &y);
 /// assert!((result - 32.0).abs() < 1e-10);
 /// ```
+///
+/// On aarch64, `f64` and `f32` vectors run on the NEON kernels behind
+/// [`dot_f64`] / [`dot_f32`] (unless the `force-scalar` feature is enabled);
+/// other element types and targets use the portable loop below.
 pub fn dot<T: Field>(x: &[T], y: &[T]) -> T {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use super::typed::{same_slice, same_value};
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f64>(x), same_slice::<T, f64>(y))
+            && let Some(r) = same_value::<f64, T>(super::dot_neon::dot_f64(xs, ys))
+        {
+            return r;
+        }
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f32>(x), same_slice::<T, f32>(y))
+            && let Some(r) = same_value::<f32, T>(super::dot_neon::dot_f32(xs, ys))
+        {
+            return r;
+        }
+    }
 
     let n = x.len();
     if n == 0 {
@@ -86,12 +105,29 @@ pub fn dotc<T: Field>(x: &[T], y: &[T]) -> T {
 /// SIMD-optimized dot product for f64.
 ///
 /// Uses NEON FMA on aarch64 and AVX2/FMA on `x86_64` for performance.
-/// For very large vectors, uses blocked accumulation for better cache utilization.
+/// On aarch64 a single 8-accumulator kernel serves every length (its two-level
+/// summation bounds error growth on long vectors); elsewhere very large vectors
+/// use blocked accumulation.
 #[inline]
 #[must_use]
 pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dot_neon::dot_f64(x, y)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f64_portable(x, y)
+    }
+}
+
+/// [`dot_f64`] on targets other than aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f64_portable(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
     if n == 0 {
         return 0.0;
@@ -104,25 +140,17 @@ pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
 
     // For medium vectors, use SIMD directly
     if n < 8192 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return unsafe { dot_f64_neon(x, y) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal).
                 return unsafe { dot_f64_avx2(x, y) };
             }
         }
     }
 
     // For large vectors, use blocked approach for better cache efficiency
-    #[cfg(target_arch = "aarch64")]
-    {
-        return dot_f64_blocked(x, y);
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -149,6 +177,21 @@ pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dot_neon::dot_f32(x, y)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f32_portable(x, y)
+    }
+}
+
+/// [`dot_f32`] on targets other than aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f32_portable(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
     if n == 0 {
         return 0.0;
@@ -161,25 +204,17 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
 
     // For medium vectors, use SIMD directly
     if n < 8192 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return unsafe { dot_f32_neon(x, y) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal).
                 return unsafe { dot_f32_avx2(x, y) };
             }
         }
     }
 
     // For large vectors, use blocked approach
-    #[cfg(target_arch = "aarch64")]
-    {
-        return dot_f32_blocked(x, y);
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -198,7 +233,8 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     dot_f32_scalar(x, y)
 }
 
-/// Scalar dot product for f64 with 8-way unrolling.
+/// Scalar dot product for f64, unrolled 4-way into four FMA accumulators.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_f64_scalar(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
@@ -227,7 +263,8 @@ fn dot_f64_scalar(x: &[f64], y: &[f64]) -> f64 {
     (acc0 + acc1) + (acc2 + acc3)
 }
 
-/// Scalar dot product for f32 with 8-way unrolling.
+/// Scalar dot product for f32, unrolled 4-way into four FMA accumulators.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
@@ -259,6 +296,7 @@ fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 /// Blocked dot product for f64 (better cache efficiency for large vectors).
 ///
 /// Processes the vector in blocks that fit well in L1/L2 cache.
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
     const BLOCK_SIZE: usize = 1024; // ~8KB per vector block, fits in L1 cache
 
@@ -271,21 +309,18 @@ fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
         let start = block * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(n);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            total += unsafe { dot_f64_neon(&x[start..end], &y[start..end]) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only the two equal-length block slices.
                 total += unsafe { dot_f64_avx2(&x[start..end], &y[start..end]) };
             } else {
                 total += dot_f64_scalar(&x[start..end], &y[start..end]);
             }
         }
 
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         {
             total += dot_f64_scalar(&x[start..end], &y[start..end]);
         }
@@ -295,6 +330,7 @@ fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
 }
 
 /// Blocked dot product for f32.
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_f32_blocked(x: &[f32], y: &[f32]) -> f32 {
     const BLOCK_SIZE: usize = 2048; // ~8KB per vector block, fits in L1 cache
 
@@ -307,131 +343,24 @@ fn dot_f32_blocked(x: &[f32], y: &[f32]) -> f32 {
         let start = block * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(n);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            total += unsafe { dot_f32_neon(&x[start..end], &y[start..end]) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only the two equal-length block slices.
                 total += unsafe { dot_f32_avx2(&x[start..end], &y[start..end]) };
             } else {
                 total += dot_f32_scalar(&x[start..end], &y[start..end]);
             }
         }
 
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         {
             total += dot_f32_scalar(&x[start..end], &y[start..end]);
         }
     }
 
     total
-}
-
-/// NEON optimized dot product for f64.
-///
-/// Processes 8 elements per iteration (4 NEON registers × 2 f64 each).
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_f64_neon(x: &[f64], y: &[f64]) -> f64 {
-    use core::arch::aarch64::{vaddq_f64, vaddvq_f64, vdupq_n_f64, vfmaq_f64, vld1q_f64};
-
-    let n = x.len();
-
-    let mut sum_vec0 = vdupq_n_f64(0.0);
-    let mut sum_vec1 = vdupq_n_f64(0.0);
-    let mut sum_vec2 = vdupq_n_f64(0.0);
-    let mut sum_vec3 = vdupq_n_f64(0.0);
-
-    let chunks = n / 8;
-    let remainder = n % 8;
-
-    for i in 0..chunks {
-        let base = i * 8;
-        let x_ptr = x.as_ptr().add(base);
-        let y_ptr = y.as_ptr().add(base);
-
-        let x0 = vld1q_f64(x_ptr);
-        let x1 = vld1q_f64(x_ptr.add(2));
-        let x2 = vld1q_f64(x_ptr.add(4));
-        let x3 = vld1q_f64(x_ptr.add(6));
-
-        let y0 = vld1q_f64(y_ptr);
-        let y1 = vld1q_f64(y_ptr.add(2));
-        let y2 = vld1q_f64(y_ptr.add(4));
-        let y3 = vld1q_f64(y_ptr.add(6));
-
-        sum_vec0 = vfmaq_f64(sum_vec0, x0, y0);
-        sum_vec1 = vfmaq_f64(sum_vec1, x1, y1);
-        sum_vec2 = vfmaq_f64(sum_vec2, x2, y2);
-        sum_vec3 = vfmaq_f64(sum_vec3, x3, y3);
-    }
-
-    // Combine accumulators
-    let sum_01 = vaddq_f64(sum_vec0, sum_vec1);
-    let sum_23 = vaddq_f64(sum_vec2, sum_vec3);
-    let sum_all = vaddq_f64(sum_01, sum_23);
-    let mut sum = vaddvq_f64(sum_all);
-
-    // Handle remainder
-    let base = chunks * 8;
-    for i in 0..remainder {
-        sum = x[base + i].mul_add(y[base + i], sum);
-    }
-
-    sum
-}
-
-/// NEON optimized dot product for f32.
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_f32_neon(x: &[f32], y: &[f32]) -> f32 {
-    use core::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
-
-    let n = x.len();
-
-    let mut sum_vec0 = vdupq_n_f32(0.0);
-    let mut sum_vec1 = vdupq_n_f32(0.0);
-    let mut sum_vec2 = vdupq_n_f32(0.0);
-    let mut sum_vec3 = vdupq_n_f32(0.0);
-
-    let chunks = n / 16;
-    let remainder = n % 16;
-
-    for i in 0..chunks {
-        let base = i * 16;
-        let x_ptr = x.as_ptr().add(base);
-        let y_ptr = y.as_ptr().add(base);
-
-        let x0 = vld1q_f32(x_ptr);
-        let x1 = vld1q_f32(x_ptr.add(4));
-        let x2 = vld1q_f32(x_ptr.add(8));
-        let x3 = vld1q_f32(x_ptr.add(12));
-
-        let y0 = vld1q_f32(y_ptr);
-        let y1 = vld1q_f32(y_ptr.add(4));
-        let y2 = vld1q_f32(y_ptr.add(8));
-        let y3 = vld1q_f32(y_ptr.add(12));
-
-        sum_vec0 = vfmaq_f32(sum_vec0, x0, y0);
-        sum_vec1 = vfmaq_f32(sum_vec1, x1, y1);
-        sum_vec2 = vfmaq_f32(sum_vec2, x2, y2);
-        sum_vec3 = vfmaq_f32(sum_vec3, x3, y3);
-    }
-
-    // Combine accumulators
-    let sum_01 = vaddq_f32(sum_vec0, sum_vec1);
-    let sum_23 = vaddq_f32(sum_vec2, sum_vec3);
-    let sum_all = vaddq_f32(sum_01, sum_23);
-    let mut sum = vaddvq_f32(sum_all);
-
-    // Handle remainder
-    let base = chunks * 16;
-    for i in 0..remainder {
-        sum = x[base + i].mul_add(y[base + i], sum);
-    }
-
-    sum
 }
 
 /// AVX2/FMA optimized dot product for f64.
@@ -572,12 +501,18 @@ pub fn dotc_c64(x: &[Complex64], y: &[Complex64]) -> Complex64 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotc_c64_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotc_c64_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotc_c64_avx2(x, y) };
         }
     }
@@ -606,12 +541,18 @@ pub fn dotc_c32(x: &[Complex32], y: &[Complex32]) -> Complex32 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotc_c32_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotc_c32_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotc_c32_avx2(x, y) };
         }
     }
@@ -640,12 +581,18 @@ pub fn dotu_c64(x: &[Complex64], y: &[Complex64]) -> Complex64 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotu_c64_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotu_c64_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotu_c64_avx2(x, y) };
         }
     }
@@ -674,12 +621,18 @@ pub fn dotu_c32(x: &[Complex32], y: &[Complex32]) -> Complex32 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotu_c32_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotu_c32_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotu_c32_avx2(x, y) };
         }
     }

@@ -105,8 +105,8 @@ pub enum Uplo {
 pub struct BunchKaufman<T: Scalar> {
     /// Factored matrix (L or U and D stored compactly).
     factors: Mat<T>,
-    /// Pivot indices. ipiv[k] > 0 means 1×1 pivot, ipiv[k] < 0 means 2×2 pivot.
-    /// The actual pivot row is |ipiv[k]| - 1 (1-indexed like LAPACK).
+    /// Pivot indices. `ipiv[k]` > 0 means 1×1 pivot, `ipiv[k]` < 0 means 2×2 pivot.
+    /// The actual pivot row is |`ipiv[k]`| - 1 (1-indexed like LAPACK).
     ipiv: Vec<i32>,
     /// Storage mode.
     uplo: Uplo,

@@ -104,13 +104,8 @@ impl Real for f16 {
 
     #[inline]
     fn signum(self) -> Self {
-        if self > f16::ZERO {
-            f16::ONE
-        } else if self < f16::ZERO {
-            -f16::ONE
-        } else {
-            f16::ZERO
-        }
+        // Inherent IEEE-754 style signum: +/-1 by sign bit (zeros included), NaN stays NaN.
+        f16::signum(self)
     }
 
     #[inline]
@@ -183,6 +178,8 @@ use core::ops::{
 use num_traits::{Float, FromPrimitive, One, Zero};
 #[cfg(feature = "f128")]
 use twofloat::TwoFloat;
+#[cfg(feature = "f128")]
+use twofloat::consts::{FRAC_PI_2, FRAC_PI_4, LN_10, PI};
 
 /// Quad-precision floating-point type using double-double arithmetic.
 ///
@@ -197,6 +194,20 @@ use twofloat::TwoFloat;
 /// - ~31 decimal digits of precision
 /// - All standard mathematical operations (sin, cos, exp, ln, etc.)
 /// - Compatible with OxiBLAS scalar traits
+///
+/// # Accuracy
+///
+/// `+`, `-`, `*`, `/`, `recip` and `sqrt` are accurate to a few units of
+/// `2^-106` relative (`powi(n)` to about `|n|` units, as repeated squaring
+/// compounds the rounding of each product). Division (and everything built
+/// on it) uses FMA-based exact residuals; it does not use
+/// `TwoFloat / TwoFloat`, which is only double precision in twofloat 0.8
+/// (see the `Div` implementation).
+/// The elementary functions (`exp`, `ln`, `sin`, `cos`, …) are twofloat's
+/// own kernels and are in general considerably less accurate than the
+/// arithmetic. Special values of the division follow IEEE 754:
+/// `x / ±0 = ±∞`, `x / ±∞ = ±0`, `0 / 0 = ∞ / ∞ = NaN`, with the IEEE sign
+/// rules.
 ///
 /// # Example
 ///
@@ -276,6 +287,23 @@ impl QuadFloat {
         }
     }
 
+    /// Sign of the value with `f32::signum` semantics: NaN for NaN, otherwise
+    /// +1 or -1 by the sign of the high word (zeros and infinities included).
+    ///
+    /// Comparisons on `TwoFloat` mis-order invalid values (e.g. -inf), so the
+    /// sign is read from the high word directly.
+    #[inline]
+    fn dd_signum(self) -> Self {
+        let hi = self.0.hi();
+        if hi.is_nan() {
+            QuadFloat(TwoFloat::from_f64(f64::NAN))
+        } else if hi.is_sign_negative() {
+            QuadFloat(TwoFloat::from_f64(-1.0))
+        } else {
+            QuadFloat(TwoFloat::from_f64(1.0))
+        }
+    }
+
     /// Truncation toward zero, at double-double precision (`f64::trunc`).
     ///
     /// Truncation is floor for non-negative values and ceil for negative ones;
@@ -349,9 +377,8 @@ impl QuadFloat {
     /// is in the safe window we therefore use the direct form; outside it we fall
     /// back to the scaled form `max * sqrt(1 + (min/max)^2)`, whose squared term
     /// is bounded to `[0, 1]` so the only overflow that can occur is a genuine
-    /// one. (twofloat's `TwoFloat / TwoFloat` division is not full precision, so
-    /// the scaled path is slightly less accurate — hence it is used only when
-    /// unavoidable.)
+    /// one. (The scaled form adds a division and a multiplication, each
+    /// rounding at the `2^-106` level, so it is used only when unavoidable.)
     #[inline]
     fn dd_hypot(self, other: Self) -> Self {
         // `sqrt(f64::MAX / 2)`, with headroom so `a*a + b*b` cannot overflow.
@@ -417,6 +444,243 @@ impl QuadFloat {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Double-double division with FMA residuals
+// -----------------------------------------------------------------------------
+//
+// WHY not twofloat's division: twofloat 0.8.4 implements `TwoFloat / TwoFloat`
+// (and `f64 / TwoFloat`, hence `TwoFloat::recip` and negative `powi`) as
+// Algorithm 18 of Joldes, Muller & Popescu (2017). That algorithm starts from
+// the residual `1 - b_hi·fl(1/b_hi)`, which it requires to be EXACT (an FMA);
+// twofloat forms it as `1.0 - rhs.hi * th` with a rounded product. For
+// `b = 3`, `3·fl(1/3)` rounds to exactly 1, the residual vanishes and
+// `1/3` comes out as `fl(1/3) + 0`: every quotient is only double precision
+// (relative error up to 2^-53), and `3/3` is not even 1.
+//
+// [`dd_div`] instead computes the quotient digit by digit (as the QD library's
+// `accurate_div`), with every residual formed exactly through `f64::mul_add`:
+// the remainder `a - q·b` of a correctly rounded quotient `q = fl(a/b)` is
+// representable, and an FMA delivers it without rounding.
+
+/// `a·b + c` with a single rounding.
+///
+/// `num_traits` maps this to `f64::mul_add` with `std` (a hardware FMA on
+/// aarch64 and FMA-capable x86_64, a correctly rounded software `fma`
+/// elsewhere) and to `libm::fma` without `std`; both are exact up to the one
+/// final rounding, which every error-free transformation below relies on.
+#[cfg(feature = "f128")]
+#[inline]
+fn fma(a: f64, b: f64, c: f64) -> f64 {
+    <f64 as Float>::mul_add(a, b, c)
+}
+
+/// Knuth's two-sum: `a + b = s + e` exactly, for any magnitudes (barring
+/// overflow).
+#[cfg(feature = "f128")]
+#[inline]
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let bb = s - a;
+    (s, (a - (s - bb)) + (b - bb))
+}
+
+/// FMA two-product: `a·b = p + e` exactly (barring underflow).
+#[cfg(feature = "f128")]
+#[inline]
+fn two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, fma(a, b, -p))
+}
+
+/// Double-double quotient `a / b`, accurate to about `2^-107` relative
+/// (below half a unit of the low word for every pair measured).
+///
+/// The quotient is built from three `f64` digits:
+///
+/// 1. `q1 = fl(a_hi / b_hi)`; its remainder `a - q1·b` is assembled from the
+///    exact FMA remainder `a_hi - q1·b_hi`, `a_lo` and the exact product
+///    `q1·b_lo`, so it is known to `O(2^-159·|a|)`;
+/// 2. `q2 = fl(r_hi / b_hi)` with the remainder `r - q2·b` formed the same
+///    way (its terms are all `O(2^-106·|a|)`, plain sums suffice);
+/// 3. `q3` corrects the `O(2^-106)` error left by `q2`.
+///
+/// `q1 + q2 + q3` is then renormalized. The digits fold in everything the
+/// one-step algorithms drop (the low words of `a` and `b` and the rounding
+/// of `q2`), so the only error left is the final rounding into two words.
+///
+/// Special values follow IEEE 754 through the leading digit: when `q1` is not
+/// finite or is zero (`x / ±0`, `±∞ / x`, `x / ±∞`, `0 / x`, `0 / 0`,
+/// `∞ / ∞`, NaN operands, overflow or underflow of the quotient) it is the
+/// IEEE quotient of the high words, which is the IEEE quotient of the values,
+/// and it is returned as is (with its sign of zero; a NaN as twofloat's
+/// canonical `TwoFloat::NAN`).
+#[cfg(feature = "f128")]
+fn dd_div(a: TwoFloat, b: TwoFloat) -> TwoFloat {
+    let (ah, al) = (a.hi(), a.lo());
+    let (bh, bl) = (b.hi(), b.lo());
+    let q1 = ah / bh;
+    if q1.is_nan() {
+        return TwoFloat::NAN;
+    }
+    if q1.is_infinite() || q1 == 0.0 {
+        return TwoFloat::from_f64(q1);
+    }
+    // r = a - q1·b = (ah - q1·bh) + al - q1·bl. The first term is the exact
+    // remainder of the correctly rounded q1; two-sum/two-product keep the
+    // O(u·|a|) terms exact and leave only O(u²·|a|) terms to round.
+    let rem = fma(-q1, bh, ah);
+    let (p, pe) = two_prod(q1, bl);
+    let (s1, t1) = two_sum(rem, al);
+    let (rh, t2) = two_sum(s1, -p);
+    let rl = (t1 + t2) - pe;
+    // r - q2·b = (rh - q2·bh) + rl - q2·bl; the first term is again an exact
+    // FMA remainder and the other two are O(u²·|a|).
+    let q2 = rh / bh;
+    let r2 = fma(-q2, bh, rh) + (rl - q2 * bl);
+    let q3 = r2 / bh;
+    let q = TwoFloat::new_add(q1, q2) + q3;
+    if q.hi().is_finite() {
+        q
+    } else {
+        // The renormalization carried past f64::MAX: overflow to ±∞ (the
+        // error-free sums would turn it into NaN).
+        TwoFloat::from_f64(q.hi())
+    }
+}
+
+/// Twofloat's `atan(1/2)` and `atan(3/2)` reduction constants (correctly
+/// rounded double-doubles; private in twofloat).
+#[cfg(feature = "f128")]
+#[inline]
+fn atan_reduction_constants() -> (TwoFloat, TwoFloat) {
+    (
+        TwoFloat::new_add(
+            f64::from_bits(0x3FDD_AC67_0561_BB4F),
+            f64::from_bits(0x3C7A_2B7F_222F_65E2),
+        ),
+        TwoFloat::new_add(
+            f64::from_bits(0x3FEF_730B_D281_F69B),
+            f64::from_bits(0x3C70_0788_7AF0_CBBD),
+        ),
+    )
+}
+
+#[cfg(feature = "f128")]
+impl QuadFloat {
+    /// `1 / self` through [`dd_div`] (twofloat's `recip` is `1.0 / TwoFloat`,
+    /// which has the inexact residual).
+    #[inline]
+    fn dd_recip(self) -> Self {
+        QuadFloat(dd_div(TwoFloat::from_f64(1.0), self.0))
+    }
+
+    /// `self^n`; a negative `n` is the reciprocal of `self^|n|` through
+    /// [`dd_div`]. Non-negative powers are twofloat's square-and-multiply,
+    /// unchanged.
+    ///
+    /// `|n|` is formed as `-(n + 1)` plus one more factor, so `i32::MIN` (whose
+    /// negation overflows, as it does inside twofloat's `powi`) is fine.
+    #[inline]
+    fn dd_powi(self, n: i32) -> Self {
+        if n >= 0 {
+            return QuadFloat(self.0.powi(n));
+        }
+        let m = -(n + 1);
+        let magnitude = if m == 0 {
+            self.0
+        } else {
+            self.0.powi(m) * self.0
+        };
+        QuadFloat(dd_div(TwoFloat::from_f64(1.0), magnitude))
+    }
+
+    /// Tangent as `sin / cos` through [`dd_div`].
+    ///
+    /// twofloat's `tan` takes `-1 / tan(reduced)` in odd quadrants with its
+    /// inexact `f64 / TwoFloat` division (errors around 1e-16). `sin` and
+    /// `cos` come from one quadrant reduction and keep their relative
+    /// accuracy near the poles, so the quotient is as accurate as they are.
+    /// Non-finite arguments pass through as in twofloat.
+    #[inline]
+    fn dd_tan(self) -> Self {
+        if !self.0.is_valid() {
+            return self;
+        }
+        let (s, c) = self.0.sin_cos();
+        QuadFloat(dd_div(s, c))
+    }
+
+    /// Arctangent with twofloat's argument reduction, but [`dd_div`] for the
+    /// reduced arguments (twofloat's own divisions there are only double
+    /// precision).
+    ///
+    /// For `|x| <= 7/16` twofloat's `atan` evaluates its polynomial directly,
+    /// so it is used unchanged; every reduced argument below lies in that
+    /// range as well (`|t| <= 16/39`). `atan(±∞) = ±π/2` (twofloat returns NaN
+    /// there because its validity check precedes its infinity branch).
+    fn dd_atan(self) -> Self {
+        let x = self.0;
+        if x.hi().is_nan() || x.lo().is_nan() {
+            return QuadFloat(TwoFloat::NAN);
+        }
+        if x.hi().is_infinite() {
+            return QuadFloat(if x.hi() > 0.0 { FRAC_PI_2 } else { -FRAC_PI_2 });
+        }
+        let ax = x.abs();
+        let k = 4.0 * ax + 0.25;
+        if k <= 2.0 {
+            return QuadFloat(x.atan());
+        }
+        let (atan_half, atan_three_halves) = atan_reduction_constants();
+        let one = TwoFloat::from_f64(1.0);
+        let result = if k < 3.0 {
+            atan_half + dd_div(ax - 0.5, 1.0 + 0.5 * ax).atan()
+        } else if k < 5.0 {
+            FRAC_PI_4 + dd_div(ax - 1.0, 1.0 + ax).atan()
+        } else if k < 10.0 {
+            atan_three_halves + dd_div(ax - 1.5, 1.0 + 1.5 * ax).atan()
+        } else {
+            FRAC_PI_2 - dd_div(one, ax).atan()
+        };
+        QuadFloat(if x.is_sign_positive() {
+            result
+        } else {
+            -result
+        })
+    }
+
+    /// Four-quadrant arctangent of `self / other`: twofloat's case analysis
+    /// with [`dd_div`] and [`Self::dd_atan`].
+    fn dd_atan2(self, other: Self) -> Self {
+        let (y, x) = (self.0, other.0);
+        let angle = if y.hi() == 0.0 {
+            if x.hi().is_sign_positive() {
+                TwoFloat::from_f64(0.0)
+            } else if y.hi().is_sign_positive() {
+                PI
+            } else {
+                -PI
+            }
+        } else if x.hi() == 0.0 {
+            if y.hi().is_sign_positive() {
+                FRAC_PI_2
+            } else {
+                -FRAC_PI_2
+            }
+        } else {
+            let a = QuadFloat(dd_div(y, x)).dd_atan().0;
+            if x.hi().is_sign_positive() {
+                a
+            } else if y.hi().is_sign_positive() {
+                a + PI
+            } else {
+                a - PI
+            }
+        };
+        QuadFloat(angle)
+    }
+}
+
 #[cfg(feature = "f128")]
 impl From<f64> for QuadFloat {
     #[inline]
@@ -461,12 +725,18 @@ impl Mul for QuadFloat {
     }
 }
 
+/// Double-double division, accurate to about `2^-107` relative.
+///
+/// It does not delegate to `TwoFloat / TwoFloat`: in twofloat 0.8 that
+/// division forms its residual without an FMA and is only double precision
+/// (`1/3` came out as `fl(1/3) + 0`). Special values follow IEEE 754
+/// (`x / ±0 = ±∞`, `x / ±∞ = ±0`, `0 / 0` and `∞ / ∞` are NaN).
 #[cfg(feature = "f128")]
 impl Div for QuadFloat {
     type Output = Self;
     #[inline]
     fn div(self, rhs: Self) -> Self::Output {
-        Self(self.0 / rhs.0)
+        Self(dd_div(self.0, rhs.0))
     }
 }
 
@@ -507,7 +777,7 @@ impl MulAssign for QuadFloat {
 impl DivAssign for QuadFloat {
     #[inline]
     fn div_assign(&mut self, rhs: Self) {
-        self.0 = self.0 / rhs.0;
+        self.0 = dd_div(self.0, rhs.0);
     }
 }
 
@@ -690,15 +960,7 @@ impl Float for QuadFloat {
     }
 
     fn signum(self) -> Self {
-        let zero = QuadFloat::from(0.0);
-        let one = QuadFloat::from(1.0);
-        if self > zero {
-            one
-        } else if self < zero {
-            -one
-        } else {
-            zero
-        }
+        self.dd_signum()
     }
 
     fn is_sign_positive(self) -> bool {
@@ -714,11 +976,11 @@ impl Float for QuadFloat {
     }
 
     fn recip(self) -> Self {
-        QuadFloat(self.0.recip())
+        self.dd_recip()
     }
 
     fn powi(self, n: i32) -> Self {
-        QuadFloat(self.0.powi(n))
+        self.dd_powi(n)
     }
 
     fn powf(self, n: Self) -> Self {
@@ -741,16 +1003,19 @@ impl Float for QuadFloat {
         QuadFloat(self.0.ln())
     }
 
+    // The logarithms divide through `dd_div`; their accuracy is still bounded
+    // by twofloat's `ln`. `log2` keeps the computed `ln(2)` as the divisor so
+    // that `log2(2)` stays exactly 1.
     fn log(self, base: Self) -> Self {
-        QuadFloat(self.0.ln() / base.0.ln())
+        QuadFloat(dd_div(self.0.ln(), base.0.ln()))
     }
 
     fn log2(self) -> Self {
-        QuadFloat(self.0.ln() / TwoFloat::from_f64(2.0).ln())
+        QuadFloat(dd_div(self.0.ln(), TwoFloat::from_f64(2.0).ln()))
     }
 
     fn log10(self) -> Self {
-        QuadFloat(self.0.log10())
+        QuadFloat(dd_div(self.0.ln(), LN_10))
     }
 
     fn max(self, other: Self) -> Self {
@@ -786,7 +1051,7 @@ impl Float for QuadFloat {
     }
 
     fn tan(self) -> Self {
-        QuadFloat(self.0.tan())
+        self.dd_tan()
     }
 
     fn asin(self) -> Self {
@@ -798,11 +1063,11 @@ impl Float for QuadFloat {
     }
 
     fn atan(self) -> Self {
-        QuadFloat(self.0.atan())
+        self.dd_atan()
     }
 
     fn atan2(self, other: Self) -> Self {
-        QuadFloat(self.0.atan2(other.0))
+        self.dd_atan2(other)
     }
 
     fn sin_cos(self) -> (Self, Self) {
@@ -1001,7 +1266,7 @@ impl Real for QuadFloat {
 
     #[inline]
     fn atan2(self, other: Self) -> Self {
-        QuadFloat(self.0.atan2(other.0))
+        self.dd_atan2(other)
     }
 
     #[inline]
@@ -1011,15 +1276,7 @@ impl Real for QuadFloat {
 
     #[inline]
     fn signum(self) -> Self {
-        let zero = QuadFloat::from(0.0);
-        let one = QuadFloat::from(1.0);
-        if self > zero {
-            one
-        } else if self < zero {
-            -one
-        } else {
-            zero
-        }
+        self.dd_signum()
     }
 
     #[inline]
@@ -1068,11 +1325,15 @@ impl Field for QuadFloat {
 
     #[inline]
     fn recip(self) -> Self {
-        QuadFloat(self.0.recip())
+        self.dd_recip()
     }
 
     #[inline]
     fn powi(self, n: i32) -> Self {
-        QuadFloat(self.0.powi(n))
+        self.dd_powi(n)
     }
 }
+
+#[cfg(all(test, feature = "f128"))]
+#[path = "extended_tests.rs"]
+mod tests;

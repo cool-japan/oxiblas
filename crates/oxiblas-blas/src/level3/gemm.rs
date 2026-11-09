@@ -40,8 +40,8 @@
 
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
 use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
-use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
-use crate::level3::gemm_packing::{pack_a_optimized, pack_b_optimized};
+use crate::level3::gemm_kernel::{GemmKernel, MicroKernel, MicroKernelShape};
+use crate::level3::gemm_packing::{PackBuffer, PackSlot, pack_a_optimized, pack_b_optimized};
 use crate::level3::gemm_small::{SMALL_THRESHOLD, gemm_small};
 use crate::level3::trsm::Trans;
 use num_complex::{Complex32, Complex64};
@@ -372,22 +372,25 @@ pub fn gemm_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
     par: Par,
 ) {
-    let m = a.nrows();
-    let k = a.ncols();
-    let n = b.ncols();
+    gemm_transposed_with_par(Trans::NoTrans, Trans::NoTrans, alpha, a, b, beta, c, par);
+}
 
-    let shape = T::micro_kernel_shape();
+/// Dimension threshold from which [`gemm_with_par`] and
+/// [`gemm_transposed_with_par`] use [`GemmBlocking::auto_tuned`].
+const AUTO_TUNE_THRESHOLD: usize = 512;
 
-    // Use auto-tuning for larger matrices
-    const AUTO_TUNE_THRESHOLD: usize = 512;
-    let blocking =
-        if m >= AUTO_TUNE_THRESHOLD || k >= AUTO_TUNE_THRESHOLD || n >= AUTO_TUNE_THRESHOLD {
-            GemmBlocking::auto_tuned::<T>(m, k, n, &shape)
-        } else {
-            GemmBlocking::for_kernel::<T>(&shape)
-        };
-
-    gemm_with_blocking(alpha, a, b, beta, c, par, &blocking);
+/// The blocking [`gemm_with_par`] uses for an `m × k` by `k × n` product.
+fn default_blocking<T: Field>(
+    m: usize,
+    k: usize,
+    n: usize,
+    shape: &MicroKernelShape,
+) -> GemmBlocking {
+    if m >= AUTO_TUNE_THRESHOLD || k >= AUTO_TUNE_THRESHOLD || n >= AUTO_TUNE_THRESHOLD {
+        GemmBlocking::auto_tuned::<T>(m, k, n, shape)
+    } else {
+        GemmBlocking::for_kernel::<T>(shape)
+    }
 }
 
 /// GEMM with asymmetric blocking optimized for rectangular matrices.
@@ -580,22 +583,20 @@ pub fn gemm_transposed_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
     let (m, k) = op_dims(&a, trans_a);
     let (_, n) = op_dims(&b, trans_b);
 
-    let shape = T::micro_kernel_shape();
-
-    const AUTO_TUNE_THRESHOLD: usize = 512;
-    let blocking =
-        if m >= AUTO_TUNE_THRESHOLD || k >= AUTO_TUNE_THRESHOLD || n >= AUTO_TUNE_THRESHOLD {
-            GemmBlocking::auto_tuned::<T>(m, k, n, &shape)
-        } else {
-            GemmBlocking::for_kernel::<T>(&shape)
-        };
-
-    gemm_transposed_with_blocking(trans_a, trans_b, alpha, a, b, beta, c, par, &blocking);
+    // One dispatch decision for the whole call: it picks the blocking and is
+    // passed down to the packers and the macro-kernel.
+    let kernel = T::micro_kernel_dispatch();
+    let blocking = default_blocking::<T>(m, k, n, &kernel.shape);
+    gemm_core(
+        trans_a, trans_b, alpha, a, b, beta, c, par, &blocking, &kernel,
+    );
 }
 
 /// Transpose-aware GEMM core with explicit blocking parameters.
 ///
-/// All the public GEMM entry points funnel through here. The `NoTrans`/`NoTrans`
+/// All the public GEMM entry points funnel through the same core as this
+/// function (the `_with_par` ones resolve the micro-kernel once and pass it
+/// on instead of re-dispatching). The `NoTrans`/`NoTrans`
 /// path uses the same small-matrix fast path, packers and blocked kernel as
 /// [`gemm`]; the transpose flags only change how operands are *read* during
 /// packing.
@@ -612,9 +613,37 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
     beta: T,
+    c: MatMut<'_, T>,
+    par: Par,
+    blocking: &GemmBlocking,
+) {
+    gemm_core(
+        trans_a,
+        trans_b,
+        alpha,
+        a,
+        b,
+        beta,
+        c,
+        par,
+        blocking,
+        &T::micro_kernel_dispatch(),
+    );
+}
+
+/// [`gemm_transposed_with_blocking`] with the micro-kernel already resolved.
+#[allow(clippy::too_many_arguments)]
+fn gemm_core<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
     mut c: MatMut<'_, T>,
     par: Par,
     blocking: &GemmBlocking,
+    kernel: &MicroKernel<T>,
 ) {
     // Logical (post-transpose) dimensions: op(A) is m x k, op(B) is k x n.
     let (m, k) = op_dims(&a, trans_a);
@@ -644,8 +673,6 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
         return;
     }
 
-    let shape = T::micro_kernel_shape();
-
     // Small matrix fast path. The NoTrans/NoTrans case keeps using the
     // specialized `gemm_small` kernel so `gemm` is unchanged; transposed cases
     // use the transpose-aware naive kernel.
@@ -661,9 +688,9 @@ pub fn gemm_transposed_with_blocking<T: Field + GemmKernel + bytemuck::Zeroable>
     // Use blocked GEMM, with the blocking targets fitted to this problem:
     // every caller (including hand-built `for_kernel` / `custom` blockings)
     // gets balanced blocks instead of a full block plus a sliver.
-    let blocking = blocking.fit_to_dims(m, k, n, &shape);
+    let blocking = blocking.fit_to_dims(m, k, n, &kernel.shape);
     gemm_blocked(
-        trans_a, trans_b, alpha, &a, &b, beta, &mut c, &blocking, &shape, par,
+        trans_a, trans_b, alpha, &a, &b, beta, &mut c, &blocking, kernel, par,
     );
 }
 
@@ -736,18 +763,23 @@ pub(super) fn op_dims<T: Scalar>(mat: &MatRef<'_, T>, trans: Trans) -> (usize, u
 ///
 /// `NoTrans` reads `mat[row, col]`; `Trans`/`ConjTrans` read `mat[col, row]`
 /// (and conjugate for `ConjTrans`). `row`/`col` are indices into `op(mat)`, so
-/// the caller must ensure `row < op(mat).nrows` and `col < op(mat).ncols`.
+/// the caller must ensure `row < op(mat).nrows` and `col < op(mat).ncols`
+/// (checked in debug builds by `MatRef::get_unchecked`).
 #[inline]
 pub(super) fn read_op<T: Scalar>(mat: &MatRef<'_, T>, trans: Trans, row: usize, col: usize) -> T {
     match trans {
-        // SAFETY: `row < op(mat).nrows == mat.nrows` and
-        // `col < op(mat).ncols == mat.ncols` by the caller's contract.
-        Trans::NoTrans => unsafe { *mat.ptr_at(row, col) },
-        // SAFETY: for a transposed read the source indices are swapped, so
-        // `col < op(mat).ncols == mat.nrows` and `row < op(mat).nrows == mat.ncols`.
-        Trans::Trans => unsafe { *mat.ptr_at(col, row) },
-        // SAFETY: same swapped-index bounds as the `Trans` arm.
-        Trans::ConjTrans => unsafe { *mat.ptr_at(col, row) }.conj(),
+        // SAFETY: `get_unchecked(row, col)` needs `row < mat.nrows()` and
+        // `col < mat.ncols()`; the caller guarantees `row < op(mat).nrows ==
+        // mat.nrows()` and `col < op(mat).ncols == mat.ncols()` for `NoTrans`.
+        Trans::NoTrans => unsafe { *mat.get_unchecked(row, col) },
+        // SAFETY: the transposed read swaps the indices: `get_unchecked(col,
+        // row)` needs `col < mat.nrows()` and `row < mat.ncols()`, which are
+        // the caller's `col < op(mat).ncols == mat.nrows()` and
+        // `row < op(mat).nrows == mat.ncols()`.
+        Trans::Trans => unsafe { *mat.get_unchecked(col, row) },
+        // SAFETY: the same swapped indices and caller bounds as the `Trans`
+        // arm.
+        Trans::ConjTrans => unsafe { *mat.get_unchecked(col, row) }.conj(),
     }
 }
 
@@ -768,12 +800,34 @@ fn materialize_op<T: Scalar + bytemuck::Zeroable>(src: &MatRef<'_, T>, trans: Tr
     out
 }
 
+/// Rows of C from which [`gemm_small_trans`] uses the axpy order for
+/// `op(A) = A` (real types only).
+///
+/// The axpy order pays a fixed cost per `(j, p)` pair and then updates `m`
+/// elements with vector instructions; the dot order costs per multiply-add.
+/// On an Apple M3 (`NoTrans`/`Trans`, `m * n * k <= 32³`) the axpy order took
+/// 1.2-1.6x the dot order's time at `m = 1, 3, 5`, and 0.30-0.93x of it for
+/// `m >= 8` (f64 and f32; square, wide and tall shapes), except for a tie
+/// (+1.7%) at `8 x 64 x 64`.
+const SMALL_AXPY_MIN_ROWS: usize = 8;
+
 /// Transpose-aware naive GEMM for the small-matrix fast path.
 ///
-/// Computes `C = alpha * op(A) * op(B) + beta * C` with an explicit triple loop
-/// that reads each operand through [`read_op`]. Only used for the transposed
-/// small-matrix case; the `NoTrans`/`NoTrans` case keeps the optimized
-/// `gemm_small` kernel.
+/// Computes `C = alpha * op(A) * op(B) + beta * C` with explicit loops that
+/// read B (and A, when transposed) through [`read_op`]. Only used for the
+/// transposed small-matrix case; the `NoTrans`/`NoTrans` case keeps the
+/// optimized `gemm_small` kernel. The loop order follows the operand whose
+/// elements are adjacent in memory:
+///
+/// - real `op(A) = A` in column-major storage with at least
+///   [`SMALL_AXPY_MIN_ROWS`] rows: `C = beta * C`, then
+///   `C[:, j] += A[:, p] * (alpha * op(B)[p, j])` over unit-stride columns of
+///   A and C (the reference-BLAS order, which vectorizes).
+/// - otherwise every `C[i, j]` becomes `alpha * dot + beta * C[i, j]`, where
+///   the dot product runs along a row of `op(A)` (a column of the stored A
+///   when A is transposed).
+///
+/// C is not read when `beta == 0`, and neither A nor B when `alpha == 0`.
 fn gemm_small_trans<T: Field>(
     trans_a: Trans,
     trans_b: Trans,
@@ -790,6 +844,30 @@ fn gemm_small_trans<T: Field>(
     if alpha == T::zero() {
         // A and B are not read when alpha == 0 (reference BLAS semantics).
         scale_matrix(c, beta);
+        return;
+    }
+
+    if T::is_real() && trans_a == Trans::NoTrans && a.col_stride() == 1 && m >= SMALL_AXPY_MIN_ROWS
+    {
+        // C = beta * C first (C is not read when beta == 0).
+        scale_matrix(c, beta);
+        for j in 0..n {
+            for p in 0..k {
+                let t = alpha * read_op(b, trans_b, p, j);
+                if let (Some(a_col), Some(c_col)) = (a.col_as_slice(p), c.col_as_slice_mut(j)) {
+                    for (ci, &ai) in c_col.iter_mut().zip(a_col) {
+                        *ci += ai * t;
+                    }
+                    continue;
+                }
+                // Not reached (`p < k`, `j < n`, unit row strides); kept so the
+                // update never depends on that.
+                for i in 0..m {
+                    let v = c[(i, j)] + a[(i, p)] * t;
+                    c.set(i, j, v);
+                }
+            }
+        }
         return;
     }
 
@@ -821,7 +899,7 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
     blocking: &GemmBlocking,
-    shape: &MicroKernelShape,
+    kernel: &MicroKernel<T>,
     par: Par,
 ) {
     // Suppress unused warning when parallel feature is disabled
@@ -842,7 +920,16 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
         // at least two tiles.
         if PARALLEL_GATE.should_parallelize(total_work, par)
             && try_gemm_blocked_parallel(
-                trans_a, trans_b, alpha, a, b, beta, c, blocking, shape, par,
+                trans_a,
+                trans_b,
+                alpha,
+                a,
+                b,
+                beta,
+                c,
+                blocking,
+                &kernel.shape,
+                par,
             )
         {
             return;
@@ -850,21 +937,43 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 
     // Sequential fallback
-    gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, shape);
+    gemm_blocked_sequential(trans_a, trans_b, alpha, a, b, beta, c, blocking, kernel);
+}
+
+/// Returns whether `op(X)` for an operand in plain column-major storage is the
+/// stored matrix transposed without conjugation (`Trans`, or `ConjTrans` on a
+/// real type, where conjugation is the identity).
+#[inline]
+fn is_plain_transpose<T: Field>(trans: Trans) -> bool {
+    match trans {
+        Trans::NoTrans => false,
+        Trans::Trans => true,
+        Trans::ConjTrans => T::is_real(),
+    }
 }
 
 /// Packs a panel of `op(A)` into the A packing buffer, transpose-aware.
 ///
-/// For `NoTrans` operands in plain column-major storage (`col_stride == 1`)
-/// this is the SIMD-friendly `pack_a_optimized`, which addresses `A[r, c]` as
-/// `ptr + r + c * row_stride`. Every other operand — `Trans`/`ConjTrans`, and
-/// `NoTrans` views whose rows are not adjacent in memory (e.g. a
-/// [`MatRef::transpose`] view) — is read element-wise through [`read_op`],
-/// which honours both strides (and conjugates for `ConjTrans`), producing the
-/// identical packed layout: the micro-kernel cannot tell the difference.
-/// Genuinely zero-copy: no transposed copy of `A` is ever materialized.
+/// For operands in plain column-major storage (`col_stride == 1`):
+/// - `NoTrans` uses [`pack_a_optimized`], which copies `MR` contiguous
+///   elements per column.
+/// - `Trans` (and `ConjTrans` on real types) uses [`pack_b_optimized`] on the
+///   stored matrix: the `MR`-row micro-panels of `op(A) = A^T` are the
+///   `MR`-column micro-panels of `A`, in exactly the layout `pack_b_optimized`
+///   writes (`MR` elements of one stored row per step, zero-padded).
+///
+/// Every other operand — `ConjTrans` on complex types, and views whose rows are
+/// not adjacent in memory (e.g. a [`MatRef::transpose`] view) — is read
+/// element-wise through [`read_op`], which honours both strides (and
+/// conjugates for `ConjTrans`). All paths produce the identical packed layout,
+/// so the micro-kernel cannot tell the difference. Genuinely zero-copy: no
+/// transposed copy of `A` is ever materialized.
 ///
 /// `row_start`/`col_start` and `nrows`/`ncols` are all in `op(A)` coordinates.
+///
+/// # Panics
+///
+/// Panics if `pack` holds fewer than `⌈nrows / mr⌉ · mr · ncols` elements.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pack_a_trans_dispatch<T: Field>(
@@ -877,13 +986,22 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
     pack: &mut AlignedVec<T>,
     mr: usize,
 ) {
-    debug_assert!(
+    // Checked in every build: the element-wise fallback below writes through
+    // a raw pointer and relies on it.
+    assert!(
         pack.len() >= nrows.div_ceil(mr) * mr * ncols,
         "A packing buffer too small"
     );
-    if trans_a == Trans::NoTrans && a.col_stride() == 1 {
-        pack_a_optimized(a, row_start, col_start, nrows, ncols, pack, mr);
-        return;
+    if a.col_stride() == 1 {
+        if trans_a == Trans::NoTrans {
+            pack_a_optimized(a, row_start, col_start, nrows, ncols, pack, mr);
+            return;
+        }
+        if is_plain_transpose::<T>(trans_a) {
+            // op(A)[row_start + i, col_start + p] = A[col_start + p, row_start + i].
+            pack_b_optimized(a, col_start, row_start, ncols, nrows, pack, mr);
+            return;
+        }
     }
 
     let dst = pack.as_mut_ptr();
@@ -897,8 +1015,11 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
                 } else {
                     T::zero()
                 };
-                // SAFETY: `idx` walks `[0, ceil(nrows/mr)*mr*ncols)`, which is
-                // <= the buffer size the caller allocated for this MR panel.
+                // SAFETY: `idx` walks `[0, ceil(nrows/mr)*mr*ncols)` (one write
+                // per `(i, p, ii)`), and the `assert!` at the top of this
+                // function guarantees `pack.len() >= ceil(nrows/mr)*mr*ncols`,
+                // so `dst.add(idx)` stays inside `pack`, which is exclusively
+                // borrowed and does not overlap `a`.
                 unsafe {
                     *dst.add(idx) = val;
                 }
@@ -910,15 +1031,21 @@ pub(super) fn pack_a_trans_dispatch<T: Field>(
 
 /// Packs a panel of `op(B)` into the B packing buffer, transpose-aware.
 ///
-/// Mirrors [`pack_a_trans_dispatch`]: `NoTrans` operands with `col_stride == 1`
-/// use `pack_b_optimized`; every other operand (transposed modes and strided
-/// `NoTrans` views) is read through [`read_op`] into the identical packed
-/// layout, with no copy.
+/// Mirrors [`pack_a_trans_dispatch`]: for operands with `col_stride == 1`,
+/// `NoTrans` uses [`pack_b_optimized`] and `Trans` (and `ConjTrans` on real
+/// types) uses [`pack_a_optimized`] on the stored matrix (the `NR`-column
+/// micro-panels of `op(B) = B^T` are the `NR`-row micro-panels of `B`). Every
+/// other operand (complex `ConjTrans`, strided views) is read through
+/// [`read_op`] into the identical packed layout, with no copy.
 ///
 /// `row_start`/`col_start` and `nrows`/`ncols` are all in `op(B)` coordinates.
+///
+/// # Panics
+///
+/// Panics if `pack` holds fewer than `⌈ncols / nr⌉ · nr · nrows` elements.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pack_b_trans_dispatch<T: Field>(
+pub(super) fn pack_b_trans_dispatch<T: Field>(
     b: &MatRef<'_, T>,
     trans_b: Trans,
     row_start: usize,
@@ -928,13 +1055,22 @@ fn pack_b_trans_dispatch<T: Field>(
     pack: &mut AlignedVec<T>,
     nr: usize,
 ) {
-    debug_assert!(
+    // Checked in every build: the element-wise fallback below writes through
+    // a raw pointer and relies on it.
+    assert!(
         pack.len() >= ncols.div_ceil(nr) * nr * nrows,
         "B packing buffer too small"
     );
-    if trans_b == Trans::NoTrans && b.col_stride() == 1 {
-        pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
-        return;
+    if b.col_stride() == 1 {
+        if trans_b == Trans::NoTrans {
+            pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
+            return;
+        }
+        if is_plain_transpose::<T>(trans_b) {
+            // op(B)[row_start + p, col_start + j] = B[col_start + j, row_start + p].
+            pack_a_optimized(b, col_start, row_start, ncols, nrows, pack, nr);
+            return;
+        }
     }
 
     let dst = pack.as_mut_ptr();
@@ -948,8 +1084,11 @@ fn pack_b_trans_dispatch<T: Field>(
                 } else {
                     T::zero()
                 };
-                // SAFETY: `idx` walks `[0, ceil(ncols/nr)*nr*nrows)`, which is
-                // <= the buffer size the caller allocated for this NR panel.
+                // SAFETY: `idx` walks `[0, ceil(ncols/nr)*nr*nrows)` (one write
+                // per `(j, p, jj)`), and the `assert!` at the top of this
+                // function guarantees `pack.len() >= ceil(ncols/nr)*nr*nrows`,
+                // so `dst.add(idx)` stays inside `pack`, which is exclusively
+                // borrowed and does not overlap `b`.
                 unsafe {
                     *dst.add(idx) = val;
                 }
@@ -970,7 +1109,7 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
     blocking: &GemmBlocking,
-    shape: &MicroKernelShape,
+    kernel: &MicroKernel<T>,
 ) {
     // Logical (post-transpose) dimensions.
     let (m, k) = op_dims(a, trans_a);
@@ -980,14 +1119,15 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     let kc = blocking.kc.min(k);
     let mc = blocking.mc.min(m);
 
-    let mr = shape.mr;
-    let nr = shape.nr;
+    let MicroKernelShape { mr, nr } = kernel.shape;
 
-    // Allocate packing buffers with padding for micro-kernel alignment
+    // Packing buffers (padded to whole micro-panels), on loan from this
+    // thread's cache: back-to-back calls reuse them instead of allocating and
+    // zero-filling them every time (policy: `PACK_CACHE_MAX_BYTES`).
     let padded_mc = mc.div_ceil(mr) * mr;
     let padded_nc = nc.div_ceil(nr) * nr;
-    let mut pack_a: AlignedVec<T> = AlignedVec::zeros(padded_mc * kc);
-    let mut pack_b: AlignedVec<T> = AlignedVec::zeros(kc * padded_nc);
+    let mut pack_a = PackBuffer::<T>::take(PackSlot::A, padded_mc * kc);
+    let mut pack_b = PackBuffer::<T>::take(PackSlot::B, kc * padded_nc);
 
     // Track if this is the first k-iteration (need to apply beta)
     let mut first_k = true;
@@ -1001,14 +1141,14 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
             let jb = nc.min(n - j);
 
             // Pack op(B) block: op(B)[p:p+pb, j:j+jb] -> pack_b (transpose-aware)
-            pack_b_trans_dispatch(b, trans_b, p, j, pb, jb, &mut pack_b, shape.nr);
+            pack_b_trans_dispatch(b, trans_b, p, j, pb, jb, &mut pack_b, nr);
 
             // Loop over m in blocks of mc
             for i in (0..m).step_by(mc) {
                 let ib = mc.min(m - i);
 
                 // Pack op(A) block: op(A)[i:i+ib, p:p+pb] -> pack_a (transpose-aware)
-                pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, &mut pack_a, shape.mr);
+                pack_a_trans_dispatch(a, trans_a, i, p, ib, pb, &mut pack_a, mr);
 
                 // Compute C[i:i+ib, j:j+jb] += alpha * pack_a * pack_b
                 let effective_beta = if first_k { beta } else { T::one() };
@@ -1016,17 +1156,16 @@ fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
                 // Get mutable submatrix of C
                 let c_sub = c.rb_mut().submatrix(i, j, ib, jb);
 
-                macro_panel_multiply(
+                macro_panel_multiply_with(
                     alpha,
                     &pack_a,
                     ib,
                     pb,
                     &pack_b,
-                    pb,
                     jb,
                     effective_beta,
                     c_sub,
-                    shape,
+                    kernel,
                 );
             }
         }
@@ -1085,8 +1224,14 @@ unsafe fn prefetch_read_panel<T>(ptr: *const T, len: usize) {
 /// holds `ceil(n / NR)` packed `k x NR` micro-panels (both zero-padded). C is
 /// not read when `beta == 0`.
 ///
-/// This function includes software prefetching to hide memory latency
-/// by prefetching the next micro-panel of A while computing the current one.
+/// Resolves `T`'s micro-kernel once for the whole block (it must have the
+/// given `shape`) and runs [`macro_panel_multiply_with`].
+///
+/// # Panics
+///
+/// Panics if `shape` is not the shape of `T`'s micro-kernel, or if the packed
+/// panels are shorter than the block needs.
+#[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
     alpha: T,
@@ -1097,11 +1242,57 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
     _kb: usize,
     n: usize,
     beta: T,
-    mut c: MatMut<'_, T>,
+    c: MatMut<'_, T>,
     shape: &MicroKernelShape,
 ) {
-    let mr = shape.mr;
-    let nr = shape.nr;
+    let kernel = T::micro_kernel_dispatch();
+    // The packed layout must be the one the kernel reads: a different MR or NR
+    // would make it stride past the panels.
+    assert_eq!(
+        kernel.shape, *shape,
+        "packing shape differs from the kernel's"
+    );
+    macro_panel_multiply_with(alpha, pack_a, m, k, pack_b, n, beta, c, &kernel);
+}
+
+/// Largest `MR × NR` of the micro-kernels in this crate (AVX-512 f32 is
+/// 16 × 16); edge tiles of larger kernels use a heap scratch tile.
+const MAX_EDGE_TILE: usize = 16 * 16;
+
+/// Multiplies packed panels with a micro-kernel the caller already resolved:
+/// the sequential blocked loop calls it directly, and the parallel driver's
+/// `macro_panel_multiply` (built with the `parallel` feature) after resolving
+/// the kernel once per block.
+///
+/// Full `MR × NR` tiles are computed in place in C. Partial (edge) tiles go
+/// through one `MR × NR` scratch tile per call (leading dimension `MR`): C is
+/// copied in when `beta != 0`, the kernel runs on the scratch tile with the
+/// same `alpha`/`beta` as a full tile (so edge and interior tiles round alike),
+/// and only the live `im × jn` corner is copied back. Entries of the scratch
+/// tile outside that corner may hold values of an earlier edge tile; the kernel
+/// may read them (when `beta != 0`), but its results there are discarded.
+///
+/// On aarch64 and x86_64 it prefetches (the first cache lines of) the next
+/// micro-panel of A while computing the current one; other targets get no
+/// prefetch.
+///
+/// # Panics
+///
+/// Panics if the packed panels are shorter than the block needs.
+#[allow(clippy::too_many_arguments)]
+fn macro_panel_multiply_with<T: Field + GemmKernel>(
+    alpha: T,
+    pack_a: &[T],
+    m: usize,
+    k: usize,
+    pack_b: &[T],
+    n: usize,
+    beta: T,
+    mut c: MatMut<'_, T>,
+    kernel: &MicroKernel<T>,
+) {
+    let MicroKernelShape { mr, nr } = kernel.shape;
+    let micro = kernel.kernel;
 
     // Number of MR×NR blocks
     let m_blocks = m.div_ceil(mr);
@@ -1110,72 +1301,87 @@ pub(super) fn macro_panel_multiply<T: Field + GemmKernel>(
     // Size of one A micro-panel
     let a_panel_size = mr * k;
 
+    // Every micro-panel the kernel reads must lie inside the packed buffers.
+    assert!(
+        pack_a.len() >= m_blocks * a_panel_size && pack_b.len() >= n_blocks * nr * k,
+        "packed panels shorter than the {m} x {n} x {k} block"
+    );
+
+    let ldc = c.row_stride();
+    let c_base = c.as_mut_ptr();
+
+    // Scratch tile for the edge tiles, created on first use.
+    let tile_len = mr * nr;
+    let mut edge_stack: Option<[T; MAX_EDGE_TILE]> = None;
+    let mut edge_heap: Vec<T> = Vec::new();
+    let read_c = beta != T::zero();
+
     for jb in 0..n_blocks {
         let j = jb * nr;
         let jn = nr.min(n - j);
 
-        // Pointer to B panel for this column block
-        let b_ptr: *const T = &raw const pack_b[jb * nr * k];
+        // B micro-panel for this column block (inside `pack_b` by the assert).
+        let b_ptr = pack_b.as_ptr().wrapping_add(jb * nr * k);
 
         for ib in 0..m_blocks {
             let i = ib * mr;
             let im = mr.min(m - i);
 
-            // Pointers to packed data for this micro-kernel
-            let a_ptr: *const T = &raw const pack_a[ib * a_panel_size];
+            // A micro-panel for this row block (inside `pack_a` by the assert).
+            let a_ptr = pack_a.as_ptr().wrapping_add(ib * a_panel_size);
 
             // Prefetch next A micro-panel while computing current
             if ib + 1 < m_blocks {
-                // SAFETY: the bounds-checked index proves `next_a_ptr` points
-                // into `pack_a`; prefetching is only a cache hint and never
+                // SAFETY: by the assert above the next micro-panel lies inside
+                // `pack_a`; prefetching is only a cache hint and never
                 // dereferences memory architecturally.
                 unsafe {
-                    let next_a_ptr: *const T = &raw const pack_a[(ib + 1) * a_panel_size];
-                    prefetch_read_panel(next_a_ptr, a_panel_size.min(mr * 64));
+                    prefetch_read_panel(a_ptr.add(a_panel_size), a_panel_size.min(mr * 64));
                 }
             }
 
-            // Get C submatrix for this micro-kernel
-            let c_row_stride = c.row_stride();
-
-            // Call the micro-kernel
-            // For partial blocks at edges, we use a temporary buffer
             if im == mr && jn == nr {
                 // Full block - can write directly to C
                 // SAFETY: the tile `C[i..i+MR, j..j+NR]` lies inside the `m x n`
-                // view `c` (full block), whose exclusive borrow we hold; the
-                // packed panels hold `MR * k` / `k * NR` elements at
-                // `a_ptr` / `b_ptr` per the caller's packing contract.
+                // view `c` (full block), whose exclusive borrow we hold, at
+                // offset `i + j * ldc` with leading dimension `ldc`; the packed
+                // panels hold `MR * k` / `k * NR` elements at `a_ptr` / `b_ptr`
+                // (assert above), and `kernel` has the shape they were packed
+                // with.
                 unsafe {
-                    let c_ptr = c.as_ptr().cast_mut();
-                    let c_ptr = c_ptr.add(i + j * c_row_stride);
-
-                    T::micro_kernel(k, alpha, a_ptr, b_ptr, beta, c_ptr, c_row_stride);
+                    micro(k, alpha, a_ptr, b_ptr, beta, c_base.add(i + j * ldc), ldc);
                 }
             } else {
-                // Partial block - use temporary buffer
-                let mut temp = [T::zero(); 32 * 32]; // Max MR * NR
+                // Partial block - use the scratch tile
+                let temp: &mut [T] = if tile_len <= MAX_EDGE_TILE {
+                    &mut edge_stack.get_or_insert([T::zero(); MAX_EDGE_TILE])[..tile_len]
+                } else {
+                    if edge_heap.len() < tile_len {
+                        edge_heap = vec![T::zero(); tile_len];
+                    }
+                    &mut edge_heap[..tile_len]
+                };
 
-                // Copy existing C values if beta != 0
-                if beta != T::zero() {
-                    for jj in 0..jn {
-                        for ii in 0..im {
-                            temp[ii + jj * mr] = c[(i + ii, j + jj)];
+                // SAFETY: `C[i..i+im, j..j+jn]` lies inside the `m x n` view `c`
+                // (exclusively borrowed), so every `c_tile.add(ii + jj * ldc)`
+                // with `ii < im`, `jj < jn` is in bounds; `temp` holds
+                // `MR * NR` initialized elements with leading dimension `mr`,
+                // which is what the kernel reads and writes; the packed panels
+                // are as for the full block (zero-padded past `im` / `jn`).
+                unsafe {
+                    let c_tile = c_base.add(i + j * ldc);
+                    if read_c {
+                        for jj in 0..jn {
+                            for ii in 0..im {
+                                temp[ii + jj * mr] = *c_tile.add(ii + jj * ldc);
+                            }
                         }
                     }
-                }
-
-                // SAFETY: `temp` holds `32 * 32 >= MR * NR` elements and is
-                // addressed with leading dimension `mr`; the packed panels are
-                // as for the full block (zero-padded past `im` / `jn`).
-                unsafe {
-                    T::micro_kernel(k, alpha, a_ptr, b_ptr, beta, temp.as_mut_ptr(), mr);
-                }
-
-                // Copy back to C
-                for jj in 0..jn {
-                    for ii in 0..im {
-                        c.set(i + ii, j + jj, temp[ii + jj * mr]);
+                    micro(k, alpha, a_ptr, b_ptr, beta, temp.as_mut_ptr(), mr);
+                    for jj in 0..jn {
+                        for ii in 0..im {
+                            *c_tile.add(ii + jj * ldc) = temp[ii + jj * mr];
+                        }
                     }
                 }
             }
@@ -1195,3 +1401,7 @@ fn scale_matrix<T: Field>(c: &mut MatMut<'_, T>, beta: T) {
 #[cfg(test)]
 #[path = "gemm_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "gemm_reuse_tests.rs"]
+mod reuse_tests;

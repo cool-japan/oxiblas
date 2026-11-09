@@ -75,7 +75,7 @@ fn lower_packed_index(i: usize, j: usize, n: usize) -> usize {
 /// Only the specified triangle (upper or lower) is stored and updated.
 /// For a Hermitian matrix, A\[i,j\] = conj(A\[j,i\]) and diagonal is real.
 ///
-/// This is the packed twin of [`her2`](crate::level2::her2) and gives the same
+/// This is the packed twin of [`her2`](crate::level2::her2()) and gives the same
 /// results as `her2` on the same data (bitwise for NaN-free input; with NaN input
 /// the NaN sign/payload may differ). As in reference BLAS `?hpr2`, the imaginary
 /// part of every diagonal element is *set to zero* by the update

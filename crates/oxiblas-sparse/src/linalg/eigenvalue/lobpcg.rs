@@ -472,7 +472,7 @@ impl Lobpcg {
 ///
 /// The matrix `a` is modified in place (diagonal → eigenvalues after convergence).
 /// Returns `(eigenvalues, eigenvectors)` with eigenvalues sorted ascending and
-/// eigenvectors stored column-major (evecs[row][col]).
+/// eigenvectors stored column-major (`evecs[row][col]`).
 fn jacobi_evd(
     a: &mut Vec<Vec<f64>>,
     max_sweeps: usize,

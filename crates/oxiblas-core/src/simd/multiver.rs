@@ -40,7 +40,7 @@ use crate::simd::dispatch::{SimdCapabilities as LegacyCaps, SimdLevel as LegacyL
 ///
 /// On `std`-enabled builds, [`SimdCapabilityInfo::detect`] returns a
 /// `&'static Self` reference that is initialised exactly once per process
-/// (via [`OnceLock`]).  On `no_std` builds it returns a fresh `Self` value
+/// (via `OnceLock`).  On `no_std` builds it returns a fresh `Self` value
 /// computed from compile-time `cfg!` constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimdCapabilityInfo {
@@ -79,7 +79,10 @@ pub struct SimdCapabilityInfo {
     // ------------------------------------------------------------------
     // Memory topology
     // ------------------------------------------------------------------
-    /// Bytes in a single cache line (typically 64 on modern CPUs).
+    /// Cache line size in bytes that this crate assumes: the compile-time
+    /// [`CACHE_LINE_SIZE`](crate::memory::CACHE_LINE_SIZE), not a value detected
+    /// on the running CPU. It is 128 on aarch64, chosen for Apple cores (many
+    /// other aarch64 cores use 64-byte lines), and 64 elsewhere.
     pub cache_line_bytes: usize,
     /// Width of the widest supported SIMD vector register in bytes.
     pub vector_width_bytes: usize,
@@ -676,6 +679,12 @@ mod tests {
     // 18. Finding 1 (multiver view): SimdCapabilityInfo mirrors the gated
     //     dispatch capabilities field-for-field — never a wider/looser view.
     // ------------------------------------------------------------------
+    #[test]
+    fn test_multiver_cache_line_matches_crate_constant() {
+        let info = SimdCapabilityInfo::detect();
+        assert_eq!(info.cache_line_bytes, crate::memory::CACHE_LINE_SIZE);
+    }
+
     #[test]
     fn test_capability_info_mirrors_dispatch_exactly() {
         let info = SimdCapabilityInfo::detect();

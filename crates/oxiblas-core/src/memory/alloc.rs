@@ -320,10 +320,15 @@ impl PrefetchDistance {
     }
 }
 
-/// Default alignment for SIMD operations (cache line size).
+/// Cache line size assumed on aarch64 targets: 128 bytes.
 ///
-/// Apple Silicon (M1/M2/M3) uses 128-byte cache lines for optimal performance.
-/// x86_64 and most other architectures use 64-byte cache lines.
+/// The value is fixed at compile time for every aarch64 target, not detected
+/// at run time. It is chosen for Apple cores (M1 and later), whose cache lines
+/// are 128 bytes; many other aarch64 cores (most Arm Cortex and Neoverse
+/// designs) use 64-byte lines. There, 128-byte alignment is still line
+/// aligned, but the range prefetch helpers, which issue one hint per
+/// `CACHE_LINE_SIZE` bytes, hint only every other line, and
+/// [`PrefetchDistance`] distances count 128-byte units.
 #[cfg(target_arch = "aarch64")]
 pub const CACHE_LINE_SIZE: usize = 128;
 
@@ -335,8 +340,9 @@ pub const CACHE_LINE_SIZE: usize = 64;
 
 /// Default alignment for matrices.
 ///
-/// This is set to match the cache line size for optimal memory access patterns.
-/// - Apple Silicon (aarch64): 128 bytes
+/// Equal to [`CACHE_LINE_SIZE`]:
+/// - every aarch64 target: 128 bytes (Apple cores' line size; a two-line
+///   multiple on aarch64 cores with 64-byte lines)
 /// - x86_64 and others: 64 bytes
 pub const DEFAULT_ALIGN: usize = CACHE_LINE_SIZE;
 
@@ -363,5 +369,5 @@ pub const fn round_up_pow2(value: usize, align: usize) -> usize {
 /// Checks if a pointer is aligned to the given alignment.
 #[inline]
 pub fn is_aligned<T>(ptr: *const T, align: usize) -> bool {
-    (ptr as usize) % align == 0
+    (ptr as usize).is_multiple_of(align)
 }

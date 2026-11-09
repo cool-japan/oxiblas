@@ -674,6 +674,35 @@ fn strassen_peel_col_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send 
     strassen_direct_gemm(alpha, a, b_right, beta, c_right, Par::Rayon);
 }
 
+/// The seven Strassen products `M1`..`M7` (see the module documentation),
+/// computed as independent tasks at the top level of
+/// [`strassen_recursive_parallel`].
+#[cfg(feature = "parallel")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrassenProduct {
+    M1,
+    M2,
+    M3,
+    M4,
+    M5,
+    M6,
+    M7,
+}
+
+#[cfg(feature = "parallel")]
+impl StrassenProduct {
+    /// Every product, in the order `M1`..`M7` used by the combine step.
+    const ALL: [Self; 7] = [
+        Self::M1,
+        Self::M2,
+        Self::M3,
+        Self::M4,
+        Self::M5,
+        Self::M6,
+        Self::M7,
+    ];
+}
+
 /// Parallel recursive Strassen with dynamic peeling.
 ///
 /// See [`strassen_recursive`] for the sequential version this mirrors.
@@ -739,16 +768,19 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
 
     // Compute M1-M7 in parallel at the top level (depth == 0)
     let (m1, m2, m3, m4, m5, m6, m7) = if depth == 0 {
-        // Parallel computation of the 7 products
-        let results: Vec<Mat<T>> = (0..7)
-            .into_par_iter()
-            .map(|idx| {
+        // Parallel computation of the 7 products: each task fills the result
+        // matrix paired with its product, so no index-to-product mapping (and
+        // no unreachable fallback arm) is needed.
+        let mut products: [Mat<T>; 7] = core::array::from_fn(|_| Mat::zeros(half_m, half_n));
+        products
+            .par_iter_mut()
+            .zip(StrassenProduct::ALL.par_iter())
+            .for_each(|(result, &product)| {
                 let mut temp_a: Mat<T> = Mat::zeros(half_m, half_k);
                 let mut temp_b: Mat<T> = Mat::zeros(half_k, half_n);
-                let mut result: Mat<T> = Mat::zeros(half_m, half_n);
 
-                match idx {
-                    0 => {
+                match product {
+                    StrassenProduct::M1 => {
                         // M1 = (A11 + A22)(B11 + B22)
                         matrix_add(&a11_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
                         matrix_add(&b11_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
@@ -761,7 +793,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    1 => {
+                    StrassenProduct::M2 => {
                         // M2 = (A21 + A22)B11
                         matrix_add(&a21_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
                         strassen_recursive_parallel(
@@ -773,7 +805,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    2 => {
+                    StrassenProduct::M3 => {
                         // M3 = A11(B12 - B22)
                         matrix_sub(&b12_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
@@ -785,7 +817,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    3 => {
+                    StrassenProduct::M4 => {
                         // M4 = A22(B21 - B11)
                         matrix_sub(&b21_owned.as_ref(), &b11_owned.as_ref(), &mut temp_b);
                         strassen_recursive_parallel(
@@ -797,7 +829,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    4 => {
+                    StrassenProduct::M5 => {
                         // M5 = (A11 + A12)B22
                         matrix_add(&a11_owned.as_ref(), &a12_owned.as_ref(), &mut temp_a);
                         strassen_recursive_parallel(
@@ -809,7 +841,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    5 => {
+                    StrassenProduct::M6 => {
                         // M6 = (A21 - A11)(B11 + B12)
                         matrix_sub(&a21_owned.as_ref(), &a11_owned.as_ref(), &mut temp_a);
                         matrix_add(&b11_owned.as_ref(), &b12_owned.as_ref(), &mut temp_b);
@@ -822,7 +854,7 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    6 => {
+                    StrassenProduct::M7 => {
                         // M7 = (A12 - A22)(B21 + B22)
                         matrix_sub(&a12_owned.as_ref(), &a22_owned.as_ref(), &mut temp_a);
                         matrix_add(&b21_owned.as_ref(), &b22_owned.as_ref(), &mut temp_b);
@@ -835,21 +867,11 @@ fn strassen_recursive_parallel<T: Field + GemmKernel + bytemuck::Zeroable + Send
                             depth + 1,
                         );
                     }
-                    _ => unreachable!(),
                 }
-                result
-            })
-            .collect();
+            });
 
-        (
-            results[0].clone(),
-            results[1].clone(),
-            results[2].clone(),
-            results[3].clone(),
-            results[4].clone(),
-            results[5].clone(),
-            results[6].clone(),
-        )
+        let [m1, m2, m3, m4, m5, m6, m7] = products;
+        (m1, m2, m3, m4, m5, m6, m7)
     } else {
         // Sequential computation for deeper recursion levels
         let mut m1: Mat<T> = Mat::zeros(half_m, half_n);
@@ -1323,6 +1345,9 @@ mod tests {
         // their validity.
         unsafe impl GlobalAlloc for TrackingAllocator {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: the caller of `GlobalAlloc::alloc` guarantees that
+                // `layout` has a non-zero size, which is all `System.alloc`
+                // requires; the layout is passed on unchanged.
                 let ptr = unsafe { System.alloc(layout) };
                 if !ptr.is_null() {
                     CURRENT.with(|current| {
@@ -1339,6 +1364,11 @@ mod tests {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: the caller of `GlobalAlloc::dealloc` guarantees that
+                // `ptr` was returned by this allocator's `alloc` with this
+                // `layout`, and `alloc` forwards to `System.alloc` with the
+                // same layout, so `ptr` is a live `System` block of exactly
+                // `layout`.
                 unsafe { System.dealloc(ptr, layout) };
                 CURRENT.with(|current| {
                     current.set(current.get().saturating_sub(layout.size()));
@@ -1387,18 +1417,10 @@ mod tests {
 
         // Mirrors the old `next_power_of_two(max(m, k, n))` global padding
         // scheme this fix removes, to quantify how bad the historical
-        // blow-up was for this exact shape.
-        let old_padded_dim = {
-            let max_dim = m.max(k).max(n);
-            let mut v = max_dim - 1;
-            v |= v >> 1;
-            v |= v >> 2;
-            v |= v >> 4;
-            v |= v >> 8;
-            v |= v >> 16;
-            v |= v >> 32;
-            v + 1
-        };
+        // blow-up was for this exact shape. (`usize::next_power_of_two`
+        // instead of a hand-rolled bit smear: the smear's `v >> 32` step is
+        // an overflowing shift on 32-bit targets.)
+        let old_padded_dim = m.max(k).max(n).next_power_of_two();
         let old_padded_bytes = 3 * old_padded_dim * old_padded_dim * elem;
 
         // Sanity check: confirm this shape really would have triggered a

@@ -51,7 +51,7 @@ pub(super) fn select_shift<T: Field + Real>(
     maxit_t: T,
     eshift: &mut T,
 ) -> Shift<T> {
-    if iiter % 10 == 0 {
+    if iiter.is_multiple_of(10) {
         // Exceptional shift. Chosen for no particularly good reason
         // (single shift only).
         let h_sub = w.h[(ilast, ilast - 1)];

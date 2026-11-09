@@ -69,10 +69,18 @@ fn detect_cache_info() -> CacheInfo {
     // Default values for different architectures
     #[cfg(target_arch = "aarch64")]
     {
-        // Apple Silicon defaults (M1/M2/M3 have large caches)
+        // Fallback for every aarch64 target where cache detection fails or
+        // does not exist (on macOS: only when neither the `hw.perflevel0.*`
+        // nor the `hw.*` L1D or L2 key can be read, see `macos_cache_info`).
+        // The values
+        // are Apple Silicon sizes (M1/M2/M3 have large caches next to the
+        // generic default of 32 KiB L1D / 256 KiB L2) but they mix core types:
+        // on an Apple M3 the performance (P) cores have 128 KiB L1D and 16 MiB
+        // L2, the efficiency (E) cores 64 KiB and 4 MiB. The L1D below is the
+        // P-core size, the L2 the E-core size.
         return CacheInfo {
-            l1d: 128 * 1024,      // 128 KB performance cores
-            l2: 4 * 1024 * 1024,  // 4 MB L2 per cluster
+            l1d: 128 * 1024,      // 128 KiB: P-core L1D (E cores: 64 KiB)
+            l2: 4 * 1024 * 1024,  // 4 MiB: E-core L2 (P cores: 16 MiB on M3)
             l3: 24 * 1024 * 1024, // ~24 MB system level cache (varies)
             line_size: 128,       // Apple Silicon uses 128-byte lines
         };
@@ -83,40 +91,73 @@ fn detect_cache_info() -> CacheInfo {
 }
 
 /// Detects cache info on macOS using sysctl.
+///
+/// See [`macos_cache_info`] for which keys are read and how they combine.
 #[cfg(target_os = "macos")]
 fn detect_cache_macos() -> Option<CacheInfo> {
-    use std::process::Command;
+    macos_cache_info(sysctl_usize)
+}
 
-    let output = Command::new("sysctl")
-        .args(["-n", "hw.l1dcachesize"])
+/// Reads a positive integer sysctl value with `sysctl -n <key>`.
+///
+/// A key the kernel does not know makes `sysctl` exit with status 1 and print
+/// nothing; some known keys (`hw.l3cachesize` on an Apple M3) exit with
+/// status 0 and print an empty value. Both, like a zero or non-numeric value,
+/// read as `None`.
+#[cfg(target_os = "macos")]
+fn sysctl_usize(key: &str) -> Option<usize> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", key])
         .output()
         .ok()?;
-    let l1d_str = String::from_utf8_lossy(&output.stdout);
-    let l1d: usize = l1d_str.trim().parse().ok()?;
-
-    let output = Command::new("sysctl")
-        .args(["-n", "hw.l2cachesize"])
-        .output()
+    if !output.status.success() {
+        return None;
+    }
+    let value: usize = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
         .ok()?;
-    let l2_str = String::from_utf8_lossy(&output.stdout);
-    let l2: usize = l2_str.trim().parse().ok()?;
+    (value > 0).then_some(value)
+}
 
-    // L3 may not exist on all Macs (Apple Silicon has SLC instead)
-    let l3 = Command::new("sysctl")
-        .args(["-n", "hw.l3cachesize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(l2 * 8); // Estimate L3 as 8x L2
-
-    // Cache line size
-    let line_size = Command::new("sysctl")
-        .args(["-n", "hw.cachelinesize"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(64);
-
+/// Builds the cache description of a Mac from sysctl lookups (`read` returns
+/// `None` for a missing or empty key), falling back key by key.
+///
+/// On Apple Silicon the plain `hw.*` keys describe the *efficiency* cores (an
+/// Apple M3 reports 64 KiB L1D and a 4 MiB L2), while the GEMM threads that
+/// matter run on the performance cores, described by the `hw.perflevel0.*`
+/// keys. Intel Macs have no `perflevel*` keys at all, so each value falls back
+/// to its `hw.*` key separately:
+///
+/// - L1D: `hw.perflevel0.l1dcachesize`, else `hw.l1dcachesize` (required).
+/// - L2: the per-core share of the performance cluster's L2,
+///   `hw.perflevel0.l2cachesize / hw.perflevel0.cpusperl2` (an M3: 16 MiB
+///   shared by 4 cores, 4 MiB each), else `hw.l2cachesize` (required). The
+///   per-core share is what one thread of a parallel GEMM can count on.
+/// - L3: `hw.perflevel0.l3cachesize`, else `hw.l3cachesize`, else 8 × L2
+///   (Apple Silicon has a system-level cache but no L3 key; on an M3 this is
+///   32 MiB, the same estimate as with the efficiency-core L2).
+/// - Line size: `hw.cachelinesize`, else 64 bytes.
+///
+/// On an Apple M3 the result differs from the plain `hw.*` keys only in the
+/// L1D (128 KiB instead of 64 KiB). The GEMM block sizes derived from it are
+/// the same either way, because the L2 and `kc` targets bind before the L1D
+/// does (see `test_m3_perflevel_detection_keeps_blocking`).
+#[cfg(any(target_os = "macos", test))]
+fn macos_cache_info(read: impl Fn(&str) -> Option<usize>) -> Option<CacheInfo> {
+    let l1d = read("hw.perflevel0.l1dcachesize").or_else(|| read("hw.l1dcachesize"))?;
+    let l2 = match (
+        read("hw.perflevel0.l2cachesize"),
+        read("hw.perflevel0.cpusperl2"),
+    ) {
+        (Some(cluster), Some(cores)) if cores > 0 => cluster / cores,
+        (Some(cluster), _) => cluster,
+        (None, _) => read("hw.l2cachesize")?,
+    };
+    let l3 = read("hw.perflevel0.l3cachesize")
+        .or_else(|| read("hw.l3cachesize"))
+        .unwrap_or(l2.saturating_mul(8));
+    let line_size = read("hw.cachelinesize").unwrap_or(64);
     Some(CacheInfo {
         l1d,
         l2,
@@ -163,10 +204,10 @@ fn detect_cache_linux() -> Option<CacheInfo> {
         let size = parse_size_linux(size_str)?;
 
         // Read line size
-        if let Ok(ls_str) = fs::read_to_string(format!("{}/coherency_line_size", index_path)) {
-            if let Ok(ls) = ls_str.trim().parse::<usize>() {
-                line_size = ls;
-            }
+        if let Ok(ls_str) = fs::read_to_string(format!("{}/coherency_line_size", index_path))
+            && let Ok(ls) = ls_str.trim().parse::<usize>()
+        {
+            line_size = ls;
         }
 
         match (level, cache_type) {
@@ -207,6 +248,10 @@ fn parse_size_linux(s: &str) -> Option<usize> {
 fn detect_cache_x86() -> Option<CacheInfo> {
     use core::arch::x86_64::__cpuid;
 
+    // SAFETY: the block only executes CPUID, which every x86_64 CPU
+    // implements, and touches no memory. Leaf 4 is queried only after leaf 0
+    // reports a maximum basic leaf of at least 4, and leaf 0x8000_0006 only
+    // after leaf 0x8000_0000 reports it, so no unsupported leaf is requested.
     unsafe {
         // Check if CPUID is available and supports extended function 0x80000006
         let basic = __cpuid(0);
@@ -362,7 +407,15 @@ pub fn compute_blocking(
 /// (`elems_per_line`) only shapes these targets; the final block sizes come
 /// from [`fit_to_dims`].
 fn cache_targets(elem_size: usize, shape: &MicroKernelShape) -> AutoTunedBlocking {
-    let cache = get_cache_info();
+    cache_targets_for(&get_cache_info(), elem_size, shape)
+}
+
+/// [`cache_targets`] for an explicit cache description.
+fn cache_targets_for(
+    cache: &CacheInfo,
+    elem_size: usize,
+    shape: &MicroKernelShape,
+) -> AutoTunedBlocking {
     let mr = shape.mr;
     let nr = shape.nr;
     let line_size = cache.line_size;
@@ -707,11 +760,11 @@ mod tests {
         // target is a single block of exactly the dimension.
         assert!(block.mc <= 1000 && block.nc <= 1000, "{block:?}");
         assert!(
-            block.mc == 1000 || block.mc % shape.mr == 0,
+            block.mc == 1000 || block.mc.is_multiple_of(shape.mr),
             "MC should be the full dimension or aligned to MR: {block:?}"
         );
         assert!(
-            block.nc == 1000 || block.nc % shape.nr == 0,
+            block.nc == 1000 || block.nc.is_multiple_of(shape.nr),
             "NC should be the full dimension or aligned to NR: {block:?}"
         );
     }
@@ -776,7 +829,10 @@ mod tests {
     /// I5 helper: `b` is a valid block for `dim` with granularity `unit`.
     fn check_block(b: usize, dim: usize, unit: usize, ctx: &str) {
         assert!(b >= 1 && b <= dim.max(1), "{ctx}: {b} vs dim {dim}");
-        assert!(b == dim || b % unit == 0, "{ctx}: {b} vs unit {unit}");
+        assert!(
+            b == dim || b.is_multiple_of(unit),
+            "{ctx}: {b} vs unit {unit}"
+        );
         let blocks = dim.div_ceil(b);
         assert!(blocks * b - dim < blocks * unit, "{ctx}: padding");
     }
@@ -809,6 +865,111 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A sysctl lookup backed by a fixed key/value table (`None` = missing or
+    /// empty key).
+    fn fake_sysctl(table: &'static [(&'static str, usize)]) -> impl Fn(&str) -> Option<usize> {
+        move |key| {
+            table
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|&(_, value)| value)
+        }
+    }
+
+    /// The keys an Apple M3 reports (`hw.l3cachesize` and
+    /// `hw.perflevel0.l3cachesize` print an empty value, so they are absent).
+    const M3_SYSCTL: &[(&str, usize)] = &[
+        ("hw.l1dcachesize", 64 * 1024),
+        ("hw.l2cachesize", 4 * 1024 * 1024),
+        ("hw.cachelinesize", 128),
+        ("hw.perflevel0.l1dcachesize", 128 * 1024),
+        ("hw.perflevel0.l2cachesize", 16 * 1024 * 1024),
+        ("hw.perflevel0.cpusperl2", 4),
+        ("hw.perflevel1.l1dcachesize", 64 * 1024),
+        ("hw.perflevel1.l2cachesize", 4 * 1024 * 1024),
+        ("hw.perflevel1.cpusperl2", 4),
+    ];
+
+    #[test]
+    fn test_macos_cache_info_m3_uses_performance_cores() {
+        let info = macos_cache_info(fake_sysctl(M3_SYSCTL)).expect("M3 keys");
+        assert_eq!(info.l1d, 128 * 1024);
+        // 16 MiB shared by 4 performance cores: 4 MiB per core.
+        assert_eq!(info.l2, 4 * 1024 * 1024);
+        assert_eq!(info.l3, 32 * 1024 * 1024);
+        assert_eq!(info.line_size, 128);
+    }
+
+    #[test]
+    fn test_macos_cache_info_intel_falls_back_per_key() {
+        // Intel Macs have no perflevel keys; each value uses its hw.* key.
+        const INTEL: &[(&str, usize)] = &[
+            ("hw.l1dcachesize", 32 * 1024),
+            ("hw.l2cachesize", 256 * 1024),
+            ("hw.l3cachesize", 12 * 1024 * 1024),
+            ("hw.cachelinesize", 64),
+        ];
+        let info = macos_cache_info(fake_sysctl(INTEL)).expect("Intel keys");
+        assert_eq!(
+            (info.l1d, info.l2, info.l3, info.line_size),
+            (32 * 1024, 256 * 1024, 12 * 1024 * 1024, 64)
+        );
+
+        // Partial perflevel information: the L2 without a core count is used
+        // whole, a missing L3 is estimated, a missing line size defaults.
+        const PARTIAL: &[(&str, usize)] = &[
+            ("hw.l1dcachesize", 48 * 1024),
+            ("hw.perflevel0.l2cachesize", 2 * 1024 * 1024),
+        ];
+        let info = macos_cache_info(fake_sysctl(PARTIAL)).expect("partial keys");
+        assert_eq!(
+            (info.l1d, info.l2, info.l3, info.line_size),
+            (48 * 1024, 2 * 1024 * 1024, 16 * 1024 * 1024, 64)
+        );
+    }
+
+    #[test]
+    fn test_macos_cache_info_requires_l1_and_l2() {
+        const NO_L2: &[(&str, usize)] = &[("hw.l1dcachesize", 64 * 1024)];
+        assert!(macos_cache_info(fake_sysctl(NO_L2)).is_none());
+        const NO_L1: &[(&str, usize)] = &[("hw.perflevel0.l2cachesize", 1 << 24)];
+        assert!(macos_cache_info(fake_sysctl(NO_L1)).is_none());
+    }
+
+    #[test]
+    fn test_m3_perflevel_detection_keeps_blocking() {
+        // On an M3 the efficiency-core keys (the previous detection) and the
+        // performance-core keys differ only in the L1D, which never binds:
+        // every GEMM block target, hence every blocking, is unchanged.
+        let old = CacheInfo {
+            l1d: 64 * 1024,
+            l2: 4 * 1024 * 1024,
+            l3: 32 * 1024 * 1024,
+            line_size: 128,
+        };
+        let new = macos_cache_info(fake_sysctl(M3_SYSCTL)).expect("M3 keys");
+        // The micro-kernels an aarch64 Mac runs: NEON f64 8x6 and f32 8x8,
+        // the scalar 4x4 (`force-scalar`), and the complex 2x2 kernels
+        // (Complex32 is 8 bytes, Complex64 16).
+        for &(mr, nr, elem) in &[
+            (8usize, 6usize, 8usize),
+            (8, 8, 4),
+            (4, 4, 8),
+            (4, 4, 4),
+            (2, 2, 8),
+            (2, 2, 16),
+        ] {
+            let shape = MicroKernelShape { mr, nr };
+            let a = cache_targets_for(&old, elem, &shape);
+            let b = cache_targets_for(&new, elem, &shape);
+            assert_eq!(
+                (a.mc, a.kc, a.nc),
+                (b.mc, b.kc, b.nc),
+                "{mr}x{nr} elem={elem}"
+            );
         }
     }
 

@@ -142,10 +142,13 @@ impl SymbolicCholesky {
         let parent = elimination_tree(a);
         let post_order = postorder_tree(&parent);
         let col_counts = column_counts(a, &parent, &post_order);
+        // Exclusive prefix sum of the column counts.
         let mut l_col_ptrs = Vec::with_capacity(n + 1);
-        l_col_ptrs.push(0);
+        let mut total = 0usize;
+        l_col_ptrs.push(total);
         for &count in &col_counts {
-            l_col_ptrs.push(l_col_ptrs.last().expect("collection should be non-empty") + count);
+            total += count;
+            l_col_ptrs.push(total);
         }
         let l_row_indices = compute_l_pattern(a, &parent, &l_col_ptrs);
         Self {

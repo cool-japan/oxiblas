@@ -1,14 +1,67 @@
 //! GMRES (Generalized Minimal Residual) and Preconditioned GMRES solvers.
 
-use super::helpers::{dot, givens_rotation_gmres, norm, solve_upper_triangular};
+use super::helpers::{
+    converged_true_residual, dot, givens_rotation_gmres, negligible_norm, norm,
+    solve_upper_triangular,
+};
+use super::scaling::{Operator, PrecondScaling, SystemScaling};
 use super::types::{GmresResult, IterativeError};
 use crate::csr::CsrMatrix;
-use crate::ops::spmv;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
-/// Solver function. See module documentation for details.
+/// Maps a result of the rescaled system back to the original one.
+fn unscale_gmres<T: Scalar<Real = T> + Clone + Field + Real>(
+    scaling: &SystemScaling<T>,
+    mut result: GmresResult<T>,
+) -> GmresResult<T> {
+    scaling.solution(&mut result.x);
+    result.residual_norm = scaling.residual(result.residual_norm);
+    scaling.residuals(&mut result.residual_history);
+    result
+}
+
+/// Restarted GMRES(`restart`) for general `A`.
+///
+/// Converges when the least-squares residual estimate `|g_{j+1}|` satisfies
+/// `<= tol·‖b‖` and the true residual `‖b − A x‖` of the updated solution
+/// confirms it; the reported `residual_norm` is then the true residual. If the
+/// true residual does not meet the tolerance (the estimate is exactly zero
+/// whenever the Krylov space becomes invariant, even when the triangular solve
+/// has to drop a singular direction), the method restarts from the true
+/// residual. `iterations` counts Arnoldi steps over all cycles. Norms are
+/// overflow-safe (see the [module documentation](super) for systems far from
+/// unit scale).
+///
+/// # Breakdown
+///
+/// A *lucky breakdown* occurs when the new sub-diagonal entry
+/// `h_{j+1,j} = ‖w‖` (after orthogonalization) is negligible relative to
+/// `‖A v_j‖`, the norm it was derived from (scale-invariant). The solution is
+/// then updated and the true residual `‖b − A x‖` decides: converged if it
+/// meets `tol·‖b‖`, otherwise the method restarts from the true residual.
 pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    restart: usize,
+    tol: T,
+    max_iter: usize,
+) -> Result<GmresResult<T>, IterativeError> {
+    let scaling = SystemScaling::for_rhs(a, b);
+    let result = gmres_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        restart,
+        tol,
+        max_iter,
+    )?;
+    Ok(unscale_gmres(&scaling, result))
+}
+
+/// [`gmres`] on the (rescaled) system `a x = b`.
+fn gmres_scaled<T: Scalar<Real = T> + Clone + Field + Real>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     restart: usize,
@@ -37,7 +90,7 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
     while total_iter < max_iter {
         // Compute initial residual r = b - A*x
         let mut r = vec![T::zero(); n];
-        spmv(T::one(), a, &x, T::zero(), &mut r);
+        a.apply(&x, &mut r);
         for i in 0..n {
             r[i] = b[i].clone() - r[i].clone();
         }
@@ -79,7 +132,8 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
         let mut g = vec![T::zero(); restart + 1];
         g[0] = beta.clone();
 
-        let mut inner_converged = false;
+        // Set when a lucky breakdown has already folded the cycle into x.
+        let mut solution_updated = false;
 
         // Inner loop (Arnoldi iteration)
         for j in 0..restart {
@@ -89,7 +143,9 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
 
             // w = A * v[j]
             let mut w = vec![T::zero(); n];
-            spmv(T::one(), a, &v[j], T::zero(), &mut w);
+            a.apply(&v[j], &mut w);
+            // ||A v_j||: the norm the sub-diagonal entry is derived from
+            let w_norm = norm(&w);
 
             // Modified Gram-Schmidt orthogonalization
             let mut h_col = vec![T::zero(); j + 2];
@@ -99,7 +155,9 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
                     w[k] = w[k].clone() - h_col[i].clone() * v[i][k].clone();
                 }
             }
-            h_col[j + 1] = norm(&w);
+            // h_{j+1,j}, kept before the Givens rotation overwrites h_col[j + 1]
+            let h_sub = norm(&w);
+            h_col[j + 1] = h_sub.clone();
 
             // Apply previous Givens rotations to new column
             for i in 0..j {
@@ -130,7 +188,7 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
             total_iter += 1;
 
             if res_norm <= tol_abs {
-                // Converged - solve upper triangular system H*y = g
+                // Converged estimate - solve upper triangular system H*y = g
                 let y = solve_upper_triangular(&h, &g, j + 1);
 
                 // Update solution: x = x + V*y
@@ -140,39 +198,58 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
                     }
                 }
 
-                return Ok(GmresResult {
-                    x,
-                    iterations: total_iter,
-                    restarts,
-                    residual_norm: res_norm,
-                    converged: true,
-                    residual_history,
-                });
+                // Confirm with the true residual before reporting: the estimate
+                // |g_{j+1}| is exactly 0 when A v_j = 0 or h_{j+1,j} = 0 (the
+                // rotation then has s = 0) even if the triangular solve had to
+                // drop a singular direction, and in finite precision it drifts
+                // away from ||b - A x||.
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(GmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
+                break;
             }
 
-            // Check for breakdown
-            if Scalar::abs(h[j][j + 1].clone()) <= <T as Scalar>::epsilon() {
-                // Lucky breakdown - exact solution found in Krylov subspace
+            // Lucky breakdown: the Krylov subspace is (numerically) invariant
+            if negligible_norm(h_sub.clone(), w_norm) {
                 let y = solve_upper_triangular(&h, &g, j + 1);
                 for i in 0..=j {
                     for k in 0..n {
                         x[k] = x[k].clone() + y[i].clone() * v[i][k].clone();
                     }
                 }
-                inner_converged = true;
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(GmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
                 break;
             }
 
             // Normalize w to get v[j+1]
             let mut v_new = vec![T::zero(); n];
-            let h_norm = h[j][j + 1].clone();
             for k in 0..n {
-                v_new[k] = w[k].clone() / h_norm.clone();
+                v_new[k] = w[k].clone() / h_sub.clone();
             }
             v.push(v_new);
         }
 
-        if !inner_converged && !h.is_empty() {
+        if !solution_updated && !h.is_empty() {
             // Solve upper triangular system before restart
             let m = h.len();
             let y = solve_upper_triangular(&h, &g, m);
@@ -190,7 +267,7 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
 
     // Final residual computation
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -206,9 +283,43 @@ pub fn gmres<T: Scalar<Real = T> + Clone + Field + Real>(
     })
 }
 
-/// Solver function. See module documentation for details.
+/// Right-preconditioned restarted GMRES; `precond` applies `M^{-1}`.
+///
+/// Minimizes the unpreconditioned residual `‖b − A x‖`, so the convergence test
+/// (including its confirmation by the true residual) and the lucky-breakdown
+/// rule are those of [`gmres`] (with `A M^{-1}` in place of `A`). For a
+/// system far from unit scale `precond` receives vectors of the rescaled
+/// system and must be linear (see the [module documentation](super)).
 pub fn pgmres<T, F>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    precond: F,
+    restart: usize,
+    tol: T,
+    max_iter: usize,
+) -> Result<GmresResult<T>, IterativeError>
+where
+    T: Scalar<Real = T> + Clone + Field + Real,
+    F: Fn(&[T]) -> Vec<T>,
+{
+    let scaling = SystemScaling::for_rhs(a, b);
+    let precond_scaling = PrecondScaling::new();
+    let result = pgmres_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        |v: &[T]| precond_scaling.finish(v, precond(v)),
+        restart,
+        tol,
+        max_iter,
+    )?;
+    Ok(unscale_gmres(&scaling, result))
+}
+
+/// [`pgmres`] on the (rescaled) system `a x = b`.
+fn pgmres_scaled<T, F>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     precond: F,
@@ -241,7 +352,7 @@ where
     while total_iter < max_iter {
         // Compute initial residual r = b - A*x
         let mut r = vec![T::zero(); n];
-        spmv(T::one(), a, &x, T::zero(), &mut r);
+        a.apply(&x, &mut r);
         for i in 0..n {
             r[i] = b[i].clone() - r[i].clone();
         }
@@ -275,7 +386,8 @@ where
         let mut g = vec![T::zero(); restart + 1];
         g[0] = beta.clone();
 
-        let mut inner_converged = false;
+        // Set when a lucky breakdown has already folded the cycle into x.
+        let mut solution_updated = false;
 
         for j in 0..restart {
             if total_iter >= max_iter {
@@ -288,7 +400,9 @@ where
 
             // w = A * z[j]
             let mut w = vec![T::zero(); n];
-            spmv(T::one(), a, &z_j, T::zero(), &mut w);
+            a.apply(&z_j, &mut w);
+            // ||A M^{-1} v_j||: the norm the sub-diagonal entry is derived from
+            let w_norm = norm(&w);
 
             let mut h_col = vec![T::zero(); j + 2];
             for i in 0..=j {
@@ -297,7 +411,9 @@ where
                     w[k] = w[k].clone() - h_col[i].clone() * v[i][k].clone();
                 }
             }
-            h_col[j + 1] = norm(&w);
+            // h_{j+1,j}, kept before the Givens rotation overwrites h_col[j + 1]
+            let h_sub = norm(&w);
+            h_col[j + 1] = h_sub.clone();
 
             for i in 0..j {
                 let temp = cs[i].clone() * h_col[i].clone() + sn[i].clone() * h_col[i + 1].clone();
@@ -324,7 +440,7 @@ where
             total_iter += 1;
 
             if res_norm <= tol_abs {
-                // Converged - solve upper triangular system H*y = g
+                // Converged estimate - solve upper triangular system H*y = g
                 let y = solve_upper_triangular(&h, &g, j + 1);
 
                 // Update: x = x + Z*y (using preconditioned vectors)
@@ -334,36 +450,57 @@ where
                     }
                 }
 
-                return Ok(GmresResult {
-                    x,
-                    iterations: total_iter,
-                    restarts,
-                    residual_norm: res_norm,
-                    converged: true,
-                    residual_history,
-                });
+                // Confirm with the true residual before reporting: the estimate
+                // |g_{j+1}| is exactly 0 when A v_j = 0 or h_{j+1,j} = 0 (the
+                // rotation then has s = 0) even if the triangular solve had to
+                // drop a singular direction, and in finite precision it drifts
+                // away from ||b - A x||.
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(GmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
+                break;
             }
 
-            if Scalar::abs(h[j][j + 1].clone()) <= <T as Scalar>::epsilon() {
-                inner_converged = true;
+            // Lucky breakdown: the Krylov subspace is (numerically) invariant
+            if negligible_norm(h_sub.clone(), w_norm) {
                 let y = solve_upper_triangular(&h, &g, j + 1);
                 for i in 0..=j {
                     for k in 0..n {
                         x[k] = x[k].clone() + y[i].clone() * z[i][k].clone();
                     }
                 }
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(GmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
                 break;
             }
 
             let mut v_new = vec![T::zero(); n];
-            let h_norm = h[j][j + 1].clone();
             for k in 0..n {
-                v_new[k] = w[k].clone() / h_norm.clone();
+                v_new[k] = w[k].clone() / h_sub.clone();
             }
             v.push(v_new);
         }
 
-        if !inner_converged && !h.is_empty() {
+        if !solution_updated && !h.is_empty() {
             let m = h.len();
             let y = solve_upper_triangular(&h, &g, m);
 
@@ -380,7 +517,7 @@ where
     }
 
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }

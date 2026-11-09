@@ -16,6 +16,16 @@
 //! For more advanced preconditioners, see:
 //! - ILU/ILUT/ILUTP in `lu` module
 //! - IC/ICT in `cholesky` module
+//!
+//! # Scale invariance
+//!
+//! No setup in this module compares a quantity that scales with `A` against
+//! an absolute constant. Tests documented as "zero diagonal" reject only an
+//! exact zero; pivots of dense block solves follow the per-column relative
+//! rule of the crate's dense LU (`eps · n · max_i |a_ij|`); other tests are
+//! relative to a reference of the same units (see each `new`). So building on
+//! `s·A` succeeds exactly when building on `A` does, and for a power-of-two
+//! `s` gives exactly `1/s` times the preconditioner of `A`.
 
 pub mod ainv;
 pub mod amg;
@@ -25,6 +35,7 @@ pub mod polynomial;
 pub mod samg;
 pub mod schwarz;
 pub mod spai;
+pub(crate) mod tolerance;
 pub mod types;
 
 pub use ainv::{AINV, AINVConfig};

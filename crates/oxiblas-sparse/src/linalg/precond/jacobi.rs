@@ -1,5 +1,6 @@
 //! Jacobi and Block Jacobi preconditioners.
 
+use super::tolerance::{finite_max_abs, pivot_tolerance};
 use super::types::PreconditionerError;
 use crate::csr::CsrMatrix;
 use oxiblas_core::scalar::{Field, Scalar};
@@ -47,7 +48,16 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Jacobi<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if any diagonal element is zero or matrix is not square.
+    /// Returns error if the matrix is not square, or
+    /// [`PreconditionerError::ZeroDiagonal`] if a diagonal element is missing
+    /// or exactly zero.
+    ///
+    /// Only an exact zero is rejected, so the outcome does not depend on the
+    /// scale of `A`: `s·A` builds whenever `A` does, and its preconditioner
+    /// is exactly `1/s` times that of `A` for a power-of-two `s`. A nonzero
+    /// diagonal entry is accepted however small it is (its reciprocal
+    /// overflows to ±∞ only for `|a_ii|` below `1 / T::MAX`, in the subnormal
+    /// range).
     pub fn new(a: &CsrMatrix<T>) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -67,7 +77,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Jacobi<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let diag_val = a.values()[k].clone();
-                    if Scalar::abs(diag_val.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if diag_val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     diag_inv[i] = T::one() / diag_val;
@@ -173,7 +183,14 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> BlockJacobi<T> {
     /// Returns error if:
     /// - Matrix is not square
     /// - Block sizes don't sum to matrix size
-    /// - Any block is singular
+    /// - Any block is (numerically) singular: [`PreconditionerError::SingularBlock`]
+    ///   with the column index within the block. Each block is inverted by
+    ///   Gauss–Jordan elimination with partial pivoting, and the block is
+    ///   singular when the largest remaining magnitude in pivot column `j` is
+    ///   at or below `eps · b · s_j`, where `b` is the block size and `s_j` the
+    ///   largest finite magnitude in column `j` of the original block (the
+    ///   per-column rule of the crate's dense LU). The threshold scales with
+    ///   the block, so `s·A` builds whenever `A` does.
     pub fn new(a: &CsrMatrix<T>, block_sizes: &[usize]) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -234,7 +251,16 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> BlockJacobi<T> {
     }
 
     /// Invert a dense matrix using Gauss-Jordan elimination.
+    ///
+    /// A pivot column is singular when its largest remaining magnitude is at
+    /// or below `eps · n · s_j`, `s_j` being the largest finite magnitude of
+    /// column `j` of `matrix` (rows are swapped, columns never move).
     fn invert_dense(matrix: &[T], n: usize) -> Result<Vec<T>, PreconditionerError> {
+        // Per-column singularity thresholds from the original block.
+        let col_tol: Vec<T> = (0..n)
+            .map(|j| pivot_tolerance(n, finite_max_abs((0..n).map(|i| matrix[i * n + j].clone()))))
+            .collect();
+
         // Create augmented matrix [A | I]
         let mut aug = vec![T::zero(); n * (2 * n)];
 
@@ -260,7 +286,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> BlockJacobi<T> {
                 }
             }
 
-            if max_val < T::from_f64(1e-14).unwrap_or(T::zero()) {
+            if max_val <= col_tol[i] {
                 return Err(PreconditionerError::SingularBlock(i));
             }
 

@@ -25,8 +25,6 @@
 //! - The CPU supports SSE4.2 (checked at call-site via
 //!   `is_x86_feature_detected!`).
 
-#![allow(clippy::incompatible_msrv)]
-
 // This entire module is x86-64-only.
 #[cfg(target_arch = "x86_64")]
 mod inner {
@@ -400,6 +398,13 @@ mod tests {
 
             gemm_scalar_ref(MR, NR, k, alpha, &a, &b, beta, &mut c_ref, MR);
 
+            // SAFETY: SSE4.2 was detected at the top of this function and SSE2
+            // is part of the x86_64 baseline (the kernel's two target
+            // features). `a` holds the packed `MR x k` panel (k * MR
+            // elements), `b` the packed `k x NR` panel (k * NR) and `c_sse`
+            // the `MR x NR` tile with leading dimension MR (MR * NR elements),
+            // which is exactly what the 4 x 2 kernel reads and writes; the
+            // three vectors are distinct allocations.
             unsafe {
                 micro_kernel_f64_sse42(
                     k,
@@ -488,6 +493,13 @@ mod tests {
 
             gemm_scalar_ref(MR, NR, k, alpha, &a, &b, beta, &mut c_ref, MR);
 
+            // SAFETY: SSE4.2 was detected at the top of this function and SSE2
+            // is part of the x86_64 baseline (the kernel's two target
+            // features). `a` holds the packed `MR x k` panel (k * MR
+            // elements), `b` the packed `k x NR` panel (k * NR) and `c_sse`
+            // the `MR x NR` tile with leading dimension MR (MR * NR elements),
+            // which is exactly what the 4 x 4 kernel reads and writes; the
+            // three vectors are distinct allocations.
             unsafe {
                 micro_kernel_f32_sse42(
                     k,

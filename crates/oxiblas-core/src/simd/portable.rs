@@ -2,16 +2,18 @@
 //!
 //! These registers store their lanes in a plain `[T; N]` array and implement
 //! every [`SimdRegister`] operation with ordinary scalar arithmetic, one lane
-//! at a time. They are the generic backend used for [`SimdScalar`] on every
-//! target that has no dedicated intrinsic backend in this crate (that is,
-//! everything other than x86_64, AArch64 and wasm32 — e.g. riscv64,
-//! powerpc64, s390x, loongarch64, 32-bit ARM, i686, ...).
+//! at a time. They are the generic backend used for
+//! [`crate::simd::SimdScalar`] on every target that has no dedicated intrinsic
+//! backend in this crate (that is, everything other than x86_64, AArch64 and
+//! wasm32 — e.g. riscv64, powerpc64, s390x, loongarch64, 32-bit ARM, i686,
+//! ...).
 //!
 //! The lane counts match the nominal register widths (`F64x4`/`F32x8` for
 //! 256 bits, `F64x8`/`F32x16` for 512 bits) so that
-//! [`SimdScalar::LANES_256`] / [`SimdScalar::LANES_512`] agree with the
-//! register's [`SimdRegister::LANES`]. The compiler's auto-vectorizer is free
-//! to lower the fixed-size lane loops to whatever vector unit the target has.
+//! [`crate::simd::SimdScalar::LANES_256`] /
+//! [`crate::simd::SimdScalar::LANES_512`] agree with the register's
+//! [`SimdRegister::LANES`]. The compiler's auto-vectorizer is free to lower
+//! the fixed-size lane loops to whatever vector unit the target has.
 //!
 //! The types are compiled on every architecture (not only on the fallback
 //! ones) so they can be unit-tested against the native SIMD backends on the

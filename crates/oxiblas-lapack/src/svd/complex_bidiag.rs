@@ -702,7 +702,7 @@ where
 /// Constructs H = I - tau * v * v^H such that H * x = alpha * e_1
 /// where x = work[start:m, col].
 ///
-/// v[0] = 1 (implicit at row `start`), v[1:] stored in work[start+1:m, col].
+/// `v[0]` = 1 (implicit at row `start`), `v[1:]` stored in `work[start+1:m, col]`.
 ///
 /// Returns (tau, alpha).
 fn complex_householder_column<T: Field + ComplexScalar>(
@@ -758,7 +758,7 @@ where
 ///   H * y = beta * e_1, then G = H^H, alpha = conj(beta).
 ///
 /// Stores the Householder vector v in work[row, start+1:n] (these are the
-/// components of v for the H on conj(x)). v[0] = 1 (implicit at col start).
+/// components of v for the H on conj(x)). `v[0]` = 1 (implicit at col start).
 ///
 /// Returns (tau_h, alpha) where tau_h is the tau for H (use conj(tau_h) for G).
 fn complex_householder_row<T: Field + ComplexScalar>(
@@ -812,7 +812,7 @@ where
 
 /// Applies left Householder H = I - tau * v * v^H to trailing columns.
 ///
-/// v starts at row `start` with v[0]=1 implicit. v[1:] in work[start+1:m, col_store].
+/// v starts at row `start` with `v[0]`=1 implicit. `v[1:]` in `work[start+1:m, col_store]`.
 /// Applied to columns col_store+1..n.
 fn complex_apply_householder_left<T: Field + ComplexScalar>(
     work: &mut Mat<T>,
@@ -845,11 +845,11 @@ fn complex_apply_householder_left<T: Field + ComplexScalar>(
 
 /// Applies right Householder G = H^H = I - conj(tau_h) * v * v^H to trailing rows.
 ///
-/// v starts at col `start` with v[0]=1 implicit. v[1:] in work[row_store, start+1:n].
+/// v starts at col `start` with `v[0]`=1 implicit. `v[1:]` in `work[row_store, start+1:n]`.
 /// Applied to rows row_store+1..m.
 ///
 /// For a row x: x * G = x - conj(tau_h) * (x * v) * v^H
-/// x*v = sum_i x[i]*v[i] (no conjugate on v).
+/// x*v = sum_i `x[i]`*`v[i]` (no conjugate on v).
 fn complex_apply_householder_right<T: Field + ComplexScalar>(
     work: &mut Mat<T>,
     row_store: usize,

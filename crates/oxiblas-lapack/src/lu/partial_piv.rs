@@ -1,15 +1,16 @@
 //! LU decomposition with partial pivoting.
 //!
 //! This is the standard LU decomposition algorithm used by LAPACK's DGETRF.
-//! For large matrices, uses blocked algorithm with GEMM/TRSM for cache efficiency.
+//! [`Lu::compute`] always runs the unblocked (column-by-column) algorithm,
+//! whatever the size. The blocked algorithm with GEMM/TRSM updates, for cache
+//! efficiency on large matrices, is used by [`Lu::compute_blocked`] /
+//! [`Lu::compute_with_block_size`] (once the order reaches the block size) and
+//! by [`Lu::compute_auto`], which calls `compute_blocked` from order 128.
 
-use num_traits::{FromPrimitive, One};
-use oxiblas_blas::level3::gemm::gemm;
-#[cfg(feature = "parallel")]
+use super::tolerance::lu_pivot_tolerances;
 use oxiblas_blas::level3::gemm::gemm_with_par;
 use oxiblas_blas::level3::gemm_kernel::GemmKernel;
-use oxiblas_blas::level3::trsm::{Diag, Side, Trans, Uplo, trsm_in_place};
-#[cfg(feature = "parallel")]
+use oxiblas_blas::level3::trsm::{Diag, Side, Trans, Uplo, trsm_in_place_with_par};
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
@@ -56,6 +57,146 @@ impl core::fmt::Display for LuError {
 
 impl std::error::Error for LuError {}
 
+/// Elimination step `k`: scales column `k` below the diagonal by
+/// `1 / lu[(k, k)]`, which turns it into the multipliers of L, then subtracts
+/// the rank-1 update `L[k+1.., k] * U[k, j]` from every column `j` in
+/// `k+1..col_end`, rows `k+1..`.
+///
+/// The storage is column-major, so each column is a contiguous slice and the
+/// update streams down columns instead of striding across rows, with no
+/// per-element bounds check. Every element still gets exactly the operations
+/// of the row-oriented formulation, on the same operands
+/// (`l_ik = a_ik * (1 / a_kk)`, then `a_ij - l_ik * a_kj`), so the factors are
+/// bit-identical to it: only the order of independent updates changes.
+///
+/// Also used by the full and rook pivoting factorizations, whose elimination
+/// step is the same once their pivot is in place.
+pub(super) fn eliminate_column<T: Field>(lu: &mut Mat<T>, k: usize, col_end: usize) {
+    let n = lu.nrows();
+    let ld = lu.row_stride();
+    let pivot_inv = T::one() / lu[(k, k)];
+    let data = lu.raw_data_mut();
+
+    let col_k = k * ld;
+    for l_ik in &mut data[col_k + k + 1..col_k + n] {
+        *l_ik = *l_ik * pivot_inv;
+    }
+
+    for j in (k + 1)..col_end {
+        // Column k ends before column j starts (k < j and n <= ld), so
+        // splitting at the start of column j borrows both disjointly.
+        let (before, from_j) = data.split_at_mut(j * ld);
+        let l_col = &before[col_k + k + 1..col_k + n];
+        let a_col = &mut from_j[..n];
+        let u_kj = a_col[k];
+        for (a_ij, &l_ik) in a_col[k + 1..].iter_mut().zip(l_col) {
+            *a_ij = *a_ij - l_ik * u_kj;
+        }
+    }
+}
+
+/// Applies the row interchanges `pivot[k0..k1]`, in order, to the columns
+/// `c0..c1` of `lu`.
+///
+/// Each column is a contiguous slice, so the interchanges are applied one
+/// column at a time (as LAPACK `?laswp` does) instead of walking strided rows;
+/// the result is the same, they only move data.
+fn apply_row_swaps<T: Field>(
+    lu: &mut Mat<T>,
+    pivot: &[usize],
+    k0: usize,
+    k1: usize,
+    c0: usize,
+    c1: usize,
+) {
+    let swaps = &pivot[k0..k1];
+    if (k0..k1).zip(swaps).all(|(k, &pk)| pk == k) {
+        return;
+    }
+    let n = lu.nrows();
+    let ld = lu.row_stride();
+    let data = lu.raw_data_mut();
+    for j in c0..c1 {
+        let col = &mut data[j * ld..j * ld + n];
+        for (k, &pk) in (k0..k1).zip(swaps) {
+            col.swap(k, pk);
+        }
+    }
+}
+
+/// Finishes the block row of panel `jb..jb + w` and updates the columns
+/// `jb + w..stop` below it, in place, once the panel columns are factored:
+///
+/// 1. applies the panel's row interchanges to those columns;
+/// 2. solves `L11 · U12 = A12` (TRSM with the unit lower triangle of the
+///    panel's diagonal block);
+/// 3. updates `A22 := A22 − L21 · U12` with one GEMM (`alpha = −1`,
+///    `beta = 1`), for every row below the panel.
+///
+/// The blocked drivers pass `stop = n` (the whole trailing submatrix); the
+/// recursive panel factorization passes the end of the panel it splits.
+///
+/// Every operand is a view of `lu`, so nothing is copied. TRSM reads only the
+/// strictly lower triangle of `L11` (unit diagonal), never the `U11` entries
+/// stored in the same block.
+///
+/// `par` is handed to TRSM and GEMM. Both give bitwise the same result for
+/// every `Par` (TRSM cuts the right-hand sides into fixed panels and GEMM keeps
+/// the sequential K partition), so the parallel drivers reproduce the
+/// sequential ones exactly.
+///
+/// Compared with forming `L21 · U12` in a zeroed temporary and subtracting it
+/// afterwards, the in-place GEMM accumulates each K block of its partition
+/// into `A22` directly: when the panel is wider than one K block of the GEMM,
+/// `(a − p₁) − p₂` replaces `a − (p₁ + p₂)`, which can change the last bits.
+fn update_trailing<T: Field + GemmKernel + bytemuck::Zeroable>(
+    lu: &mut Mat<T>,
+    pivot: &[usize],
+    jb: usize,
+    w: usize,
+    stop: usize,
+    par: Par,
+) -> Result<(), LuError> {
+    let n = lu.nrows();
+    let end = jb + w;
+    if end >= stop {
+        return Ok(());
+    }
+    let (r, cols) = (n - end, stop - end);
+
+    apply_row_swaps(lu, pivot, jb, end, end, stop);
+
+    let (left, right) = lu.as_mut().split_cols(end);
+    let left = left.rb();
+    let l11 = left.submatrix(jb, jb, w, w);
+    let l21 = left.submatrix(end, jb, r, w);
+    let (mut u12, a22) = right.submatrix(jb, 0, w + r, cols).split_rows(w);
+
+    let solved = trsm_in_place_with_par(
+        Side::Left,
+        Uplo::Lower,
+        Trans::NoTrans,
+        Diag::Unit,
+        l11,
+        u12.rb_mut(),
+        par,
+    );
+    // A unit-diagonal solve fails only on inconsistent shapes, and these
+    // come from the panel; report a shape error rather than ignore it.
+    debug_assert!(solved.is_ok(), "TRSM of a factored LU panel failed");
+    solved.map_err(|_| LuError::DimensionMismatch {
+        expected: w,
+        actual: u12.nrows(),
+    })?;
+
+    gemm_with_par(-T::one(), l21, u12.rb(), T::one(), a22, par);
+    Ok(())
+}
+
+/// Panel width up to which the blocked drivers factor a panel with the
+/// unblocked kernel instead of splitting it ([`Lu::factor_panel_recursive`]).
+const PANEL_BASE: usize = 16;
+
 /// LU decomposition with partial (row) pivoting.
 ///
 /// Stores the factorization PA = LU where:
@@ -65,13 +206,23 @@ impl std::error::Error for LuError {}
 ///
 /// The L and U factors are stored compactly in a single matrix,
 /// with L below the diagonal and U on and above the diagonal.
+///
+/// The pivot of column `j` is treated as zero, and reported as
+/// [`LuError::Singular`], when its magnitude is at most `eps · n · s_j`, where
+/// `s_j = max_i |a_ij|` is taken over the finite entries of column `j` of the
+/// input. The threshold is relative to each column: scaling the columns of a
+/// real matrix by powers of two, `A · diag(c)`, changes neither the pivots
+/// nor the outcome (only column `j` of U, by `c_j`), as long as no entry or
+/// intermediate value overflows or underflows. A badly scaled but
+/// well-conditioned matrix such as `diag(1e20, 1)` therefore factors, while a
+/// column that elimination reduces to rounding noise is still rejected.
 #[derive(Clone, Debug)]
 pub struct Lu<T: Scalar> {
     /// Combined L and U factors.
     /// L is stored below the diagonal (with implicit unit diagonal).
     /// U is stored on and above the diagonal.
     lu: Mat<T>,
-    /// Pivot indices: row i was swapped with row pivot[i].
+    /// Pivot indices: row i was swapped with row `pivot[i]`.
     pivot: Vec<usize>,
     /// Number of row swaps (for determinant sign).
     num_swaps: usize,
@@ -138,6 +289,10 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
 
+        // Per-column singularity thresholds `eps · n · max_i |a_ij|`, computed
+        // once from the input.
+        let col_tol = lu_pivot_tolerances(a);
+
         // Doolittle algorithm with partial pivoting
         for k in 0..n {
             // Find pivot: largest absolute value in column k, rows k..n
@@ -152,11 +307,10 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            // Use a relative tolerance based on machine epsilon and matrix size
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Check for singularity against the threshold of column k. A NaN
+            // pivot fails this comparison and propagates instead of being
+            // reported as singular.
+            if pivot_val <= col_tol[k] {
                 return Err(LuError::Singular { index: k });
             }
 
@@ -173,19 +327,9 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
                 num_swaps += 1;
             }
 
-            // Compute multipliers (L's subdiagonal entries) and update
-            let pivot_inv = T::one() / lu[(k, k)];
-            for i in (k + 1)..n {
-                // Multiplier (stored in L)
-                let mult = lu[(i, k)] * pivot_inv;
-                lu[(i, k)] = mult;
-
-                // Update remaining submatrix
-                for j in (k + 1)..n {
-                    let val = lu[(i, j)] - mult * lu[(k, j)];
-                    lu[(i, j)] = val;
-                }
-            }
+            // Compute multipliers (L's subdiagonal entries) and update the
+            // remaining submatrix, column by column.
+            eliminate_column(&mut lu, k, n);
         }
 
         Ok(Lu {
@@ -223,7 +367,7 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
             return T::one();
         }
 
-        let mut det = if self.num_swaps % 2 == 0 {
+        let mut det = if self.num_swaps.is_multiple_of(2) {
             T::one()
         } else {
             -T::one()
@@ -264,36 +408,15 @@ impl<T: Field + bytemuck::Zeroable> Lu<T> {
         let m = b.ncols();
         let mut x = Mat::zeros(n, m);
 
-        // Copy b to x, applying row permutation
-        for k in 0..n {
-            let pk = self.pivot[k];
-            for j in 0..m {
-                let tmp = if k != pk { b[(pk, j)] } else { b[(k, j)] };
-                x[(k, j)] = tmp;
-            }
-        }
-
-        // Apply permutation in-place
-        for k in 0..n {
-            let pk = self.pivot[k];
-            if k != pk {
-                for j in 0..m {
-                    let tmp = x[(k, j)];
-                    x[(k, j)] = x[(pk, j)];
-                    x[(pk, j)] = tmp;
-                }
-            }
-        }
-
-        // Re-copy b with permutation (the swap above doesn't work correctly for all cases)
-        // Let's fix by properly applying the permutation sequence
+        // Pb: copy b, then apply the row interchanges in factorization order.
+        // `pivot` records the interchanges (row k was swapped with row
+        // pivot[k] at step k, as LAPACK's IPIV), not a permutation map, so it
+        // must be replayed swap by swap.
         for j in 0..m {
             for i in 0..n {
                 x[(i, j)] = b[(i, j)];
             }
         }
-
-        // Apply permutations in order
         for k in 0..n {
             let pk = self.pivot[k];
             if k != pk {
@@ -507,7 +630,11 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     }
 
     /// Computes LU decomposition with a specified block size.
+    ///
+    /// A block size of 0 is treated as 1 (one column per panel).
     pub fn compute_with_block_size(a: MatRef<'_, T>, nb: usize) -> Result<Self, LuError> {
+        // A zero-width panel would never advance the blocked loop.
+        let nb = nb.max(1);
         let n = a.nrows();
 
         if n != a.ncols() {
@@ -535,12 +662,22 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
 
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
+        // Per-column singularity thresholds, shared by every path below.
+        let col_tol = lu_pivot_tolerances(a);
 
         // Use blocked algorithm for larger matrices
         if n >= nb {
-            Self::blocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, nb)?;
+            Self::blocked_factor(
+                &mut lu,
+                &mut pivot,
+                &mut num_swaps,
+                n,
+                nb,
+                &col_tol,
+                Par::Seq,
+            )?;
         } else {
-            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0)?;
+            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, &col_tol)?;
         }
 
         Ok(Lu {
@@ -550,13 +687,27 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         })
     }
 
-    /// Blocked LU factorization using GEMM for Schur complement updates.
+    /// Blocked right-looking LU factorization (LAPACK `?getrf`).
+    ///
+    /// Each panel of `nb` columns is factored by
+    /// [`Self::factor_panel_recursive`]; its row interchanges are then applied
+    /// to the columns left of it, and [`update_trailing`] applies them to the
+    /// columns right of it, solves for the block row of U with TRSM and
+    /// updates the trailing submatrix with one GEMM, in place on `lu`. `par`
+    /// is passed to TRSM and GEMM (also inside the panel); the rest runs on
+    /// the calling thread.
+    ///
+    /// `col_tol[j]` is the singularity threshold of column `j`, computed from
+    /// the input matrix before factorizing.
+    #[allow(clippy::too_many_arguments)]
     fn blocked_factor(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
         num_swaps: &mut usize,
         n: usize,
         nb: usize,
+        col_tol: &[T::Real],
+        par: Par,
     ) -> Result<(), LuError> {
         let mut jb = 0;
 
@@ -565,86 +716,14 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
             let jb_size = nb.min(n - jb);
 
             // Factor the current panel (columns jb:jb+jb_size)
-            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size)?;
+            Self::factor_panel_recursive(lu, pivot, num_swaps, n, jb, jb_size, col_tol, par)?;
 
-            // If there are more columns after this panel
-            if jb + jb_size < n {
-                // Apply row interchanges to columns jb+jb_size:n
-                for k in jb..jb + jb_size {
-                    let pk = pivot[k];
-                    if pk != k {
-                        for j in (jb + jb_size)..n {
-                            let tmp = lu[(k, j)];
-                            lu[(k, j)] = lu[(pk, j)];
-                            lu[(pk, j)] = tmp;
-                        }
-                    }
-                }
+            // The panel's row interchanges for the columns left of it
+            apply_row_swaps(lu, pivot, jb, jb + jb_size, 0, jb);
 
-                // Solve L11 * U12 = A12 using TRSM
-                // Extract L11 (lower triangular with unit diagonal)
-                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
-                for i in 0..jb_size {
-                    l11[(i, i)] = T::one();
-                    for j in 0..i {
-                        l11[(i, j)] = lu[(jb + i, jb + j)];
-                    }
-                }
-
-                // Extract and update U12 block
-                let mut u12: Mat<T> = Mat::zeros(jb_size, n - jb - jb_size);
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..jb_size {
-                        u12[(i, j)] = lu[(jb + i, jb + jb_size + j)];
-                    }
-                }
-
-                // Solve L11 * U12 = A12 (in-place on u12)
-                let _ = trsm_in_place(
-                    Side::Left,
-                    Uplo::Lower,
-                    Trans::NoTrans,
-                    Diag::Unit,
-                    l11.as_ref(),
-                    u12.as_mut(),
-                );
-
-                // Copy U12 back
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..jb_size {
-                        lu[(jb + i, jb + jb_size + j)] = u12[(i, j)];
-                    }
-                }
-
-                // Update trailing submatrix: A22 -= L21 * U12 using GEMM
-                let rows_remaining = n - jb - jb_size;
-
-                // Extract L21 block
-                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l21[(i, j)] = lu[(jb + jb_size + i, jb + j)];
-                    }
-                }
-
-                // Compute update = L21 * U12 and subtract from A22
-                let mut update: Mat<T> = Mat::zeros(rows_remaining, n - jb - jb_size);
-                gemm(
-                    T::one(),
-                    l21.as_ref(),
-                    u12.as_ref(),
-                    T::zero(),
-                    update.as_mut(),
-                );
-
-                // A22 -= update
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..rows_remaining {
-                        lu[(jb + jb_size + i, jb + jb_size + j)] =
-                            lu[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
-                    }
-                }
-            }
+            // Row interchanges, U12 and the Schur complement of the columns
+            // right of the panel
+            update_trailing(lu, pivot, jb, jb_size, n, par)?;
 
             jb += jb_size;
         }
@@ -652,7 +731,50 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         Ok(())
     }
 
+    /// Factors the panel `jb..jb + w` (rows `jb..n`) recursively, as LAPACK
+    /// `?getrf2` does: the left half is factored, its row interchanges and
+    /// block row of U are applied to the right half and the right half's
+    /// Schur complement is updated by [`update_trailing`] (TRSM and GEMM),
+    /// then the right half is factored and its interchanges are applied to
+    /// the left half. Panels of at most [`PANEL_BASE`] columns are factored
+    /// by [`Self::factor_panel`].
+    ///
+    /// The row interchanges are applied to the panel's columns only; the
+    /// caller applies them to the columns outside it. Most of the panel's
+    /// multiply-adds run in GEMM instead of rank-1 updates that stream the
+    /// whole panel through memory for every column.
+    #[allow(clippy::too_many_arguments)]
+    fn factor_panel_recursive(
+        lu: &mut Mat<T>,
+        pivot: &mut [usize],
+        num_swaps: &mut usize,
+        n: usize,
+        jb: usize,
+        w: usize,
+        col_tol: &[T::Real],
+        par: Par,
+    ) -> Result<(), LuError> {
+        if w <= PANEL_BASE {
+            return Self::factor_panel(lu, pivot, num_swaps, n, jb, w, jb, col_tol);
+        }
+        let n1 = w / 2;
+        Self::factor_panel_recursive(lu, pivot, num_swaps, n, jb, n1, col_tol, par)?;
+        update_trailing(lu, pivot, jb, n1, jb + w, par)?;
+        Self::factor_panel_recursive(lu, pivot, num_swaps, n, jb + n1, w - n1, col_tol, par)?;
+        apply_row_swaps(lu, pivot, jb + n1, jb + w, jb, jb + n1);
+        Ok(())
+    }
+
     /// Factor a panel of columns using unblocked algorithm.
+    ///
+    /// Each row interchange is applied to the columns `swap_from..jb +
+    /// jb_size`, so `swap_from = 0` swaps whole rows up to the end of the
+    /// panel and `swap_from = jb` leaves the columns left of the panel to
+    /// the caller.
+    ///
+    /// `col_tol[j]` is the singularity threshold of column `j`, computed from
+    /// the input matrix before factorizing.
+    #[allow(clippy::too_many_arguments)]
     fn factor_panel(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
@@ -660,6 +782,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
         n: usize,
         jb: usize,
         jb_size: usize,
+        swap_from: usize,
+        col_tol: &[T::Real],
     ) -> Result<(), LuError> {
         for k in jb..(jb + jb_size) {
             // Find pivot in column k, rows k..n
@@ -674,18 +798,17 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Check for singularity against the threshold of column k (a NaN
+            // pivot fails the comparison)
+            if pivot_val <= col_tol[k] {
                 return Err(LuError::Singular { index: k });
             }
 
             pivot[k] = pivot_row;
 
-            // Swap rows k and pivot_row in columns 0..jb+jb_size
+            // Swap rows k and pivot_row in columns swap_from..jb+jb_size
             if pivot_row != k {
-                for j in 0..(jb + jb_size) {
+                for j in swap_from..(jb + jb_size) {
                     let tmp = lu[(k, j)];
                     lu[(k, j)] = lu[(pivot_row, j)];
                     lu[(pivot_row, j)] = tmp;
@@ -693,30 +816,24 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 *num_swaps += 1;
             }
 
-            // Compute multipliers and update within the panel
-            let pivot_inv = T::one() / lu[(k, k)];
-            for i in (k + 1)..n {
-                let mult = lu[(i, k)] * pivot_inv;
-                lu[(i, k)] = mult;
-
-                // Update remaining columns in this panel
-                for j in (k + 1)..(jb + jb_size) {
-                    let val = lu[(i, j)] - mult * lu[(k, j)];
-                    lu[(i, j)] = val;
-                }
-            }
+            // Compute multipliers and update the remaining columns of the panel
+            eliminate_column(lu, k, jb + jb_size);
         }
 
         Ok(())
     }
 
     /// Unblocked LU factorization (for small matrices or panels).
+    ///
+    /// `col_tol[j]` is the singularity threshold of column `j`, computed from
+    /// the input matrix before factorizing.
     fn unblocked_factor(
         lu: &mut Mat<T>,
         pivot: &mut [usize],
         num_swaps: &mut usize,
         n: usize,
         start: usize,
+        col_tol: &[T::Real],
     ) -> Result<(), LuError> {
         for k in start..n {
             // Find pivot: largest absolute value in column k, rows k..n
@@ -731,10 +848,9 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 }
             }
 
-            // Check for singularity
-            let tol = T::epsilon()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // Check for singularity against the threshold of column k (a NaN
+            // pivot fails the comparison)
+            if pivot_val <= col_tol[k] {
                 return Err(LuError::Singular { index: k });
             }
 
@@ -750,17 +866,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
                 *num_swaps += 1;
             }
 
-            // Compute multipliers and update
-            let pivot_inv = T::one() / lu[(k, k)];
-            for i in (k + 1)..n {
-                let mult = lu[(i, k)] * pivot_inv;
-                lu[(i, k)] = mult;
-
-                for j in (k + 1)..n {
-                    let val = lu[(i, j)] - mult * lu[(k, j)];
-                    lu[(i, j)] = val;
-                }
-            }
+            // Compute multipliers and update the trailing submatrix
+            eliminate_column(lu, k, n);
         }
 
         Ok(())
@@ -769,13 +876,11 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
 
 // Recursive cache-oblivious LU factorization with partial pivoting
 impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
-    /// Recursion threshold: matrices at or below this size use the unblocked algorithm.
-    const RECURSIVE_THRESHOLD: usize = 64;
-
     /// Computes the LU decomposition using a recursive cache-oblivious algorithm.
     ///
-    /// This divide-and-conquer approach automatically adapts to the cache hierarchy
-    /// by recursively splitting the matrix. At each level:
+    /// This divide-and-conquer approach (LAPACK `?getrf2`) automatically
+    /// adapts to the cache hierarchy by recursively splitting the columns. At
+    /// each level:
     ///
     /// 1. Split A into left panel (n x n1) and right panel (n x n2)
     /// 2. Recursively factor the left panel to get [L11, U11, P1] and L21
@@ -785,8 +890,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// 6. Recursively factor the Schur complement to get [L22, U22, P2]
     /// 7. Apply P2 to L21
     ///
-    /// For matrices smaller than the recursion threshold (64), falls back to the
-    /// unblocked algorithm.
+    /// Every step works in place on the factor's storage. Panels of at most
+    /// 16 columns are factored by the unblocked algorithm.
     ///
     /// # Arguments
     ///
@@ -843,8 +948,19 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
 
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
+        // Per-column singularity thresholds, shared by every path below.
+        let col_tol = lu_pivot_tolerances(a);
 
-        Self::recursive_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, n)?;
+        Self::factor_panel_recursive(
+            &mut lu,
+            &mut pivot,
+            &mut num_swaps,
+            n,
+            0,
+            n,
+            &col_tol,
+            Par::Seq,
+        )?;
 
         Ok(Lu {
             lu,
@@ -852,137 +968,10 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
             num_swaps,
         })
     }
-
-    /// Recursive LU factorization on a submatrix.
-    ///
-    /// Factors columns `col_start..col_start+width` of the full n x n matrix `lu`,
-    /// considering all rows from `col_start..n` for pivoting.
-    ///
-    /// # Arguments
-    ///
-    /// * `lu` - The full n x n working matrix (modified in place)
-    /// * `pivot` - Pivot indices array (global indices)
-    /// * `num_swaps` - Counter for row swaps
-    /// * `n` - Full matrix dimension
-    /// * `col_start` - Starting column of the current panel
-    /// * `width` - Number of columns to factor in this call
-    fn recursive_factor(
-        lu: &mut Mat<T>,
-        pivot: &mut [usize],
-        num_swaps: &mut usize,
-        n: usize,
-        col_start: usize,
-        width: usize,
-    ) -> Result<(), LuError> {
-        if width == 0 {
-            return Ok(());
-        }
-
-        // Base case: use unblocked panel factorization for small widths
-        if width <= Self::RECURSIVE_THRESHOLD {
-            // Factor columns col_start..col_start+width as a panel, considering all rows
-            Self::factor_panel(lu, pivot, num_swaps, n, col_start, width)?;
-
-            // If there are trailing columns, apply updates
-            let trailing_cols = n - col_start - width;
-            if trailing_cols > 0 {
-                // Apply row interchanges to trailing columns
-                for k in col_start..col_start + width {
-                    let pk = pivot[k];
-                    if pk != k {
-                        for j in (col_start + width)..n {
-                            let tmp = lu[(k, j)];
-                            lu[(k, j)] = lu[(pk, j)];
-                            lu[(pk, j)] = tmp;
-                        }
-                    }
-                }
-
-                // Extract L11 (lower triangular with unit diagonal, width x width)
-                let mut l11 = Mat::zeros(width, width);
-                for i in 0..width {
-                    l11[(i, i)] = T::one();
-                    for j in 0..i {
-                        l11[(i, j)] = lu[(col_start + i, col_start + j)];
-                    }
-                }
-
-                // Extract U12 block (width x trailing_cols)
-                let mut u12 = Mat::zeros(width, trailing_cols);
-                for j in 0..trailing_cols {
-                    for i in 0..width {
-                        u12[(i, j)] = lu[(col_start + i, col_start + width + j)];
-                    }
-                }
-
-                // Solve L11 * U12 = A12 via TRSM
-                let _ = trsm_in_place(
-                    Side::Left,
-                    Uplo::Lower,
-                    Trans::NoTrans,
-                    Diag::Unit,
-                    l11.as_ref(),
-                    u12.as_mut(),
-                );
-
-                // Copy U12 back
-                for j in 0..trailing_cols {
-                    for i in 0..width {
-                        lu[(col_start + i, col_start + width + j)] = u12[(i, j)];
-                    }
-                }
-
-                // Update trailing submatrix: A22 -= L21 * U12
-                let rows_below = n - col_start - width;
-                if rows_below > 0 {
-                    // Extract L21 (rows_below x width)
-                    let mut l21 = Mat::zeros(rows_below, width);
-                    for j in 0..width {
-                        for i in 0..rows_below {
-                            l21[(i, j)] = lu[(col_start + width + i, col_start + j)];
-                        }
-                    }
-
-                    // Compute update = L21 * U12
-                    let mut update = Mat::zeros(rows_below, trailing_cols);
-                    gemm(
-                        T::one(),
-                        l21.as_ref(),
-                        u12.as_ref(),
-                        T::zero(),
-                        update.as_mut(),
-                    );
-
-                    // A22 -= update
-                    for j in 0..trailing_cols {
-                        for i in 0..rows_below {
-                            lu[(col_start + width + i, col_start + width + j)] =
-                                lu[(col_start + width + i, col_start + width + j)] - update[(i, j)];
-                        }
-                    }
-                }
-            }
-
-            return Ok(());
-        }
-
-        // Recursive case: split the width in half
-        let n1 = width / 2;
-        let n2 = width - n1;
-
-        // Step 1: Recursively factor the left half (columns col_start..col_start+n1)
-        // This will also update the right half via the trailing column logic in the base case
-        Self::recursive_factor(lu, pivot, num_swaps, n, col_start, n1)?;
-
-        // Step 2: Now recursively factor the right half (columns col_start+n1..col_start+width)
-        // The Schur complement for these columns has already been computed in step 1
-        Self::recursive_factor(lu, pivot, num_swaps, n, col_start + n1, n2)?;
-
-        Ok(())
-    }
 }
 
-// Optimized automatic algorithm selection for f64 and f32
+// Automatic algorithm selection, for the element types with GEMM micro-kernels
+// (f32, f64, Complex32 and Complex64).
 impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// Computes the LU decomposition with automatic algorithm selection.
     ///
@@ -990,7 +979,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
     /// for better cache efficiency and performance. Otherwise uses the unblocked
     /// algorithm which has less overhead for small matrices.
     ///
-    /// This method is available for f32 and f64 types which have optimized GEMM kernels.
+    /// This method is available for the element types with GEMM micro-kernels
+    /// (`f32`, `f64`, `Complex32` and `Complex64`).
     ///
     /// # Example
     ///
@@ -1029,9 +1019,13 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable> Lu<T> {
 impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
     /// Computes the LU decomposition using a parallel blocked algorithm.
     ///
-    /// Parallelizes the GEMM (Schur complement) updates within the blocked
-    /// factorization using Rayon. For matrices smaller than the block size,
-    /// falls back to the sequential unblocked algorithm.
+    /// Same algorithm as [`Self::compute_blocked`], with the TRSM (block row
+    /// of U) and GEMM (Schur complement) updates of every panel run on the
+    /// Rayon pool; the panels themselves are factored on the calling thread.
+    /// Both kernels give bitwise the same result for any number of threads,
+    /// so this returns exactly the factors of [`Self::compute_blocked`]. For
+    /// matrices smaller than the block size, falls back to the sequential
+    /// unblocked algorithm.
     ///
     /// # Arguments
     ///
@@ -1052,10 +1046,15 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
     }
 
     /// Computes parallel blocked LU decomposition with a specified block size.
+    ///
+    /// Returns exactly the factors of [`Self::compute_with_block_size`] with
+    /// the same `nb`; a block size of 0 is treated as 1 there and here.
     pub fn compute_blocked_par_with_block_size(
         a: MatRef<'_, T>,
         nb: usize,
     ) -> Result<Self, LuError> {
+        // A zero-width panel would never advance the blocked loop.
+        let nb = nb.max(1);
         let n = a.nrows();
 
         if n != a.ncols() {
@@ -1083,12 +1082,22 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
 
         let mut pivot = vec![0usize; n];
         let mut num_swaps = 0;
+        // Per-column singularity thresholds, shared by every path below.
+        let col_tol = lu_pivot_tolerances(a);
 
-        // Use blocked parallel algorithm for larger matrices
+        // Blocked algorithm with parallel TRSM/GEMM updates for larger matrices
         if n >= nb {
-            Self::blocked_factor_par(&mut lu, &mut pivot, &mut num_swaps, n, nb)?;
+            Self::blocked_factor(
+                &mut lu,
+                &mut pivot,
+                &mut num_swaps,
+                n,
+                nb,
+                &col_tol,
+                Par::Rayon,
+            )?;
         } else {
-            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0)?;
+            Self::unblocked_factor(&mut lu, &mut pivot, &mut num_swaps, n, 0, &col_tol)?;
         }
 
         Ok(Lu {
@@ -1097,107 +1106,8 @@ impl<T: Field + GemmKernel + bytemuck::Zeroable + Send + Sync> Lu<T> {
             num_swaps,
         })
     }
-
-    /// Blocked LU factorization with parallel GEMM for Schur complement updates.
-    fn blocked_factor_par(
-        lu: &mut Mat<T>,
-        pivot: &mut [usize],
-        num_swaps: &mut usize,
-        n: usize,
-        nb: usize,
-    ) -> Result<(), LuError> {
-        let mut jb = 0;
-
-        while jb < n {
-            // Current block size (may be smaller for last block)
-            let jb_size = nb.min(n - jb);
-
-            // Factor the current panel (columns jb:jb+jb_size) -- sequential
-            Self::factor_panel(lu, pivot, num_swaps, n, jb, jb_size)?;
-
-            // If there are more columns after this panel
-            if jb + jb_size < n {
-                // Apply row interchanges to columns jb+jb_size:n
-                for k in jb..jb + jb_size {
-                    let pk = pivot[k];
-                    if pk != k {
-                        for j in (jb + jb_size)..n {
-                            let tmp = lu[(k, j)];
-                            lu[(k, j)] = lu[(pk, j)];
-                            lu[(pk, j)] = tmp;
-                        }
-                    }
-                }
-
-                // Solve L11 * U12 = A12 using TRSM
-                // Extract L11 (lower triangular with unit diagonal)
-                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
-                for i in 0..jb_size {
-                    l11[(i, i)] = T::one();
-                    for j in 0..i {
-                        l11[(i, j)] = lu[(jb + i, jb + j)];
-                    }
-                }
-
-                // Extract and update U12 block
-                let mut u12: Mat<T> = Mat::zeros(jb_size, n - jb - jb_size);
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..jb_size {
-                        u12[(i, j)] = lu[(jb + i, jb + jb_size + j)];
-                    }
-                }
-
-                // Solve L11 * U12 = A12 (TRSM internally uses parallel GEMM)
-                let _ = trsm_in_place(
-                    Side::Left,
-                    Uplo::Lower,
-                    Trans::NoTrans,
-                    Diag::Unit,
-                    l11.as_ref(),
-                    u12.as_mut(),
-                );
-
-                // Copy U12 back
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..jb_size {
-                        lu[(jb + i, jb + jb_size + j)] = u12[(i, j)];
-                    }
-                }
-
-                // Update trailing submatrix: A22 -= L21 * U12 using parallel GEMM
-                let rows_remaining = n - jb - jb_size;
-
-                // Extract L21 block
-                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l21[(i, j)] = lu[(jb + jb_size + i, jb + j)];
-                    }
-                }
-
-                // Compute update = L21 * U12 using parallel GEMM and subtract from A22
-                let mut update: Mat<T> = Mat::zeros(rows_remaining, n - jb - jb_size);
-                gemm_with_par(
-                    T::one(),
-                    l21.as_ref(),
-                    u12.as_ref(),
-                    T::zero(),
-                    update.as_mut(),
-                    Par::Rayon,
-                );
-
-                // A22 -= update
-                for j in 0..(n - jb - jb_size) {
-                    for i in 0..rows_remaining {
-                        lu[(jb + jb_size + i, jb + jb_size + j)] =
-                            lu[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
-                    }
-                }
-            }
-
-            jb += jb_size;
-        }
-
-        Ok(())
-    }
 }
+
+#[cfg(test)]
+#[path = "partial_piv_tests.rs"]
+mod tests;

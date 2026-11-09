@@ -1,15 +1,31 @@
 //! TRSM: Triangular solve for matrices.
 //!
 //! Solves A·X = α·B or X·A = α·B where A is triangular.
+//!
+//! The private `tri_*` modules hold the blocked machinery shared with TRMM
+//! ([`mod@crate::level3::trmm`]): the canonical-problem driver, the packing of
+//! diagonal blocks and right-hand sides, and the register-tiled kernels.
 
 pub mod complex32;
 pub mod complex64;
 pub mod generic;
+pub(crate) mod tri_driver;
+mod tri_kernel;
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+mod tri_kernel_neon;
+mod tri_pack;
 pub mod types;
+
+#[cfg(test)]
+mod tri_test_util;
+#[cfg(test)]
+mod tri_tests;
+#[cfg(test)]
+mod tri_trmm_tests;
 
 pub use complex32::{trsm_c32, trsm_c32_in_place};
 pub use complex64::{trsm_c64, trsm_c64_in_place};
-pub use generic::{trsm, trsm_in_place};
+pub use generic::{trsm, trsm_in_place, trsm_in_place_with_par, trsm_with_par};
 pub use types::{Diag, Side, Trans, TrsmError, Uplo};
 
 /// Validates the shapes of a TRSM call: `A` must be square and match the relevant
@@ -453,8 +469,8 @@ mod tests {
 
     #[test]
     fn test_trsm_c64_large_blocked() {
-        // Test blocked algorithm with larger matrix (> 64)
-        let n = 100;
+        // Test the blocked algorithm: order 150 spans two 128-row diagonal blocks
+        let n = 150;
         let m = 80;
 
         // Create a lower triangular matrix with 2 on diagonal

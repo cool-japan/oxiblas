@@ -18,8 +18,8 @@
 //! touching the operands. These helpers reproduce the returning half of that
 //! contract (validate-then-return): they return `false` and the caller
 //! **no-ops**, without calling `cblas_xerbla` (value-returning routines return
-//! zero). Panicking is not an option — unwinding across an `extern "C"`
-//! boundary is undefined behavior.
+//! zero). Panicking is not an option — a panic that reaches an `extern "C"`
+//! boundary aborts the process (since Rust 1.81).
 //!
 //! Null-pointer checks live at the call sites (`is_null()`), because which
 //! pointers a routine dereferences varies per routine.

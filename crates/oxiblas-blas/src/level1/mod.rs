@@ -50,12 +50,18 @@ mod axpy;
 mod copy;
 mod dot;
 mod dot_extended;
+#[cfg(target_arch = "aarch64")]
+mod dot_neon;
 mod iamax;
 mod nrm2;
+#[cfg(target_arch = "aarch64")]
+mod nrm2_blue;
 pub mod parallel;
 mod rot;
 mod scal;
 mod strided;
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+pub(crate) mod typed;
 
 pub use asum::{
     ComplexRotgResult, asum, cabs1, casum, crotg, dcabs1, dzasum, scabs1, scasum, zdrot,

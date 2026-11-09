@@ -25,7 +25,8 @@
 //! - Poole, G. and Neal, L. (2000). "The rook's pivoting strategy".
 //!   J. Comput. Appl. Math. 123, 353-369.
 
-use num_traits::{FromPrimitive, One};
+use super::partial_piv::eliminate_column;
+use super::tolerance::lu_pivot_tolerances;
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -102,15 +103,21 @@ pub struct RookPivotStats {
 ///
 /// Rook pivoting provides a good balance between numerical stability and
 /// computational cost by alternating between row and column pivot searches.
+///
+/// By default a pivot is treated as zero, and reported as
+/// [`LuRookError::Singular`], when its magnitude is at most `eps · n · s_c`,
+/// where `s_c = max_i |a_ic|` is taken over the finite entries of the column
+/// `c` of the input that the pivot comes from (the column interchanges are
+/// tracked).
 #[derive(Clone, Debug)]
 pub struct LuRook<T: Scalar> {
     /// Combined L and U factors.
     /// L is stored below the diagonal (with implicit unit diagonal).
     /// U is stored on and above the diagonal.
     lu: Mat<T>,
-    /// Row pivot indices: row i was swapped with row row_pivot[i].
+    /// Row pivot indices: row i was swapped with row `row_pivot[i]`.
     row_pivot: Vec<usize>,
-    /// Column pivot indices: column j was swapped with column col_pivot[j].
+    /// Column pivot indices: column j was swapped with column `col_pivot[j]`.
     col_pivot: Vec<usize>,
     /// Number of row swaps (for determinant sign).
     num_row_swaps: usize,
@@ -155,8 +162,12 @@ impl<T: Field + bytemuck::Zeroable> LuRook<T> {
     /// # Arguments
     ///
     /// * `a` - The matrix to decompose
-    /// * `tol` - Optional tolerance for detecting singularity. If None, uses
-    ///           machine epsilon scaled by matrix size.
+    /// * `tol` - Optional absolute tolerance for detecting singularity: a pivot
+    ///           whose magnitude is at most `tol` is treated as zero. If None,
+    ///           a pivot taken from column `c` of `a` is compared with
+    ///           `eps · n · max_i |a_ic|` (the maximum over the finite entries
+    ///           of that column), which does not depend on the scale of `a`
+    ///           or of its columns.
     pub fn compute_with_tol(a: MatRef<'_, T>, tol: Option<T::Real>) -> Result<Self, LuRookError> {
         let n = a.nrows();
 
@@ -192,10 +203,16 @@ impl<T: Field + bytemuck::Zeroable> LuRook<T> {
         let mut num_col_swaps = 0;
         let mut stats = RookPivotStats::default();
 
-        // Default tolerance
-        let default_tol = T::epsilon()
-            * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-        let tolerance = tol.unwrap_or(default_tol);
+        // Singularity threshold of every column of A: an explicit tolerance is
+        // used as given; the default is `eps · n · max_i |a_ij|` over the
+        // finite entries of each column.
+        let col_tol = match tol {
+            Some(tol) => vec![tol; n],
+            None => lu_pivot_tolerances(a),
+        };
+        // `orig_col[j]` is the column of A currently held at position `j`;
+        // the column interchanges below keep it up to date.
+        let mut orig_col: Vec<usize> = (0..n).collect();
 
         // LU factorization with rook pivoting
         for k in 0..n {
@@ -203,8 +220,9 @@ impl<T: Field + bytemuck::Zeroable> LuRook<T> {
             let (pivot_row, pivot_col, pivot_val, iterations) =
                 Self::rook_pivot_search(&lu, n, k, &mut stats)?;
 
-            // Check for singularity
-            if pivot_val <= tolerance {
+            // Check for singularity against the threshold of the column of A
+            // the pivot comes from. A NaN pivot fails the comparison.
+            if pivot_val <= col_tol[orig_col[pivot_col]] {
                 return Err(LuRookError::Singular { index: k });
             }
 
@@ -235,22 +253,14 @@ impl<T: Field + bytemuck::Zeroable> LuRook<T> {
                     lu[(i, k)] = lu[(i, pivot_col)];
                     lu[(i, pivot_col)] = tmp;
                 }
+                orig_col.swap(k, pivot_col);
                 num_col_swaps += 1;
             }
 
-            // Compute multipliers (L's subdiagonal entries) and update
-            let pivot_inv = T::one() / lu[(k, k)];
-            for i in (k + 1)..n {
-                // Multiplier (stored in L)
-                let mult = lu[(i, k)] * pivot_inv;
-                lu[(i, k)] = mult;
-
-                // Update remaining submatrix
-                for j in (k + 1)..n {
-                    let val = lu[(i, j)] - mult * lu[(k, j)];
-                    lu[(i, j)] = val;
-                }
-            }
+            // Compute multipliers (L's subdiagonal entries) and update the
+            // remaining submatrix, column by column (same arithmetic as the
+            // row-by-row loops, so the factors are bit-identical)
+            eliminate_column(&mut lu, k, n);
         }
 
         Ok(LuRook {
@@ -379,7 +389,7 @@ impl<T: Field + bytemuck::Zeroable> LuRook<T> {
         }
 
         let total_swaps = self.num_row_swaps + self.num_col_swaps;
-        let mut det = if total_swaps % 2 == 0 {
+        let mut det = if total_swaps.is_multiple_of(2) {
             T::one()
         } else {
             -T::one()
@@ -1016,5 +1026,224 @@ mod tests {
                 x[(i, 0)]
             );
         }
+    }
+}
+
+/// Bit-exactness of the column-oriented elimination against the previous
+/// row-by-row loops.
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    use num_complex::Complex64;
+
+    /// The previous `LuRook::compute_with_tol`, with its row-order
+    /// elimination, kept verbatim as the reference (the pivot search is the
+    /// unchanged `rook_pivot_search`).
+    fn oracle<T: Field + bytemuck::Zeroable>(
+        a: MatRef<'_, T>,
+        tol: Option<T::Real>,
+    ) -> Result<LuRook<T>, LuRookError> {
+        let n = a.nrows();
+        let mut lu = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                lu[(i, j)] = a[(i, j)];
+            }
+        }
+        let mut row_pivot = vec![0usize; n];
+        let mut col_pivot = vec![0usize; n];
+        let mut num_row_swaps = 0;
+        let mut num_col_swaps = 0;
+        let mut stats = RookPivotStats::default();
+        let col_tol = match tol {
+            Some(tol) => vec![tol; n],
+            None => lu_pivot_tolerances(a),
+        };
+        let mut orig_col: Vec<usize> = (0..n).collect();
+
+        for k in 0..n {
+            let (pivot_row, pivot_col, pivot_val, iterations) =
+                LuRook::rook_pivot_search(&lu, n, k, &mut stats)?;
+            if pivot_val <= col_tol[orig_col[pivot_col]] {
+                return Err(LuRookError::Singular { index: k });
+            }
+            stats.total_rook_iterations += iterations;
+            if iterations > stats.max_rook_iterations {
+                stats.max_rook_iterations = iterations;
+            }
+            row_pivot[k] = pivot_row;
+            col_pivot[k] = pivot_col;
+            if pivot_row != k {
+                for j in 0..n {
+                    let tmp = lu[(k, j)];
+                    lu[(k, j)] = lu[(pivot_row, j)];
+                    lu[(pivot_row, j)] = tmp;
+                }
+                num_row_swaps += 1;
+            }
+            if pivot_col != k {
+                for i in 0..n {
+                    let tmp = lu[(i, k)];
+                    lu[(i, k)] = lu[(i, pivot_col)];
+                    lu[(i, pivot_col)] = tmp;
+                }
+                orig_col.swap(k, pivot_col);
+                num_col_swaps += 1;
+            }
+            let pivot_inv = T::one() / lu[(k, k)];
+            for i in (k + 1)..n {
+                let mult = lu[(i, k)] * pivot_inv;
+                lu[(i, k)] = mult;
+                for j in (k + 1)..n {
+                    let val = lu[(i, j)] - mult * lu[(k, j)];
+                    lu[(i, j)] = val;
+                }
+            }
+        }
+
+        Ok(LuRook {
+            lu,
+            row_pivot,
+            col_pivot,
+            num_row_swaps,
+            num_col_swaps,
+            stats,
+        })
+    }
+
+    /// Exact bit pattern of a scalar.
+    trait Bits: Field + bytemuck::Zeroable {
+        fn bits(self) -> (u64, u64);
+    }
+
+    impl Bits for f64 {
+        fn bits(self) -> (u64, u64) {
+            (self.to_bits(), 0)
+        }
+    }
+
+    impl Bits for f32 {
+        fn bits(self) -> (u64, u64) {
+            (u64::from(self.to_bits()), 0)
+        }
+    }
+
+    impl Bits for Complex64 {
+        fn bits(self) -> (u64, u64) {
+            (self.re.to_bits(), self.im.to_bits())
+        }
+    }
+
+    fn assert_same<T: Bits>(label: &str, a: &Mat<T>, tol: Option<T::Real>) {
+        match (
+            LuRook::compute_with_tol(a.as_ref(), tol),
+            oracle(a.as_ref(), tol),
+        ) {
+            (Ok(got), Ok(want)) => {
+                assert_eq!(got.row_pivot, want.row_pivot, "{label}: row pivots differ");
+                assert_eq!(got.col_pivot, want.col_pivot, "{label}: col pivots differ");
+                assert_eq!(got.num_row_swaps, want.num_row_swaps, "{label}: row swaps");
+                assert_eq!(got.num_col_swaps, want.num_col_swaps, "{label}: col swaps");
+                let (gs, ws) = (&got.stats, &want.stats);
+                assert_eq!(
+                    (
+                        gs.column_searches,
+                        gs.row_searches,
+                        gs.max_rook_iterations,
+                        gs.total_rook_iterations
+                    ),
+                    (
+                        ws.column_searches,
+                        ws.row_searches,
+                        ws.max_rook_iterations,
+                        ws.total_rook_iterations
+                    ),
+                    "{label}: statistics differ"
+                );
+                let n = a.nrows();
+                for j in 0..n {
+                    for i in 0..n {
+                        assert_eq!(
+                            got.lu[(i, j)].bits(),
+                            want.lu[(i, j)].bits(),
+                            "{label}: LU({i}, {j}) differs: {} vs {}",
+                            got.lu[(i, j)],
+                            want.lu[(i, j)]
+                        );
+                    }
+                }
+            }
+            (Err(got), Err(want)) => assert_eq!(got, want, "{label}: errors differ"),
+            (got, want) => panic!(
+                "{label}: outcome differs: got {:?}, oracle {:?}",
+                got.map(|_| ()),
+                want.map(|_| ())
+            ),
+        }
+    }
+
+    /// Deterministic matrix filled by `f(state)` from a xorshift64 state.
+    fn matrix_from<T: Bits>(n: usize, seed: u64, f: impl Fn(u64) -> T) -> Mat<T> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut a = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                a[(i, j)] = f(x);
+            }
+        }
+        a
+    }
+
+    /// Uniform sample in `[-1, 1)` from a xorshift64 state.
+    fn unit(x: u64) -> f64 {
+        2.0 * ((x >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+    }
+
+    #[test]
+    fn test_lu_rook_bit_identical_random() {
+        for &n in &[0usize, 1, 2, 3, 5, 8, 17, 33, 64, 65, 100] {
+            let seed = 1900 + n as u64;
+            assert_same(&format!("f64 n={n}"), &matrix_from(n, seed, unit), None);
+            let a32 = matrix_from(n, seed, |x| unit(x) as f32);
+            assert_same(&format!("f32 n={n}"), &a32, None);
+            let c = matrix_from(n, seed, |x| {
+                Complex64::new(unit(x), unit(x.rotate_left(17)))
+            });
+            assert_same(&format!("c64 n={n}"), &c, None);
+        }
+    }
+
+    #[test]
+    fn test_lu_rook_bit_identical_ties_and_singular() {
+        // Entries in {-2, ..., 2} (ties in every search, some singular
+        // matrices), a rank-deficient matrix, an explicit tolerance and a
+        // zero row and column.
+        for &n in &[2usize, 5, 8, 17, 40] {
+            for seed in 0..4u64 {
+                let a = matrix_from(n, 2000 + 10 * n as u64 + seed, |x| (x % 5) as f64 - 2.0);
+                assert_same(&format!("ties n={n} seed={seed}"), &a, None);
+            }
+        }
+        let a: Mat<f64> =
+            Mat::from_rows(&[&[1.0, 2.0, -2.0], &[2.0, -2.0, 1.0], &[3.0, 0.0, -1.0]]);
+        assert_same("rank-deficient 3x3", &a, None);
+        assert_same("explicit tolerance", &a, Some(0.5));
+        let mut z = matrix_from(30, 78, unit);
+        for i in 0..30 {
+            z[(i, 11)] = 0.0;
+            z[(4, i)] = 0.0;
+        }
+        assert_same("zero row and column", &z, None);
+    }
+
+    #[test]
+    fn test_lu_rook_bit_identical_non_finite() {
+        let mut a = matrix_from(12, 15, unit);
+        a[(7, 3)] = f64::NAN;
+        a[(2, 9)] = f64::INFINITY;
+        assert_same("nan and inf", &a, None);
     }
 }

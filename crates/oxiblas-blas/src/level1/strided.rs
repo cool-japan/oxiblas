@@ -365,7 +365,7 @@ impl<'a, T: Copy> StridedSliceMut<'a, T> {
 
 /// Strided dot product `Σ x[i]·y[i]` (unconjugated).
 ///
-/// General entry point behind the contiguous [`dot`](super::dot): honours
+/// General entry point behind the contiguous [`dot`](super::dot()): honours
 /// arbitrary positive, negative and zero increments per reference BLAS. A
 /// unit-stride call is forwarded to the SIMD-optimised contiguous kernel so it
 /// stays bit-identical to the legacy path.
@@ -417,7 +417,7 @@ pub fn dotc_strided<T: Field>(x: StridedSlice<'_, T>, y: StridedSlice<'_, T>) ->
 
 /// Strided AXPY `y ← α·x + y`.
 ///
-/// General entry point behind the contiguous [`axpy`](super::axpy): honours
+/// General entry point behind the contiguous [`axpy`](super::axpy()): honours
 /// arbitrary positive, negative and zero increments.
 ///
 /// # Panics
@@ -441,7 +441,7 @@ pub fn axpy_strided<T: Field>(alpha: T, x: StridedSlice<'_, T>, mut y: StridedSl
 
 /// Strided COPY `y ← x`.
 ///
-/// General entry point behind the contiguous [`copy`](super::copy): honours
+/// General entry point behind the contiguous [`copy`](super::copy()): honours
 /// arbitrary positive, negative and zero increments.
 ///
 /// # Panics
@@ -492,7 +492,7 @@ pub fn swap_strided<T: Copy>(mut x: StridedSliceMut<'_, T>, mut y: StridedSliceM
 
 /// Strided plane rotation: applies `[c s; -s c]` to each pair `(x[i], y[i])`.
 ///
-/// General entry point behind the contiguous [`rot`](super::rot): honours
+/// General entry point behind the contiguous [`rot`](super::rot()): honours
 /// arbitrary positive, negative and zero increments.
 ///
 /// # Panics
@@ -637,7 +637,7 @@ pub fn zdrot_strided<T: ComplexScalar>(
 
 /// Strided SCAL `x ← α·x`.
 ///
-/// General entry point behind the contiguous [`scal`](super::scal). Per
+/// General entry point behind the contiguous [`scal`](super::scal()). Per
 /// reference BLAS a non-positive increment (`stride <= 0`) is a **no-op**.
 pub fn scal_strided<T: Field>(alpha: T, mut x: StridedSliceMut<'_, T>) {
     let n = x.len();
@@ -656,7 +656,7 @@ pub fn scal_strided<T: Field>(alpha: T, mut x: StridedSliceMut<'_, T>) {
 
 /// Strided NRM2 (Euclidean/L2 norm).
 ///
-/// General entry point behind the contiguous [`nrm2`](super::nrm2). Follows
+/// General entry point behind the contiguous [`nrm2`](super::nrm2()). Follows
 /// Netlib >= 3.10 (`dnrm2.f90`, unchanged in 3.12): every increment is
 /// accepted — a negative stride walks the vector backwards from offset
 /// `(n - 1)·|stride|`, and a zero stride reads `x[0]` on every iteration,
@@ -728,7 +728,7 @@ pub fn cnrm2_strided<T: ComplexScalar>(x: StridedSlice<'_, T>) -> T::Real {
 
 /// Strided ASUM (sum of absolute values, L1 norm).
 ///
-/// General entry point behind the contiguous [`asum`](super::asum). Per
+/// General entry point behind the contiguous [`asum`](super::asum()). Per
 /// reference BLAS a non-positive increment returns `0`.
 #[must_use]
 pub fn asum_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
@@ -748,12 +748,12 @@ pub fn asum_strided<T: Real>(x: StridedSlice<'_, T>) -> T {
 
 /// Strided IAMAX (index of first element with maximum absolute value).
 ///
-/// General entry point behind the contiguous [`iamax`](super::iamax). Per
+/// General entry point behind the contiguous [`iamax`](super::iamax()). Per
 /// reference BLAS a non-positive increment returns `0`.
 ///
 /// For complex scalar types elements are ranked by
 /// [`cabs1`](super::cabs1)`(z) = |Re(z)| + |Im(z)|` on **every** stride,
-/// exactly like Netlib `ICAMAX`/`IZAMAX` and the contiguous [`iamax`](super::iamax)
+/// exactly like Netlib `ICAMAX`/`IZAMAX` and the contiguous [`iamax`](super::iamax())
 /// (not by the modulus `|z|`); ties keep the first occurrence and a NaN never
 /// displaces the running maximum. For real types this is plain `|x[i]|`.
 #[must_use]

@@ -138,11 +138,11 @@ pub unsafe extern "C" fn cblas_dsymv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
         return;
     }
@@ -197,11 +197,11 @@ pub unsafe extern "C" fn cblas_ssymv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
         return;
     }
@@ -285,11 +285,11 @@ pub unsafe extern "C" fn cblas_dsyr(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -336,11 +336,11 @@ pub unsafe extern "C" fn cblas_ssyr(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -423,11 +423,11 @@ pub unsafe extern "C" fn cblas_dsyr2(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
         return;
     }
@@ -481,11 +481,11 @@ pub unsafe extern "C" fn cblas_ssyr2(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) || !inc_valid(incy) {
         return;
     }
@@ -571,11 +571,11 @@ pub unsafe extern "C" fn cblas_dger(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
         return;
     }
@@ -629,11 +629,11 @@ pub unsafe extern "C" fn cblas_sger(
     lda: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
         return;
     }
@@ -718,11 +718,11 @@ pub unsafe extern "C" fn cblas_dtrmv(
     incx: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -770,11 +770,11 @@ pub unsafe extern "C" fn cblas_strmv(
     incx: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -861,11 +861,11 @@ pub unsafe extern "C" fn cblas_dtrsv(
     incx: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -914,11 +914,11 @@ pub unsafe extern "C" fn cblas_strsv(
     incx: i32,
 ) {
     // Reference BLAS calls xerbla and returns on invalid arguments; a void C
-    // ABI cannot surface an error code and unwinding across it would be UB, so
-    // we no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` indexing run out of bounds; a zero
-    // increment would alias every logical vector element onto element 0.
+    // ABI cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` indexing run out of bounds;
+    // a zero increment would alias every logical vector element onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) || !inc_valid(incx) {
         return;
     }
@@ -1052,6 +1052,11 @@ mod tests {
         let alpha = 1.5;
         let beta = 0.75;
 
+        // SAFETY: `a` holds the 3 x 3 column-major matrix with lda = 3 (9
+        // elements) and `x`, `y`, `y_ref` hold 3 elements each with unit
+        // increments, which covers the n = 3 call. `MatRef::new` views the
+        // same 9 elements with row stride 3, so every offset `i + 3 * j` with
+        // `i, j < 3` is in bounds, and `a` outlives the view.
         unsafe {
             cblas_dsymv(
                 CblasLayout::ColMajor,
@@ -1085,6 +1090,11 @@ mod tests {
         let alpha = 1.0;
         let beta = 1.0;
 
+        // SAFETY: n = 2: `a` holds the 2 x 2 matrix with lda = 2 (4 elements);
+        // with incx = 2, x is read at offsets 0 and 2 of the 3-element
+        // `x_storage`, and with incy = -1, y is accessed at offsets 1 and 0 of
+        // the 2-element `y_storage` (1 + (n - 1) * |inc| elements are needed
+        // in both cases).
         unsafe {
             cblas_dsymv(
                 CblasLayout::ColMajor,
@@ -1120,6 +1130,9 @@ mod tests {
         let x = [1.0f64, 2.0];
         let mut y_row = [0.0f64, 0.0];
         let mut y_col = [0.0f64, 0.0];
+        // SAFETY: both calls have n = 2 and leading dimension 2: each A buffer
+        // holds 4 elements, and `x`, `y_row`, `y_col` hold 2 elements each
+        // with unit increments.
         unsafe {
             cblas_dsymv(
                 CblasLayout::RowMajor,
@@ -1159,6 +1172,10 @@ mod tests {
         let x = [1.0f64, 2.0, 3.0];
         let mut a = a_init;
         let mut a_ref_buf = a_init;
+        // SAFETY: n = 3: `x` holds 3 elements (incx = 1) and `a` the 3 x 3
+        // column-major matrix with lda = 3 (9 elements). `MatMut::new` views
+        // the separate 9-element `a_ref_buf` with row stride 3, so its offsets
+        // `i + 3 * j` are in bounds and the view aliases nothing else.
         unsafe {
             cblas_dsyr(
                 CblasLayout::ColMajor,
@@ -1185,6 +1202,10 @@ mod tests {
         let y = [0.5f64, -1.0, 2.0];
         let mut a = a_init;
         let mut a_ref_buf = a_init;
+        // SAFETY: n = 3: `x` and `y` hold 3 elements (unit increments) and `a`
+        // the 3 x 3 column-major matrix with lda = 3 (9 elements).
+        // `MatMut::new` views the separate 9-element `a_ref_buf` with row
+        // stride 3, so its offsets are in bounds and it aliases nothing else.
         unsafe {
             cblas_dsyr2(
                 CblasLayout::ColMajor,
@@ -1213,6 +1234,10 @@ mod tests {
         let y = [3.0f64, 4.0, 5.0];
         let mut a = a_init;
         let mut a_ref_buf = a_init;
+        // SAFETY: m = 2, n = 3: `x` holds 2 and `y` 3 elements (unit
+        // increments) and `a` the 2 x 3 column-major matrix with lda = 2 (6
+        // elements). `MatMut::new` views the separate 6-element `a_ref_buf` as
+        // 2 x 3 with row stride 2, so every offset `i + 2 * j` is in bounds.
         unsafe {
             cblas_dger(
                 CblasLayout::ColMajor,
@@ -1240,6 +1265,8 @@ mod tests {
         let mut a = [0.0f64; 6]; // row-major 2x3, row stride 3
         let x = [1.0f64, 2.0];
         let y = [3.0f64, 4.0, 5.0];
+        // SAFETY: row-major m = 2, n = 3: `x` holds 2 and `y` 3 elements (unit
+        // increments) and `a` holds 2 rows of lda = 3 elements (6).
         unsafe {
             cblas_dger(
                 CblasLayout::RowMajor,
@@ -1268,6 +1295,10 @@ mod tests {
         let x = [1.0f64, 2.0, 3.0];
         let mut xg = x;
         let mut xr = x;
+        // SAFETY: n = 3: `a` holds the 3 x 3 column-major matrix with lda = 3
+        // (9 elements) and `xg` 3 elements (incx = 1). `MatRef::new` views the
+        // same 9 elements with row stride 3, so every offset `i + 3 * j` is in
+        // bounds, and `a` outlives the view.
         unsafe {
             cblas_dtrmv(
                 CblasLayout::ColMajor,
@@ -1300,6 +1331,9 @@ mod tests {
         let a = [2.0f64, 1.0, 3.0, 0.0, 4.0, -1.0, 0.0, 0.0, 5.0]; // lower, col-major
         let b = [4.0f64, 10.0, 8.0];
         let mut x = b;
+        // SAFETY: both calls have n = 3: `a` holds the 3 x 3 column-major
+        // matrix with lda = 3 (9 elements) and `x` (and the vector of the
+        // second call) 3 elements with incx = 1.
         unsafe {
             cblas_dtrsv(
                 CblasLayout::ColMajor,
@@ -1339,6 +1373,8 @@ mod tests {
         let a = [9.0f64, 1.0, 3.0, 0.0, 9.0, -1.0, 0.0, 0.0, 9.0]; // diag values are junk (9)
         let b = [1.0f64, 3.0, 4.0];
         let mut x = b;
+        // SAFETY: n = 3: `a` holds the 3 x 3 column-major matrix with lda = 3
+        // (9 elements) and `x` 3 elements with incx = 1.
         unsafe {
             cblas_dtrsv(
                 CblasLayout::ColMajor,

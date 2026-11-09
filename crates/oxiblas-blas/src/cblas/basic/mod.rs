@@ -1,8 +1,9 @@
-//! CBLAS-compatible interface for BLAS-TESTER compatibility.
+//! CBLAS-compatible C ABI: basic Level 1, 2 and 3 routines.
 //!
-//! This module provides a C-compatible interface that follows the standard
-//! CBLAS specification, enabling interoperability with BLAS test suites
-//! like BLAS-TESTER.
+//! The `extern "C"` entry points in this module and its submodules follow the
+//! semantics of reference CBLAS for valid calls. Invalid arguments are a silent
+//! no-op: there is no `cblas_xerbla` (see [`crate::cblas`] for the other
+//! deviations from reference CBLAS).
 //!
 //! # Layout
 //!

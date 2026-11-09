@@ -183,6 +183,21 @@ impl<T: Scalar + Clone> HybMatrix<T> {
             return Err(HybError::InvalidDimensions { nrows, ncols });
         }
 
+        // Every COO entry, and every nonzero ELL entry, is read by `matvec` and
+        // `to_csr`, so its indices must be in range. Zero ELL slots are padding
+        // and never read: `from_ell` stores the ELL sentinel `usize::MAX` there.
+        let ell_out_of_range = ell_data
+            .iter()
+            .zip(&ell_indices)
+            .any(|(val, &col)| !val.is_zero() && col >= ncols);
+        let coo_out_of_range = coo_rows
+            .iter()
+            .zip(&coo_cols)
+            .any(|(&row, &col)| row >= nrows || col >= ncols);
+        if ell_out_of_range || coo_out_of_range {
+            return Err(HybError::InvalidDimensions { nrows, ncols });
+        }
+
         Ok(Self {
             nrows,
             ncols,
@@ -554,8 +569,17 @@ impl<T: Scalar + Clone> HybMatrix<T> {
 
         for row in 0..nrows {
             for k in 0..ell_width {
-                ell_data.push(data[row][k].clone());
-                ell_indices.push(indices[row][k]);
+                let col = indices[row][k];
+                // ELL ignores its sentinel slots (the only ones with a column
+                // `>= ncols`) whatever value they hold, while HYB reads every
+                // nonzero ELL slot, so store them as zero padding.
+                let val = if col < ncols {
+                    data[row][k].clone()
+                } else {
+                    T::zero()
+                };
+                ell_data.push(val);
+                ell_indices.push(col);
             }
         }
 
@@ -572,52 +596,53 @@ impl<T: Scalar + Clone> HybMatrix<T> {
     }
 
     /// Converts to CSR format.
+    ///
+    /// ELL entries whose magnitude is at most `T::epsilon()` are dropped; COO
+    /// entries are kept. A position stored more than once (in both parts, or
+    /// twice in the COO part, which `matvec` treats as a sum) yields a single
+    /// CSR entry holding the sum. The CSR rows are sorted by column.
     pub fn to_csr(&self) -> CsrMatrix<T>
     where
         T: Field,
     {
         let eps = <T as Scalar>::epsilon();
 
-        // Collect all entries
-        let mut entries: Vec<(usize, usize, T)> = Vec::new();
-
-        // ELL entries
-        for row in 0..self.nrows {
+        // Collect the entries of each row: ELL part first, then COO part.
+        let mut rows: Vec<Vec<(usize, T)>> = vec![Vec::new(); self.nrows];
+        for (row, entries) in rows.iter_mut().enumerate() {
             let ell_start = row * self.ell_width;
             for k in 0..self.ell_width {
                 let idx = ell_start + k;
                 let val = self.ell_data[idx].clone();
                 if Scalar::abs(val.clone()) > eps {
-                    entries.push((row, self.ell_indices[idx], val));
+                    entries.push((self.ell_indices[idx], val));
                 }
             }
         }
-
-        // COO entries
         for (i, (&row, &col)) in self.coo_rows.iter().zip(self.coo_cols.iter()).enumerate() {
-            entries.push((row, col, self.coo_data[i].clone()));
+            rows[row].push((col, self.coo_data[i].clone()));
         }
 
-        // Sort by row, then column
-        entries.sort_by_key(|(r, c, _)| (*r, *c));
-
-        // Build CSR
-        let mut row_ptrs = vec![0usize; self.nrows + 1];
-        let mut col_indices = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
-
-        for (row, col, val) in entries {
-            col_indices.push(col);
-            values.push(val);
-            row_ptrs[row + 1] += 1;
+        // Build CSR, sorting each row by column and summing repeated columns.
+        let nnz_bound: usize = rows.iter().map(Vec::len).sum();
+        let mut row_ptrs = Vec::with_capacity(self.nrows + 1);
+        let mut col_indices = Vec::with_capacity(nnz_bound);
+        let mut values = Vec::with_capacity(nnz_bound);
+        row_ptrs.push(0);
+        for entries in &mut rows {
+            crate::csr::push_summed_run(entries, &mut col_indices, &mut values);
+            row_ptrs.push(values.len());
         }
 
-        // Cumulative sum
-        for i in 1..=self.nrows {
-            row_ptrs[i] += row_ptrs[i - 1];
-        }
-
-        // Safety: we constructed valid CSR data
+        // SAFETY: `row_ptrs` gets 0 plus the running `values.len()` after each
+        // of the `nrows` rows: `nrows + 1` non-decreasing entries ending at
+        // nnz. Columns and values are pushed together. Only COO entries and
+        // nonzero ELL entries are read, and every constructor keeps their
+        // indices in range (`new` validates them; `zeros`, `eye`, `from_csr`,
+        // `from_ell` and `rebalance` store only in-range indices outside zero
+        // padding; `scale` maps zero padding to zero or NaN, which the
+        // `abs() > eps` filter skips). `push_summed_run` makes each row
+        // strictly ascending, so no row repeats a column.
         unsafe { CsrMatrix::new_unchecked(self.nrows, self.ncols, row_ptrs, col_indices, values) }
     }
 
@@ -680,9 +705,15 @@ impl<T: Scalar + Clone> HybMatrix<T> {
 
         let max_width = row_lengths.iter().max().copied().unwrap_or(0).max(1);
 
-        // Build ELL with Vec<Vec<T>> format
+        // Build ELL with Vec<Vec<T>> format. Padding slots get column 0 (as
+        // before), or the ELL sentinel when there is no column 0.
+        let pad_col = if self.ncols > 0 {
+            0
+        } else {
+            crate::ell::INVALID_INDEX
+        };
         let mut data: Vec<Vec<T>> = vec![vec![T::zero(); max_width]; self.nrows];
-        let mut indices: Vec<Vec<usize>> = vec![vec![0usize; max_width]; self.nrows];
+        let mut indices: Vec<Vec<usize>> = vec![vec![pad_col; max_width]; self.nrows];
         let mut current_counts = vec![0usize; self.nrows];
 
         // Add ELL entries
@@ -708,7 +739,11 @@ impl<T: Scalar + Clone> HybMatrix<T> {
             current_counts[row] += 1;
         }
 
-        // Safety: we constructed valid ELL data
+        // SAFETY: `data` and `indices` are `nrows x max_width`, and `max_width`
+        // bounds every row's entry count, so each slot holds either one of the
+        // entries `to_csr` reads (column `< ncols`: every constructor keeps
+        // those in range) or zero padding at `pad_col`, which is column 0
+        // (in range, as `ncols > 0`) or the ELL sentinel.
         unsafe { EllMatrix::new_unchecked(self.nrows, self.ncols, max_width, data, indices) }
     }
 
@@ -977,7 +1012,7 @@ fn compute_ell_width(row_lengths: &[usize], strategy: HybWidthStrategy) -> usize
             let mut sorted = row_lengths.to_vec();
             sorted.sort_unstable();
             let mid = sorted.len() / 2;
-            if sorted.len() % 2 == 0 {
+            if sorted.len().is_multiple_of(2) {
                 (sorted[mid - 1] + sorted[mid]).div_ceil(2)
             } else {
                 sorted[mid]
@@ -1206,5 +1241,104 @@ mod tests {
 
         assert_eq!(hyb.coo_nnz(), 0);
         assert_eq!(hyb.nnz(), 7);
+    }
+
+    // --- Regression: `new` must reject what `to_csr` cannot convert ---------
+    //
+    // `HybMatrix::new` checked only array lengths, so out-of-range indices
+    // reached `to_csr`, which copied them into the CSR via `new_unchecked`
+    // (or panicked indexing `row_ptrs`), and an entry stored in both parts was
+    // emitted twice.
+
+    #[test]
+    fn test_hyb_new_rejects_out_of_range_indices() {
+        let dims = HybError::InvalidDimensions { nrows: 2, ncols: 2 };
+        // COO row out of range.
+        let r = HybMatrix::new(
+            2,
+            2,
+            1,
+            vec![0.0f64; 2],
+            vec![0; 2],
+            vec![2],
+            vec![0],
+            vec![1.0],
+        );
+        assert_eq!(r.err(), Some(dims.clone()));
+        // COO column out of range.
+        let r = HybMatrix::new(
+            2,
+            2,
+            1,
+            vec![0.0f64; 2],
+            vec![0; 2],
+            vec![1],
+            vec![2],
+            vec![1.0],
+        );
+        assert_eq!(r.err(), Some(dims.clone()));
+        // Nonzero ELL entry with an out-of-range column.
+        let r = HybMatrix::new(
+            2,
+            2,
+            1,
+            vec![1.0f64, 0.0],
+            vec![3, 0],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert_eq!(r.err(), Some(dims));
+        // Zero ELL padding may carry any index (`from_ell` copies the ELL
+        // sentinel `usize::MAX` there).
+        let ok = HybMatrix::new(
+            2,
+            2,
+            1,
+            vec![1.0f64, 0.0],
+            vec![1, usize::MAX],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(ok.is_ok());
+    }
+
+    /// ELL ignores its sentinel slots whatever value they hold; `from_ell`
+    /// copied those values, so a nonzero one became a HYB entry at column
+    /// `usize::MAX` (a panic in `matvec`, an invalid CSR from `to_csr`).
+    #[test]
+    fn test_hyb_from_ell_ignores_sentinel_slots() {
+        let ell =
+            crate::ell::EllMatrix::new(1, 2, 2, vec![vec![3.0f64, 5.0]], vec![vec![1, usize::MAX]])
+                .expect("valid ELL: sentinel slots are not validated");
+        let hyb = HybMatrix::from_ell(&ell);
+        assert_eq!(hyb.mul_vec(&[1.0, 10.0]), ell.mul_vec(&[1.0, 10.0]));
+        let csr = hyb.to_csr();
+        crate::csr::assert_valid_csr(&csr);
+        assert_eq!(csr.get(0, 1), Some(&3.0));
+        assert_eq!(csr.nnz(), 1);
+    }
+
+    #[test]
+    fn test_hyb_to_csr_sums_entries_stored_twice() {
+        // (0, 1) is stored in the ELL part and twice in the COO part.
+        let hyb = HybMatrix::new(
+            2,
+            2,
+            1,
+            vec![1.0f64, 4.0],
+            vec![1, 0],
+            vec![0, 0],
+            vec![1, 1],
+            vec![2.0, 3.0],
+        )
+        .expect("valid HYB");
+        let csr = hyb.to_csr();
+        crate::csr::assert_valid_csr(&csr);
+        assert_eq!(csr.get(0, 1), Some(&6.0));
+        assert_eq!(csr.get(1, 0), Some(&4.0));
+        assert_eq!(csr.nnz(), 2);
+        assert_eq!(hyb.mul_vec(&[1.0, 10.0]), vec![60.0, 4.0]);
     }
 }

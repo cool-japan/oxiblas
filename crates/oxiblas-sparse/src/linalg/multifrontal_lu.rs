@@ -318,14 +318,14 @@ pub struct MultifrontalLU<T: Scalar> {
     #[allow(dead_code)]
     postorder: Vec<usize>,
     /// For each column j: L values below diagonal.
-    /// l_values[j][k] = L[l_row_indices[j][k], j]
+    /// `l_values[j][k]` = `L[l_row_indices[j][k], j]`
     l_row_indices: Vec<Vec<usize>>,
     /// L values (unit diagonal implicit, stored entries are below diagonal).
     l_values: Vec<Vec<T>>,
     /// For each row j of U: U values to the right of diagonal.
-    /// u_col_indices[j][k] = column index, u_values[j][0] = U[j,j] diagonal
+    /// `u_col_indices[j][k]` = column index, `u_values[j][0]` = `U[j,j]` diagonal
     u_col_indices: Vec<Vec<usize>>,
-    /// U values: [U[j,j], U[j, u_col_indices[j][0]], ...]
+    /// U values: \[`U[j,j]`, `U[j, u_col_indices[j][0]]`, ...\]
     u_values: Vec<Vec<T>>,
     /// Row permutation (from pivoting within frontal matrices).
     row_perm: Vec<usize>,
@@ -699,10 +699,16 @@ fn symmetrize_pattern<T: Scalar + Clone + Field>(a: &CscMatrix<T>) -> CscMatrix<
         col_ptrs[j + 1] = values.len();
     }
 
+    // SAFETY: `col_ptrs` has `n + 1` entries, `col_ptrs[0] == 0`, and
+    // `col_ptrs[j + 1]` is the running `values.len()` (non-decreasing);
+    // `row_indices` and `values` are only pushed together. Every stored row
+    // is either a column `j < n` or an `i` from `a` that, unless `i == j`,
+    // was also used to index `entries[i]` (length `n`), which would have
+    // panicked for `i >= n` before this point.
     unsafe { CscMatrix::new_unchecked(n, n, col_ptrs, row_indices, values) }
 }
 
-/// Permutes columns of a CSC matrix: A_q = A * Q where Q[new_j] = old_j.
+/// Permutes columns of a CSC matrix: A_q = A * Q where `Q[new_j]` = old_j.
 fn permute_columns<T: Scalar + Clone>(a: &CscMatrix<T>, perm: &[usize]) -> CscMatrix<T> {
     let n = a.ncols();
     let nrows = a.nrows();
@@ -728,6 +734,12 @@ fn permute_columns<T: Scalar + Clone>(a: &CscMatrix<T>, perm: &[usize]) -> CscMa
         col_ptrs[new_j + 1] = values.len();
     }
 
+    // SAFETY: `col_ptrs` has `n + 1` entries, `col_ptrs[0] == 0`, and
+    // `col_ptrs[new_j + 1]` is the running `values.len()` (non-decreasing);
+    // `row_indices` and `values` are only pushed together; the rows are
+    // `a`'s, reordered within each column, so they are `< a.nrows() ==
+    // nrows` by `a`'s `CscMatrix` invariant (`perm` is only used as a
+    // bounds-checked index).
     unsafe { CscMatrix::new_unchecked(nrows, n, col_ptrs, row_indices, values) }
 }
 

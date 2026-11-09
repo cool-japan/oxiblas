@@ -26,6 +26,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 // Stylistic choices for BLAS library
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::similar_names)]

@@ -4,6 +4,7 @@
 
 use oxiblas::prelude::*;
 use oxiblas_lapack::lu::Lu;
+use oxiblas_lapack::workspace::optimal_block_size_lu;
 use std::time::Instant;
 
 fn lu_naive(a: &Mat<f64>) -> Mat<f64> {
@@ -31,13 +32,19 @@ fn lu_naive(a: &Mat<f64>) -> Mat<f64> {
     lu
 }
 
+/// Median of the samples (sorted in place).
+fn median(times: &mut [f64]) -> f64 {
+    times.sort_by(f64::total_cmp);
+    times[times.len() / 2]
+}
+
 fn bench_lu(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
     println!("\n=== f64 LU Factorization Benchmark ===");
     println!(
-        "{:>8} {:>12} {:>12} {:>12} {:>12}",
-        "Size", "Naive", "Unblocked", "Blocked", "Speedup"
+        "{:>8} {:>5} {:>12} {:>12} {:>12} {:>12}",
+        "Size", "nb", "Naive", "Unblocked", "Blocked", "Speedup"
     );
-    println!("{}", "-".repeat(62));
+    println!("{}", "-".repeat(68));
 
     for &(n, label) in sizes {
         // Create diagonally dominant matrix
@@ -63,8 +70,7 @@ fn bench_lu(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             let _ = lu_naive(&a);
             naive_times.push(start.elapsed().as_secs_f64());
         }
-        naive_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let naive_median = naive_times[n_samples / 2];
+        let naive_median = median(&mut naive_times);
 
         // Warmup unblocked
         for _ in 0..n_warmup {
@@ -78,8 +84,7 @@ fn bench_lu(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             let _ = Lu::compute(a.as_ref());
             unblocked_times.push(start.elapsed().as_secs_f64());
         }
-        unblocked_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let unblocked_median = unblocked_times[n_samples / 2];
+        let unblocked_median = median(&mut unblocked_times);
 
         // Warmup blocked
         for _ in 0..n_warmup {
@@ -93,8 +98,7 @@ fn bench_lu(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             let _ = Lu::compute_blocked(a.as_ref());
             blocked_times.push(start.elapsed().as_secs_f64());
         }
-        blocked_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let blocked_median = blocked_times[n_samples / 2];
+        let blocked_median = median(&mut blocked_times);
 
         // LU has ~(2/3)n³ flops
         let flops = 2.0 * (n as f64).powi(3) / 3.0;
@@ -103,9 +107,12 @@ fn bench_lu(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
         let blocked_gflops = flops / blocked_median / 1e9;
         let speedup = unblocked_median / blocked_median;
 
+        // The panel width `Lu::compute_blocked` uses for this size.
+        let nb = optimal_block_size_lu(n, n);
+
         println!(
-            "{:>8} {:>9.2} G/s {:>9.2} G/s {:>9.2} G/s {:>9.2}x",
-            label, naive_gflops, unblocked_gflops, blocked_gflops, speedup
+            "{:>8} {:>5} {:>9.2} G/s {:>9.2} G/s {:>9.2} G/s {:>9.2}x",
+            label, nb, naive_gflops, unblocked_gflops, blocked_gflops, speedup
         );
     }
 }
@@ -119,8 +126,11 @@ fn main() {
     println!("Blocked algorithm uses GEMM/TRSM for cache efficiency.");
     println!();
     println!("Naive: Simple O(n³) without pivoting (for reference)");
-    println!("Unblocked: With pivoting, row-by-row updates");
-    println!("Blocked: With pivoting, panel + GEMM updates (nb=64)");
+    println!("Unblocked: With pivoting, column-oriented rank-1 updates");
+    println!("Blocked: With pivoting, recursive panel + in-place TRSM/GEMM updates,");
+    println!("         panel width nb from optimal_block_size_lu: n if n < 64,");
+    println!("         32 if n < 256, 64 if n < 1024, 128 otherwise (nb column below)");
+    println!("The test matrices are diagonally dominant: no row interchanges occur.");
 
     let sizes = [
         (64, "64"),

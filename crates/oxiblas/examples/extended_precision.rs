@@ -75,53 +75,72 @@ fn main() {
     // Kahan Summation
     // ========================================
     println!("--- Kahan Summation (Compensated Summation) ---");
-    println!("Reduces numerical errors in sum of many numbers\n");
+    println!("dot_kahan carries the rounding error of each addition into the next one\n");
 
-    // Create a scenario where naive summation loses precision
-    let large_numbers = vec![1e16; 1000];
-    let small_numbers = vec![1.0; 1000];
-    let mut mixed_data = Vec::new();
-    mixed_data.extend_from_slice(&large_numbers);
-    mixed_data.extend_from_slice(&small_numbers);
-
-    // Naive dot product (may lose precision)
+    // Sixteen terms 1e16 (one per lane of the vectorised `dot` kernel on
+    // aarch64) followed by 16 000 unit terms. The exact sum, 1.6e17 + 16 000,
+    // is a double, but a partial sum of 1e16 or more (doubles there are at
+    // least 2 apart) rounds a lone `+ 1` away.
+    let mut mixed_data = vec![1e16; 16];
+    mixed_data.extend(std::iter::repeat_n(1.0, 16_000));
     let ones: Vec<f64> = vec![1.0; mixed_data.len()];
-    let naive_sum = dot(&mixed_data, &ones);
+    let exact_mixed = 16.0 * 1e16 + 16_000.0;
 
-    // Kahan dot product (compensated summation)
+    let dot_sum = dot(&mixed_data, &ones);
+    let pairwise_sum = dot_pairwise(&mixed_data, &ones);
     let kahan_sum = dot_kahan(&mixed_data, &ones);
 
-    println!("Summing 1000 × 1e16 + 1000 × 1.0:");
-    println!("Naive sum:  {:.10e}", naive_sum);
-    println!("Kahan sum:  {:.10e}", kahan_sum);
-    println!("Expected:   1.000000001e19");
-    println!("(Kahan summation preserves the small contributions)\n");
+    println!("Summing 16 × 1e16 + 16000 × 1.0:");
+    for (name, value) in [
+        ("dot", dot_sum),
+        ("dot_pairwise", pairwise_sum),
+        ("dot_kahan", kahan_sum),
+    ] {
+        println!(
+            "{name:<13} {value:.0} (error {:.0})",
+            (value - exact_mixed).abs()
+        );
+    }
+    println!("Exact:        {exact_mixed:.0}");
+    println!("(dot and dot_pairwise drop the unit terms added to a partial sum");
+    println!(" that holds a 1e16; Kahan summation keeps them)\n");
 
     // ========================================
     // Pairwise Summation
     // ========================================
     println!("--- Pairwise Summation (Divide-and-Conquer) ---");
-    println!("O(log n) error growth vs O(n) for naive summation\n");
+    println!("dot_pairwise halves the vector down to blocks of at most 128 terms and");
+    println!("sums each block in turn: its error bound grows like 128 + log2(n/128)");
+    println!("roundings instead of the n of one running sum. dot is not one running");
+    println!("sum either: on aarch64 it keeps 16 NEON lanes flushed every 1024 terms");
+    println!("(about 72 + n/1024 roundings), elsewhere four accumulators (about n/4),");
+    println!("so neither result is reliably the more accurate one.\n");
 
     // Large vector where order matters for precision
     let n = 100000;
     let data: Vec<f64> = (0..n).map(|i| 1.0 / (i as f64 + 1.0)).collect();
     let ones_large: Vec<f64> = vec![1.0; n];
 
-    let naive_result = dot(&data, &ones_large);
+    let dot_result = dot(&data, &ones_large);
     let pairwise_result = dot_pairwise(&data, &ones_large);
+    let kahan_result = dot_kahan(&data, &ones_large);
 
     println!("Sum of 1/i for i=1 to {}:", n);
-    println!("Naive:    {:.15}", naive_result);
-    println!("Pairwise: {:.15}", pairwise_result);
-    println!("Difference: {:.2e}", (naive_result - pairwise_result).abs());
-    println!("(Pairwise is more accurate for long sums)\n");
+    println!("dot:          {:.15}", dot_result);
+    println!("dot_pairwise: {:.15}", pairwise_result);
+    println!("dot_kahan:    {:.15} (reference)", kahan_result);
+    println!(
+        "|dot - Kahan| = {:.2e}, |pairwise - Kahan| = {:.2e}\n",
+        (dot_result - kahan_result).abs(),
+        (pairwise_result - kahan_result).abs()
+    );
 
     // ========================================
     // Mixed Precision Operations
     // ========================================
     println!("--- Mixed Precision (f32 → f64) ---");
-    println!("Compute in f32, accumulate in f64 for speed + accuracy\n");
+    println!("dsdot / sdsdot widen every f32 element to f64 and multiply and");
+    println!("accumulate in f64 (sdsdot rounds the final sum back to f32)\n");
 
     let x_f32 = vec![1.5_f32, 2.5, 3.5, 4.5];
     let y_f32 = vec![5.5_f32, 6.5, 7.5, 8.5];
@@ -150,47 +169,48 @@ fn main() {
     let prices: Vec<f64> = vec![100.5, 50.25, 75.75, 200.0, 10.5];
     let quantities: Vec<f64> = vec![1000.0, 2000.0, 500.0, 100.0, 10000.0];
 
-    let portfolio_value_naive = dot(&prices, &quantities);
+    let portfolio_value_dot = dot(&prices, &quantities);
     let portfolio_value_kahan = dot_kahan(&prices, &quantities);
 
     println!("Portfolio calculation (price × quantity):");
     println!("Prices:     {:?}", prices);
     println!("Quantities: {:?}", quantities);
-    println!("Total value (naive):  ${:.2}", portfolio_value_naive);
+    println!("Total value (dot):    ${:.2}", portfolio_value_dot);
     println!("Total value (Kahan):  ${:.2}", portfolio_value_kahan);
     println!(
         "Difference: ${:.2e}",
-        (portfolio_value_naive - portfolio_value_kahan).abs()
+        (portfolio_value_dot - portfolio_value_kahan).abs()
     );
     println!("(For financial calculations, Kahan reduces rounding errors)\n");
 
     // ========================================
     // Accuracy Comparison
     // ========================================
-    println!("--- Accuracy Comparison: Kahan vs Pairwise vs Naive ---");
+    println!("--- Accuracy Comparison: Kahan vs Pairwise vs dot ---");
 
     // Harmonic series partial sum - known to accumulate error
     let n_harmonic = 10_000_000;
     let harmonic: Vec<f64> = (1..=n_harmonic).map(|i| 1.0 / i as f64).collect();
     let ones_h: Vec<f64> = vec![1.0; n_harmonic];
 
-    let naive_harmonic = dot(&harmonic, &ones_h);
+    let dot_harmonic = dot(&harmonic, &ones_h);
     let kahan_harmonic = dot_kahan(&harmonic, &ones_h);
     let pairwise_harmonic = dot_pairwise(&harmonic, &ones_h);
 
     println!("Harmonic series H_{} = Σ(1/i):", n_harmonic);
-    println!("Naive:    {:.15}", naive_harmonic);
+    println!("dot:      {:.15}", dot_harmonic);
     println!("Kahan:    {:.15}", kahan_harmonic);
     println!("Pairwise: {:.15}", pairwise_harmonic);
     println!(
-        "Difference (Kahan - Naive):    {:.2e}",
-        (kahan_harmonic - naive_harmonic).abs()
+        "Difference (dot - Kahan):      {:.2e}",
+        (dot_harmonic - kahan_harmonic).abs()
     );
     println!(
-        "Difference (Pairwise - Naive): {:.2e}",
-        (pairwise_harmonic - naive_harmonic).abs()
+        "Difference (Pairwise - Kahan): {:.2e}",
+        (pairwise_harmonic - kahan_harmonic).abs()
     );
-    println!("(Kahan typically has best accuracy, Pairwise is a good compromise)\n");
+    println!("(Kahan has the smallest error bound, about two roundings of the sum;");
+    println!(" pairwise and the multi-accumulator dot trade some accuracy for speed)\n");
 
     println!("=== Extended precision operations completed! ===");
 

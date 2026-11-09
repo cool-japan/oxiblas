@@ -186,7 +186,7 @@ pub fn gemm_winograd_blocked<T>(
     assert_eq!(b.nrows(), k);
     assert_eq!(c.nrows(), m);
     assert_eq!(c.ncols(), n);
-    assert!(block_size % 2 == 0, "Block size must be even");
+    assert!(block_size.is_multiple_of(2), "Block size must be even");
 
     // Scale C by beta first
     if beta == T::zero() {

@@ -585,7 +585,7 @@ fn linux_bind_memory_policy(ptr: *mut u8, len: usize, hint: &NumaAllocHint) -> s
     // `mbind` requires a page-aligned start address (the kernel rounds the
     // length up to a page multiple itself, but we do it explicitly so the
     // policy provably spans the whole region).
-    if (ptr as usize) % page != 0 {
+    if !(ptr as usize).is_multiple_of(page) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "mbind requires a page-aligned address",

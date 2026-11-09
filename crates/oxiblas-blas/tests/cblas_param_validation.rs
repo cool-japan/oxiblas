@@ -9,7 +9,8 @@
 //! The contract being asserted is reference BLAS's: on an invalid argument the
 //! routine calls `xerbla` and returns **without touching the operands** — so
 //! the checks are "did not crash" *and* "output buffer unchanged". Panicking
-//! is not an option: unwinding across an `extern "C"` boundary is UB.
+//! is not an option: a panic reaching an `extern "C"` boundary aborts the
+//! process.
 
 use num_complex::{Complex32, Complex64};
 use oxiblas_blas::cblas::*;

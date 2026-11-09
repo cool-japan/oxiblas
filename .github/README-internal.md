@@ -2,6 +2,8 @@
 
 This directory contains GitHub Actions workflows for automated testing, benchmarking, and releasing.
 
+> **None of these workflows runs.** Under the COOLJAPAN CI cost policy only `pypi-publish.yml` and `npm-publish.yml` may be active, so `benchmarks`, `ci` and `release` are kept as `*.yml.disabled`. The rest of this document describes those files as they would behave if re-enabled. Run the checks locally instead; see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
 ## Workflows
 
 ### CI (`ci.yml`)

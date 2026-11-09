@@ -181,18 +181,21 @@
 //!
 //! OxiBLAS automatically selects optimized code paths based on matrix size:
 //!
-//! | Size | GEMM Strategy | Expected Performance |
-//! |------|---------------|---------------------|
-//! | < 32 | Unrolled small-matrix kernels | Minimal overhead |
-//! | 32-512 | BLIS-style blocked GEMM | ~70% peak |
-//! | > 512 | Auto-tuned blocking + parallel | ~80% peak |
-//! | > 2048 | Consider Strassen (optional) | Reduced complexity |
+//! | Size | GEMM Strategy |
+//! |------|---------------|
+//! | `m * n * k <= 32³` | Small-matrix kernels, no packing |
+//! | Every dimension < 512 | BLIS-style blocked GEMM |
+//! | Any dimension >= 512 | Blocked GEMM with auto-tuned block sizes |
+//!
+//! `gemm` stays sequential at every size; parallelism is opt-in, see
+//! [Parallelization](#parallelization). `gemm_strassen` is an optional
+//! alternative for very large matrices.
 //!
 //! ## Memory Layout
 //!
 //! - **Column-major** (default): Best for BLAS/LAPACK compatibility
-//! - **Contiguous data**: Avoid strided views when possible for 2-10x speedup
-//! - **Aligned allocation**: `Mat<T>` uses 64-byte alignment for SIMD
+//! - **Contiguous data**: Avoid strided views when possible; the fast paths need contiguous columns
+//! - **Aligned allocation**: `Mat<T>` aligns to the cache line (128 bytes on AArch64, 64 elsewhere)
 //!
 //! ## Parallelization
 //!
@@ -219,14 +222,16 @@
 //!
 //! ## Cache Optimization Tips
 //!
-//! 1. **Blocking parameters**: Use `GemmBlocking::auto_tuned()` for runtime tuning
+//! 1. **Blocking parameters**: `GemmBlocking::auto_tuned()` derives block sizes from
+//!    the cache hierarchy; the `runtime-tuning` feature of `oxiblas-blas` benchmarks them
 //! 2. **Panel reuse**: Process multiple right-hand sides together when possible
 //! 3. **Prefetching**: Enabled automatically in GEMM micro-kernels
 //!
 //! ## Complex Numbers
 //!
-//! For complex GEMM, the 3M algorithm (3 real multiplies) is used automatically
-//! for matrices >= 64, providing ~25% speedup over naive 4-multiply approach.
+//! Plain `gemm` runs complex types on a scalar micro-kernel. `gemm3m_c64` and
+//! `gemm3m_c32` use the 3M algorithm instead: three real GEMMs, so they get the SIMD
+//! kernels. `hemm` switches to it automatically from order 64.
 //!
 //! # Migration Guide
 //!
@@ -561,7 +566,7 @@ pub mod prelude {
 
     // Sparse iterative solvers (commonly used, requires `sparse` feature)
     #[cfg(feature = "sparse")]
-    pub use oxiblas_sparse::linalg::{bicgstab, cg, gmres};
+    pub use oxiblas_sparse::linalg::{bicgstab, cg, gmres, pcg};
 
     // LAPACK operations - selective imports to avoid ambiguous re-exports
     // Note: Side and Trans are intentionally not imported from LAPACK to avoid

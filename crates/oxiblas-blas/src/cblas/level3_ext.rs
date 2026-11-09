@@ -49,10 +49,10 @@
 //! Invalid arguments (negative dimensions, undersized leading dimensions, the
 //! rejected `ConjTrans` above) and null pointers make the call a silent no-op,
 //! the convention of every wrapper in this crate (a C ABI cannot surface an
-//! error and must not unwind). A singular triangular factor in `trsm` makes
-//! the native solve stop with an error that is likewise ignored: B is left as
-//! the solver left it, and reference ?TRSM makes no promise about B for a
-//! singular A either.
+//! error and a panic reaching it would abort the process). A singular
+//! triangular factor in `trsm` makes the native solve stop with an error that
+//! is likewise ignored: B is left as the solver left it, and reference ?TRSM
+//! makes no promise about B for a singular A either.
 //!
 //! # Deviations from the reference
 //!

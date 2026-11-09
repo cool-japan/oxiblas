@@ -71,10 +71,11 @@ pub(super) fn real_alpha_conj<T: Field>(alpha: T::Real, x: T) -> T {
 /// If `n == 0` or `alpha == 0` the matrix is left completely untouched (including an
 /// imaginary diagonal). The column temp is the complex product
 /// `(alpha, 0) * conj(x[j])`, so, as in reference `?her`, an infinite `x[j]` gives a
-/// NaN diagonal.
+/// NaN diagonal for complex `T` (for real `T` the temp is `alpha * x[j]` and the
+/// diagonal becomes infinite).
 ///
 /// Note: alpha is real (`T::Real`); the Hermitian update with a complex scalar is
-/// the rank-2 update [`her2`](crate::level2::her2).
+/// the rank-2 update [`her2`](crate::level2::her2()).
 ///
 /// # Arguments
 ///
@@ -197,6 +198,22 @@ where
 ///
 /// Returns alpha * x * x^H as a fully Hermitian matrix.
 ///
+/// The lower triangle is computed by [`her`] with [`HerUplo::Lower`] on a zero
+/// matrix, so it has the reference `?her` semantics, and the strictly upper
+/// triangle is its conjugated mirror, `A[j,i] = conj(A[i,j])`. In particular:
+///
+/// * A column with `x[j] == 0` is skipped and stays zero, so an infinite or NaN
+///   `x[i]` cannot reach it. Like the reference this is order dependent:
+///   `x = [0, Inf]` gives `A[1,0] = A[0,1] = 0`, but `x = [Inf, 0]` gives
+///   `A[1,0] = x[1] * (alpha * conj(x[0])) = 0 * Inf = NaN`, mirrored into
+///   `A[0,1]`.
+/// * The column temp is the complex product `(alpha, 0) * conj(x[j])`, so for
+///   complex `T` an infinite `x[j]` gives a NaN diagonal (as in the reference);
+///   the diagonal is exactly real.
+/// * Every lower entry is accumulated onto `+0`, so a `-0` product is stored as
+///   `+0`. The upper entries are exact conjugates, so a zero imaginary part there
+///   has the opposite sign.
+///
 /// # Arguments
 ///
 /// * `alpha` - The real scalar alpha
@@ -216,16 +233,20 @@ where
         return a;
     }
 
-    // Create full Hermitian matrix
-    for i in 0..n {
-        for j in 0..=i {
-            let val = T::from_real(alpha) * x[i] * x[j].conj();
-            if i == j {
-                // Diagonal must be real
-                a[(i, j)] = T::from_real(val.real());
-            } else {
-                a[(i, j)] = val;
-                a[(j, i)] = val.conj();
+    // `a` is `n x n` and `x.len() == n`, so `her` cannot fail. Should a future
+    // dimension bug make it fail anyway, debug builds stop at the assertion;
+    // release builds return the zero matrix (`her` reports its errors before
+    // writing) instead of panicking.
+    let updated = her(HerUplo::Lower, alpha, x, a.as_mut());
+    debug_assert!(
+        updated.is_ok(),
+        "her_new: her rejected an {n} x {n} matrix with x.len() == {n}: {updated:?}"
+    );
+    if updated.is_ok() {
+        // Mirror the strictly lower triangle into the upper one, conjugated.
+        for j in 0..n {
+            for i in (j + 1)..n {
+                a[(j, i)] = a[(i, j)].conj();
             }
         }
     }
@@ -607,5 +628,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a[(0, 0)], Complex32::new(3.0, 0.0));
+    }
+
+    /// `her_new` builds its lower triangle with `her(Lower, ..)` on a zero matrix, so
+    /// the reference zero-column skip applies: for `x = [0, Inf]` column 0 is
+    /// skipped, `A[1,0]` stays `0` and is mirrored into `A[0,1]`. (The old direct
+    /// product `alpha * x[1] * conj(x[0]) = Inf * 0` made both NaN.)
+    #[test]
+    fn test_her_new_skips_zero_column() {
+        let inf = f64::INFINITY;
+
+        let a = her_new(1.0, &[0.0f64, inf]);
+        assert_eq!((a[(0, 0)], a[(1, 0)], a[(0, 1)]), (0.0, 0.0, 0.0));
+        assert_eq!(a[(1, 1)], inf);
+
+        let a = her_new(1.0, &[c(0.0, 0.0), c(inf, 0.0)]);
+        assert_eq!(a[(0, 0)], c(0.0, 0.0));
+        assert_eq!(a[(1, 0)], c(0.0, 0.0));
+        assert_eq!(a[(0, 1)], c(0.0, 0.0));
+        // The diagonal follows reference zher: `real(0 + x1 * temp)`, where the
+        // complex temp `(1, 0) * conj(Inf)` holds a NaN part, gives `(NaN, +0)`.
+        assert!(a[(1, 1)].re.is_nan());
+        assert_eq!(a[(1, 1)].im.to_bits(), 0.0f64.to_bits());
+
+        // The lower-triangle semantics are order dependent, as in the reference:
+        // with x = [Inf, 0] column 0 is not skipped and A[1,0] = x[1] * temp0 =
+        // 0 * Inf is NaN (mirrored), while the skipped column 1 stays zero.
+        let a = her_new(1.0, &[inf, 0.0f64]);
+        assert_eq!(a[(0, 0)], inf);
+        assert!(a[(1, 0)].is_nan() && a[(0, 1)].is_nan());
+        assert_eq!(a[(1, 1)], 0.0);
+    }
+
+    /// Every lower entry of `her_new` is `0 + product` (a skipped column stays `+0`),
+    /// so a `-0` product is stored as `+0`. The old direct products kept the `-0`.
+    #[test]
+    fn test_her_new_negative_zero_product_is_positive_zero() {
+        let a = her_new(-1.0, &[1.0f64, 0.0]);
+        assert_eq!(a[(0, 0)], -1.0);
+        for (i, j) in [(1, 0), (0, 1), (1, 1)] {
+            assert_eq!(a[(i, j)].to_bits(), 0.0f64.to_bits(), "({i},{j})");
+        }
+    }
+
+    /// `her_new` equals `her(Lower, ..)` on a zero matrix bit for bit (reference
+    /// temps and evaluation order), with the strictly lower triangle mirrored,
+    /// conjugated, into the upper one.
+    #[test]
+    fn test_her_new_matches_lower_her_on_zero_matrix() {
+        let x = [c(1.0, 0.5), c(-0.3, 2.0), c(0.0, 0.0), c(0.7, -1.1)];
+        let alpha = 0.37;
+        let a = her_new(alpha, &x);
+        let mut lower: Mat<Complex64> = Mat::zeros(4, 4);
+        her(HerUplo::Lower, alpha, &x, lower.as_mut()).unwrap();
+        for j in 0..4 {
+            assert_eq!(bits(a[(j, j)]), bits(lower[(j, j)]), "({j},{j})");
+            for i in (j + 1)..4 {
+                assert_eq!(bits(a[(i, j)]), bits(lower[(i, j)]), "({i},{j})");
+                assert_eq!(bits(a[(j, i)]), bits(lower[(i, j)].conj()), "({j},{i})");
+            }
+        }
     }
 }

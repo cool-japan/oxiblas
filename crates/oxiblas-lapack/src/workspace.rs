@@ -770,9 +770,9 @@ pub fn tridiagonal_solve_workspace(n: usize, _nrhs: usize) -> WorkspaceQuery {
 /// panels to better amortize Level-3 BLAS (GEMM) call overhead.
 ///
 /// This is the function [`crate::lu::Lu::compute_blocked`] and
-/// [`crate::lu::Lu::compute_blocked_par`] use internally to pick their block
-/// size; callers of [`crate::lu::Lu::compute_with_block_size`] /
-/// [`crate::lu::Lu::compute_blocked_par_with_block_size`] can call it
+/// `Lu::compute_blocked_par` (feature `parallel`) use internally to pick their
+/// block size; callers of [`crate::lu::Lu::compute_with_block_size`] /
+/// `Lu::compute_blocked_par_with_block_size` (feature `parallel`) can call it
 /// directly to reproduce (or tune around) that default.
 ///
 /// # Arguments
@@ -815,7 +815,7 @@ pub fn optimal_block_size_lu(m: usize, n: usize) -> usize {
 /// Recommends a panel/block width for blocked Cholesky factorization (POTRF).
 ///
 /// This is the function [`crate::cholesky::Cholesky::compute_blocked`] and
-/// [`crate::cholesky::Cholesky::compute_blocked_par`] use internally to pick
+/// `Cholesky::compute_blocked_par` (feature `parallel`) use internally to pick
 /// their block size.
 ///
 /// # Arguments

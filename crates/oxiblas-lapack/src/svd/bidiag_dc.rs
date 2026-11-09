@@ -1,88 +1,79 @@
-//! Real bidiagonal SVD via divide-and-conquer.
+//! Real bidiagonal SVD by divide and conquer (LAPACK `dbdsdc` / `dlasd0`).
 //!
-//! This module implements the singular value decomposition of an upper
-//! bidiagonal matrix `B` (diagonal `d`, super-diagonal `e`).  It is shared by
-//! both the real ([`crate::svd::SvdDc`]) and complex ([`crate::svd::ComplexSvdDc`])
-//! divide-and-conquer front-ends: complex bidiagonalization produces a *real*
-//! bidiagonal matrix, so exactly the same real kernel serves both.
+//! This module computes the SVD `B = U·diag(σ)·Vᵀ` of an upper bidiagonal
+//! matrix `B` (diagonal `d`, super-diagonal `e`). It is shared by the real
+//! ([`crate::svd::SvdDc`]) and complex ([`crate::svd::ComplexSvdDc`])
+//! divide-and-conquer front-ends: complex bidiagonalisation produces a *real*
+//! bidiagonal matrix, so the same kernel serves both.
 //!
 //! # Algorithm
 //!
-//! For small problems (`n <= DIRECT_THRESHOLD`) the SVD is computed directly by
-//! the implicit-shift (Golub–Kahan) bidiagonal QR sweep with a Wilkinson shift.
+//! The divide and conquer works on `B` itself (Gu & Eisenstat), never on
+//! `BᵀB`, so it is backward stable and `U` and `V` come out numerically
+//! orthogonal without any re-orthogonalisation:
 //!
-//! For larger problems the SVD is obtained by a genuine divide-and-conquer
-//! solve of the symmetric tridiagonal eigenproblem `T = Bᵀ·B`:
+//! 1. **Scaling.** `d` and `e` are scaled to unit max-norm by a power of two
+//!    (exactly; `dbdsdc` scales with `dlascl`) and the singular values are
+//!    unscaled on exit, so the absolute tolerances below are relative to
+//!    `‖B‖_max` whatever the magnitude of the input.
+//! 2. **Small matrices** (`n ≤ 25`) are solved by the implicit QR iteration
+//!    of [`crate::svd::bidiag_qr`] (`dbdsqr` in relative-accuracy mode with
+//!    explicit removal of zero diagonal entries).
+//! 3. **Splitting.** Larger matrices split at every `|eᵢ| < 0.9·ε` (scaled);
+//!    each subproblem is solved independently.
+//! 4. **Divide and conquer** (`dlasd0`): a subproblem of more than 25 rows
+//!    is cut at its middle row into an upper `nl × (nl + 1)` and a lower
+//!    `nr × (nr + sqre)` bidiagonal, solved recursively (leaves by the QR
+//!    iteration), and merged by [`crate::svd::bidiag_merge`] (`dlasd1`–
+//!    `dlasd3`: deflation relative to the scaled node, the `dlasd4` secular
+//!    equation, Gu–Eisenstat vectors and GEMM back-transforms over the
+//!    diagonal blocks).
+//! 5. The singular values are sorted descending with their vectors.
 //!
-//! 1. **Divide** – `T` is split at its midpoint by removing the coupling
-//!    off-diagonal `β`, writing `T = T̃₁ ⊕ T̃₂ + |β|·u·uᵀ` (Cuppen's rank-one
-//!    modification, with the two boundary diagonal entries shifted by `|β|`).
-//! 2. **Conquer** – the two halves are solved recursively, yielding the merged
-//!    diagonal `D` (their eigenvalues) and block-diagonal eigenvector matrix
-//!    `Q = diag(Q₁, Q₂)`.
-//! 3. **Deflate** – eigenpairs whose rank-one coupling component `uᵢ` is
-//!    negligible pass through unchanged (their eigenvector is the corresponding
-//!    unit vector). Numerically-coincident eigenvalues are deflated by the exact
-//!    `dlaed2` Givens rotation `G(i,j)` (`c = uᵢ/r, s = uⱼ/r, r = √(uᵢ²+uⱼ²)`):
-//!    it merges the coupling pair `(uᵢ, uⱼ) → (r, 0)` and rotates the two
-//!    accumulated eigenvector columns together, so column `j` becomes an exact
-//!    eigenvector that deflates out while column `i` keeps the combined coupling
-//!    `r` and stays in the active secular problem.
-//! 4. **Secular equation** – the remaining eigenvalues solve
-//!    `f(λ) = 1 + |β|·Σᵢ uᵢ²/(dᵢ − λ) = 0`, found by safeguarded
-//!    Newton–Raphson with bisection fall-back.  The associated eigenvectors are
-//!    `(D − λI)⁻¹u`, normalised, then rotated back through `Q`.
+//! Singular values carry absolute errors of order `ε·‖B‖` (as for
+//! `dbdsdc`, whose deflation and splitting tolerances are absolute within
+//! each scaled subproblem). Singular values well above `ε·‖B‖` come out with
+//! high relative accuracy in practice (graded bidiagonals spanning twelve
+//! decades agree with the QR iteration to a few ulps, as reference LAPACK
+//! does); below `ε·‖B‖` only the absolute bound holds, and in exactly
+//! singular cases the smallest ones come out as `O(ε·‖B‖)` rather than
+//! exactly zero once the divide and conquer is used. The QR path (`n ≤ 25`)
+//! keeps high relative accuracy for every singular value. Unlike `dbdsdc`,
+//! diagonal entries below `ε·‖B‖` are not raised to `±ε·‖B‖` before the
+//! divide and conquer, which keeps tiny singular values far more accurate.
 //!
-//! The right singular vectors of `B` are the eigenvectors `V` of `T`; the
-//! corresponding singular values are `σᵢ = ‖B·vᵢ‖`, and the left singular
-//! vectors are `uᵢ = B·vᵢ / σᵢ`.  Because `V` is orthonormal this reconstructs
-//! `B = U·Σ·Vᵀ` to working precision.
+//! Non-finite input is reported as [`BidiagDcError::NotConverged`].
 //!
 //! # References
 //!
 //! - Gu, M. & Eisenstat, S. C. (1995). *A Divide-and-Conquer Algorithm for the
 //!   Bidiagonal SVD*. SIAM J. Matrix Anal. Appl., 16(1), 79–92.
-//! - Cuppen, J. J. M. (1981). *A divide and conquer method for the symmetric
-//!   tridiagonal eigenproblem*. Numer. Math., 36(2), 177–195.
+//! - Demmel, J. & Kahan, W. (1990). *Accurate Singular Values of Bidiagonal
+//!   Matrices*. SIAM J. Sci. Stat. Comput., 11(5), 873–912.
+//! - LAPACK 3.12: `dbdsdc`, `dlasd0`–`dlasd5`, `dlasdq`, `dbdsqr`.
 
-use oxiblas_core::scalar::{Field, Real, Scalar};
+use oxiblas_core::scalar::{Field, Real};
 use oxiblas_matrix::Mat;
 
-/// Error returned by the real bidiagonal divide-and-conquer SVD kernel.
+use super::bidiag_merge::{Node, merge};
+use super::bidiag_qr::lasdq;
+use super::dc_kernels::{
+    BlasOps, DenseOps, PortableOps, cmp_desc_nan_last, fabs, lapack_eps, max_abs, pow2_exponent,
+    real_const, same_mut, same_ref, scale_pow2, sign_of, transpose_into,
+};
+
+/// Error returned by the real bidiagonal SVD kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BidiagDcError {
-    /// An iterative sub-solver (bidiagonal QR or Jacobi base case) failed to
-    /// converge within its iteration budget.
+    /// The QR iteration exhausted its budget, or the input is not finite.
     NotConverged,
-    /// The secular-equation solver produced an inconsistent result.
+    /// The secular-equation solver produced no finite root or vector.
     SecularEquationFailed,
 }
 
-/// Below this size the bidiagonal SVD is computed directly by shifted QR.
-const DIRECT_THRESHOLD: usize = 25;
-/// Below this size a tridiagonal block is solved directly by Jacobi rotations.
-const CUPPEN_BASE: usize = 8;
-/// Maximum bidiagonal QR sweeps allowed (per diagonal entry).
-const MAX_QR_SWEEPS: usize = 40;
-/// Maximum Newton iterations for a single secular-equation root.
-const MAX_SECULAR_ITER: usize = 80;
-/// Maximum Jacobi sweeps for a base-case tridiagonal block.
-const MAX_JACOBI_SWEEPS: usize = 100;
-
-#[inline]
-fn fabs<R: Real>(x: R) -> R {
-    if x < R::zero() { -x } else { x }
-}
-
-#[inline]
-fn from_f64<R: Real>(v: f64) -> R {
-    R::from_f64(v).unwrap_or_else(R::zero)
-}
-
-#[inline]
-fn rsqrt<R: Real>(x: R) -> R {
-    <R as Real>::sqrt(x)
-}
+/// Subproblems of at most this many rows are solved by the QR iteration
+/// (`SMLSIZ`, LAPACK `ilaenv(9)`).
+pub(crate) const SMLSIZ: usize = 25;
 
 /// Computes the SVD of the upper bidiagonal matrix with diagonal `d` and
 /// super-diagonal `e` (`e.len() == d.len() - 1`).
@@ -98,1233 +89,279 @@ where
     R: Field + Real + bytemuck::Zeroable,
 {
     let n = d.len();
-
-    if n == 0 {
-        return Ok((Mat::zeros(0, 0), Vec::new(), Mat::zeros(0, 0)));
-    }
-
-    if n == 1 {
-        let sigma = vec![fabs(d[0])];
-        let mut u = Mat::zeros(1, 1);
-        let mut vt = Mat::zeros(1, 1);
-        u[(0, 0)] = if d[0] >= R::zero() {
-            R::one()
-        } else {
-            -R::one()
-        };
-        vt[(0, 0)] = R::one();
-        return Ok((u, sigma, vt));
-    }
-
-    if n <= DIRECT_THRESHOLD {
-        return bidiagonal_svd_qr(d, e);
-    }
-
-    // Divide-and-conquer on the symmetric tridiagonal T = Bᵀ·B.
-    //   T[i,i]   = d[i]² + e[i-1]²   (e[-1] ≡ 0)
-    //   T[i,i+1] = d[i] · e[i]
-    let mut t_diag = vec![R::zero(); n];
-    let mut t_off = vec![R::zero(); n - 1];
-    for i in 0..n {
-        let mut diag = d[i] * d[i];
-        if i > 0 {
-            diag = diag + e[i - 1] * e[i - 1];
-        }
-        t_diag[i] = diag;
-    }
-    for i in 0..n - 1 {
-        t_off[i] = d[i] * e[i];
-    }
-
-    let (evals, vmat) = cuppen_tridiag(&t_diag, &t_off)?;
-    assemble_svd(d, e, &evals, vmat)
-}
-
-/// Builds the bidiagonal SVD from the eigen-decomposition `T = V·diag(evals)·Vᵀ`.
-///
-/// `evals` are the eigenvalues of `T = BᵀB` (i.e. `σ²`) and `vmat` holds the
-/// corresponding orthonormal eigenvectors as columns.  The singular values are
-/// recovered as `σⱼ = ‖B·vⱼ‖` (a Rayleigh quotient, more accurate than
-/// `√evalⱼ` for reconstruction) and the left vectors as `uⱼ = B·vⱼ/σⱼ`.
-fn assemble_svd<R>(
-    d: &[R],
-    e: &[R],
-    evals: &[R],
-    mut vmat: Mat<R>,
-) -> Result<(Mat<R>, Vec<R>, Mat<R>), BidiagDcError>
-where
-    R: Field + Real + bytemuck::Zeroable,
-{
-    let n = d.len();
-
-    // The eigen-solver must return exactly one eigenpair per column.
-    if evals.len() != n || vmat.nrows() != n || vmat.ncols() != n {
-        return Err(BidiagDcError::SecularEquationFailed);
-    }
-
-    // Guarantee V is orthonormal to working precision before deriving U from it.
-    mgs_orthonormalize(&mut vmat);
-
-    // w_j = B · v_j and σ_j = ‖w_j‖.
-    let mut w = Mat::zeros(n, n);
-    let mut sigma_col = vec![R::zero(); n];
-    for j in 0..n {
-        let mut norm_sq = R::zero();
-        for i in 0..n {
-            let mut bv = d[i] * vmat[(i, j)];
-            if i + 1 < n {
-                bv = bv + e[i] * vmat[(i + 1, j)];
-            }
-            w[(i, j)] = bv;
-            norm_sq = norm_sq + bv * bv;
-        }
-        sigma_col[j] = rsqrt(norm_sq);
-    }
-
-    // Order columns by descending singular value.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        sigma_col[b]
-            .partial_cmp(&sigma_col[a])
-            .unwrap_or(core::cmp::Ordering::Equal)
-    });
-
-    let scale = sigma_col.iter().copied().fold(R::zero(), |m, s| m.max(s));
-    let eps = <R as Scalar>::epsilon();
-    let tiny = eps * scale.max(R::one()) * from_f64::<R>(8.0);
-
-    let mut sigma = vec![R::zero(); n];
+    let d_vec = d.to_vec();
+    let e_vec = e.to_vec();
     let mut u = Mat::zeros(n, n);
+    let mut sigma = vec![R::zero(); n];
+    let mut v = Mat::zeros(n, n);
+
+    if let Some(res) = typed_bidiag::<R, f64>(&d_vec, &e_vec, &mut u, &mut sigma, &mut v) {
+        res?;
+    } else if let Some(res) = typed_bidiag::<R, f32>(&d_vec, &e_vec, &mut u, &mut sigma, &mut v) {
+        res?;
+    } else {
+        bidiag_svd_into::<R, PortableOps>(PortableOps, &d_vec, &e_vec, &mut u, &mut sigma, &mut v)?;
+    }
+
     let mut vt = Mat::zeros(n, n);
-    let mut needs_fill = Vec::new();
-
-    for (new_j, &old_j) in order.iter().enumerate() {
-        sigma[new_j] = sigma_col[old_j];
-        for i in 0..n {
-            vt[(new_j, i)] = vmat[(i, old_j)];
-        }
-        if sigma_col[old_j] > tiny {
-            let inv = R::one() / sigma_col[old_j];
-            for i in 0..n {
-                u[(i, new_j)] = w[(i, old_j)] * inv;
-            }
-        } else {
-            needs_fill.push(new_j);
-        }
-    }
-
-    // For (near-)zero singular values, B·v carries no reliable direction, so
-    // complete U with an orthonormal basis of the remaining left null-space.
-    if !needs_fill.is_empty() {
-        fill_orthonormal_columns(&mut u, &needs_fill);
-    }
-
+    transpose_into(v.as_ref(), vt.as_mut());
     Ok((u, sigma, vt))
 }
 
-// ---------------------------------------------------------------------------
-// Direct bidiagonal SVD by implicit-shift (Golub–Kahan) QR
-// ---------------------------------------------------------------------------
-
-/// Computes the SVD of a small upper bidiagonal matrix by the implicit-shift
-/// Golub–Kahan QR algorithm (LAPACK `dbdsqr` style) with a Wilkinson shift.
-///
-/// Returns `Err(BidiagDcError::NotConverged)` if the sweep budget is exhausted
-/// before every super-diagonal entry is negligible.
-fn bidiagonal_svd_qr<R>(d: &[R], e: &[R]) -> Result<(Mat<R>, Vec<R>, Mat<R>), BidiagDcError>
+/// Runs the GEMM-backed kernel when `R` is the BLAS scalar `G`.
+fn typed_bidiag<R, G>(
+    d: &Vec<R>,
+    e: &Vec<R>,
+    u: &mut Mat<R>,
+    sigma: &mut Vec<R>,
+    v: &mut Mat<R>,
+) -> Option<Result<(), BidiagDcError>>
 where
     R: Field + Real + bytemuck::Zeroable,
+    G: Field + Real + bytemuck::Zeroable + oxiblas_blas::level3::gemm_kernel::GemmKernel,
 {
-    let n = d.len();
-    let mut d_work: Vec<R> = d.to_vec();
-    let mut e_work: Vec<R> = e.to_vec();
-
-    let mut u = Mat::zeros(n, n);
-    let mut vt = Mat::zeros(n, n);
-    for i in 0..n {
-        u[(i, i)] = R::one();
-        vt[(i, i)] = R::one();
-    }
-
-    let eps = <R as Scalar>::epsilon();
-    let tol = eps * from_f64::<R>(4.0);
-
-    let max_iter = MAX_QR_SWEEPS * n + 20;
-    let mut converged = false;
-
-    for _iter in 0..max_iter {
-        // Deflate: zero-out negligible super-diagonals.
-        for i in 0..e_work.len() {
-            let thresh = tol * (fabs(d_work[i]) + fabs(d_work[i + 1]));
-            if fabs(e_work[i]) <= thresh {
-                e_work[i] = R::zero();
-            }
-        }
-
-        // Find the bottom `p` of the lowest unreduced block: the largest index
-        // with e[p-1] != 0.
-        let mut p = e_work.len();
-        while p > 0 && e_work[p - 1] == R::zero() {
-            p -= 1;
-        }
-        if p == 0 {
-            converged = true;
-            break;
-        }
-
-        // Find the top `q` of that block: the smallest index such that all
-        // e[q..p] are non-zero.
-        let mut q = p - 1;
-        while q > 0 && e_work[q - 1] != R::zero() {
-            q -= 1;
-        }
-
-        golub_kahan_step(&mut d_work, &mut e_work, &mut u, &mut vt, q, p + 1);
-    }
-
-    if !converged {
-        return Err(BidiagDcError::NotConverged);
-    }
-
-    // Make singular values non-negative (flip the matching left vector).
-    for i in 0..n {
-        if d_work[i] < R::zero() {
-            d_work[i] = -d_work[i];
-            for r in 0..n {
-                u[(r, i)] = -u[(r, i)];
-            }
-        }
-    }
-
-    // Sort descending.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        d_work[b]
-            .partial_cmp(&d_work[a])
-            .unwrap_or(core::cmp::Ordering::Equal)
-    });
-
-    let mut sigma = vec![R::zero(); n];
-    let mut u_sorted = Mat::zeros(n, n);
-    let mut vt_sorted = Mat::zeros(n, n);
-    for (new_idx, &old_idx) in order.iter().enumerate() {
-        sigma[new_idx] = d_work[old_idx];
-        for r in 0..n {
-            u_sorted[(r, new_idx)] = u[(r, old_idx)];
-            vt_sorted[(new_idx, r)] = vt[(old_idx, r)];
-        }
-    }
-
-    Ok((u_sorted, sigma, vt_sorted))
+    let d = same_ref::<Vec<R>, Vec<G>>(d)?;
+    let e = same_ref::<Vec<R>, Vec<G>>(e)?;
+    let u = same_mut::<Mat<R>, Mat<G>>(u)?;
+    let sigma = same_mut::<Vec<R>, Vec<G>>(sigma)?;
+    let v = same_mut::<Mat<R>, Mat<G>>(v)?;
+    Some(bidiag_svd_into::<G, BlasOps>(
+        BlasOps::SEQ,
+        d,
+        e,
+        u,
+        sigma,
+        v,
+    ))
 }
 
-/// One implicit-shift Golub–Kahan sweep over the unreduced block `[start, end)`
-/// of the bidiagonal matrix, accumulating the rotations into `u` and `vt`.
-fn golub_kahan_step<R>(
+/// `n × n` identity.
+fn identity<R: Field + bytemuck::Zeroable>(n: usize) -> Mat<R> {
+    let mut m = Mat::zeros(n, n);
+    for i in 0..n {
+        m[(i, i)] = R::one();
+    }
+    m
+}
+
+/// Bidiagonal SVD `B = U·diag(sigma)·Vᵀ` written into caller-provided
+/// buffers (`u`, `v`: `n×n`, `sigma`: `n`), with `V` stored by columns and
+/// `sigma` descending.
+///
+/// `ops` selects the dense backend (see [`crate::svd::dc_kernels`]).
+pub(crate) fn bidiag_svd_into<R, B>(
+    ops: B,
+    d: &[R],
+    e: &[R],
+    u: &mut Mat<R>,
+    sigma: &mut [R],
+    v: &mut Mat<R>,
+) -> Result<(), BidiagDcError>
+where
+    R: Field + Real + bytemuck::Zeroable,
+    B: DenseOps<R>,
+{
+    let n = d.len();
+    if n == 0 {
+        return Ok(());
+    }
+    if d.iter().chain(e.iter()).any(|x| !x.is_finite()) {
+        return Err(BidiagDcError::NotConverged);
+    }
+    let mut dd = d.to_vec();
+    let mut ee = e[..n - 1].to_vec();
+
+    // Scale to unit max-norm (power of two, exact).
+    let anorm = max_abs(&dd).max(max_abs(&ee));
+    if anorm == R::zero() {
+        sigma.fill(R::zero());
+        for (target, dim) in [(&mut *u, n), (&mut *v, n)] {
+            let ld = target.row_stride();
+            let data = target.raw_data_mut();
+            for j in 0..dim {
+                data[j * ld..j * ld + dim].fill(R::zero());
+                data[j * ld + j] = R::one();
+            }
+        }
+        return Ok(());
+    }
+    let ks = pow2_exponent(anorm);
+    scale_pow2(&mut dd, ks);
+    scale_pow2(&mut ee, ks);
+
+    let (mut uw, mut vw) = if n <= SMLSIZ {
+        let mut uw = identity::<R>(n);
+        let mut vw = identity::<R>(n);
+        lasdq(0, &mut dd, &mut ee, &mut uw, &mut vw)?;
+        (uw, vw)
+    } else {
+        let mut uw = Mat::<R>::zeros(n, n);
+        let mut vw = Mat::<R>::zeros(n, n);
+        solve_split(&ops, &mut dd, &mut ee, &mut uw, &mut vw)?;
+        (uw, vw)
+    };
+    scale_pow2(&mut dd, -ks);
+
+    // Descending order (NaN last), columns permuted alongside.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| cmp_desc_nan_last(dd[a], dd[b]));
+    let ldu = u.row_stride();
+    let ldv = v.row_stride();
+    let lduw = uw.row_stride();
+    let ldvw = vw.row_stride();
+    {
+        let ud = u.raw_data_mut();
+        let uwd = uw.raw_data_mut();
+        for (new_j, &old_j) in order.iter().enumerate() {
+            ud[new_j * ldu..new_j * ldu + n].copy_from_slice(&uwd[old_j * lduw..old_j * lduw + n]);
+        }
+    }
+    {
+        let vd = v.raw_data_mut();
+        let vwd = vw.raw_data_mut();
+        for (new_j, &old_j) in order.iter().enumerate() {
+            vd[new_j * ldv..new_j * ldv + n].copy_from_slice(&vwd[old_j * ldvw..old_j * ldvw + n]);
+        }
+    }
+    for (new_j, &old_j) in order.iter().enumerate() {
+        sigma[new_j] = dd[old_j];
+    }
+    Ok(())
+}
+
+/// Splits the scaled bidiagonal at negligible super-diagonal entries
+/// (`|eᵢ| < 0.9·ε`, as `dbdsdc`) and solves every piece into the diagonal
+/// blocks of the zero-initialised `u` and `v`.
+fn solve_split<R, B>(
+    ops: &B,
     d: &mut [R],
     e: &mut [R],
     u: &mut Mat<R>,
-    vt: &mut Mat<R>,
-    start: usize,
-    end: usize,
-) where
-    R: Field + Real + bytemuck::Zeroable,
-{
-    let n = u.nrows();
-    let last = end - 1;
-
-    // Wilkinson shift: eigenvalue of the trailing 2×2 of Bᵀ·B nearest t22.
-    let d_last = d[last];
-    let d_prev = d[last - 1];
-    let e_prev = e[last - 1];
-    let e_prev2 = if last >= start + 2 {
-        e[last - 2]
-    } else {
-        R::zero()
-    };
-
-    let t11 = d_prev * d_prev + e_prev2 * e_prev2;
-    let t22 = d_last * d_last + e_prev * e_prev;
-    let t12 = d_prev * e_prev;
-
-    let shift = wilkinson_shift(t11, t12, t22);
-
-    // Chase the bulge.
-    let mut f = d[start] * d[start] - shift;
-    let mut g = d[start] * e[start];
-
-    for k in start..last {
-        let (c, s, r) = givens(f, g);
-        if k > start {
-            e[k - 1] = r;
-        }
-
-        f = c * d[k] + s * e[k];
-        e[k] = c * e[k] - s * d[k];
-        g = s * d[k + 1];
-        d[k + 1] = c * d[k + 1];
-
-        // Right rotation acts on rows k, k+1 of Vᵀ.
-        for j in 0..n {
-            let vk = vt[(k, j)];
-            let vk1 = vt[(k + 1, j)];
-            vt[(k, j)] = c * vk + s * vk1;
-            vt[(k + 1, j)] = c * vk1 - s * vk;
-        }
-
-        let (c, s, r) = givens(f, g);
-        d[k] = r;
-        f = c * e[k] + s * d[k + 1];
-        d[k + 1] = c * d[k + 1] - s * e[k];
-        if k < last - 1 {
-            g = s * e[k + 1];
-            e[k + 1] = c * e[k + 1];
-        }
-
-        // Left rotation acts on columns k, k+1 of U.
-        for i in 0..n {
-            let uk = u[(i, k)];
-            let uk1 = u[(i, k + 1)];
-            u[(i, k)] = c * uk + s * uk1;
-            u[(i, k + 1)] = c * uk1 - s * uk;
-        }
-    }
-
-    e[last - 1] = f;
-}
-
-/// Wilkinson shift for the symmetric 2×2 `[[t11, t12], [t12, t22]]`: the
-/// eigenvalue nearest `t22`.
-#[inline]
-fn wilkinson_shift<R: Real>(t11: R, t12: R, t22: R) -> R {
-    if t12 == R::zero() {
-        return t22;
-    }
-    let two = from_f64::<R>(2.0);
-    let delta = (t11 - t22) / two;
-    let sign = if delta < R::zero() {
-        -R::one()
-    } else {
-        R::one()
-    };
-    // λ = t22 − t12² / (δ + sign(δ)·√(δ² + t12²))
-    let denom = delta + sign * rsqrt(delta * delta + t12 * t12);
-    if denom == R::zero() {
-        t22
-    } else {
-        t22 - (t12 * t12) / denom
-    }
-}
-
-/// Givens rotation zeroing `g`: returns `(c, s, r)` with
-/// `[c s; -s c]·[f; g] = [r; 0]`.
-#[inline]
-fn givens<R: Field + Real>(f: R, g: R) -> (R, R, R) {
-    if g == R::zero() {
-        (R::one(), R::zero(), f)
-    } else if f == R::zero() {
-        let sign = if g < R::zero() { -R::one() } else { R::one() };
-        (R::zero(), sign, fabs(g))
-    } else {
-        let r = <R as Real>::hypot(f, g);
-        (f / r, g / r, r)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cuppen divide-and-conquer for the symmetric tridiagonal eigenproblem
-// ---------------------------------------------------------------------------
-
-/// Eigen-decomposition of a symmetric tridiagonal matrix by Cuppen's D&C.
-///
-/// Returns `(evals, V)` with `evals` sorted ascending and `V` holding the
-/// orthonormal eigenvectors as columns (`V[(i, k)]` is component `i` of the
-/// `k`-th eigenvector).
-fn cuppen_tridiag<R>(diag: &[R], off: &[R]) -> Result<(Vec<R>, Mat<R>), BidiagDcError>
+    v: &mut Mat<R>,
+) -> Result<(), BidiagDcError>
 where
     R: Field + Real + bytemuck::Zeroable,
-{
-    let (evals, evecs) = cuppen_impl(diag, off)?;
-    let n = evals.len();
-    let mut v = Mat::zeros(n, n);
-    for (k, col) in evecs.iter().enumerate() {
-        for (i, &val) in col.iter().enumerate() {
-            v[(i, k)] = val;
-        }
-    }
-    Ok((evals, v))
-}
-
-/// Recursive core.  Eigenvectors are returned as `evecs[k]` = `k`-th eigenvector.
-fn cuppen_impl<R>(diag: &[R], off: &[R]) -> Result<(Vec<R>, Vec<Vec<R>>), BidiagDcError>
-where
-    R: Field + Real + bytemuck::Zeroable,
-{
-    let n = diag.len();
-
-    if n == 1 {
-        return Ok((vec![diag[0]], vec![vec![R::one()]]));
-    }
-    if n <= CUPPEN_BASE {
-        return jacobi_tridiag(diag, off);
-    }
-
-    let mid = n / 2;
-    let beta = off[mid - 1];
-    let abs_beta = fabs(beta);
-
-    let scale = tridiag_scale(diag, off);
-    let eps = <R as Scalar>::epsilon();
-
-    // Decoupled case: negligible coupling ⇒ solve the two halves independently.
-    if abs_beta <= eps * scale {
-        let (ev1, evec1) = cuppen_impl(&diag[..mid], &off[..mid - 1])?;
-        let (ev2, evec2) = cuppen_impl(&diag[mid..], &off[mid..])?;
-        return Ok(combine_block_diag(ev1, evec1, ev2, evec2, mid, n));
-    }
-
-    // Rank-one modification: T = T̃₁ ⊕ T̃₂ + |β|·u·uᵀ.
-    let mut diag1 = diag[..mid].to_vec();
-    let mut diag2 = diag[mid..].to_vec();
-    diag1[mid - 1] = diag1[mid - 1] - abs_beta;
-    diag2[0] = diag2[0] - abs_beta;
-
-    let off1 = &off[..mid - 1];
-    let off2 = &off[mid..];
-
-    let (evals1, evecs1) = cuppen_impl(&diag1, off1)?;
-    let (evals2, evecs2) = cuppen_impl(&diag2, off2)?;
-
-    // Merged diagonal d = [d₁; d₂].
-    let d: Vec<R> = evals1.iter().chain(evals2.iter()).copied().collect();
-
-    // Rank-one vector u = Qᵀ·z, z = sign(β)·e_{mid-1} + e_mid.
-    let sign_beta = if beta < R::zero() {
-        -R::one()
-    } else {
-        R::one()
-    };
-    let mut u = Vec::with_capacity(n);
-    for ev1 in evecs1.iter().take(mid) {
-        u.push(sign_beta * ev1[mid - 1]);
-    }
-    for ev2 in evecs2.iter().take(n - mid) {
-        u.push(ev2[0]);
-    }
-
-    let deflation_tol = eps * from_f64::<R>(n as f64) * scale.max(R::one());
-    let (d_defl, u_defl, active_idx, trivial, rot) = deflate(&d, &u, deflation_tol);
-
-    // Solve the secular equation for the active part and build its eigenvectors
-    // with the Gu–Eisenstat stable (Löwner) formula, which stays orthogonal even
-    // for tightly-clustered eigenvalues.
-    let (secular_evals, secular_evecs) = if d_defl.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        secular_eigenpairs(&d_defl, &u_defl, abs_beta)?
-    };
-
-    let total = trivial.len() + secular_evals.len();
-    if total != n {
-        // Deflation bookkeeping disagreed with the split; fall back to a direct
-        // (always-correct) Jacobi solve of the original block.
-        return jacobi_tridiag(diag, off);
-    }
-
-    // Assemble (eigenvalue, D-space eigenvector) pairs. Both deflated and active
-    // eigenvectors are expressed through the columns of `rot`, so any
-    // coincident-eigenvalue Givens rotation applied during deflation is
-    // reflected in the D-space vectors (identity columns leave this unchanged).
-    let mut pairs: Vec<(R, Vec<R>)> = Vec::with_capacity(n);
-
-    for &(eval, col) in trivial.iter() {
-        let mut ev = vec![R::zero(); n];
-        for (p, ev_p) in ev.iter_mut().enumerate() {
-            *ev_p = rot[(p, col)];
-        }
-        pairs.push((eval, ev));
-    }
-
-    for (lam, evec_active) in secular_evals.into_iter().zip(secular_evecs) {
-        let mut ev = vec![R::zero(); n];
-        for (k, &ai) in active_idx.iter().enumerate() {
-            let x = evec_active[k];
-            if x != R::zero() {
-                for (p, ev_p) in ev.iter_mut().enumerate() {
-                    *ev_p = *ev_p + x * rot[(p, ai)];
-                }
-            }
-        }
-        pairs.push((lam, ev));
-    }
-
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
-
-    // Back-transform through Q = diag(Q₁, Q₂).
-    let n2 = n - mid;
-    let mut evals_final = Vec::with_capacity(n);
-    let mut evecs_final = Vec::with_capacity(n);
-    for (lam, v_d) in pairs {
-        evals_final.push(lam);
-        let mut out = vec![R::zero(); n];
-        for (k, evec1) in evecs1.iter().enumerate().take(mid) {
-            let x = v_d[k];
-            if x != R::zero() {
-                for (i, &c) in evec1.iter().enumerate().take(mid) {
-                    out[i] = out[i] + x * c;
-                }
-            }
-        }
-        for (k, evec2) in evecs2.iter().enumerate().take(n2) {
-            let x = v_d[mid + k];
-            if x != R::zero() {
-                for (i, &c) in evec2.iter().enumerate().take(n2) {
-                    out[mid + i] = out[mid + i] + x * c;
-                }
-            }
-        }
-        evecs_final.push(out);
-    }
-
-    Ok((evals_final, evecs_final))
-}
-
-/// Combines two independent (decoupled) sub-solutions block-diagonally.
-#[allow(clippy::type_complexity)]
-fn combine_block_diag<R: Real>(
-    ev1: Vec<R>,
-    evec1: Vec<Vec<R>>,
-    ev2: Vec<R>,
-    evec2: Vec<Vec<R>>,
-    mid: usize,
-    n: usize,
-) -> (Vec<R>, Vec<Vec<R>>) {
-    let n2 = n - mid;
-    let mut pairs: Vec<(R, Vec<R>)> = Vec::with_capacity(n);
-    for (k, lam) in ev1.into_iter().enumerate() {
-        let mut ev = vec![R::zero(); n];
-        for i in 0..mid {
-            ev[i] = evec1[k][i];
-        }
-        pairs.push((lam, ev));
-    }
-    for (k, lam) in ev2.into_iter().enumerate() {
-        let mut ev = vec![R::zero(); n];
-        for i in 0..n2 {
-            ev[mid + i] = evec2[k][i];
-        }
-        pairs.push((lam, ev));
-    }
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
-    let evals = pairs.iter().map(|p| p.0).collect();
-    let evecs = pairs.into_iter().map(|p| p.1).collect();
-    (evals, evecs)
-}
-
-/// Estimate of the magnitude scale of a symmetric tridiagonal matrix.
-fn tridiag_scale<R: Real>(diag: &[R], off: &[R]) -> R {
-    let mut s = R::zero();
-    for &x in diag {
-        s = s.max(fabs(x));
-    }
-    for &x in off {
-        s = s.max(fabs(x));
-    }
-    if s > R::zero() { s } else { R::one() }
-}
-
-// ---------------------------------------------------------------------------
-// Deflation and secular equation
-// ---------------------------------------------------------------------------
-
-/// Deflates the rank-one modification `D + β·u·uᵀ`: drops eigenpairs with
-/// negligible coupling `|uᵢ|` and merges numerically-coincident `dᵢ` with the
-/// exact Gu–Eisenstat/LAPACK `dlaed2` Givens rotation.
-///
-/// Returns `(deflated_d, deflated_u, active_indices, trivial_pairs, rotation)`:
-/// - `deflated_d`, `deflated_u` – the reduced active secular problem.
-/// - `active_indices[k]` – the column of `rotation` carrying active component
-///   `k` (its D-space basis direction).
-/// - `trivial_pairs[t] = (λ, col)` – a deflated eigenpair whose D-space
-///   eigenvector is column `col` of `rotation` and whose eigenvalue is `λ`.
-/// - `rotation` – the accumulated orthogonal transform of the D-eigenbasis
-///   (identity except for the columns touched by a coincident-eigenvalue
-///   Givens rotation). Its columns are orthonormal by construction.
-///
-/// Carrying `(λ, col)` together (rather than pairing a separate ascending
-/// position list against a merge-ordered eigenvalue list) keeps every deflated
-/// eigenvalue attached to its own eigenvector even when negligible-coupling and
-/// coincident-eigenvalue deflations interleave.
-#[allow(clippy::type_complexity)]
-fn deflate<R>(d: &[R], u: &[R], tol: R) -> (Vec<R>, Vec<R>, Vec<usize>, Vec<(R, usize)>, Mat<R>)
-where
-    R: Field + Real + bytemuck::Zeroable,
+    B: DenseOps<R>,
 {
     let n = d.len();
-    let mut u_norm_sq = R::zero();
-    for &x in u {
-        u_norm_sq = u_norm_sq + x * x;
-    }
-    let u_norm = rsqrt(u_norm_sq).max(R::min_positive());
-
-    // Accumulated orthogonal transform G of the D-eigenbasis: its columns are
-    // the (possibly rotated) basis directions, initialised to the identity.
-    let mut rot = Mat::zeros(n, n);
-    for i in 0..n {
-        rot[(i, i)] = R::one();
-    }
-
-    let mut defl_d = Vec::new();
-    let mut defl_u = Vec::new();
-    let mut active_idx = Vec::new();
-    let mut trivial: Vec<(R, usize)> = Vec::new();
-
-    for i in 0..n {
-        if fabs(u[i]) < tol * u_norm {
-            // Negligible coupling: eᵢ is already an eigenvector (eigenvalue dᵢ);
-            // column i of `rot` is still eᵢ.
-            trivial.push((d[i], i));
-        } else {
-            defl_d.push(d[i]);
-            defl_u.push(u[i]);
-            active_idx.push(i);
-        }
-    }
-
-    // Merge numerically-coincident diagonal entries. In the exact
-    // Gu–Eisenstat/LAPACK `dlaed2` algorithm this is a Givens rotation
-    // G(i,j) = [[c, s], [-s, c]] with c = uᵢ/r, s = uⱼ/r, r = √(uᵢ²+uⱼ²): it maps
-    // the coupling pair (uᵢ, uⱼ) → (r, 0) and rotates the two accumulated
-    // eigenvector columns together, so column j becomes an exact eigenvector
-    // (zero coupling ⇒ eigenvalue dⱼ) that deflates out while column i keeps the
-    // combined coupling r and stays active. Omitting the rotation would rotate
-    // both members of the pair away from their true eigenvectors by atan2(uⱼ,uᵢ),
-    // silently losing orthogonality for genuinely repeated spectra.
-    let mut i = 0;
-    while i < defl_d.len() {
-        let mut j = i + 1;
-        while j < defl_d.len() {
-            if fabs(defl_d[j] - defl_d[i]) < tol * (fabs(defl_d[i]) + R::one()) {
-                let ui = defl_u[i];
-                let uj = defl_u[j];
-                let r = rsqrt(ui * ui + uj * uj);
-                let pos_i = active_idx[i];
-                let pos_j = active_idx[j];
-                if r > R::min_positive() {
-                    let c = ui / r;
-                    let s = uj / r;
-                    // Rotate columns pos_i, pos_j of the accumulated transform:
-                    //   new col pos_i =  c·col_i + s·col_j   (∥ u ⇒ coupling r)
-                    //   new col pos_j = -s·col_i + c·col_j   (⟂ u ⇒ coupling 0)
-                    for p in 0..n {
-                        let a = rot[(p, pos_i)];
-                        let b = rot[(p, pos_j)];
-                        rot[(p, pos_i)] = c * a + s * b;
-                        rot[(p, pos_j)] = c * b - s * a;
-                    }
-                }
-                // Position i now carries the combined coupling r and stays
-                // active; position j deflates as an exact eigenvector (its
-                // rotated column) with eigenvalue dⱼ (≈ dᵢ within `tol`).
-                defl_u[i] = r;
-                trivial.push((defl_d[j], pos_j));
-                defl_d.remove(j);
-                defl_u.remove(j);
-                active_idx.remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
-    }
-
-    (defl_d, defl_u, active_idx, trivial, rot)
-}
-
-/// Solves `1 + β·Σᵢ uᵢ²/(dᵢ − λ) = 0` (`β = |β| > 0`) for all `m` eigenvalues of
-/// `D + β·u·uᵀ` and their eigenvectors.
-///
-/// Returns `(evals, evecs)` where `evals` is ascending and `evecs[k]` is the
-/// `k`-th eigenvector in the *input* ordering of `d`/`u`.  Eigenvectors are
-/// formed from Gu–Eisenstat's stable weights
-/// `ŵᵢ² = ∏ₖ(λₖ − dᵢ) / ∏_{k≠i}(dₖ − dᵢ)`, so that `vₖ[i] = ŵᵢ/(dᵢ − λₖ)`
-/// (normalised) is numerically orthogonal even for clustered eigenvalues.
-#[allow(clippy::type_complexity)]
-fn secular_eigenpairs<R>(d: &[R], u: &[R], beta: R) -> Result<(Vec<R>, Vec<Vec<R>>), BidiagDcError>
-where
-    R: Field + Real,
-{
-    let m = d.len();
-    if m == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    // Sort d ascending, permuting u alongside; remember the inverse map.
-    let mut idx: Vec<usize> = (0..m).collect();
-    idx.sort_by(|&a, &b| {
-        d[a].partial_cmp(&d[b])
-            .unwrap_or(core::cmp::Ordering::Equal)
-    });
-    let d_s: Vec<R> = idx.iter().map(|&i| d[i]).collect();
-    let u_s: Vec<R> = idx.iter().map(|&i| u[i]).collect();
-
-    // Eigenvalues (ascending): root i lies in (d_i, d_{i+1}); the top one above.
-    let mut weight_sum = R::zero();
-    for &ui in &u_s {
-        weight_sum = weight_sum + ui * ui;
-    }
-    let mut lam = vec![R::zero(); m];
-    for i in 0..m {
-        let (lo, hi) = if i < m - 1 {
-            (d_s[i], d_s[i + 1])
-        } else {
-            (d_s[m - 1], d_s[m - 1] + beta * weight_sum + R::one())
-        };
-        lam[i] = find_secular_root(&d_s, &u_s, beta, lo, hi)?;
-    }
-    lam.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
-
-    // Stable Löwner weights ŵ (up to a global scale, which cancels on
-    // normalisation).  The interleaved product keeps magnitudes bounded.
-    let mut w_hat = vec![R::zero(); m];
-    for i in 0..m {
-        let mut prod = R::one();
-        for k in 0..m {
-            prod = prod * (lam[k] - d_s[i]);
-            if k != i {
-                prod = prod / (d_s[k] - d_s[i]);
-            }
-        }
-        let mag = rsqrt(prod.max(R::zero()));
-        let sign = if u_s[i] < R::zero() {
-            -R::one()
-        } else {
-            R::one()
-        };
-        w_hat[i] = sign * mag;
-    }
-
-    // Eigenvectors in sorted order, then permuted back to the input ordering.
-    let mut evecs = vec![vec![R::zero(); m]; m];
-    for k in 0..m {
-        let mut col = vec![R::zero(); m];
-        let mut norm_sq = R::zero();
-        for i in 0..m {
-            let denom = d_s[i] - lam[k];
-            let val = if fabs(denom) < R::min_positive() {
-                let s = if w_hat[i] < R::zero() {
-                    -R::one()
-                } else {
-                    R::one()
-                };
-                s / R::min_positive()
-            } else {
-                w_hat[i] / denom
-            };
-            col[i] = val;
-            norm_sq = norm_sq + val * val;
-        }
-        let norm = rsqrt(norm_sq);
-        let inv = if norm > R::min_positive() {
-            R::one() / norm
-        } else {
-            R::one()
-        };
-        for i in 0..m {
-            evecs[k][idx[i]] = col[i] * inv;
-        }
-    }
-
-    Ok((lam, evecs))
-}
-
-/// Evaluates `f(λ) = 1 + β·Σ uᵢ²/(dᵢ − λ)` and `f'(λ) = β·Σ uᵢ²/(dᵢ − λ)²`.
-#[inline]
-fn secular_f_df<R: Field + Real>(d: &[R], u: &[R], beta: R, lam: R) -> (R, R) {
-    let mut f = R::one();
-    let mut df = R::zero();
-    for (&di, &ui) in d.iter().zip(u.iter()) {
-        let t = di - lam;
-        let w = ui * ui / t;
-        f = f + beta * w;
-        df = df + beta * w / t;
-    }
-    (f, df)
-}
-
-/// Finds the single root of the secular equation in `(lo, hi)` by safeguarded
-/// Newton–Raphson with bisection fall-back.
-///
-/// On each interval `(dᵢ, dᵢ₊₁)` (with `β > 0`) `f` increases monotonically from
-/// `−∞` to `+∞`, so `f(lo) < 0 < f(hi)`; the bracket is maintained purely from
-/// the sign of `f(x)`.
-fn find_secular_root<R>(d: &[R], u: &[R], beta: R, lo: R, hi: R) -> Result<R, BidiagDcError>
-where
-    R: Field + Real,
-{
-    let eps = <R as Scalar>::epsilon();
-    let two = from_f64::<R>(2.0);
-    let margin = eps * (fabs(lo) + fabs(hi) + R::one()) * from_f64::<R>(4.0);
-
-    let mut lo_m = lo + margin;
-    let mut hi_m = hi - margin;
-    if hi_m <= lo_m {
-        return Ok((lo + hi) / two);
-    }
-
-    let conv = eps * from_f64::<R>(8.0);
-    let mut x = (lo_m + hi_m) / two;
-
-    for _ in 0..MAX_SECULAR_ITER {
-        let (fx, dfx) = secular_f_df(d, u, beta, x);
-        if !fx.is_finite() {
-            x = (lo_m + hi_m) / two;
+    let eps = real_const::<R>(0.9) * lapack_eps::<R>();
+    let mut start = 0usize;
+    for i in 0..n - 1 {
+        let small = fabs(e[i]) < eps;
+        if !(small || i == n - 2) {
             continue;
         }
-
-        // f is increasing: f < 0 ⇒ root is to the right, f > 0 ⇒ to the left.
-        if fx < R::zero() {
-            lo_m = x;
-        } else if fx > R::zero() {
-            hi_m = x;
+        let nsize = if i < n - 2 || !small {
+            if i < n - 2 { i - start + 1 } else { n - start }
         } else {
-            return Ok(x);
-        }
-
-        let newton_ok = dfx > R::min_positive();
-        let x_new = if newton_ok { x - fx / dfx } else { x };
-
-        let next = if newton_ok && x_new > lo_m && x_new < hi_m {
-            x_new
-        } else {
-            (lo_m + hi_m) / two
+            // e[n − 2] negligible: d[n − 1] is a 1×1 subproblem of its own.
+            u[(n - 1, n - 1)] = sign_of(R::one(), d[n - 1]);
+            v[(n - 1, n - 1)] = R::one();
+            d[n - 1] = fabs(d[n - 1]);
+            i - start + 1
         };
-
-        let step = fabs(next - x);
-        x = next;
-        if step < conv * (fabs(x) + R::one()) || hi_m - lo_m < conv * (fabs(x) + R::one()) {
-            return Ok(x);
-        }
+        let end = start + nsize;
+        solve_piece(ops, &mut d[start..end], &mut e[start..end - 1], u, v, start)?;
+        start = i + 1;
     }
-
-    Ok(x)
+    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Base-case tridiagonal eigensolver (Jacobi)
-// ---------------------------------------------------------------------------
-
-/// Eigen-decomposition of a small symmetric tridiagonal matrix by cyclic
-/// Jacobi rotations on its dense symmetric form.  Returns eigenvalues ascending
-/// and eigenvectors as columns (`evecs[k]` = `k`-th eigenvector).
-fn jacobi_tridiag<R>(diag: &[R], off: &[R]) -> Result<(Vec<R>, Vec<Vec<R>>), BidiagDcError>
+/// Solves one unreduced piece (`sqre = 0`) at diagonal offset `off`.
+fn solve_piece<R, B>(
+    ops: &B,
+    d: &mut [R],
+    e: &mut [R],
+    u: &mut Mat<R>,
+    v: &mut Mat<R>,
+    off: usize,
+) -> Result<(), BidiagDcError>
 where
     R: Field + Real + bytemuck::Zeroable,
+    B: DenseOps<R>,
 {
-    let n = diag.len();
-    if n == 1 {
-        return Ok((vec![diag[0]], vec![vec![R::one()]]));
+    if d.len() == 1 {
+        u[(off, off)] = sign_of(R::one(), d[0]);
+        v[(off, off)] = R::one();
+        d[0] = fabs(d[0]);
+        return Ok(());
     }
-
-    let mut a = Mat::zeros(n, n);
-    for i in 0..n {
-        a[(i, i)] = diag[i];
-    }
-    for i in 0..n - 1 {
-        a[(i, i + 1)] = off[i];
-        a[(i + 1, i)] = off[i];
-    }
-
-    // q[(i, k)] accumulates the k-th eigenvector.
-    let mut q = Mat::zeros(n, n);
-    for i in 0..n {
-        q[(i, i)] = R::one();
-    }
-
-    let eps = <R as Scalar>::epsilon();
-    let scale = tridiag_scale(diag, off);
-    let tol = eps * scale * from_f64::<R>(n as f64);
-    let two = from_f64::<R>(2.0);
-
-    let mut converged = false;
-    for _sweep in 0..MAX_JACOBI_SWEEPS {
-        let mut off_norm = R::zero();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                off_norm = off_norm + a[(i, j)] * a[(i, j)];
-            }
-        }
-        if rsqrt(off_norm) <= tol {
-            converged = true;
-            break;
-        }
-
-        for p in 0..n {
-            for qcol in (p + 1)..n {
-                let apq = a[(p, qcol)];
-                if apq == R::zero() {
-                    continue;
-                }
-                let app = a[(p, p)];
-                let aqq = a[(qcol, qcol)];
-                let theta = (aqq - app) / (two * apq);
-                let sign_t = if theta < R::zero() {
-                    -R::one()
-                } else {
-                    R::one()
-                };
-                let t = sign_t / (fabs(theta) + rsqrt(theta * theta + R::one()));
-                let c = R::one() / rsqrt(t * t + R::one());
-                let s = t * c;
-
-                // Rotate rows/cols p, qcol.
-                for k in 0..n {
-                    let akp = a[(k, p)];
-                    let akq = a[(k, qcol)];
-                    a[(k, p)] = c * akp - s * akq;
-                    a[(k, qcol)] = s * akp + c * akq;
-                }
-                for k in 0..n {
-                    let apk = a[(p, k)];
-                    let aqk = a[(qcol, k)];
-                    a[(p, k)] = c * apk - s * aqk;
-                    a[(qcol, k)] = s * apk + c * aqk;
-                }
-                a[(p, qcol)] = R::zero();
-                a[(qcol, p)] = R::zero();
-
-                for k in 0..n {
-                    let qkp = q[(k, p)];
-                    let qkq = q[(k, qcol)];
-                    q[(k, p)] = c * qkp - s * qkq;
-                    q[(k, qcol)] = s * qkp + c * qkq;
-                }
-            }
-        }
-    }
-
-    if !converged {
-        return Err(BidiagDcError::NotConverged);
-    }
-
-    let mut pairs: Vec<(R, Vec<R>)> = (0..n)
-        .map(|k| {
-            let col: Vec<R> = (0..n).map(|i| q[(i, k)]).collect();
-            (a[(k, k)], col)
-        })
-        .collect();
-    pairs.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(core::cmp::Ordering::Equal));
-
-    let evals = pairs.iter().map(|p| p.0).collect();
-    let evecs = pairs.into_iter().map(|p| p.1).collect();
-    Ok((evals, evecs))
+    let mut idxq = vec![0usize; d.len()];
+    divide(ops, 0, d, e, u, v, off, &mut idxq)
 }
 
-// ---------------------------------------------------------------------------
-// Orthonormalisation helpers
-// ---------------------------------------------------------------------------
-
-/// Modified Gram–Schmidt orthonormalisation of the columns of `mat`, replacing
-/// any (numerically) dependent column by an orthonormal complement direction.
-fn mgs_orthonormalize<R>(mat: &mut Mat<R>)
+/// Divide-and-conquer SVD (LAPACK `dlasd0`) of the `n × (n + sqre)` upper
+/// bidiagonal `(d, e)` (`e`: `n − 1 + sqre` entries) into the blocks of `u`
+/// (`n × n`) and `v` (`(n + sqre) × (n + sqre)`) at diagonal offset `off`,
+/// which must be zero outside the diagonal blocks this call writes.
+///
+/// On exit `d` holds the singular values and `idxq` the permutation that
+/// sorts them ascending.
+#[allow(clippy::too_many_arguments)]
+fn divide<R, B>(
+    ops: &B,
+    sqre: usize,
+    d: &mut [R],
+    e: &mut [R],
+    u: &mut Mat<R>,
+    v: &mut Mat<R>,
+    off: usize,
+    idxq: &mut [usize],
+) -> Result<(), BidiagDcError>
 where
     R: Field + Real + bytemuck::Zeroable,
+    B: DenseOps<R>,
 {
-    let m = mat.nrows();
-    let n = mat.ncols();
-    let eps = <R as Scalar>::epsilon();
-    let tol = eps * from_f64::<R>(16.0);
-
-    for j in 0..n {
-        for k in 0..j {
-            let mut dot = R::zero();
-            for i in 0..m {
-                dot = dot + mat[(i, j)] * mat[(i, k)];
-            }
-            for i in 0..m {
-                mat[(i, j)] = mat[(i, j)] - dot * mat[(i, k)];
-            }
+    let n = d.len();
+    let m = n + sqre;
+    if n <= SMLSIZ {
+        // Leaf: QR iteration from the identity, then copy into the blocks.
+        let mut lu = identity::<R>(n);
+        let mut lv = identity::<R>(m);
+        lasdq(sqre, d, e, &mut lu, &mut lv)?;
+        copy_block(&lu, u, off);
+        copy_block(&lv, v, off);
+        for (i, q) in idxq.iter_mut().enumerate() {
+            *q = i;
         }
-        let mut norm_sq = R::zero();
-        for i in 0..m {
-            norm_sq = norm_sq + mat[(i, j)] * mat[(i, j)];
-        }
-        let norm = rsqrt(norm_sq);
-        if norm > tol {
-            let inv = R::one() / norm;
-            for i in 0..m {
-                mat[(i, j)] = mat[(i, j)] * inv;
-            }
-        } else {
-            fill_orthonormal_columns(mat, &[j]);
-        }
+        return Ok(());
     }
+    let nl = n / 2;
+    let nr = n - nl - 1;
+    let alpha = d[nl];
+    let beta = e[nl];
+    {
+        let (dl, dr) = d.split_at_mut(nl);
+        let (el, er) = e.split_at_mut(nl);
+        let (ql, qr) = idxq.split_at_mut(nl);
+        divide(ops, 1, dl, el, u, v, off, ql)?;
+        divide(
+            ops,
+            sqre,
+            &mut dr[1..],
+            &mut er[1..],
+            u,
+            v,
+            off + nl + 1,
+            &mut qr[1..],
+        )?;
+    }
+    merge(ops, Node { nl, nr, sqre, off }, d, alpha, beta, u, v, idxq)
 }
 
-/// Fills the listed columns of `mat` with unit vectors orthonormal to every
-/// other (already-orthonormal) column, completing an orthonormal basis.
-fn fill_orthonormal_columns<R>(mat: &mut Mat<R>, cols: &[usize])
-where
-    R: Field + Real + bytemuck::Zeroable,
-{
-    let m = mat.nrows();
-    let n = mat.ncols();
-    let eps = <R as Scalar>::epsilon();
-    let tol = eps * from_f64::<R>(16.0);
-
-    for &j in cols {
-        for i in 0..m {
-            mat[(i, j)] = R::zero();
-        }
-        let mut placed = false;
-        for basis in 0..m {
-            for i in 0..m {
-                mat[(i, j)] = if i == basis { R::one() } else { R::zero() };
-            }
-            for k in 0..n {
-                if k == j {
-                    continue;
-                }
-                let mut dot = R::zero();
-                for i in 0..m {
-                    dot = dot + mat[(i, j)] * mat[(i, k)];
-                }
-                for i in 0..m {
-                    mat[(i, j)] = mat[(i, j)] - dot * mat[(i, k)];
-                }
-            }
-            let mut norm_sq = R::zero();
-            for i in 0..m {
-                norm_sq = norm_sq + mat[(i, j)] * mat[(i, j)];
-            }
-            let norm = rsqrt(norm_sq);
-            if norm > tol {
-                let inv = R::one() / norm;
-                for i in 0..m {
-                    mat[(i, j)] = mat[(i, j)] * inv;
-                }
-                placed = true;
-                break;
-            }
-        }
-        if !placed {
-            // Should not happen for a well-formed basis; leave the column zero.
-            for i in 0..m {
-                mat[(i, j)] = R::zero();
-            }
-        }
+/// Copies the square `src` into `dst` at diagonal offset `off`.
+fn copy_block<R: Field>(src: &Mat<R>, dst: &mut Mat<R>, off: usize) {
+    let k = src.nrows();
+    let lds = src.row_stride();
+    let ldd = dst.row_stride();
+    let sd = src.raw_data();
+    let dd = dst.raw_data_mut();
+    for j in 0..src.ncols() {
+        let to = (off + j) * ldd + off;
+        dd[to..to + k].copy_from_slice(&sd[j * lds..j * lds + k]);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn build_bidiag(d: &[f64], e: &[f64]) -> Vec<Vec<f64>> {
-        let n = d.len();
-        let mut b = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            b[i][i] = d[i];
-            if i + 1 < n {
-                b[i][i + 1] = e[i];
-            }
-        }
-        b
-    }
-
-    /// Returns `(max |UᵀU−I|, max |VᵀV−I|, max |UΣVᵀ − B|, sigma)`.
-    fn svd_errors(d: &[f64], e: &[f64]) -> (f64, f64, f64, Vec<f64>) {
-        let n = d.len();
-        let (u, sigma, vt) = bidiagonal_svd_dc(d, e).expect("svd");
-
-        let mut uu_err = 0.0f64;
-        let mut vv_err = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
-                let mut uu = 0.0;
-                let mut vv = 0.0;
-                for k in 0..n {
-                    uu += u[(k, i)] * u[(k, j)];
-                    vv += vt[(i, k)] * vt[(j, k)];
-                }
-                let expect = if i == j { 1.0 } else { 0.0 };
-                uu_err = uu_err.max((uu - expect).abs());
-                vv_err = vv_err.max((vv - expect).abs());
-            }
-        }
-
-        let b = build_bidiag(d, e);
-        let mut rec_err = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
-                let mut acc = 0.0;
-                for k in 0..n {
-                    acc += u[(i, k)] * sigma[k] * vt[(k, j)];
-                }
-                rec_err = rec_err.max((acc - b[i][j]).abs());
-            }
-        }
-
-        for i in 1..n {
-            assert!(sigma[i] <= sigma[i - 1] + 1e-12, "not descending at {i}");
-        }
-        (uu_err, vv_err, rec_err, sigma)
-    }
-
-    #[test]
-    fn svd_small_qr_path() {
-        let d = vec![2.0, 3.0, 1.5, 4.0, 0.7];
-        let e = vec![0.5, -0.3, 0.8, 0.2];
-        let (uu, vv, rec, _) = svd_errors(&d, &e);
-        assert!(uu < 1e-12 && vv < 1e-12 && rec < 1e-12, "{uu} {vv} {rec}");
-    }
-
-    #[test]
-    fn svd_accuracy_across_sizes() {
-        for &n in &[26usize, 50, 100, 200] {
-            let d: Vec<f64> = (0..n)
-                .map(|i| 2.0 + (i as f64 * 0.37).sin() + 0.5 * (i as f64 * 1.7).cos())
-                .collect();
-            let e: Vec<f64> = (0..n - 1)
-                .map(|i| 0.6 + 0.4 * (i as f64 * 0.9).cos() + 0.2 * (i as f64 * 0.3).sin())
-                .collect();
-            let (uu, vv, rec, _) = svd_errors(&d, &e);
-            println!("n={n}: UtU={uu:.2e} VtV={vv:.2e} recon={rec:.2e}");
-            assert!(uu < 1e-6, "n={n} UtU={uu}");
-            assert!(vv < 1e-9, "n={n} VtV={vv}");
-            assert!(rec < 1e-8, "n={n} recon={rec}");
-        }
-    }
-
-    #[test]
-    fn svd_dc_path_with_zero_coupling() {
-        let mut d = vec![0.0; 30];
-        let mut e = vec![0.6; 29];
-        for (i, di) in d.iter_mut().enumerate() {
-            *di = 3.0 + (i as f64 * 0.5).sin();
-        }
-        e[15] = 0.0;
-        let (uu, vv, rec, _) = svd_errors(&d, &e);
-        assert!(uu < 1e-6 && vv < 1e-9 && rec < 1e-8, "{uu} {vv} {rec}");
-    }
-
-    /// Directly exercises the coincident-eigenvalue deflation branch of
-    /// [`deflate`] — unreachable from generic public input (measure-zero) — and
-    /// verifies the `dlaed2` Givens rotation keeps the eigenvector basis exactly
-    /// orthonormal and turns the deflated column into a true eigenvector.
-    #[test]
-    fn deflate_coincident_merge_applies_givens() {
-        // Positions 1 and 2 share a diagonal entry (5.0) with non-negligible
-        // coupling; positions 0 and 3 are distinct. M = D + β·u·uᵀ.
-        let d = vec![1.0_f64, 5.0, 5.0, 9.0];
-        let u = vec![0.5_f64, 0.8, 0.6, 0.4];
-        let beta = 0.7_f64; // |β| > 0
-        let tol = 1e-12_f64;
-        let n = d.len();
-
-        let (d_defl, u_defl, active_idx, trivial, rot) = deflate(&d, &u, tol);
-
-        // (a) The coincident-merge branch fired: exactly one pair deflated out.
-        assert_eq!(d_defl.len(), 3, "one active component should have deflated");
-        assert_eq!(u_defl.len(), 3);
-        assert_eq!(active_idx.len(), 3);
-        assert_eq!(
-            trivial.len(),
-            1,
-            "exactly one coincident pair should deflate"
-        );
-
-        // The survivor (original position 1) carries the combined coupling
-        // r = √(0.8² + 0.6²) = 1.0; the deflated column is position 2, λ = 5.0.
-        let survivor = active_idx
-            .iter()
-            .position(|&p| p == 1)
-            .expect("position 1 must remain active");
-        assert!(
-            (u_defl[survivor] - 1.0).abs() < 1e-14,
-            "combined coupling r, got {}",
-            u_defl[survivor]
-        );
-        let (defl_lambda, defl_col) = trivial[0];
-        assert_eq!(defl_col, 2, "deflated column");
-        assert!((defl_lambda - 5.0).abs() < 1e-14, "deflated eigenvalue");
-
-        // (b) `rot` is orthonormal to tight tolerance.
-        let mut max_orth = 0.0_f64;
-        for a in 0..n {
-            for b in 0..n {
-                let mut dot = 0.0;
-                for p in 0..n {
-                    dot += rot[(p, a)] * rot[(p, b)];
-                }
-                let expect = if a == b { 1.0 } else { 0.0 };
-                max_orth = max_orth.max((dot - expect).abs());
-            }
-        }
-        assert!(max_orth < 1e-14, "rot not orthonormal: {max_orth}");
-
-        // The rotated coupling û = rotᵀ·u is zeroed at the deflated column and
-        // equals the combined magnitude r at the survivor column.
-        let u_hat: Vec<f64> = (0..n)
-            .map(|k| (0..n).map(|p| rot[(p, k)] * u[p]).sum::<f64>())
-            .collect();
-        assert!(u_hat[2].abs() < 1e-14, "coupling not zeroed: {}", u_hat[2]);
-        assert!(
-            (u_hat[1] - 1.0).abs() < 1e-14,
-            "survivor coupling: {}",
-            u_hat[1]
-        );
-
-        // (c) The deflated column q = rot[:,2] is an exact eigenvector of
-        // M = D + β·u·uᵀ with eigenvalue λ = 5.0 (⟨u, q⟩ = 0 ⇒ M·q = D·q).
-        let q: Vec<f64> = (0..n).map(|p| rot[(p, 2)]).collect();
-        let u_dot_q: f64 = (0..n).map(|p| u[p] * q[p]).sum();
-        let mut resid = 0.0_f64;
-        for p in 0..n {
-            let mq = d[p] * q[p] + beta * u[p] * u_dot_q;
-            resid = resid.max((mq - defl_lambda * q[p]).abs());
-        }
-        assert!(
-            resid < 1e-13,
-            "deflated column not an eigenvector: residual {resid}"
-        );
-    }
-
-    /// Full-SVD regression for genuinely repeated singular values: a
-    /// block-diagonal bidiagonal `B = B₀ ⊕ B₀` (n = 32 > `DIRECT_THRESHOLD`)
-    /// routes through divide-and-conquer with every singular value doubled, and
-    /// must still reconstruct `B` with orthonormal `U`/`V`.
-    #[test]
-    fn svd_repeated_singular_values_reconstructs() {
-        let k = 16usize;
-        let d0: Vec<f64> = (0..k)
-            .map(|i| 2.5 + (i as f64 * 0.53).sin() + 0.4 * (i as f64 * 1.3).cos())
-            .collect();
-        let e0: Vec<f64> = (0..k - 1)
-            .map(|i| 0.7 + 0.3 * (i as f64 * 0.8).cos())
-            .collect();
-
-        let mut d = Vec::with_capacity(2 * k);
-        d.extend_from_slice(&d0);
-        d.extend_from_slice(&d0);
-        let mut e = Vec::with_capacity(2 * k - 1);
-        e.extend_from_slice(&e0);
-        e.push(0.0); // decouple the two identical blocks
-        e.extend_from_slice(&e0);
-
-        let (uu, vv, rec, sigma) = svd_errors(&d, &e);
-
-        // Every singular value has a coincident partner (one from each block).
-        for (a, &sa) in sigma.iter().enumerate() {
-            let has_partner = sigma
-                .iter()
-                .enumerate()
-                .any(|(b, &sb)| b != a && (sa - sb).abs() < 1e-8);
-            assert!(has_partner, "no coincident partner for sigma[{a}] = {sa}");
-        }
-
-        assert!(uu < 1e-6, "UtU orthonormality: {uu}");
-        assert!(vv < 1e-9, "VtV orthonormality: {vv}");
-        assert!(rec < 1e-8, "reconstruction: {rec}");
-    }
-}
+#[path = "bidiag_dc_tests.rs"]
+mod tests;

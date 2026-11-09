@@ -17,7 +17,7 @@ Issues #4 and #6-#16 (#5, "Add CLAUDE.md/AGENTS.md", is not part of this sweep).
 - [x] `crates/oxiblas-blas/src/level1/` — **Native Level 1 gaps: complex nrm2, public cabs1, csscal/zdscal, strided rotm/zdrot** _(missing-feature)_ (#15)
 - [x] `crates/oxiblas-blas/src/level3/{gemm_parallel,gemm_small}.rs` — **Apple M4: GEMM at 0.03x-0.16x of Accelerate (no SME2 path, one thread for squares)** _(perf)_ — partial: the 2D parallel driver and the NEON small-GEMM dispatch are in; the SME2 path is open (see "Advanced SIMD"); `Par::RayonWith(n)` still runs on the ambient rayon pool (documented in 0.2.3, fix planned for 0.2.4) (#16)
 
-Open follow-ups from the 0.2.3 reviews are listed under "Release Milestones" (v0.2.4, v0.3.0, backlog) near the end of this file; SME2 is under "Advanced SIMD", the ggev item under "Generalized Eigenvalue", and DTGSEN `IJOB != 0` in `crates/oxiblas-lapack/TODO.md`.
+Open follow-ups from the 0.2.3 reviews are listed under "Release Milestones" (v0.2.4, v0.3.0, backlog) near the end of this file; SME2 is under "Advanced SIMD", the ggev item under "Generalized Eigenvalue", and DTGSEN `IJOB != 0` in `crates/oxiblas-lapack/TODO.md`. The second 0.2.3 round (Level 1-3 and LAPACK performance, sparse and LAPACK correctness, soundness, 2026-11) is described in the CHANGELOG; the Release Milestones lists tick the items it closed and add the ones it recorded.
 
 ## v0.2.2 Production-Readiness Audit TODO (added 2026-07-16)
 
@@ -36,7 +36,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Rewrite compute/solve to follow LAPACK dgbtf2/dgbtrs exactly: do NOT swap previous L columns; store L multipliers relative to the row order at elimination time, and interleave pivot application with the L sweep in solve (swap x[j]<->x[ipiv[j]] immediately …
 - [x] `crates/oxiblas-lapack/src/qr/complete_orthogonal.rs:301` — **CompleteOrthogonalDecomp::solve uses Z instead of Z^T, returning wrong solutions in exactly the rank-deficient/underdetermined cases COD exists for** _(bug, easy)_
   - Fix: In solve() step 3, index Z transposed: `sum = sum + self.z[(n - r + k, i)] * y[(k, j)]` (or fix the comment convention and reconstruct consistently).
-- [x] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:544` — **Divide-and-conquer SVD merge produces wrong U/V/Σ for matrices larger than 25** _(fabrication, hard)_
+- [x] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:544` — **Divide-and-conquer SVD merge produces wrong U/V/Σ for matrices larger than 25** _(fabrication, hard)_ — 0.2.3: the repaired merge worked on `BᵀB` and formed `U = B·V/σ`, which was not backward stable for graded spectra and depended on the input magnitude; replaced by a port of LAPACK `dbdsdc` (backward stable, scale invariant)
   - Fix: Implement a correct bidiagonal D&C merge (Gu-Eisenstat): after solving the secular equation, form the true singular vectors by multiplying the deflated/secular eigenvector matrix by the block-diagonal [[U1,0],[0,U2]] and [[V1,0],[0,V2]] respectively, with …
 - [x] `crates/oxiblas-ndarray/src/lapack.rs:78` — **lu_ndarray().solve() misinterprets the pivot swap-sequence as a direct permutation, returning wrong solutions whenever a row swap occurs** _(bug, medium)_
   - Fix: Do not treat the pivot array as a permutation. Either reuse the correct internal Lu::solve (partial_piv.rs) by keeping the decomposition object, or reproduce its logic: copy b into x, then for k in 0..n apply swap(x[k], x[pivot[k]]) in order before …
@@ -81,7 +81,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Replace the simplified L-column update with the correct Aasen recurrence (L[i,j] = (H[i,j-1] - sum_k L[i,k]*(T[k,j-1] + L[j,k]*T[j-1,j-1]))/T[j-1,j]) with proper H updating, or return an honest 'unsupported' error.
 - [x] `crates/oxiblas-lapack/src/evd/hermitian.rs:302` — **Complex Hermitian EVD returns wrong eigenvectors (missing diagonal phase correction)** _(bug, hard)_
   - Fix: Track the complex phase of each reduced sub-diagonal element (as LAPACK ZHETRD/ZSTEQR does): accumulate the diagonal unitary D during reduction and multiply the final eigenvector matrix U by D so that A*u = lambda*u holds.
-- [x] `crates/oxiblas-lapack/src/evd/hermitian_dc.rs:302` — **Hermitian divide-and-conquer EVD has the same missing-phase eigenvector bug** _(bug, hard)_
+- [x] `crates/oxiblas-lapack/src/evd/hermitian_dc.rs:302` — **Hermitian divide-and-conquer EVD has the same missing-phase eigenvector bug** _(bug, hard)_ — 0.2.3: `HermitianEvdDc` still returned non-finite or wrong eigenvalues for n > 100 (its private secular solver was broken); it now follows LAPACK `ZHEEVD` on the real divide and conquer of `SymmetricEvdDc`
   - Fix: Same as hermitian.rs: propagate and apply the sub-diagonal phase (diagonal unitary D) to the eigenvector matrix. Consider sharing a single corrected tridiagonalization routine between hermitian.rs and hermitian_dc.rs.
 - [x] `crates/oxiblas-lapack/src/evd/schur.rs:204` — **Real Schur QR iteration silently returns non-converged garbage; NotConverged never raised** _(bug, medium)_
   - Fix: After the loop, if iter_count >= MAX_ITERATIONS*n and the active block has not deflated (p > 2, or the remaining sub-diagonals are not negligible), return Err(SchurError::NotConverged).
@@ -120,7 +120,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Compute the actual Schur/eigenvectors of the small Hessenberg matrix (e.g. inverse iteration on (H - lambda_idx I) or back-substitution from the real Schur form) for each selected Ritz value, then map x = V*y; validate with a residual against A.
 - [x] `crates/oxiblas-sparse/src/linalg/out_of_core.rs:594` — **OutOfCoreLu partial pivoting is broken (permutation misapplied + left blocks not swapped)** _(bug, medium)_
   - Fix: Apply pivots as a permutation (b_new[i]=b[perm[i]] or track a proper LAPACK-style swap sequence in original order), and swap the entire block-row including left L blocks A[k,0..k] whenever the diagonal block pivots.
-- [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:119` — **SparseLuThreshold: already-computed L rows not swapped on a pivot at step k>0 (PA ≠ LU)** _(bug, medium)_
+- [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:119` — **SparseLuThreshold: already-computed L rows not swapped on a pivot at step k>0 (PA ≠ LU)** _(bug, medium)_ — 0.2.3: `SparseLU` in `linalg/lu.rs` had the same bug (wrong solutions after any row swap past the first step); fixed in 0.2.3
   - Fix: On perm.swap(k, max_row), also swap rows k and max_row of the already-computed columns of l_data (l_data[k][0..k] with l_data[max_row][0..k]); or physically permute the working rows instead of using perm indirection.
 - [x] `crates/oxiblas-sparse/src/linalg/pivoting.rs:557` — **SparseLdlt (Bunch-Kaufman): L rows not swapped on symmetric pivot at step k>0** _(bug, medium)_
   - Fix: When swapping perm positions during pivoting, also swap the corresponding already-computed rows of l_data (columns 0..k), consistent with the position-indexed L used in solve().
@@ -161,7 +161,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
   - Fix: Replace `_ => core::hint::unreachable_unchecked()` with a real `assert!(index < LANES)` (or return a Result / clamp), or make extract/insert unsafe fns in the SimdRegister trait with a documented index precondition.
 - [x] `crates/oxiblas-core/src/simd/dispatch.rs:112` — **force-scalar / max-simd-128 / max-simd-256 features are silently ignored by the entire dispatch layer** _(fabrication, easy)_
   - Fix: Apply the same feature gating in SimdCapabilities::compute() (and multiver's from_legacy): under force-scalar return an all-false capability set; under max-simd-128/256 mask has_avx2/has_avx512* and clamp vector_width_bytes.
-- [x] `crates/oxiblas-matrix/src/mat_ref.rs:103` — **Legal empty boundary submatrices panic in debug builds via ptr_at debug_assert** _(bug, easy)_
+- [x] `crates/oxiblas-matrix/src/mat_ref.rs:103` — **Legal empty boundary submatrices panic in debug builds via ptr_at debug_assert** _(bug, easy)_ — 0.2.3: `ptr_at` still formed out-of-range pointers with in-bounds arithmetic (undefined behaviour from safe code; only a `debug_assert` guarded it); it uses wrapping arithmetic since 0.2.3, and `MatMut` splits and edge submatrices were fixed with it
   - Fix: In submatrix, compute the pointer only when nrows>0 && ncols>0 (else reuse self.ptr), or relax ptr_at to allow one-past-the-end offsets for empty views (row <= nrows etc.) and guard the ptr.add with an emptiness check.
 
 ### P2b — Verified LOW
@@ -186,14 +186,14 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-core/src/scalar/extended.rs:438` — **QuadFloat floor/ceil/round/trunc/fract operate on the hi f64 component only — wrong results at quad precision** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/scalar/extended.rs:547` — **QuadFloat hypot overflows (violating the Real::hypot no-overflow contract) and cbrt returns NaN for negative inputs** _(bug, medium)_
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:667` — **LANES_512 constant contradicts the actual Simd512 register width on aarch64 and wasm32 (latent OOB/stride trap)** _(bug, easy)_
-- [x] `crates/oxiblas-core/src/simd/aarch64.rs:722` — **AArch64 SVE kernels are gated only on target_feature="sve" and cannot build on the stable toolchain** _(bug, hard)_
+- [x] `crates/oxiblas-core/src/simd/aarch64.rs:722` — **AArch64 SVE kernels are gated only on target_feature="sve" and cannot build on the stable toolchain** _(bug, hard)_ — 0.2.3: the `sve-nightly` configuration still did not build on nightly, because `lib.rs` did not declare `feature(stdarch_aarch64_sve)`; declared in 0.2.3 and compile-checked with `-C target-feature=+sve` (not run on SVE hardware)
 - [x] `crates/oxiblas-core/src/simd/aarch64.rs:1091` — **sve_dot_f64/f32 tail reduction reads unspecified inactive lanes (_x-predicated FMLA then full-predicate reduce)** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/simd/multiver.rs:356` — **multiver duplicates dispatch.rs types with divergent semantics; its dispatch() and KernelSelector silently drop the SSE4.2 tier** _(bug, easy)_
 - [x] `crates/oxiblas-lapack/src/evd/general.rs:167` — **GeneralEvd never reports non-convergence (dead NotConverged variant)** _(bug, easy)_
-- [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:157` — **Absolute singularity/positive-definiteness tolerance (eps*n) falsely rejects well-conditioned small-magnitude matrices across all LU and Cholesky variants** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:157` — **Absolute singularity/positive-definiteness tolerance (eps*n) falsely rejects well-conditioned small-magnitude matrices across all LU and Cholesky variants** _(bug, medium)_ — 0.2.3: not fixed in 0.2.2, whose LU, Cholesky and LDLᵀ families still compared every pivot with the absolute `eps·n`. Fixed in 0.2.3 with a per-column rule (`lu/tolerance.rs`): an LU pivot is singular at `|u_jj| <= eps·n·s_j` with `s_j` the largest finite entry of the original column `j` (rook/full pivoting follow their column interchanges, `BandLu` uses the band), the LLᵀ radicand must exceed `eps·n·a_jj`, and LDLᵀ uses the whole symmetric column; `LuFullPiv::rank` keeps a global threshold and an explicit tolerance stays absolute. The outcome is invariant under power-of-two scaling; cancellation residues such as `[[1,2,3],[4,5,6],[5,7,9]]` are now `Singular`. The sparse factorizations use `eps·m·s` with `m` the number of terms of the pivot
 - [x] `crates/oxiblas-lapack/src/qr/col_pivot.rs:181` — **QrPivot reports rank 1 for a zero matrix due to `j > 0` guard** _(bug, easy)_
 - [x] `crates/oxiblas-lapack/src/qr/lq.rs:175` — **Lq::compute accepts empty matrices but l_factor() then panics (usize underflow / index out of bounds)** _(bug, easy)_
-- [x] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:285` — **SvdDc bidiagonal QR: silent non-convergence, dead error variants, and discarded Wilkinson shift** _(bug, medium)_
+- [x] `crates/oxiblas-lapack/src/svd/divide_conquer.rs:285` — **SvdDc bidiagonal QR: silent non-convergence, dead error variants, and discarded Wilkinson shift** _(bug, medium)_ — 0.2.3: it still returned `NotConverged` for every bidiagonal with an exact zero on its diagonal (for example `[[0,1],[0,1]]`) and for inputs above about `1e80`; replaced by a `dbdsqr` port with zero chasing and power-of-two input scaling
 - [x] `crates/oxiblas-lapack/src/svd/qr_based.rs:200` — **QrSvd bidiagonal QR silently returns garbage on non-convergence; NotConverged{num_unconverged} is dead** _(bug, medium)_
 - [x] `crates/oxiblas-lapack/src/utils/condition.rs:289` — **rcond_estimate advertises LAPACK/Hager-Higham but omits the transpose solves, can overestimate rcond** _(bug, medium)_
 - [x] `crates/oxiblas-lapack/src/utils/matfun/functions.rs:1135` — **solve_sylvester_same builds I⊗A + A⊗I instead of I⊗A + A^T⊗I; frechet_sqrtm wrong for non-symmetric A** _(bug, medium)_
@@ -311,7 +311,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-blas/src/level3/gemm_kernel.rs:1513` — **Complex and scalar-fallback GEMM microkernels ignore beta==0 'C not referenced' semantics** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/blocking.rs:92` — **trsm_block_size and factorization_panel_width return blocks larger than the matrix for small n** _(bug, easy)_
 - [x] `crates/oxiblas-core/src/memory/numa.rs:374` — **get_page_size casts sysconf(-1) failure to a huge usize** _(bug, easy)_
-- [x] `crates/oxiblas-core/src/scalar/traits.rs:109` — **Real::signum behavior inconsistent across implementations (and doc wrong for f32/f64)** _(bug, easy)_
+- [x] `crates/oxiblas-core/src/scalar/traits.rs:109` — **Real::signum behavior inconsistent across implementations (and doc wrong for f32/f64)** _(bug, easy)_ — 0.2.3: `f16` and `QuadFloat` still returned 0 for ±0 (and `QuadFloat` +1 for -inf) until 0.2.3; they now follow `f32::signum`
 - [x] `crates/oxiblas-core/src/simd/x86_64.rs:129` — **F64x2Sse/F32x4Sse reduce_sum uses SSE3 haddpd/haddps but the 128-bit tier is granted on bare SSE2** _(bug, easy)_
 - [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:288` — **Lu::solve contains dead duplicated permutation code with an in-code admission that the first attempt 'doesn't work correctly'** _(bug, easy)_
 - [x] `crates/oxiblas-lapack/src/qr/householder.rs:239` — **Qr::solve_least_squares silently zeroes solution components on tiny R diagonals and returns EmptyMatrix for dimension mismatch** _(bug, easy)_
@@ -339,7 +339,7 @@ Baseline at audit time: clippy clean, 2,946 nextest + 136+ doctests passing, rus
 - [x] `crates/oxiblas-lapack/src/lu/partial_piv.rs:267` — **Dead, self-admitted-broken permutation block left in Lu::solve** _(stub, easy)_
 - [x] `crates/oxiblas-lapack/src/workspace.rs:173` — **workspace.rs is an orphaned advisory module — no routine in the crate consumes its lwork sizes** _(stub, medium)_
 - [x] `crates/oxiblas-matrix/src/prefetch.rs:168` — **prefetch module is orphaned, duplicates oxiblas-core, hardcodes CACHE_LINE_SIZE=64 contradicting core's arch-dependent value, and its strided path covers ~1/8 of lines** _(stub, medium)_
-- [x] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_
+- [x] `crates/oxiblas-sparse/src/csr.rs:43` — **DuplicateEntry error variant is dead code; new() performs no duplicate/sorted-index validation** _(stub, easy)_ — 0.2.3: `CsrMatrix::new` and `CscMatrix::new` also accepted a first pointer other than 0, and `CscMatrix::new` duplicate rows; both are rejected since 0.2.3
 
 **policy** (10)
 
@@ -534,32 +534,34 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 ### Refuted during adversarial verification (do NOT re-flag)
 
-- `crates/oxiblas-matrix/src/symmetric.rs:665` — HermitianMat::set/get "missing conjugation": documented design behavior for out-of-contract usage, not a bug
+- `crates/oxiblas-matrix/src/symmetric.rs:665` — HermitianMat::set/get "missing conjugation": documented design behavior for out-of-contract usage, not a bug (0.2.3: `set` now conjugates writes to the non-stored triangle and keeps only the real part on the diagonal; `get` stays raw slot access and `element()` returns the logical value)
 - Version-not-bumped / CHANGELOG-empty reports were reclassified as normal pre-release state → tracked above as release steps
 
 ---
 
 Production-grade pure Rust BLAS/LAPACK implementation.
 
-## Project Status (v0.2.2 Release - Updated 2026-07-18; test/code counts refreshed 2026-08-06 during Phase-0 publish validation)
+## Project Status (0.2.3, unreleased - Updated 2026-11-09)
 
-- **Tests:** 3,431 tests passing (100% success rate, `cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 373 doctests (this figure and README's "Project Status" section were previously three different, mutually-inconsistent numbers — 2,922/287 here, ~3,300/~310 and "All 2,922" elsewhere in README.md; both now report this one measured figure)
-- **Code:** ~220,400 lines of Rust across 365 files (`tokei`, excluding the retired `oxiblas-ffi` crate)
-- **Documentation:** ~16,163 lines of comments, 12 comprehensive examples
-- **Benchmarks:** 14 criterion suites (+ size_variations, precision_bench), 121+ benchmarks
+- **Tests:** 4,437 tests passing, 4 skipped (release-only SVD comparisons; run them with `--release` or `--run-ignored all`) (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 358 doctests (`cargo test --doc --workspace --exclude oxiblas-benchmarks`)
+- **Code:** ~283,000 lines of Rust across 467 files, of which 228,258 are code (`tokei`, excluding the retired `oxiblas-ffi` crate)
+- **Documentation:** ~22,000 lines of comments, 13 examples
+- **Benchmarks:** 15 criterion suites, 136 benchmark functions
 - **Coverage:** Full BLAS/LAPACK feature parity + modern extensions + sparse operations
 - **no_std:** oxiblas-core and oxiblas-matrix support `#![no_std]` with alloc
-- **Performance:**
-  - **macOS (Apple M3):** DGEMM 25.6 GFLOPS (matches OpenBLAS 25.4!), rectangular 2.6-3.6× faster
-  - **Linux x86_64 (Intel Xeon E5-2623 v4):** DGEMM 220 GFLOPS (256×256), **102% of OpenBLAS on 1024×1024**, **112% on f32 small matrices**
-  - **Cholesky n=500: 9.75× speedup** (1.65 → 16.06 Gelem/s) with blocked algorithm
-  - **5 LAPACK operations optimized:** Cholesky (9.75×), LU (~7×), QR (✅ complete), Bidiag (~3×), Hessenberg (~3×)
-  - **OpenBLAS parity achieved:** 80-112% performance (sometimes faster on Linux!)
-  - **All operations have `compute_auto()` for automatic optimization**
+- **Performance** (Apple M3 against OpenBLAS 0.3.30, measured 2026-11-09; details in [Performance](README.md#performance) in the README):
+  - **GEMM, one thread:** 55.0 GFLOPS f64 and 116.8 f32 at n = 1024, 97% and 101% of OpenBLAS; 92-99% (f64) and 101-120% (f32) from n = 64 to 1024
+  - **GEMM, parallel:** 95-103% of OpenBLAS on 4 threads, 115-169% on 8; each at its better thread count, 115-144%
+  - **Other routines, one thread:** DOT 109-137%, AXPY 96-112%, NRM2 14-16×, GEMV 143-222% except 97% at 5000×5000, TRSM 117-200%, SYRK 99-108%, rectangular GEMM 96-98%
+  - **Blocked vs unblocked at n = 1024:** Cholesky 3.6×, LU 3.5×, QR 5.3× (unblocked LU and Cholesky run at 9-12 GFLOPS since they work column by column; blocked LU reaches 37.9 GFLOPS and blocked Cholesky 40.9)
+  - **EVD and SVD (n = 200-2000):** `SymmetricEvdDc` 1.6-2.2× faster than `SymmetricEvd`, `SvdDc` 13-32× faster than the Jacobi `Svd`
+  - **Linux x86_64:** not re-measured since 0.1.0 (f64 GEMM 26.6 GFLOPS at n = 1024); the OpenBLAS comparison from that time was invalid
+  - **`compute_auto()`** picks the algorithm by size for Cholesky, LU, QR, bidiagonalization and Hessenberg reduction
 - **Zero warnings:** ✅ clippy clean + rustdoc clean
-- **Zero unwrap():** ✅ All production code free of unwrap() calls
+- **Zero unwrap():** ✅ All production code free of unwrap()/expect() calls (the last 41 removed in 0.2.3)
+- **Unsafe:** every `unsafe` block in `oxiblas-blas`, `oxiblas-matrix`, `oxiblas-lapack`, `oxiblas-sparse` and `oxiblas-ndarray` has a `// SAFETY:` comment, enforced by `clippy::undocumented_unsafe_blocks`; `oxiblas-core` (and the benchmark crate) are not linted yet
 - **Refactoring:** 16 files (51,890 lines) → 113 modules, all <2000 lines; +4 more files split in the 2026-08-04 hygiene pass (see "Refactoring Status" below)
-- **Files >2000:** 0 (100% compliant; largest is `oxiblas-blas/src/level1/dot.rs` at 1,998 lines as of 2026-08-04)
+- **Files >2000:** 0 (100% compliant; largest is `oxiblas-lapack/src/svd/bidiag_reduce.rs` at 1,997 lines as of 2026-11-09)
 - **v0.2.0 New:**
   - Fixed blocked QR factorization (WY representation) - T→T^T bug fixed, 3-7× speedup
   - Recursive cache-oblivious factorizations: Cholesky, LU, QR (`compute_recursive()`)
@@ -806,23 +808,23 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 - [x] Extended precision dot products (sdsdot, dsdot, dot_kahan, dot_pairwise)
 - [x] Auto-tuning utilities for block sizes (TuningConfig, AutoTuner)
 - [x] Tensor contraction operations (einsum, batched matmul, outer product)
-- [x] f128 / quad precision support via `twofloat` crate (QuadFloat newtype)
+- [x] f128 / quad precision support via `twofloat` crate (QuadFloat newtype) — 0.2.3: division, `recip` and negative `powi` were only double precision until 0.2.3 (twofloat's division); they are FMA-based double-double now, while the elementary functions remain less accurate (see Backlog)
 - [x] Mixed precision algorithms - `mixed_precision_solve`, `mixed_precision_solve_cholesky`, `mixed_precision_solve_symmetric` (f32 factorization + f64 refinement)
 
 ### Advanced Sparse Preconditioners
 - [x] ILUT (incomplete LU with threshold)
 - [x] ILUTP (ILUT with pivoting)
-- [x] IC (incomplete Cholesky) - IC0, ICT implemented
+- [x] IC (incomplete Cholesky) - IC0, ICT implemented — 0.2.3: `IC0` dropped the coupling terms of its elimination and `ICT` never created fill-in until 0.2.3
 - [x] Jacobi / Block Jacobi
 - [x] Gauss-Seidel / SOR / SSOR
 - [x] AMG (algebraic multigrid) - classical Ruge-Stüben with V/W-cycle
 - [x] SPAI (sparse approximate inverse) - least-squares column computation
 - [x] AINV (approximate inverse) - factored sparse approximate inverse
 - [x] Additive Schwarz (domain decomposition) - overlapping subdomains with ILU/Jacobi
-- [x] Polynomial preconditioners (Neumann series, Chebyshev)
+- [x] Polynomial preconditioners (Neumann series, Chebyshev) — 0.2.3: the Chebyshev recurrence was wrong (not a Chebyshev polynomial, possibly indefinite) until 0.2.3
 
 ### Block Iterative Solvers
-- [x] GMRES with restart (includes preconditioned variant)
+- [x] GMRES with restart (includes preconditioned variant) — 0.2.3: restarted after every step until 0.2.3 (a lucky-breakdown test read an already zeroed entry)
 - [x] Block-CG (with Block-PCG preconditioned variant)
 - [x] MINRES (minimum residual) - includes pminres (preconditioned)
 - [x] QMR (quasi-minimal residual)
@@ -900,7 +902,7 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 
 ### Tensor Operations
 - [x] BLAS-like tensor contractions (Tensor3, contract_2d, contract_3d_2d)
-- [x] Einsum-style operations (einsum with 24 patterns including advanced contractions)
+- [x] Einsum-style operations (einsum with 22 patterns including advanced contractions)
 - [x] Batched matrix multiplication
 - [x] Outer product operations
 - [x] More einsum patterns (advanced contractions: trace, dot product, 3D transposes, tensor-matrix contraction, axis sums)
@@ -910,6 +912,10 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 ---
 
 ## Performance Targets
+
+*2026-11-02: this section is a log from 2025-12; current figures are in [Performance](README.md#performance) in the README. The percentages of OpenBLAS never measured OpenBLAS (see the 0.2.3 CHANGELOG), the SYRK, SYR2K and TRMM Gf/s are 2× too high, and the "4×6 NEON kernel" is 8×6 today.*
+
+*2026-11-09: the algorithms behind several rows changed in 0.2.3. SYRK, SYR2K and GEMMT run a triangle-only blocked kernel instead of a full GEMM; TRMM is triangle-only and in place instead of expanding the triangle; TRSM packs diagonal blocks of order 128 with their reciprocals and is sequential unless `trsm_with_par` asks otherwise; LU and Cholesky work in place with recursive panels (LU) and triangle-only diagonal updates (Cholesky). The rows below were not re-measured.*
 
 **Platform:** Apple M3 (ARM64 NEON), tested 2025-12-23
 
@@ -976,12 +982,12 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 2. ✅ Parallel GEMM: 2D decomposition, 130.81 Gf/s (f64), 324.31 Gf/s (f32) — 0.2.3: not accurate for 0.2.2, whose driver split C over NC column blocks only, so square problems up to NC ran as a single work item and `Par::Rayon` was no faster than `Par::Seq` on squares (Apple M3, 8 threads); the 2D (M×N) tile driver is new in 0.2.3 and the figures here were not re-measured on a quiet machine (#16)
 3. ✅ Complex GEMM: 3M method, 40.72 Gf/s (c64), 88.95 Gf/s (c32)
 4. ✅ SYMM: GEMM-based, 1.1-1.8× speedup
-5. ✅ SYRK/SYR2K: GEMM-based, 6-15× speedup
-6. ✅ HERK/HER2K: GEMM-based, 6-15× speedup (same as SYRK/SYR2K for real types)
-7. ✅ TRMM: GEMM-based, 7-11× speedup (expand triangular to full matrix)
-8. ✅ TRSM: Blocked algorithm, 2.5-10× speedup (GEMM for off-diagonal updates)
-9. ✅ LU: Blocked algorithm, 14-23× speedup (panel factorization + GEMM updates)
-10. ✅ Cholesky: Blocked algorithm, 6-10× speedup (GEMM for symmetric rank-k updates)
+5. ✅ SYRK/SYR2K: GEMM-based, 6-15× speedup — 0.2.3: replaced by a triangle-only blocked kernel (`level3/tri_gemm.rs`) that computes only the micro-tiles of the referenced triangle; GEMMT uses it too
+6. ✅ HERK/HER2K: GEMM-based, 6-15× speedup (same as SYRK/SYR2K for real types) — 0.2.3: still GEMM-based (full product, one triangle kept); moving them to `tri_gemm` is a v0.2.4 item
+7. ✅ TRMM: GEMM-based, 7-11× speedup (expand triangular to full matrix) — 0.2.3: no expansion any more; packed diagonal blocks with tile kernels and in-place GEMMs on views
+8. ✅ TRSM: Blocked algorithm, 2.5-10× speedup (GEMM for off-diagonal updates) — 0.2.3: rewritten (diagonal blocks of order 128 packed with reciprocals, register-tiled kernels, one in-place GEMM per off-diagonal block); sequential unless called through `trsm_with_par`
+9. ✅ LU: Blocked algorithm, 14-23× speedup (panel factorization + GEMM updates) — 0.2.3: the old speedup came from a very slow row-by-row unblocked LU; the unblocked LU now runs column by column, and the blocked LU works in place with recursive (`?getrf2`) panels
+10. ✅ Cholesky: Blocked algorithm, 6-10× speedup (GEMM for symmetric rank-k updates) — 0.2.3: in place, with GEMM on the lower off-diagonal blocks and a triangle-only SYRK on the diagonal blocks
 
 **Next optimizations for 90% GEMM target:**
 - [x] SIMD-optimized packing (+5-8%) - Implemented with AVX2 (x86_64) and NEON (aarch64) support
@@ -1016,14 +1022,14 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
   - [x] All LAPACK decompositions (LU, QR, Cholesky, SVD, EVD) documented
   - [x] Core types (Mat, MatRef, MatMut) fully documented
   - [x] Scalar traits and extended precision documented
-  - [x] Tensor operations documented with 24 einsum patterns
+  - [x] Tensor operations documented with 22 einsum patterns
   - [x] Fix remaining rustdoc "unresolved link" warnings in oxiblas main crate (27→0 warnings)
   - [x] 258 passing doctests across workspace
 - [x] Examples for common use cases
   - [x] basic_blas.rs - BLAS Level 1/2/3 operations
   - [x] lapack_decompositions.rs - LU, QR, Cholesky, SVD, EVD
   - [x] extended_precision.rs - f128, Kahan, pairwise, mixed precision
-  - [x] tensor_operations.rs - einsum (24 patterns), batched matmul
+  - [x] tensor_operations.rs - einsum (22 patterns), batched matmul
   - [x] sparse_matrices.rs - CSR/CSC/COO, CG/GMRES, preconditioners
 - [x] Performance guide - Added to lib.rs with algorithm selection, memory layout, parallelization tips
 - [x] Migration guide from other libraries (from NumPy, ndarray-linalg, nalgebra) - Added to lib.rs
@@ -1044,7 +1050,7 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 - Advanced preconditioners (AMG, SPAI, AINV, Additive Schwarz)
 - Reordering algorithms (AMD, RCM, MMD, COLAMD)
 - Extended precision operations (f16, f128, dsdot, dot_kahan, dot_pairwise)
-- Tensor operations (einsum with 24 patterns, batched matmul, outer product)
+- Tensor operations (einsum with 22 patterns, batched matmul, outer product)
 - GEMM 3M for complex matrices
 - Complete orthogonal decomposition
 - RQ/LQ/QL factorizations
@@ -1097,10 +1103,14 @@ let hess = Hessenberg::compute_auto(a)?;       // ~3× faster (expected)
 - [x] Out-of-core factorization - `OutOfCoreLu`, `OutOfCoreCholesky` with block I/O + RAII temp files (v0.2.0)
 
 ### v0.2.4 - Planned (from the 0.2.3 reviews)
-Sources name the review stage: Gate 1 / Gate 2 (code reviews), FB3 (GEMM gate benchmark), FX-A / FX-B / FX-D (fix-up batches), CBLAS check (comparison with netlib `cblas.h` 3.12.1).
+Sources name the review stage: Gate 1 / Gate 2 (code reviews), FB3 (GEMM gate benchmark), FX-A / FX-B / FX-D (fix-up batches), CBLAS check (comparison with netlib `cblas.h` 3.12.1), 0.2.3 README audit, and the second 0.2.3 round: W1-A..D, W3-A..C (work items), P-GEMM / P-L12 / P-TRSM / P-SYRK / P-LU / P-EVD / P-SVD (performance items), FX1 and GX1-GX6 (fix-ups after the code reviews).
 
 - [ ] cblas reference-order triangular kernels: a cblas-private `crates/oxiblas-blas/src/cblas/tri_ref.rs` that transcribes `dtrmv.f`/`dtrsv.f` (and the `z` forms) loop for loop, with the `NoTrans` zero-`x(j)` skip and no singular stop, used by the `?trmv`/`?trsv`/`?tbmv`/`?tbsv`/`?tpmv`/`?tpsv` wrappers; the native `Err(Singular)` semantics stay _(source: Gate 2, triangular disposition)_
-- [ ] `Par::RayonWith(n)` executes on an `n`-thread pool in every blas/lapack driver, via a public `oxiblas_core::parallel::install(par, op)` wrapping `run_in_pool`; `Par::num_threads()` for `Rayon` should honour `set_global_thread_pool` _(source: Gate 2, RayonWith disposition; documented in 0.2.3)_
+- [ ] `cblas_strsm`/`cblas_dtrsm` drop the `Err(Singular)` of the native solve (a C ABI cannot return it), so with an exactly singular `A` they return `B` scaled by `alpha` but unsolved, without any signal; reference `?TRSM` divides by the zero and propagates Inf/NaN. Settle the semantics together with the `tri_ref` kernels above _(source: 0.2.3 Gate 2, record only)_
+- [ ] `Par::RayonWith(n)` executes on an `n`-thread pool in every blas/lapack driver, via a public `oxiblas_core::parallel::install(par, op)` wrapping `run_in_pool`; `Par::num_threads()` for `Rayon` should honour `set_global_thread_pool`. This includes the `Par`-taking entry points added in 0.2.3: `trsm_with_par`, `trsm_in_place_with_par` and the `compute_with_par` of `SymmetricEvd`, `SymmetricEvdDc` and `SvdDc` _(source: Gate 2, RayonWith disposition; documented in 0.2.3; 0.2.3 P-TRSM, W3-C, GX1)_
+- [ ] Explicit `Par` everywhere a driver can use threads: `compute_with_par` for `HermitianEvd`, `HermitianEvdDc`, `GeneralEvd` and `Svd`; a parallel `DLATRD` panel and `symv` in the blocked tridiagonal reduction; `Par` for SYRK, SYR2K and GEMMT (the triangle-only kernel is sequential); and `auto_gemm`/`auto_matmul` in `crates/oxiblas/src/auto.rs`, which switch to `Par::Rayon` on their own above a size threshold, should take a `Par` or document that _(source: 0.2.3 W3-C, GX6, P-SYRK)_
+- [ ] HERK and HER2K on the triangle-only `tri_gemm` kernel that SYRK/SYR2K/GEMMT use since 0.2.3 (they still form a full GEMM product and keep one triangle); align their NaN/Inf propagation with `zherk.f`/`zher2k.f` (the FX-D entry below) at the same time _(source: 0.2.3 P-SYRK)_
+- [ ] Complex `NoTrans` SYRK and SYR2K always run the naive loops, which beat the scalar 2×2 complex micro-kernel in the blocked path; revisit once the complex micro-kernel is vectorized (see Backlog), and measure above n = 1024 _(source: 0.2.3 P-SYRK, Gate 2 ruling e)_
 - [ ] cblas/native `herk`/`her2k` NaN/Inf propagation alignment with `zherk.f`/`zher2k.f`, as gfortran compiles them with default floating-point flags (a real scalar times a complex value is a complex multiply by `(r, 0)`); the cblas `NoTrans` part is also the G1-09 entry under Backlog. Paths: native `herk_naive`/`her2k_naive`, native `herk_via_gemm`/`her2k_via_gemm` (`n >= 32`, `k >= 8`, `alpha != 0`), cblas `herk_colmajor`/`her2k_colmajor` _(source: FX-D, differential against a gfortran build of `zherk.f`/`zher2k.f` 3.12.0; 0.2.4 candidate)_
   - `NoTrans` loop form: the reference is an axpy per column `L` (`C(I,J) = C(I,J) + TEMP*A(I,L)`), skipped when `A(J,L) == 0` (`zher2k`: when `A(J,L)` and `B(J,L)` are both zero). `herk_naive`/`her2k_naive` have the axpy form without the skip; the GEMM path and the cblas kernels compute dot products. A zero `A(J,L)` next to an infinite `A(I,L)` gives NaN here, while the reference leaves `C(I,J)` finite.
   - beta product form: the off-diagonal `BETA*C(I,J)` is a complex multiply (native matches; the cblas kernels use the componentwise `Complex::scale`), the diagonal is the real `BETA*DBLE(C(J,J))` (cblas matches; native multiplies the complex entry by `beta + 0i` and keeps the real part, NaN for an infinite or NaN imaginary part). At `beta == 1` the reference multiplies the off-diagonal elements by `(1, 0)` for `ConjTrans` only; `herk_naive`/`her2k_naive` and the cblas kernels leave `C` unscaled, `write_herk_triangle`/`write_her2k_triangle` (GEMM path) always multiply, the diagonal included.
@@ -1109,13 +1119,49 @@ Sources name the review stage: Gate 1 / Gate 2 (code reviews), FB3 (GEMM gate be
 
 ### v0.3.0 - Planned (breaking)
 - [ ] `cblas_i{s,d,c,z}amax` return `size_t`/`usize` instead of `i32`, and the layout/trans/uplo/side/diag parameters are taken as `c_int` and validated (an out-of-range value is undefined behaviour while they are Rust enums) _(source: CBLAS check)_
+- [ ] Candidate: put the `#[no_mangle]` on the `cblas_*` entry points behind a feature. Every `cblas_*` reference in a binary that links `oxiblas-blas` binds to OxiBLAS, even when another BLAS is linked too; this is how the `compare-openblas` bench measured OxiBLAS against itself until 0.2.3 _(source: 0.2.3 README audit)_
+- [ ] `mmap` soundness in the type system: the constructors of `MmapMat`/`MmapMatMut`/`MmapBuilder` and `write_mat` are safe functions whose soundness rests on two documented caller obligations (no other writer and no truncation of the file while mapped; an element type valid for every bit pattern). Either make them `unsafe fn`, or bound the element type by a sealed `bytemuck::Pod`-style trait (the file header check uses `type_name` and `size_of` only) and take an advisory lock on the file. Two safe opens of one path as `MmapMatMut` alias `&mut T` today, and truncation by another process faults (`SIGBUS`) _(source: 0.2.3 W3-C, GX4)_
+- [ ] `PreconditionerError::InvalidParameter` for invalid parameters (for example the Chebyshev eigenvalue bounds, reported as `InvalidMatrix` in 0.2.3); adding a variant breaks exhaustive matches _(source: 0.2.3 GX2)_
 
 ### Backlog (unscheduled, from the 0.2.3 reviews)
-- [ ] `her_new`/`her2_new`/`syr_new`/`syr2_new` compute direct products, without the zero-column skip; route them through the in-place kernels on a zero matrix (`hpr_new`/`hpr2_new`/`spr_new`/`spr2_new` already inherit the fix) _(source: FX-A)_
-- [ ] The pre-existing cblas Level-1 unit-stride fast paths (`cblas_?dot`, `?nrm2`, `?asum`, `?scal`, `?axpy`, `?copy`, `?swap`, `i?amax` and the complex `?copy`/`?swap`) build slices with `slice::from_raw_parts(x, n)`, which can exceed `isize::MAX` bytes on 32-bit targets for contract-violating input. The strided views (`StridedSlice[Mut]::from_raw_parts`, used by the rot, rotm, dot and complex nrm2 wrappers) and the unit-stride paths of `cblas_sdsdot`/`cblas_dsdot` are already guarded _(source: FX-B)_
+- [x] `her_new`/`her2_new`/`syr_new`/`syr2_new` compute direct products, without the zero-column skip; route them through the in-place kernels on a zero matrix (`hpr_new`/`hpr2_new`/`spr_new`/`spr2_new` already inherit the fix) (Fixed in v0.2.3: the lower triangle comes from `her`/`her2`/`syr`/`syr2` on a zero matrix and is mirrored) _(source: FX-A)_
+- [x] The pre-existing cblas Level-1 unit-stride fast paths (`cblas_?dot`, `?nrm2`, `?asum`, `?scal`, `?axpy`, `?copy`, `?swap`, `i?amax` and the complex `?copy`/`?swap`) build slices with `slice::from_raw_parts(x, n)`, which can exceed `isize::MAX` bytes on 32-bit targets for contract-violating input. The strided views (`StridedSlice[Mut]::from_raw_parts`, used by the rot, rotm, dot and complex nrm2 wrappers) and the unit-stride paths of `cblas_sdsdot`/`cblas_dsdot` are already guarded (Fixed in v0.2.3: the unit-stride paths check the byte size first; the strided fallbacks of these wrappers are a separate entry below) _(source: FX-B)_
 - [ ] Validate on x86_64 and re-measure the GEMM parallel gate (`PARALLEL_GATE`, 128³ total / 80³ per thread) there and on 12+ thread machines; it was tuned on an Apple M3 with 4 and 8 threads only, and the AVX2/AVX-512 paths were not exercised in 0.2.3 _(source: Gate 2, G2-08; Gate 1, G1-10)_
-- [ ] Apple Silicon cache detection reads the E-core `hw.l1dcachesize`/`hw.l2cachesize` (64 KB / 4 MiB) instead of `hw.perflevel0.*` (128 KB / 16 MiB), so the auto-tuned GEMM blocking (used when a dimension is >= 512) rests on E-core sizes; the gate crossover (96³-192³) runs on the static `for_kernel` targets and does not read them, but re-check `PARALLEL_GATE` if the detection changes _(source: FB3, Gate 2)_
-- [ ] Sweep of pre-existing items in files touched by 0.2.3: `unsafe` blocks without a `// SAFETY:` comment, `unreachable!()` panics, and the NaN propagation of cblas `?herk`/`?her2k` `NoTrans` (dot-product form instead of the reference axpy form with the `A(J,L) != 0` skip) _(source: Gate 1, G1-09)_
+- [x] Apple Silicon cache detection reads the E-core `hw.l1dcachesize`/`hw.l2cachesize` (64 KB / 4 MiB) instead of `hw.perflevel0.*` (128 KB / 16 MiB), so the auto-tuned GEMM blocking (used when a dimension is >= 512) rests on E-core sizes; the gate crossover (96³-192³) runs on the static `for_kernel` targets and does not read them, but re-check `PARALLEL_GATE` if the detection changes (Fixed in v0.2.3: `hw.perflevel0.*` with per-key fallback, L2 taken as the per-core share `l2cachesize / cpusperl2`, which is 4 MiB on an M3, so the M3 blocking and the gate are unchanged; other chips are in the "tuned on an Apple M3 only" entry below) _(source: FB3, Gate 2)_
+- [x] Sweep of pre-existing items in files touched by 0.2.3: `unsafe` blocks without a `// SAFETY:` comment and `unreachable!()` panics (Fixed in v0.2.3: every `unsafe` block in `oxiblas-blas`, `oxiblas-matrix`, `oxiblas-lapack`, `oxiblas-sparse` and `oxiblas-ndarray` is documented and `clippy::undocumented_unsafe_blocks` is enabled there; parallel Strassen and HERK/HER2K have no `unreachable!()`; `oxiblas-core` is a separate entry below) _(source: Gate 1, G1-09)_
+- [ ] The rest of G1-09: the NaN propagation of `?herk`/`?her2k` `NoTrans` (dot-product form instead of the reference axpy form with the `A(J,L) != 0` skip; cblas here, native paths in the v0.2.4 entry) _(source: Gate 1, G1-09)_
+- [x] `rust-version` and `clippy.toml` `msrv` raised from 1.85 to 1.89, which the x86_64 AVX-512 code, the `memory::numa` let chains and `nalgebra` 0.35 need (Fixed in v0.2.3) _(source: 0.2.3 README audit)_
+- [x] `sve-nightly`: `simd/aarch64.rs` needs `#![feature(stdarch_aarch64_sve)]` on an SVE target, but `oxiblas-core/src/lib.rs` does not declare it. Add the `cfg_attr` and build that configuration on nightly, which no one has done here (Fixed in v0.2.3: `lib.rs` declares the gate under `cfg(all(feature = "sve-nightly", target_arch = "aarch64", target_feature = "sve"))`; compile-checked on nightly with `-C target-feature=+sve`, not run on SVE hardware) _(source: 0.2.3 README audit)_
+- [ ] Re-measure on x86_64 with the fixed `compare-openblas` bench: the Linux figures in the README date from 2025-12, and their OpenBLAS column came from the old bench, which never ran OpenBLAS. Still open after 0.2.3, which was measured on an Apple M3 only; the 0.2.3 DOT/NRM2/GEMV kernels are aarch64-only, so x86_64 keeps the older kernels (with the 0.2.3 AVX2 fixes for strided GEMV views and NRM2 with a tiny maximum) _(source: 0.2.3 README audit)_
+- [x] `SimdCapabilities::cache_line_bytes` is a hard-coded 64, while `CACHE_LINE_SIZE` is 128 on aarch64 (Fixed in v0.2.3: it and the `multiver` mirror report `CACHE_LINE_SIZE`) _(source: 0.2.3 README audit)_
+- [x] `signum` of `f16` and `QuadFloat` returns 0 for ±0, unlike `f32`/`f64::signum` (Fixed in v0.2.3: `±0 → ±1`, NaN stays NaN, `QuadFloat` maps `-inf` to `-1`) _(source: 0.2.3 README audit)_
+- [x] `cg`/`pcg` report `Breakdown` from an absolute `|pᵀAp| <= eps` test, so IC(0)-preconditioned `pcg` with `tol = 1e-10` on `laplacian_2d(10, 10)` fails at iteration 13 instead of converging; make the test relative (Fixed in v0.2.3: `|pᵀAp| <= eps·‖p‖·‖Ap‖`, confirmed by the true residual; `pcg`/`block_pcg` also check `rᵀz` and a change of sign; regression test `test_ic0_pcg_laplacian_2d_tight_tolerance`) _(source: 0.2.3 README audit)_
+- [x] `oxiblas_sparse::linalg` does not re-export `pcg`; it is only in `linalg::iterative` (Fixed in v0.2.3: re-exported from `linalg`, `linalg::prelude` and `oxiblas::prelude`) _(source: 0.2.3 README audit)_
+- [x] LU walks a column-major matrix row by row: `factor_panel` in `oxiblas-lapack/src/lu/partial_piv.rs` updates the panel with `for i` outside `for j`, and `unblocked_factor` does the same. Scaling the multipliers first and then updating column by column computes the same expression for every element. In a trial build of the `factor_panel` change, blocked LU went from 3.8 to 23.8 GFLOPS at n = 1024, 6.8 to 18.3 at n = 512 and 15.4 to 22.4 at n = 768 on an Apple M3. Interchanging only the trailing row swaps changed nothing. This is not a 0.2.3 regression: 0.2.2 gives 3.5 GFLOPS at n = 1024 (Fixed in v0.2.3: the elimination loops run column by column with bit-identical results, also in `LuFullPiv`, `LuRook` and `Cholesky::compute`, and the blocked LU was then rebuilt in place with recursive panels; `lu_bench` reached 37.9 GFLOPS at n = 1024 on 2026-11-09) _(source: 0.2.3 README audit)_
+- [x] Close the gaps to OpenBLAS measured on an Apple M3 on one thread: SYRK and SYR2K run a full GEMM and keep one triangle (39-51%); TRSM 41-60%; GEMV 36-70%; DOT 48-59%; NRM2 63-64%; GEMM 73-85% at n = 64 and 128 (Fixed in v0.2.3: SYRK/SYR2K are triangle-only, TRSM is blocked with packed diagonal blocks, small GEMM lost most of its per-call overhead, and aarch64 has NEON DOT, NRM2 and GEMV kernels. Measured on 2026-11-09: SYRK 99-108%, TRSM 117-200%, GEMM at n = 64 and 128 92-96% (f64) and 103-120% (f32), DOT 109-137%, NRM2 14-16×, GEMV 143-222% except 97% at 5000×5000) _(source: 0.2.3 README audit)_
+- [x] `SymmetricEvdDc` takes 1.3-1.9× as long as `SymmetricEvd` at n = 200 to 2000 on random symmetric matrices, and `SvdDc` is 1.3× slower than `Svd` at n = 500, although it is 1.4-1.8× faster at n = 200, 1000 and 2000 (Fixed in v0.2.3: `SymmetricEvdDc` follows `DSYEVD` and is faster than `SymmetricEvd` at every size from 200 to 2000; `SvdDc` follows `dgesdd`/`dbdsdc` and is faster than the Jacobi `Svd` at every size) _(source: 0.2.3 README audit)_
+- [ ] OpenBLAS's GEMM speed at n <= 256 moved between two levels from one process to the next in the comparison bench, for example 25 or 48 GFLOPS for f64 at n = 64, while OxiBLAS did not. The cause is unknown; the published table uses the faster level. Measured again for 0.2.3 on 2026-11-09: still two levels (f64 n = 64 at 25 or 49 GFLOPS, f32 n = 64 at 50 or 86, f64 n = 128 / 256 at 42 or 52 / 48 or 55, DOT at 1K at 127 or 310-330 ns), with OxiBLAS within 3.3% in the same processes. It is not a threading leak (one core of CPU time in every window) and not core placement: the benchmark thread already ran at the user-interactive QoS class, and requesting it again changed neither the levels nor OxiBLAS (6 + 6 alternating processes). In a C program that calls Homebrew's OpenBLAS directly, `sgemm` at n = 64 ran at 82-87 GFLOPS with its operands in one large aligned block and at 50-52 GFLOPS in separate `posix_memalign` allocations, so operand placement matters; the f64 fast level and the slow DOT level appeared only inside the benchmark process. The trigger is still unknown _(source: 0.2.3 README audit, 0.2.3 release measurement)_
+- [ ] Complex kernels: the complex GEMM micro-kernel is a scalar 2×2 kernel, which limits complex GEMM, the complex blocked SYRK/SYR2K path (so complex `NoTrans` SYRK/SYR2K use naive loops), complex LU (+5-13% from the 0.2.3 LU work against much more for f64) and the complex CBLAS GEMM with transposed operands (routing it to the blocked GEMM measured slower). Write a SIMD complex micro-kernel, or a 4M split onto the real kernels. The complex TRSM updates run through `gemm3m`, which allocates temporaries and turns `Inf` into NaN through its `beta = 1 + 0i` product _(source: 0.2.3 P-GEMM, P-SYRK, P-LU, P-TRSM)_
+- [ ] x86_64 kernels: route the typed Level-1 and GEMV kernels on x86_64 the way 0.2.3 does on aarch64 (NEON DOT, Blue-algorithm NRM2, column-major GEMV, the unit-stride `cblas_?gemv` fast path), and give the TRSM/TRMM tile kernels AVX2/AVX-512 forms (x86_64 runs the portable tiles). This needs AVX2/AVX-512 hardware to measure on _(source: 0.2.3 P-L12, P-TRSM)_
+- [ ] The strided (`inc != 1`) fallbacks of the pre-existing CBLAS Level-1 wrappers do not check that the extent `(n-1)·|inc|+1` fits in `isize::MAX` bytes before building a view; the unit-stride paths do since 0.2.3 _(source: 0.2.3 W1-C)_
+- [ ] GEMV at 5000×5000 runs at 97% of OpenBLAS on an Apple M3 (3.64 ms against 3.53 ms on 2026-11-09), while the other GEMV, DOT and NRM2 sizes are ahead; also `gemv_add`, `gemv_add_inplace` and `gemv_sum2` still use the generic loops, and the complex parallel `Trans` path could interleave four columns _(source: 0.2.3 P-L12)_
+- [ ] `QuadFloat`: the elementary functions are twofloat's and are far less accurate than the arithmetic (in spot checks `exp` about 18 digits, `ln`, `log2`, `log10`, `powf` and `acosh` about 12-14); write QD-style `exp`/`ln` and build the others on them. twofloat's multiplication gives NaN instead of `±inf` on overflow; `to_degrees`/`to_radians` are only accurate to about `1e-16`; the `extended_precision` example lifts π and e from `f64` instead of using twofloat's constants. `QuadFloat` does not implement `bytemuck::Zeroable`, so `SvdDc`, `SymmetricEvd` and `SymmetricEvdDc` cannot be used with it _(source: 0.2.3 GX6, P-SVD, P-EVD)_
+- [ ] Eigensolver reductions: a blocked `ZHETRD` and a compact-WY `ZUNMTR` for `HermitianEvdDc` (the unblocked Hermitian reduction takes about 92% of its time); a two-stage symmetric reduction, since half of the blocked `DSYTRD` is the memory-bound `symv`; blocked forms of the public `sytrd`, `orgtr` and `ormtr` (the drivers use private blocked kernels, the public functions are still unblocked); `ParallelSymmetricEvd` still runs naive kernels; the `SymmetricEvdDc` secular solver is a safeguarded rational-interpolation scheme, not a full `DLAED4` port _(source: 0.2.3 P-EVD, GX3, GX6)_
+- [ ] SVD: reuse the merge workspace of the bidiagonal divide and conquer (peak memory is about 10-11 `n²` elements, about 350 MB in f64 at n = 2000); `ComplexSvdDc` has its own unblocked bidiagonalization, and `QrSvd` is unblocked as well _(source: 0.2.3 GX1, P-SVD)_
+- [ ] Sparse thresholds still absolute: the supernodal and multifrontal factorizations (`supernodal.rs`, `multifrontal_lu.rs`, `multifrontal_cholesky.rs`), `pivoting.rs`, `qr.rs` (13 sites) and the eigenvalue modules compare with a bare `eps`; `spmv`/`spmv_transpose` treat `beta` as zero when `|beta| <= epsilon` _(source: 0.2.3 W3-B, GX2, Gate 2 record)_
+- [ ] Sparse complexity: `SparseLU` works on a dense copy (`O(n³)` time, `O(n²)` memory); `SparseCholesky` is left-looking at `O(n·nnz(L))`; `permute_symmetric` is `O(n·nnz)` _(source: 0.2.3 W3-B, Gate 2 record)_
+- [ ] Iterative-solver rules: `cg` and `block_cg` have no `pᵀAp` sign rule (so `pcg` with an identity preconditioner and `cg` differ on an indefinite `A`), and `block_gmres` uses one common scaling factor for all right-hand sides _(source: 0.2.3 GX2)_
+- [ ] `oxiblas-core` does not enable `clippy::undocumented_unsafe_blocks`: 434 blocks would be flagged (`memory/arena.rs` among them) _(source: 0.2.3 W3-C, GX5)_
+- [ ] Docs: rustdoc with `--document-private-items` still reports broken private intra-doc links (`parallel.rs` in core, `ell.rs`, `eigenvalue/block.rs`, `lobpcg.rs`, `polynomial_filtered.rs`, `thick_restart.rs`); `SymmetricBandedMat::from_banded` and `SymmetricMat::from_dense` assert without a `# Panics` section; `evd/mod.rs` still describes `SymmetricEvd` as handling Hermitian matrices (it is real-only; `HermitianEvd`/`HermitianEvdDc` are not listed); `linalg/pivoting.rs` cites a sorted-rows "CSC invariant" the crate does not require _(source: 0.2.3 GX5, P-EVD, GX4)_
+- [x] `GeneralEvd::compute` paired eigenvectors with the wrong eigenvalues, and `HermitianMat::set` on the non-stored triangle stored the value without conjugating it (Fixed in v0.2.3: LAPACK-style `DLAHQR`/`DLANV2` real Schur, `DTREVC`/`ZTREVC` eigenvectors, `ComplexGeneralEvd` through `ComplexSchur`; `HermitianMat::set` conjugates, `element()` added) _(source: 0.2.3 GX5, GX7)_
+- [ ] `GeneralizedEvd` copies only `eigenvectors_real()` of the underlying `GeneralEvd`, so complex eigenvector pairs lose their imaginary parts _(source: 0.2.3 GX7)_
+- [ ] Nonsymmetric eigensolvers: no `DGEBAL` balancing (graded or badly scaled matrices can be less accurate than LAPACK's default `dgeev`), unblocked O(n³) Schur loops without aggressive early deflation (`DLAQR0`), and a total sweep budget of `100·n` where LAPACK allows about `30·max(10, n)` per deflation _(source: 0.2.3 GX7)_
+- [ ] `LuFullPiv::rank` compares with a global `n·eps·max|a_ij|` instead of the per-column rule of the factorization, and an infinite entry makes that threshold infinite (rank 0) _(source: 0.2.3 Gate 2, record only)_
+- [ ] `get_cache_info` on macOS spawns the `sysctl` binary through `std::process::Command` for each key; query the values in-process instead _(source: 0.2.3 Gate 2, record only)_
+- [ ] `syr2k` accepts `ConjTrans` for complex types as `Trans`, while `syrk` rejects it (documented); make them consistent _(source: 0.2.3 P-SYRK)_
+- [ ] GEMM details: the transpose-aware packers (`pack_*_trans_dispatch`) check the buffer length, not that the source region lies inside the matrix; and the small-GEMM path is not stride-invariant (a transposed view of `A` takes the non-FMA loop, so its results can differ in the last bit from the same matrix stored normally) _(source: 0.2.3 GX3, P-TRSM)_
+- [ ] Tuned on an Apple M3 only: the SYRK/SYR2K/GEMMT path switches (the `beta != 0` cases measured up to n = 64), the TRSM block and panel sizes, `LOWER_UPDATE_LEAF` in Cholesky, the LU panel and recursion sizes, the EVD and SVD block sizes, and the `16·n·eps` tolerances of the EVD accuracy tests; Apple chips with another per-core L2 share (an M1 has 3 MiB instead of 4 MiB) get different auto-tuned GEMM blocking, untested _(source: 0.2.3 P-SYRK, P-TRSM, P-LU, P-EVD, P-GEMM, GX3)_
+- [ ] Performance observations to follow up: matrices whose leading dimension is a power of two (4 KiB columns, n = 512) showed cache-set conflicts in row-direction loops (the 2.3× per-flop slowdown of the old `SvdDc` at n = 500/512); the strided `cblas_dgemv` column-major `Trans` case moves by 4-6% with code placement alone (loop head alignment), so compare such kernels with aligned builds _(source: 0.2.3 P-SVD, P-L12, W3-A, GX3)_
 
 ---
 
@@ -1130,7 +1176,7 @@ Sources name the review stage: Gate 1 / Gate 2 (code reviews), FB3 (GEMM gate be
 | blas1.rs | 2,252 | 2 modules | ✅ Complete |
 | blas2.rs | 5,481 | 5 modules | ✅ Complete |
 | blas3.rs | 3,565 | 3 modules | ✅ Complete |
-| cblas.rs | 2,300 | 3 modules | ✅ Complete |
+| cblas.rs | 2,300 | 3 modules (split further since; see the 2026-08 table below) | ✅ Complete |
 | memory.rs | 2,417 | 6 modules | ✅ Complete |
 | lapack/solve.rs | 3,639 | 3 modules | ✅ Complete |
 | ops.rs | 2,186 | 3 modules | ✅ Complete |
@@ -1163,4 +1209,4 @@ f64x8_traits}.rs` since this note was written, and two other files had grown pas
 | oxiblas-blas/src/cblas/basic.rs (grew past 2,000 while this pass added missing `# Safety` doc sections to 74 CBLAS entry points) | 2,509 | 6 modules (`cblas/basic/{mod,level1_ops,level2_ops,level3_ops,complex_ops,tests}.rs`) | ✅ Complete |
 | oxiblas-sparse/src/linalg/eigenvalue/special.rs (grew past 2,000 while this pass converted its 3 `\`\`\`ignore` doctests to real, runnable examples) | 2,013 | 3 modules (`eigenvalue/special/{mod,interval,polynomial_filtered}.rs`) | ✅ Complete |
 
-**All files now under 2000 lines.** Largest file (measured 2026-08-04): `oxiblas-blas/src/level1/dot.rs` at 1,998 lines.
+**All files now under 2000 lines.** Largest file (measured 2026-11-09): `oxiblas-lapack/src/svd/bidiag_reduce.rs` at 1,997 lines.

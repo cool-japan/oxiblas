@@ -709,10 +709,12 @@ impl SimdScalar for f32 {
 // whenever the target enables SVE (e.g. `-C target-cpu=neoverse-v1`), breaking
 // the build. All SVE items below are therefore gated on
 // `all(feature = "sve-nightly", target_feature = "sve")`: the `sve-nightly`
-// cargo feature is **off by default** and, when enabled, requires a nightly
-// compiler (see the crate-root `#![cfg_attr(..., feature(stdarch_aarch64_sve))]`).
-// On stable, or with the feature off, the crate falls back to the always-present
-// NEON (`F64x2`/`F32x4`) and emulated 256-bit (`F64x4`/`F32x8`) paths above.
+// cargo feature is **off by default**, and on an SVE target it requires a
+// nightly compiler with that feature gate (`lib.rs` enables `stdarch_aarch64_sve`
+// under the same cfg). On any other target the feature
+// has no effect, which is why `--all-features` still builds on stable. Without
+// SVE code the crate falls back to the always-present NEON (`F64x2`/`F32x4`) and
+// emulated 256-bit (`F64x4`/`F32x8`) paths above.
 
 /// SVE feature detection and utilities.
 pub struct SveSupport;

@@ -1,8 +1,11 @@
-//! CBLAS-compatible interface for BLAS-TESTER compatibility.
+//! CBLAS-compatible C ABI: the shared enums.
 //!
-//! This module provides a C-compatible interface that follows the standard
-//! CBLAS specification, enabling interoperability with BLAS test suites
-//! like BLAS-TESTER.
+//! This module defines the `#[repr(C)]` enums taken by the `cblas_*` entry
+//! points, with the discriminants of `cblas.h`. The entry points follow the
+//! semantics of reference CBLAS for valid calls. Because these are Rust enums,
+//! a value outside the set defined here is undefined behaviour rather than an
+//! error exit; there is no `cblas_xerbla` to report it to (see
+//! [`crate::cblas`] for the other deviations from reference CBLAS).
 //!
 //! # Layout
 //!

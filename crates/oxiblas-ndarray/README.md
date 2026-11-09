@@ -7,14 +7,15 @@
 
 ## Overview
 
-`oxiblas-ndarray` provides seamless integration between OxiBLAS and the ndarray crate, enabling you to use high-performance BLAS/LAPACK operations on ndarray arrays.
+`oxiblas-ndarray` provides integration between OxiBLAS and the ndarray crate (0.17), enabling you to use OxiBLAS BLAS/LAPACK operations on ndarray arrays. The API is a set of free functions, re-exported through `oxiblas_ndarray::prelude`, that take and return `Array1` / `Array2` values.
 
 ## Features
 
-- **Zero-copy conversions** between `ndarray::Array` and `oxiblas_matrix::Mat`
-- **BLAS operations** on ndarray arrays
-- **LAPACK decompositions** (LU, QR, SVD, Cholesky, etc.)
-- **Type-safe** API leveraging Rust's type system
+- **Conversions** between `ndarray::Array2` and `oxiblas_matrix::Mat`: the owned conversions always copy, while the view conversions (`ArrayView2` to `MatRef`) borrow the array's buffer without copying
+- **BLAS operations** on ndarray arrays: Level 1 (dot, nrm2, asum, axpy, scal), Level 2 (gemv), Level 3 (gemm), matrix norms and helpers, with `Complex32` / `Complex64` variants
+- **LAPACK decompositions** (LU, QR, SVD, Cholesky, symmetric, Hermitian and general eigenvalue decompositions, Schur), solvers, inverse, pseudo-inverse, determinant, rank, condition number and randomized SVD
+- **Parallel GEMM** with Rayon (`parallel` feature) and **sparse** CSR/CSC conversions, SpMV and a CG solver (`sparse` feature)
+- **Type-safe** API: result structs (`LuResult`, `QrResult`, `SvdResult`, ...) and a `LapackError` type for the LAPACK wrappers
 - **Compatible** with existing ndarray code
 
 ## Installation
@@ -22,6 +23,12 @@
 ```toml
 [dependencies]
 oxiblas-ndarray = "0.2"
+
+# With parallel GEMM (Rayon)
+oxiblas-ndarray = { version = "0.2", features = ["parallel"] }
+
+# With sparse (CSR/CSC) integration
+oxiblas-ndarray = { version = "0.2", features = ["sparse"] }
 ```
 
 ## Usage
@@ -29,167 +36,210 @@ oxiblas-ndarray = "0.2"
 ### BLAS Operations
 
 ```rust
-use ndarray::Array2;
-use oxiblas_ndarray::NdarrayExt;
+use ndarray::{array, Array1, Array2};
+use oxiblas_ndarray::prelude::*;
 
-// Create ndarray matrices
-let a = Array2::<f64>::from_shape_vec((2, 3), vec![
-    1.0, 2.0, 3.0,
-    4.0, 5.0, 6.0,
-]).unwrap();
-
-let b = Array2::<f64>::from_shape_vec((3, 2), vec![
-    7.0, 8.0,
-    9.0, 10.0,
-    11.0, 12.0,
-]).unwrap();
+let a = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+let b = array![[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]];
 
 // Matrix multiplication using OxiBLAS
-let c = a.gemm(&b, 1.0, 0.0)?;
-// c = [[58, 64], [139, 154]]
+let c = matmul(&a, &b);
+assert_eq!(c, array![[58.0, 64.0], [139.0, 154.0]]);
 
-// Or use method syntax
-let c = a.matmul(&b)?;
+// C = alpha * A * B + beta * C
+let mut c2 = Array2::<f64>::zeros((2, 2));
+gemm_ndarray(1.0, &a, &b, 0.0, &mut c2);
+assert_eq!(c2, c);
+
+// Matrix-vector product and dot product
+let x = array![1.0, 0.0, 1.0];
+let y = matvec(&a, &x);                 // [4.0, 10.0]
+let d = dot_ndarray(&x, &Array1::from_vec(vec![1.0, 2.0, 3.0]));  // 4.0
 ```
 
 ### Decompositions
 
 ```rust
-use ndarray::Array2;
-use oxiblas_ndarray::NdarrayExt;
+use ndarray::{array, Array1};
+use oxiblas_ndarray::prelude::*;
 
-let a = Array2::<f64>::from_shape_vec((3, 3), vec![
-    2.0, 1.0, 1.0,
-    4.0, 3.0, 3.0,
-    8.0, 7.0, 9.0,
-]).unwrap();
+fn main() -> LapackResult<()> {
+    let a = array![
+        [2.0, 1.0, 1.0],
+        [4.0, 3.0, 3.0],
+        [8.0, 7.0, 9.0],
+    ];
 
-// LU decomposition
-let lu = a.lu()?;
-let det = lu.determinant();
-let inv = lu.inverse()?;
+    // LU decomposition (A = P * L * U)
+    let lu = lu_ndarray(&a)?;
+    let det = lu.det();                              // 4.0
+    let b = Array1::from_vec(vec![4.0, 10.0, 24.0]);
+    let x = lu.solve(&b);                            // solves A x = b: [1.0, 1.0, 1.0]
 
-// Solve Ax = b
-let b = Array1::from_vec(vec![4.0, 10.0, 24.0]);
-let x = lu.solve(&b)?;
+    // QR decomposition
+    let qr = qr_ndarray(&a)?;
+    let (q, r) = (&qr.q, &qr.r);
 
-// QR decomposition
-let qr = a.qr()?;
-let q = qr.q();
-let r = qr.r();
+    // SVD (singular values in descending order)
+    let svd = svd_ndarray(&a)?;
+    let (u, s, vt) = (&svd.u, &svd.s, &svd.vt);
 
-// SVD
-let svd = a.svd()?;
-let singular_values = svd.singular_values();
-let u = svd.u();
-let vt = svd.vt();
+    // Cholesky (symmetric positive definite matrices)
+    let spd = array![[4.0, 1.0], [1.0, 3.0]];
+    let chol = cholesky_ndarray(&spd)?;
+    let l = &chol.l;
 
-// Cholesky (for SPD matrices)
-let chol = a.cholesky()?;
-let l = chol.l();
+    // Symmetric eigenvalue decomposition (eigenvalues in ascending order)
+    let evd = eig_symmetric(&spd)?;
+    let eigenvalues = &evd.eigenvalues;
+    let eigenvectors = &evd.eigenvectors;
+
+    Ok(())
+}
 ```
 
 ### Linear Solvers
 
 ```rust
-use ndarray::{Array1, Array2};
-use oxiblas_ndarray::NdarrayExt;
+use ndarray::array;
+use oxiblas_ndarray::prelude::*;
 
-let a = Array2::from_shape_vec((2, 2), vec![
-    2.0, 1.0,
-    1.0, 3.0,
-]).unwrap();
+fn main() -> LapackResult<()> {
+    let a = array![[2.0, 1.0], [1.0, 3.0]];
+    let b = array![5.0, 8.0];
 
-let b = Array1::from_vec(vec![5.0, 8.0]);
+    // Solve linear system
+    let x = solve_ndarray(&a, &b)?;
+    // x = [1.4, 2.2]
 
-// Solve linear system
-let x = a.solve(&b)?;
-// x = [1.0, 3.0]
+    // Multiple right-hand sides
+    let b_multi = array![[5.0, 1.0], [8.0, 2.0]];
+    let x_multi = solve_multiple_ndarray(&a, &b_multi)?;
 
-// Multiple right-hand sides
-let b_multi = Array2::from_shape_vec((2, 2), vec![
-    5.0, 1.0,
-    8.0, 2.0,
-]).unwrap();
-let x_multi = a.solve_multiple(&b_multi)?;
+    // Least squares, inverse, determinant, rank
+    let x_ls = lstsq_ndarray(&a, &b)?;
+    let a_inv = inv_ndarray(&a)?;
+    let det = det_ndarray(&a)?;                      // 5.0
+    let rank = rank_ndarray(&a)?;                    // 2
+
+    Ok(())
+}
 ```
 
 ### Conversions
 
 ```rust
-use ndarray::Array2;
-use oxiblas_matrix::Mat;
-use oxiblas_ndarray::{FromNdarray, ToNdarray};
+use ndarray::{array, Array2};
+use oxiblas_ndarray::prelude::*;
 
-// ndarray -> oxiblas
-let nd = Array2::<f64>::zeros((3, 3));
-let ox = Mat::from_ndarray(&nd);
+// ndarray -> oxiblas (copies into a new Mat)
+let nd = array![[1.0, 2.0], [3.0, 4.0]];
+let ox = array2_to_mat(&nd);
 
-// oxiblas -> ndarray
-let ox = Mat::<f64>::zeros(3, 3);
-let nd = ox.to_ndarray();
+// oxiblas -> ndarray (copies)
+let back: Array2<f64> = mat_to_array2(&ox);
+assert_eq!(back, nd);
 
-// Zero-copy views (when possible)
-let nd = Array2::<f64>::zeros((3, 3));
-let ox_view = MatRef::from_ndarray_view(nd.view());
+// Zero-copy view of a column-major array (None for layouts that cannot be borrowed)
+let col_major: Array2<f64> = zeros_f(3, 3);
+let view = col_major.view();
+let mat_ref = array_view_to_mat_ref(&view);
+assert!(mat_ref.is_some());
+
+// A row-major array is borrowed as a transposed MatRef; the flag says so
+let row_major = Array2::<f64>::zeros((3, 3));
+let view = row_major.view();
+let (mat_ref, transposed) = array_view_to_mat_ref_or_transposed(&view).expect("contiguous");
+assert!(transposed);
+```
+
+### Parallel and Sparse
+
+```rust
+// Requires the `parallel` and `sparse` features
+use ndarray::array;
+use oxiblas_ndarray::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let a = array![[1.0, 2.0], [3.0, 4.0]];
+    let b = array![[5.0, 6.0], [7.0, 8.0]];
+    let c = matmul_par(&a, &b);                      // Rayon-parallel GEMM
+
+    // Dense -> CSR (keeps every entry that is not exactly zero)
+    let dense = array![[4.0, 1.0, 0.0], [1.0, 4.0, 1.0], [0.0, 1.0, 4.0]];
+    let csr = array2_to_csr(&dense);
+    assert_eq!(csr.nnz(), 7);
+
+    // y = A * x
+    let x = array![1.0, 2.0, 3.0];
+    let y = spmv_ndarray(&csr, &x);                  // [6.0, 12.0, 14.0]
+
+    // Conjugate gradient solve (A must be symmetric positive definite)
+    let solution = sparse_solve_ndarray(&csr, &y)?;  // ~ [1.0, 2.0, 3.0]
+    Ok(())
+}
 ```
 
 ## Performance
 
-All operations use OxiBLAS's optimized SIMD kernels:
+The BLAS and LAPACK wrappers delegate to OxiBLAS's optimized SIMD kernels:
 
-- **GEMM**: 80-172% of OpenBLAS performance
-- **Zero-copy** when data layout permits
-- **Column-major** conversion handled automatically
+- **GEMM**: runs `oxiblas-blas` GEMM; see [Performance](../../README.md#performance) in the root README for measured figures
+- **Copying wrappers** - The BLAS/LAPACK convenience functions copy their inputs into `Mat`; only the view conversions are zero-copy
+- **Column-major** - `matmul` and `matmul_par` return column-major arrays (`matmul_c` returns row-major); input layout is handled by the copy
 
 ## API Reference
 
-### Extension Trait
+All of the items below are available through `oxiblas_ndarray::prelude::*` unless noted.
 
-The `NdarrayExt` trait extends `Array2<T>` with BLAS/LAPACK methods:
+### BLAS (`blas`)
 
-```rust
-pub trait NdarrayExt<T: Scalar> {
-    // BLAS Level 3
-    fn gemm(&self, other: &Array2<T>, alpha: T, beta: T) -> Result<Array2<T>>;
-    fn matmul(&self, other: &Array2<T>) -> Result<Array2<T>>;
+| Level | Functions |
+|-------|-----------|
+| Level 1 | `dot_ndarray`, `dot_view`, `nrm2_ndarray`, `asum_ndarray`, `axpy_ndarray`, `scal_ndarray`; complex: `dotc_c64_ndarray`, `dotu_c64_ndarray`, `nrm2_c64_ndarray`, `asum_c64_ndarray`, `axpy_c64_ndarray`, `scal_c64_ndarray` and the `_c32_` counterparts |
+| Level 2 | `gemv_ndarray` (takes a `Transpose`), `matvec`, `matvec_t` |
+| Level 3 | `gemm_ndarray(alpha, a, b, beta, c)`, `matmul`, `matmul_c`, `matmul_into`; with `parallel`: `gemm_par_ndarray`, `matmul_par` |
+| Norms | `frobenius_norm`, `norm_1`, `norm_inf`, `norm_max` (the last three for `f64`), complex `*_c32` / `*_c64` versions |
+| Helpers | `eye`, `eye_f`, `trace`, `transpose`, `conj_transpose_c32`, `conj_transpose_c64`, `eye_c32`, `eye_c64`, `trace_c32`, `trace_c64` |
 
-    // LAPACK decompositions
-    fn lu(&self) -> Result<Lu<T>>;
-    fn qr(&self) -> Result<Qr<T>>;
-    fn svd(&self) -> Result<Svd<T>>;
-    fn cholesky(&self) -> Result<Cholesky<T>>;
-    fn evd(&self) -> Result<SymmetricEvd<T>>;
+### LAPACK (`lapack`)
 
-    // Linear solvers
-    fn solve(&self, b: &Array1<T>) -> Result<Array1<T>>;
-    fn solve_multiple(&self, b: &Array2<T>) -> Result<Array2<T>>;
+| Area | Functions and results |
+|------|-----------------------|
+| Decompositions | `lu_ndarray` (`LuResult { l, u, perm }` with `solve`, `det`), `qr_ndarray` (`QrResult { q, r }`), `svd_ndarray` / `svd_truncated` (`SvdResult { u, s, vt }`), `cholesky_ndarray` (`CholeskyResult { l }` with `solve`, `det`), `schur_ndarray` (`SchurResult`) |
+| Eigenvalues | `eig_symmetric` / `eigvals_symmetric` (`SymEvdResult { eigenvalues, eigenvectors }`), `eig_ndarray` / `eigvals_ndarray` (general matrices, `Eigenvalue` values) |
+| Randomized | `rsvd_ndarray`, `rsvd_power_ndarray` (`RandomizedSvdResult { u, s, v }`), `low_rank_approx_ndarray` |
+| Solvers | `solve_ndarray`, `solve_multiple_ndarray`, `lstsq_ndarray`, `tridiag_solve_ndarray`, `tridiag_solve_spd_ndarray`, `tridiag_solve_multiple_ndarray` |
+| Matrix functions | `inv_ndarray`, `pinv_ndarray`, `det_ndarray`, `cond_ndarray`, `rank_ndarray` |
+| Complex (`lapack` module only) | `svd_complex_ndarray`, `qr_complex_ndarray`, `cholesky_hermitian_ndarray`, `eig_hermitian_ndarray` |
+| Errors | `LapackError` (`Singular`, `NotPositiveDefinite`, `DimensionMismatch`, `NotConverged`, `Other`) and `LapackResult<T>` |
 
-    // Utilities
-    fn det(&self) -> Result<T>;
-    fn inv(&self) -> Result<Array2<T>>;
-    fn rank(&self, tol: f64) -> Result<usize>;
-}
-```
+### Conversions (`conversions`)
 
-### Conversion Traits
+| Kind | Functions |
+|------|-----------|
+| Copying | `array2_to_mat`, `array2_into_mat`, `mat_to_array2`, `mat_to_array2_c`, `mat_ref_to_array2`, and `ArrayD` versions (`arrayd_to_mat`, `mat_to_arrayd`, `arrayd_to_array2`, `array2_to_arrayd`, ...) |
+| Zero-copy views | `array_view_to_mat_ref`, `array_view_to_mat_ref_or_transposed`, `array_view_mut_to_mat_mut`, and `ArrayViewD` versions; they return `None` for layouts that cannot be borrowed (not contiguous along one axis, or a negative stride) |
+| Layout helpers | `zeros_f`, `filled_f`, `is_column_major`, `is_row_major`, `to_column_major`, `array1_to_vec`, `slice_to_array1` |
 
-```rust
-pub trait FromNdarray<T> {
-    fn from_ndarray(arr: &Array2<T>) -> Self;
-    fn from_ndarray_view(view: ArrayView2<T>) -> Self;
-}
+### Sparse (`sparse`, feature `sparse`)
 
-pub trait ToNdarray<T> {
-    fn to_ndarray(&self) -> Array2<T>;
-    fn to_ndarray_view(&self) -> ArrayView2<T>;
-}
-```
+`array2_to_csr`, `array2_to_csc` (and `*_with_tolerance`), `csr_to_array2`, `csc_to_array2`, `spmv_ndarray`, `spmv_full_ndarray`, `sparse_solve_ndarray`, `sparse_solve_ndarray_with_options` and `SparseNdarrayError`.
 
-## Examples
+## Feature Flags
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `parallel` | Rayon-parallel GEMM (`gemm_par_ndarray`, `matmul_par`) via `oxiblas-blas/parallel` and `oxiblas-core/parallel` | |
+| `sparse` | CSR/CSC conversions, SpMV and a CG solver via `oxiblas-sparse` | |
+
+The default features enable `std` support in `oxiblas-core` and `oxiblas-matrix`.
+
+## Benchmarks
 
 ```bash
-cargo run --example ndarray_integration
+cargo bench --package oxiblas-ndarray --bench ndarray_blas
+cargo bench --package oxiblas-ndarray --bench faer_comparison
 ```
 
 ## Comparison with ndarray-linalg
@@ -197,12 +247,12 @@ cargo run --example ndarray_integration
 | Feature | oxiblas-ndarray | ndarray-linalg |
 |---------|----------------|----------------|
 | Pure Rust | ✓ | |
-| No C dependencies | ✓ | |
+| No C dependencies (library and its normal dependencies) | ✓ | |
 | BLAS/LAPACK | ✓ | ✓ |
 | OpenBLAS backend | | ✓ |
 | Intel MKL backend | | ✓ |
 | Custom backend | ✓ (OxiBLAS) | |
-| Performance | 80-172% OpenBLAS | 100% (uses OpenBLAS) |
+| Performance | See [Performance](../../README.md#performance) | Depends on the backend |
 | Cross-compilation | Easy | Difficult |
 
 ## Related Crates

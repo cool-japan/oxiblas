@@ -8,9 +8,23 @@
 //! - For `Trans::Trans`: C = α·A^T·B + α·B^T·A + β·C where A, B are k×n, C is n×n
 //!
 //! Only the specified triangle (upper or lower) of C is updated.
+//!
+//! # Algorithm
+//!
+//! Larger problems run in one call of the triangle-only blocked kernel shared
+//! with SYRK and GEMMT, as the rank-`2k` product `alpha·[A B]·[B A]^T` (or its
+//! transposed form): every k-block is packed straight from `A` or `B` by the
+//! GEMM packers and only the micro-tiles that meet the `uplo` triangle are
+//! computed, accumulating straight into C (no transposed copies and no
+//! `n × n` temporary). Each k-block is one sweep over the triangle, and no
+//! k-block spans both segments, so C is swept at least twice. Small problems, and complex
+//! `NoTrans` problems of every size, use the loops of reference ?SYR2K; the
+//! measured switch-over points are documented on the private `use_blocked`.
+//! `Trans::ConjTrans` is treated as `Trans` (no conjugation) for every
+//! element type.
 
-use crate::level3::gemm::gemm;
 use crate::level3::gemm_kernel::GemmKernel;
+use crate::level3::tri_gemm::{KSegment, tri_update};
 use crate::level3::trsm::{Trans, Uplo};
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatMut, MatRef};
@@ -121,115 +135,98 @@ pub fn syr2k<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // Use GEMM-based optimization for larger matrices. alpha == 0 never reads A or B
-    // (reference ?SYR2K: C := beta * C on the triangle), so it stays on the naive path.
-    const GEMM_THRESHOLD: usize = 32;
-    if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
-        syr2k_via_gemm(uplo, trans, alpha, a, b, beta, c, n, k)
+    // alpha == 0 never reads A or B (reference ?SYR2K: C := beta * C on the
+    // triangle); both paths honour that, the naive one is simply cheaper for it.
+    if alpha != T::zero() && use_blocked::<T>(trans, n, k, beta == T::zero()) {
+        syr2k_blocked(uplo, trans, alpha, a, b, beta, c);
+        Ok(())
     } else {
         syr2k_naive(uplo, trans, alpha, a, b, beta, c, n, k)
     }
 }
 
-/// GEMM-based SYR2K for larger matrices.
+/// Whether [`syr2k`] runs the blocked triangle-only kernel (otherwise the
+/// reference loops of `syr2k_naive`) for an `n × n` C and inner dimension `k`.
 ///
-/// Computes:
-/// - `NoTrans`: C = α·A·B^T + α·B·A^T + β·C using two GEMMs
-/// - Trans: C = α·A^T·B + α·B^T·A + β·C using two GEMMs
-fn syr2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
+/// Chosen from the time of the blocked kernel over the time of the loops,
+/// measured on an Apple M3 (one thread, f64 and f32; the rules follow f64,
+/// where the loops fare relatively better). With `beta == 0` (`beta_is_zero`):
+///
+/// - real `NoTrans` (the loops are column updates): the kernel wins from
+///   `k >= 16` at `n = 8..12` (0.82-0.83), from `k >= 6` at `n = 16..64`
+///   (0.80-0.91), from `k >= 4` at `n = 128..256` (0.74-0.87) and from
+///   `k >= 2` at `n = 512` (0.78); with `k = 1` the loops stay ahead up to
+///   `n = 512` (1.04);
+/// - real `Trans` (dot products): from `k >= 16` at `n = 12..16` (0.69-0.85),
+///   from `k >= 4` at `n = 24..32` (0.64-0.86) and for every `k` from
+///   `n = 48` (0.76-0.80 at `k = 1`);
+/// - complex `NoTrans`: never. Against the column updates of the loops, the
+///   scalar `2 × 2` complex micro-kernel does not pay off: the kernel took
+///   1.12-1.8 times as long for Complex64 (`n` up to 1024, `k >= 8`);
+/// - complex `Trans` (dot products): from `k >= 128` at `n >= 32`
+///   (0.88-0.97, Complex32).
+///
+/// With `beta != 0` the kernel also scales the triangle up front and reads C
+/// back in every tile of both k-segments, which small `k` cannot amortize
+/// (`beta = 0.5`, f64, `n = 16..64`): real `NoTrans` wins from `k >= 8` at
+/// `n >= 24` (0.69-0.91; 1.01 at `n = 16`), real `Trans` from `k >= 8` at
+/// `n >= 24` (0.84-0.91) and from `k >= 2` at `n >= 48` (0.65-0.88), but took
+/// 1.08-1.09 times as long with `k = 4` at `n = 24` and with `k = 1` at
+/// `n = 48`. Shapes without a `beta != 0` measurement keep the loops (the
+/// path they took before the blocked kernel existed); `k >= 16` at `n >= 16`
+/// is taken for both `trans`, as it amortizes the extra pass twice as well as
+/// `k = 8`. The complex rule needs a long `k` and applies unchanged.
+fn use_blocked<T: Field>(trans: Trans, n: usize, k: usize, beta_is_zero: bool) -> bool {
+    match (T::is_real(), trans, beta_is_zero) {
+        (true, Trans::NoTrans, true) => {
+            (n >= 8 && k >= 16)
+                || (n >= 16 && k >= 6)
+                || (n >= 128 && k >= 4)
+                || (n >= 512 && k >= 2)
+        }
+        (true, Trans::NoTrans, false) => (n >= 16 && k >= 16) || (n >= 24 && k >= 8),
+        (true, Trans::Trans | Trans::ConjTrans, true) => {
+            (n >= 12 && k >= 16) || (n >= 24 && k >= 4) || n >= 48
+        }
+        (true, Trans::Trans | Trans::ConjTrans, false) => {
+            (n >= 16 && k >= 16) || (n >= 24 && k >= 8) || (n >= 48 && k >= 2)
+        }
+        (false, Trans::NoTrans, _) => false,
+        (false, Trans::Trans | Trans::ConjTrans, _) => n >= 32 && k >= 128,
+    }
+}
+
+/// Blocked SYR2K: one triangle-only call of the GEMM packers and
+/// micro-kernel over `k' = 2k`.
+///
+/// `NoTrans` computes `C := beta·C + alpha·[A B]·[B A]ᵀ` as the two k-segments
+/// `(A, Bᵀ)` and `(B, Aᵀ)`; `Trans` (and `ConjTrans`, which this routine has
+/// always treated as the plain transpose) computes `alpha·[A B]ᵀ·[B A]` as
+/// `(Aᵀ, B)` and `(Bᵀ, A)`. Every k-block is packed straight from `A` or `B`
+/// according to the segment its k range falls in, so neither the
+/// concatenations nor any transposed copy or `n × n` temporary are formed,
+/// and C is accumulated in place (one sweep of the triangle per k-block, so
+/// at least one per segment).
+fn syr2k_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     uplo: Uplo,
     trans: Trans,
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
     beta: T,
-    mut c: MatMut<'_, T>,
-    n: usize,
-    k: usize,
-) -> Result<(), Syr2kError> {
-    // Create transposed copies based on trans mode
-    match trans {
-        Trans::NoTrans => {
-            // A is n×k, B is n×k
-            // Need A·B^T (n×k × k×n = n×n) and B·A^T (n×k × k×n = n×n)
-            // Create B^T (k×n) and A^T (k×n)
-            let mut b_t: Mat<T> = Mat::zeros(k, n);
-            for i in 0..n {
-                for j in 0..k {
-                    b_t[(j, i)] = b[(i, j)];
-                }
-            }
-            let mut a_t: Mat<T> = Mat::zeros(k, n);
-            for i in 0..n {
-                for j in 0..k {
-                    a_t[(j, i)] = a[(i, j)];
-                }
-            }
-
-            // Compute temp = A·B^T + B·A^T using two GEMMs
-            let mut temp: Mat<T> = Mat::zeros(n, n);
-            gemm(alpha, a, b_t.as_ref(), T::zero(), temp.as_mut()); // temp = α·A·B^T
-            gemm(alpha, b, a_t.as_ref(), T::one(), temp.as_mut()); // temp += α·B·A^T
-
-            // Copy triangle with beta scaling (beta == 0 must not read C)
-            add_temp_to_triangle(uplo, beta, &temp, &mut c, n);
-        }
-        Trans::Trans | Trans::ConjTrans => {
-            // A is k×n, B is k×n
-            // Need A^T·B (n×k × k×n = n×n) and B^T·A (n×k × k×n = n×n)
-            // Create A^T (n×k) and B^T (n×k)
-            let mut a_t: Mat<T> = Mat::zeros(n, k);
-            for i in 0..k {
-                for j in 0..n {
-                    a_t[(j, i)] = a[(i, j)];
-                }
-            }
-            let mut b_t: Mat<T> = Mat::zeros(n, k);
-            for i in 0..k {
-                for j in 0..n {
-                    b_t[(j, i)] = b[(i, j)];
-                }
-            }
-
-            // Compute temp = A^T·B + B^T·A using two GEMMs
-            let mut temp: Mat<T> = Mat::zeros(n, n);
-            gemm(alpha, a_t.as_ref(), b, T::zero(), temp.as_mut()); // temp = α·A^T·B
-            gemm(alpha, b_t.as_ref(), a, T::one(), temp.as_mut()); // temp += α·B^T·A
-
-            // Copy triangle with beta scaling (beta == 0 must not read C)
-            add_temp_to_triangle(uplo, beta, &temp, &mut c, n);
-        }
-    }
-
-    Ok(())
-}
-
-/// Writes `temp`'s `uplo` triangle into `c` as `β·C + temp`.
-///
-/// `β == 0` must not read `C`: the result is `temp` alone, because forming `0·C` would
-/// let NaN/garbage in an uninitialised `C` poison the output (`0·NaN == NaN`).
-fn add_temp_to_triangle<T: Field>(
-    uplo: Uplo,
-    beta: T,
-    temp: &Mat<T>,
-    c: &mut MatMut<'_, T>,
-    n: usize,
+    c: MatMut<'_, T>,
 ) {
-    let beta_is_zero = beta == T::zero();
-    for j in 0..n {
-        let i_range = match uplo {
-            Uplo::Lower => j..n,
-            Uplo::Upper => 0..(j + 1),
-        };
-        for i in i_range {
-            let val = if beta_is_zero {
-                temp[(i, j)]
-            } else {
-                beta * c[(i, j)] + temp[(i, j)]
-            };
-            c.set(i, j, val);
-        }
-    }
+    let segments = match trans {
+        Trans::NoTrans => [
+            KSegment::new(a, Trans::NoTrans, b, Trans::Trans),
+            KSegment::new(b, Trans::NoTrans, a, Trans::Trans),
+        ],
+        Trans::Trans | Trans::ConjTrans => [
+            KSegment::new(a, Trans::Trans, b, Trans::NoTrans),
+            KSegment::new(b, Trans::Trans, a, Trans::NoTrans),
+        ],
+    };
+    tri_update(uplo, alpha, &segments, beta, c);
 }
 
 /// Naive SYR2K implementation for small matrices.

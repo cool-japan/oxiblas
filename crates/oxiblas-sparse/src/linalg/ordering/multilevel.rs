@@ -87,7 +87,7 @@ struct CoarseGraph {
     n_verts: usize,
     /// CSR row pointers (length n_verts + 1).
     xadj: Vec<usize>,
-    /// CSR adjacency (length xadj[n_verts]).
+    /// CSR adjacency (length `xadj[n_verts]`).
     adjncy: Vec<usize>,
     /// Vertex weights (length n_verts).
     vwgt: Vec<f64>,
@@ -303,8 +303,12 @@ impl MultilevelPartitioner {
         }
 
         // ---- Coarsen ----
-        let mut levels: Vec<CoarseGraph> = Vec::new();
-        let root = CoarseGraph {
+        // The hierarchy is `finer` (finest first) followed by `coarsest`.
+        // Keeping the coarsest level in its own binding (instead of at the end
+        // of one `Vec`) means it always exists, so no fallible `last()` lookup
+        // is needed.
+        let mut finer: Vec<CoarseGraph> = Vec::new();
+        let mut coarsest = CoarseGraph {
             n_verts: n,
             xadj: xadj.to_vec(),
             adjncy: adjncy.to_vec(),
@@ -312,37 +316,30 @@ impl MultilevelPartitioner {
             adjwgt: adjwgt.to_vec(),
             cmap: (0..n).collect(),
         };
-        levels.push(root);
 
-        loop {
-            let current = levels.last().expect("levels non-empty");
-            if current.n_verts <= self.config.max_coarse_size {
-                break;
-            }
+        while coarsest.n_verts > self.config.max_coarse_size {
             let coarsened = self.coarsen(
-                current.n_verts,
-                &current.xadj,
-                &current.adjncy,
-                &current.adjwgt,
-                &current.vwgt,
+                coarsest.n_verts,
+                &coarsest.xadj,
+                &coarsest.adjncy,
+                &coarsest.adjwgt,
+                &coarsest.vwgt,
             )?;
             // If coarsening didn't reduce size meaningfully, stop.
-            if coarsened.n_verts >= current.n_verts {
+            if coarsened.n_verts >= coarsest.n_verts {
                 break;
             }
-            levels.push(coarsened);
+            finer.push(core::mem::replace(&mut coarsest, coarsened));
         }
 
         // ---- Initial partition on coarsest graph ----
-        let coarsest = levels.last().expect("levels non-empty");
-        let mut partition = self.initial_partition(coarsest)?;
+        let mut partition = self.initial_partition(&coarsest)?;
 
         // ---- Uncoarsen + refine ----
-        // levels: [fine ... coarse]
-        // We iterate from second-to-last down to index 0.
-        for level_idx in (0..levels.len() - 1).rev() {
-            let coarse = &levels[level_idx + 1];
-            let fine = &levels[level_idx];
+        // Project from each level onto the next finer one, walking from the
+        // second-coarsest level down to the original graph.
+        let mut coarse = &coarsest;
+        for fine in finer.iter().rev() {
             partition = self.uncoarsen_and_refine(
                 coarse,
                 &partition,
@@ -352,6 +349,7 @@ impl MultilevelPartitioner {
                 &fine.adjwgt,
                 &fine.vwgt,
             )?;
+            coarse = fine;
         }
 
         Ok(partition)
@@ -642,7 +640,7 @@ impl MultilevelPartitioner {
 
 /// Build a local CSR subgraph induced by `global_ids` (a subset of 0..full_n).
 /// Returns (xadj, adjncy, adjwgt, vwgt) for the local graph where local vertex i
-/// corresponds to global_ids[i].
+/// corresponds to `global_ids[i]`.
 fn build_subgraph(
     _full_n: usize,
     full_xadj: &[usize],

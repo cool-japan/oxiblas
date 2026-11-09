@@ -36,10 +36,10 @@
 //!   `P[3] = h12`, `flag = 1` writes `P[1] = h11`, `P[4] = h22`, and
 //!   `flag = -2` writes nothing else. ROTM reads only the entries its flag
 //!   uses, with the same layout.
-//! * **Null pointers**: a C ABI cannot report an error and must not unwind,
-//!   so a null operand makes the routine a no-op; value-returning routines
-//!   return their identity (`alpha` for SDSDOT, `0` for DSDOT, SCABS1 and
-//!   DCABS1).
+//! * **Null pointers**: a C ABI cannot report an error and a panic reaching it
+//!   would abort the process, so a null operand makes the routine a no-op;
+//!   value-returning routines return their identity (`alpha` for SDSDOT, `0`
+//!   for DSDOT, SCABS1 and DCABS1).
 //! * **Aliasing**: as in the reference, `x` and `y` (and the scalar operands
 //!   of ROTG/ROTMG) must not overlap.
 

@@ -6,6 +6,8 @@
 //!
 //! PAQ = LU where P is the row permutation and Q is the column permutation.
 
+use super::partial_piv::eliminate_column;
+use super::tolerance::lu_pivot_tolerances;
 use num_traits::{FromPrimitive, One, Zero};
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
@@ -52,6 +54,36 @@ impl core::fmt::Display for LuFullPivError {
 
 impl std::error::Error for LuFullPivError {}
 
+/// Pivot of elimination step `k`: the row, column and magnitude of the entry
+/// of largest magnitude in `lu[k.., k..]`.
+///
+/// Among entries of equal magnitude the first in row-major order wins, as in
+/// a search that walks the rows. This search walks the contiguous columns of
+/// the column-major storage instead, so on a tie it keeps the entry with the
+/// smaller row (an equal entry in the same row has a larger column, and was
+/// therefore met later by a row-major walk). Starting from `lu[k, k]` and
+/// replacing the candidate only on a strictly larger or tied magnitude, a NaN
+/// entry is never chosen unless it is `lu[k, k]` itself, which is then kept.
+/// The pivot is therefore exactly that of the row-major search.
+fn full_pivot_search<T: Field>(lu: &Mat<T>, k: usize) -> (usize, usize, T::Real) {
+    let n = lu.nrows();
+    let ld = lu.row_stride();
+    let data = lu.raw_data();
+    let (mut pivot_row, mut pivot_col) = (k, k);
+    let mut pivot_val = Scalar::abs(data[k * ld + k]);
+    for j in k..n {
+        for (i, &x) in (k..n).zip(&data[j * ld + k..j * ld + n]) {
+            let val = Scalar::abs(x);
+            if val > pivot_val || (val == pivot_val && i < pivot_row) {
+                pivot_val = val;
+                pivot_row = i;
+                pivot_col = j;
+            }
+        }
+    }
+    (pivot_row, pivot_col, pivot_val)
+}
+
 /// LU decomposition with full (row and column) pivoting.
 ///
 /// Stores the factorization PAQ = LU where:
@@ -62,15 +94,23 @@ impl std::error::Error for LuFullPivError {}
 ///
 /// Full pivoting provides maximum numerical stability by selecting the
 /// largest element in the remaining submatrix as the pivot.
+///
+/// By default a pivot is treated as zero, and reported as
+/// [`LuFullPivError::Singular`], when its magnitude is at most `eps · n · s_c`,
+/// where `s_c = max_i |a_ic|` is taken over the finite entries of the column
+/// `c` of the input that the pivot comes from (the column interchanges are
+/// tracked). [`Self::rank`] instead counts the diagonal entries of U above
+/// the global threshold `n · eps · max |a_ij|`, so a badly scaled matrix such
+/// as `diag(1e20, 1)` factors successfully but has numerical rank 1.
 #[derive(Clone, Debug)]
 pub struct LuFullPiv<T: Scalar> {
     /// Combined L and U factors.
     /// L is stored below the diagonal (with implicit unit diagonal).
     /// U is stored on and above the diagonal.
     lu: Mat<T>,
-    /// Row pivot indices: row i was swapped with row row_pivot[i].
+    /// Row pivot indices: row i was swapped with row `row_pivot[i]`.
     row_pivot: Vec<usize>,
-    /// Column pivot indices: column j was swapped with column col_pivot[j].
+    /// Column pivot indices: column j was swapped with column `col_pivot[j]`.
     col_pivot: Vec<usize>,
     /// Number of row swaps (for determinant sign).
     num_row_swaps: usize,
@@ -98,8 +138,12 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
     /// # Arguments
     ///
     /// * `a` - The matrix to decompose
-    /// * `tol` - Optional tolerance for detecting singularity. If None, uses
-    ///           machine epsilon scaled by matrix size.
+    /// * `tol` - Optional absolute tolerance for detecting singularity: a pivot
+    ///           whose magnitude is at most `tol` is treated as zero. If None,
+    ///           a pivot taken from column `c` of `a` is compared with
+    ///           `eps · n · max_i |a_ic|` (the maximum over the finite entries
+    ///           of that column), which does not depend on the scale of `a`
+    ///           or of its columns.
     ///
     /// # Errors
     ///
@@ -142,10 +186,16 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
         let mut num_row_swaps = 0;
         let mut num_col_swaps = 0;
 
-        // Default tolerance
-        let default_tol = T::epsilon()
-            * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-        let tolerance = tol.unwrap_or(default_tol);
+        // Singularity threshold of every column of A: an explicit tolerance is
+        // used as given; the default is `eps · n · max_i |a_ij|` over the
+        // finite entries of each column.
+        let col_tol = match tol {
+            Some(tol) => vec![tol; n],
+            None => lu_pivot_tolerances(a),
+        };
+        // `orig_col[j]` is the column of A currently held at position `j`;
+        // the column interchanges below keep it up to date.
+        let mut orig_col: Vec<usize> = (0..n).collect();
 
         // Norm of the original matrix (max absolute entry), captured before `lu`
         // is overwritten by the elimination. Used below to build a *relative*
@@ -164,23 +214,11 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
         // Doolittle algorithm with full pivoting
         for k in 0..n {
             // Find pivot: largest absolute value in submatrix lu[k..n, k..n]
-            let mut pivot_row = k;
-            let mut pivot_col = k;
-            let mut pivot_val = Scalar::abs(lu[(k, k)]);
+            let (pivot_row, pivot_col, pivot_val) = full_pivot_search(&lu, k);
 
-            for i in k..n {
-                for j in k..n {
-                    let val = Scalar::abs(lu[(i, j)]);
-                    if val > pivot_val {
-                        pivot_val = val;
-                        pivot_row = i;
-                        pivot_col = j;
-                    }
-                }
-            }
-
-            // Check for singularity
-            if pivot_val <= tolerance {
+            // Check for singularity against the threshold of the column of A
+            // the pivot comes from. A NaN pivot fails the comparison.
+            if pivot_val <= col_tol[orig_col[pivot_col]] {
                 // Matrix is numerically singular
                 return Err(LuFullPivError::Singular { index: k });
             }
@@ -206,22 +244,14 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
                     lu[(i, k)] = lu[(i, pivot_col)];
                     lu[(i, pivot_col)] = tmp;
                 }
+                orig_col.swap(k, pivot_col);
                 num_col_swaps += 1;
             }
 
-            // Compute multipliers (L's subdiagonal entries) and update
-            let pivot_inv = T::one() / lu[(k, k)];
-            for i in (k + 1)..n {
-                // Multiplier (stored in L)
-                let mult = lu[(i, k)] * pivot_inv;
-                lu[(i, k)] = mult;
-
-                // Update remaining submatrix
-                for j in (k + 1)..n {
-                    let val = lu[(i, j)] - mult * lu[(k, j)];
-                    lu[(i, j)] = val;
-                }
-            }
+            // Compute multipliers (L's subdiagonal entries) and update the
+            // remaining submatrix, column by column (same arithmetic as the
+            // row-by-row loops, so the factors are bit-identical)
+            eliminate_column(&mut lu, k, n);
         }
 
         // Numerical rank: count diagonal entries of the completed U factor whose
@@ -294,7 +324,7 @@ impl<T: Field + bytemuck::Zeroable> LuFullPiv<T> {
         }
 
         let total_swaps = self.num_row_swaps + self.num_col_swaps;
-        let mut det = if total_swaps % 2 == 0 {
+        let mut det = if total_swaps.is_multiple_of(2) {
             T::one()
         } else {
             -T::one()
@@ -799,5 +829,239 @@ mod tests {
             }
             assert!((sum - b[(i, 0)]).abs() < 1e-5, "Ax[{}] = {}", i, sum);
         }
+    }
+}
+
+/// Bit-exactness of the column-oriented pivot search and elimination against
+/// the previous row-by-row loops.
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    use num_complex::Complex64;
+
+    /// The previous `LuFullPiv::compute_with_tol`, with its row-major pivot
+    /// search and row-order elimination, kept verbatim as the reference.
+    fn oracle<T: Field + bytemuck::Zeroable>(
+        a: MatRef<'_, T>,
+        tol: Option<T::Real>,
+    ) -> Result<LuFullPiv<T>, LuFullPivError> {
+        let n = a.nrows();
+        let mut lu = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                lu[(i, j)] = a[(i, j)];
+            }
+        }
+        let mut row_pivot = vec![0usize; n];
+        let mut col_pivot = vec![0usize; n];
+        let mut num_row_swaps = 0;
+        let mut num_col_swaps = 0;
+        let col_tol = match tol {
+            Some(tol) => vec![tol; n],
+            None => lu_pivot_tolerances(a),
+        };
+        let mut orig_col: Vec<usize> = (0..n).collect();
+        let mut norm_a = <T::Real as Zero>::zero();
+        for j in 0..n {
+            for i in 0..n {
+                let val = Scalar::abs(a[(i, j)]);
+                if val > norm_a {
+                    norm_a = val;
+                }
+            }
+        }
+
+        for k in 0..n {
+            let mut pivot_row = k;
+            let mut pivot_col = k;
+            let mut pivot_val = Scalar::abs(lu[(k, k)]);
+            for i in k..n {
+                for j in k..n {
+                    let val = Scalar::abs(lu[(i, j)]);
+                    if val > pivot_val {
+                        pivot_val = val;
+                        pivot_row = i;
+                        pivot_col = j;
+                    }
+                }
+            }
+            if pivot_val <= col_tol[orig_col[pivot_col]] {
+                return Err(LuFullPivError::Singular { index: k });
+            }
+            row_pivot[k] = pivot_row;
+            col_pivot[k] = pivot_col;
+            if pivot_row != k {
+                for j in 0..n {
+                    let tmp = lu[(k, j)];
+                    lu[(k, j)] = lu[(pivot_row, j)];
+                    lu[(pivot_row, j)] = tmp;
+                }
+                num_row_swaps += 1;
+            }
+            if pivot_col != k {
+                for i in 0..n {
+                    let tmp = lu[(i, k)];
+                    lu[(i, k)] = lu[(i, pivot_col)];
+                    lu[(i, pivot_col)] = tmp;
+                }
+                orig_col.swap(k, pivot_col);
+                num_col_swaps += 1;
+            }
+            let pivot_inv = T::one() / lu[(k, k)];
+            for i in (k + 1)..n {
+                let mult = lu[(i, k)] * pivot_inv;
+                lu[(i, k)] = mult;
+                for j in (k + 1)..n {
+                    let val = lu[(i, j)] - mult * lu[(k, j)];
+                    lu[(i, j)] = val;
+                }
+            }
+        }
+
+        let rank_tolerance = T::epsilon()
+            * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one())
+            * norm_a;
+        let mut rank = 0usize;
+        for i in 0..n {
+            if Scalar::abs(lu[(i, i)]) > rank_tolerance {
+                rank += 1;
+            }
+        }
+        Ok(LuFullPiv {
+            lu,
+            row_pivot,
+            col_pivot,
+            num_row_swaps,
+            num_col_swaps,
+            rank,
+        })
+    }
+
+    /// Exact bit pattern of a scalar.
+    trait Bits: Field + bytemuck::Zeroable {
+        fn bits(self) -> (u64, u64);
+    }
+
+    impl Bits for f64 {
+        fn bits(self) -> (u64, u64) {
+            (self.to_bits(), 0)
+        }
+    }
+
+    impl Bits for f32 {
+        fn bits(self) -> (u64, u64) {
+            (u64::from(self.to_bits()), 0)
+        }
+    }
+
+    impl Bits for Complex64 {
+        fn bits(self) -> (u64, u64) {
+            (self.re.to_bits(), self.im.to_bits())
+        }
+    }
+
+    fn assert_same<T: Bits>(label: &str, a: &Mat<T>, tol: Option<T::Real>) {
+        match (
+            LuFullPiv::compute_with_tol(a.as_ref(), tol),
+            oracle(a.as_ref(), tol),
+        ) {
+            (Ok(got), Ok(want)) => {
+                assert_eq!(got.row_pivot, want.row_pivot, "{label}: row pivots differ");
+                assert_eq!(got.col_pivot, want.col_pivot, "{label}: col pivots differ");
+                assert_eq!(got.num_row_swaps, want.num_row_swaps, "{label}: row swaps");
+                assert_eq!(got.num_col_swaps, want.num_col_swaps, "{label}: col swaps");
+                assert_eq!(got.rank, want.rank, "{label}: ranks differ");
+                let n = a.nrows();
+                for j in 0..n {
+                    for i in 0..n {
+                        assert_eq!(
+                            got.lu[(i, j)].bits(),
+                            want.lu[(i, j)].bits(),
+                            "{label}: LU({i}, {j}) differs: {} vs {}",
+                            got.lu[(i, j)],
+                            want.lu[(i, j)]
+                        );
+                    }
+                }
+            }
+            (Err(got), Err(want)) => assert_eq!(got, want, "{label}: errors differ"),
+            (got, want) => panic!(
+                "{label}: outcome differs: got {:?}, oracle {:?}",
+                got.map(|_| ()),
+                want.map(|_| ())
+            ),
+        }
+    }
+
+    /// Deterministic matrix filled by `f(state)` from a xorshift64 state.
+    fn matrix_from<T: Bits>(n: usize, seed: u64, f: impl Fn(u64) -> T) -> Mat<T> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut a = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                a[(i, j)] = f(x);
+            }
+        }
+        a
+    }
+
+    /// Uniform sample in `[-1, 1)` from a xorshift64 state.
+    fn unit(x: u64) -> f64 {
+        2.0 * ((x >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+    }
+
+    #[test]
+    fn test_lu_full_piv_bit_identical_random() {
+        for &n in &[0usize, 1, 2, 3, 5, 8, 17, 33, 64, 65, 100] {
+            let seed = 900 + n as u64;
+            assert_same(&format!("f64 n={n}"), &matrix_from(n, seed, unit), None);
+            let a32 = matrix_from(n, seed, |x| unit(x) as f32);
+            assert_same(&format!("f32 n={n}"), &a32, None);
+            let c = matrix_from(n, seed, |x| {
+                Complex64::new(unit(x), unit(x.rotate_left(17)))
+            });
+            assert_same(&format!("c64 n={n}"), &c, None);
+        }
+    }
+
+    #[test]
+    fn test_lu_full_piv_bit_identical_ties_and_singular() {
+        // Entries in {-2, ..., 2}: many pivot candidates of equal magnitude,
+        // so the tie rule of the column-major search decides; some of these
+        // matrices are singular, which must be reported at the same step.
+        for &n in &[2usize, 5, 8, 17, 40] {
+            for seed in 0..4u64 {
+                let a = matrix_from(n, 1000 + 10 * n as u64 + seed, |x| (x % 5) as f64 - 2.0);
+                assert_same(&format!("ties n={n} seed={seed}"), &a, None);
+            }
+        }
+        // Rank-deficient with ties, and an explicit tolerance.
+        let a: Mat<f64> =
+            Mat::from_rows(&[&[1.0, 2.0, -2.0], &[2.0, -2.0, 1.0], &[3.0, 0.0, -1.0]]);
+        assert_same("rank-deficient 3x3", &a, None);
+        assert_same("explicit tolerance", &a, Some(0.5));
+        // A zero row and column.
+        let mut z = matrix_from(30, 77, unit);
+        for i in 0..30 {
+            z[(i, 11)] = 0.0;
+            z[(4, i)] = 0.0;
+        }
+        assert_same("zero row and column", &z, None);
+    }
+
+    #[test]
+    fn test_lu_full_piv_bit_identical_non_finite() {
+        // NaN and infinite entries: the search never picks a NaN unless it is
+        // the leading entry, exactly as the row-major search.
+        let mut a = matrix_from(12, 5, unit);
+        a[(7, 3)] = f64::NAN;
+        a[(2, 9)] = f64::INFINITY;
+        assert_same("nan and inf", &a, None);
+        let mut b = matrix_from(9, 6, unit);
+        b[(0, 0)] = f64::NAN;
+        assert_same("leading nan", &b, None);
     }
 }

@@ -12,9 +12,10 @@
 //!
 //! # Optimization
 //!
-//! For larger matrices (n >= 32), uses optimized GEMM after expanding the symmetric
-//! matrix to a full dense matrix. This provides significant speedup compared to
-//! the naive implementation.
+//! When the order of A is at least 32 (`m` for `Side::Left`, `n` for
+//! `Side::Right`; the other dimension of C does not matter), uses optimized GEMM
+//! after expanding the symmetric matrix to a full dense matrix. This provides
+//! significant speedup compared to the naive implementation.
 
 use crate::level3::gemm::gemm;
 use crate::level3::gemm_kernel::GemmKernel;

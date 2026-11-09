@@ -3,11 +3,21 @@
 //! Performs B = alpha * op(A) * B (left) or B = alpha * B * op(A) (right)
 //! where A is a triangular matrix.
 //!
-//! For large matrices, uses optimized GEMM kernel by expanding the triangular
-//! matrix to a full matrix with zeros in the non-triangular part.
+//! The multiply is blocked and in place, and touches only the referenced
+//! triangle: diagonal blocks of A are packed (the unreferenced triangle is
+//! never read, nor the diagonal for `TrmmDiag::Unit`) and multiplied by
+//! register-tiled kernels, and off-diagonal blocks are applied with one
+//! in-place GEMM on views of A and B, ordered so that every block of B is
+//! read before it is overwritten. For an `m × n` B this performs the
+//! multiply-adds of a triangular product, about `m²·n/2` (Left, A of order
+//! `m`) or `m·n²/2` (Right, A of order `n`), half of a dense GEMM of the
+//! same shape, and allocates only the packed diagonal blocks and a small
+//! micro-panel buffer. The shared machinery lives in
+//! [`mod@crate::level3::trsm`] (private `tri_*` modules).
 
-use crate::level3::gemm::{GemmBlocking, gemm_with_blocking};
 use crate::level3::gemm_kernel::GemmKernel;
+use crate::level3::trsm::tri_driver::trmm_apply;
+use crate::level3::trsm::{Side, Trans, Uplo};
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatMut, MatRef};
@@ -145,6 +155,12 @@ pub fn trmm<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// For Left: A is m×m, B is m×n
 /// For Right: A is n×n, B is m×n
 ///
+/// Only the `uplo` triangle of A is read, and its diagonal only for
+/// `TrmmDiag::NonUnit`. `alpha == 0` sets B to zero without reading A or B.
+/// `alpha == 1` skips the scaling in the diagonal-block kernels; for complex
+/// types the off-diagonal GEMM updates still multiply by `1 + 0i`, which can
+/// turn an infinite component into NaN. Sequential.
+///
 /// # Arguments
 ///
 /// * `side` - Left or Right
@@ -190,7 +206,7 @@ pub fn trmm_in_place<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // Scale by alpha if needed
+    // Reference ?TRMM: alpha == 0 sets B := 0 without reading A or B.
     if alpha == T::zero() {
         for j in 0..n {
             for i in 0..m {
@@ -200,184 +216,39 @@ pub fn trmm_in_place<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // Use GEMM-based optimization for larger matrices
-    const GEMM_THRESHOLD: usize = 32;
-    let size = match side {
-        TrmmSide::Left => m,
-        TrmmSide::Right => n,
+    let side = match side {
+        TrmmSide::Left => Side::Left,
+        TrmmSide::Right => Side::Right,
     };
-
-    if size >= GEMM_THRESHOLD {
-        trmm_via_gemm(side, uplo, trans, diag, alpha, a, b, m, n, k_a)
-    } else {
-        match side {
-            TrmmSide::Left => trmm_left_naive(uplo, trans, diag, alpha, a, b, m, n),
-            TrmmSide::Right => trmm_right_naive(uplo, trans, diag, alpha, a, b, m, n),
-        }
-        Ok(())
-    }
-}
-
-/// GEMM-based TRMM optimization.
-/// Expands triangular matrix to full matrix and uses optimized GEMM.
-fn trmm_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
-    side: TrmmSide,
-    uplo: TrmmUplo,
-    trans: TrmmTrans,
-    diag: TrmmDiag,
-    alpha: T,
-    a: MatRef<'_, T>,
-    mut b: MatMut<'_, T>,
-    m: usize,
-    n: usize,
-    k_a: usize,
-) -> Result<(), TrmmError> {
-    // Get kernel shape for blocking parameter calculation
-    let shape = T::micro_kernel_shape();
-    let mr = shape.mr;
-    let nr = shape.nr;
-
-    // Use moderate blocking parameters optimized for triangular operations
-    // These are smaller than the default GEMM blocking to reduce overhead
-    // for the intermediate-sized matrices typical in TRMM
-    let elem_size = std::mem::size_of::<T>();
-    let (mc, kc) = if elem_size >= 8 {
-        // f64: smaller blocking to reduce overhead
-        (256, 128)
-    } else {
-        // f32: moderate blocking
-        (256, 256)
+    let uplo = match uplo {
+        TrmmUplo::Lower => Uplo::Lower,
+        TrmmUplo::Upper => Uplo::Upper,
     };
-
-    let blocking = GemmBlocking {
-        mc: (mc / mr) * mr,
-        kc,
-        nc: (2048 / nr) * nr,
+    let trans = match trans {
+        TrmmTrans::NoTrans => Trans::NoTrans,
+        TrmmTrans::Trans => Trans::Trans,
+        TrmmTrans::ConjTrans => Trans::ConjTrans,
     };
-
-    // Create expanded triangular matrix with zeros in non-triangular part
-    let mut a_full: Mat<T> = Mat::zeros(k_a, k_a);
-
-    let conj = matches!(trans, TrmmTrans::ConjTrans);
-
-    match uplo {
-        TrmmUplo::Lower => {
-            for j in 0..k_a {
-                for i in j..k_a {
-                    if i == j {
-                        // Diagonal element
-                        a_full[(i, j)] = if diag == TrmmDiag::Unit {
-                            T::one()
-                        } else if conj {
-                            a[(i, j)].conj()
-                        } else {
-                            a[(i, j)]
-                        };
-                    } else {
-                        a_full[(i, j)] = if conj { a[(i, j)].conj() } else { a[(i, j)] };
-                    }
-                }
-            }
-        }
-        TrmmUplo::Upper => {
-            for j in 0..k_a {
-                for i in 0..=j {
-                    if i == j {
-                        // Diagonal element
-                        a_full[(i, j)] = if diag == TrmmDiag::Unit {
-                            T::one()
-                        } else if conj {
-                            a[(i, j)].conj()
-                        } else {
-                            a[(i, j)]
-                        };
-                    } else {
-                        a_full[(i, j)] = if conj { a[(i, j)].conj() } else { a[(i, j)] };
-                    }
-                }
-            }
-        }
-    }
-
-    // Prepare A matrix based on transpose
-    let a_op: Mat<T> = match trans {
-        TrmmTrans::NoTrans => a_full,
-        TrmmTrans::Trans | TrmmTrans::ConjTrans => {
-            // Transpose the full matrix
-            let mut a_t: Mat<T> = Mat::zeros(k_a, k_a);
-            for i in 0..k_a {
-                for j in 0..k_a {
-                    a_t[(j, i)] = a_full[(i, j)];
-                }
-            }
-            a_t
-        }
-    };
-
-    match side {
-        TrmmSide::Left => {
-            // B = alpha * op(A) * B
-            // Create a copy of B to use as input
-            let mut b_copy: Mat<T> = Mat::zeros(m, n);
-            for j in 0..n {
-                for i in 0..m {
-                    b_copy[(i, j)] = b[(i, j)];
-                }
-            }
-
-            // Zero out B for GEMM
-            for j in 0..n {
-                for i in 0..m {
-                    b[(i, j)] = T::zero();
-                }
-            }
-
-            // Compute B = alpha * A * B_copy via GEMM with TRMM-optimized blocking
-            gemm_with_blocking(
-                alpha,
-                a_op.as_ref(),
-                b_copy.as_ref(),
-                T::zero(),
-                b.rb_mut(),
-                Par::Seq,
-                &blocking,
-            );
-        }
-        TrmmSide::Right => {
-            // B = alpha * B * op(A)
-            // Create a copy of B to use as input
-            let mut b_copy: Mat<T> = Mat::zeros(m, n);
-            for j in 0..n {
-                for i in 0..m {
-                    b_copy[(i, j)] = b[(i, j)];
-                }
-            }
-
-            // Zero out B for GEMM
-            for j in 0..n {
-                for i in 0..m {
-                    b[(i, j)] = T::zero();
-                }
-            }
-
-            // Compute B = alpha * B_copy * A via GEMM with TRMM-optimized blocking
-            gemm_with_blocking(
-                alpha,
-                b_copy.as_ref(),
-                a_op.as_ref(),
-                T::zero(),
-                b.rb_mut(),
-                Par::Seq,
-                &blocking,
-            );
-        }
-    }
-
+    trmm_apply(
+        side,
+        uplo,
+        trans,
+        diag == TrmmDiag::Unit,
+        alpha,
+        a,
+        b,
+        Par::Seq,
+    );
     Ok(())
 }
 
+// =============================================================================
+// Previous (textbook) implementation, kept as a test oracle.
+// =============================================================================
+
 /// Left multiply: B = alpha * op(A) * B where A is m×m (naive implementation)
-fn trmm_left_naive<T: Field>(
+#[cfg(test)]
+pub(crate) fn trmm_left_naive<T: Field>(
     uplo: TrmmUplo,
     trans: TrmmTrans,
     diag: TrmmDiag,
@@ -474,7 +345,8 @@ fn trmm_left_naive<T: Field>(
 }
 
 /// Right multiply: B = alpha * B * op(A) where A is n×n (naive implementation)
-fn trmm_right_naive<T: Field>(
+#[cfg(test)]
+pub(crate) fn trmm_right_naive<T: Field>(
     uplo: TrmmUplo,
     trans: TrmmTrans,
     diag: TrmmDiag,

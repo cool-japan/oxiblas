@@ -9,6 +9,13 @@ use num_complex::{Complex32, Complex64};
 use num_traits::{One, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Real, Scalar};
 
+/// Shortest vector handed to the NEON kernel on aarch64. Below it the dlassq
+/// loop is cheaper than the kernel's setup and lane reductions (on an Apple M3
+/// the kernel was up to 2.2x slower at n = 2..4 and faster from n = 8), so short
+/// vectors keep the previous code and results.
+#[cfg(target_arch = "aarch64")]
+const BLUE_MIN_LEN: usize = 8;
+
 /// Computes the Euclidean (L2) norm of a vector.
 ///
 /// ||x||_2 = sqrt(Σ |x\[i\]|^2)
@@ -27,6 +34,11 @@ use oxiblas_core::scalar::{ComplexScalar, Real, Scalar};
 /// // ||[3,4]||_2 = sqrt(9 + 16) = 5
 /// assert!((norm - 5.0).abs() < 1e-10);
 /// ```
+///
+/// On aarch64, `f64` and `f32` vectors of at least eight elements use the
+/// one-pass NEON kernel of [`nrm2_f64`] / [`nrm2_f32`] (LAPACK 3.12 `dnrm2.f90`
+/// algorithm) unless the `force-scalar` feature is enabled; shorter vectors and
+/// other types use the loop below.
 pub fn nrm2<T: Real>(x: &[T]) -> T {
     let n = x.len();
     if n == 0 {
@@ -36,6 +48,21 @@ pub fn nrm2<T: Real>(x: &[T]) -> T {
     if n == 1 {
         // `abs` propagates NaN and maps ±Inf to +Inf, matching reference BLAS.
         return Scalar::abs(x[0]);
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    if n >= BLUE_MIN_LEN {
+        use super::typed::{same_slice, same_value};
+        if let Some(xs) = same_slice::<T, f64>(x)
+            && let Some(r) = same_value::<f64, T>(super::nrm2_blue::nrm2_f64(xs))
+        {
+            return r;
+        }
+        if let Some(xs) = same_slice::<T, f32>(x)
+            && let Some(r) = same_value::<f32, T>(super::nrm2_blue::nrm2_f32(xs))
+        {
+            return r;
+        }
     }
 
     // dlassq-style scaled sum of squares (a single accumulator, not the three-bin
@@ -120,7 +147,29 @@ pub(crate) fn nrm2_finalize<T: Real>(state: (T, T)) -> T {
 /// // sqrt(9 + 16 + 144) = 13
 /// assert!((cnrm2(&x) - 13.0).abs() < 1e-12);
 /// ```
+///
+/// On aarch64, `Complex64` / `Complex32` vectors are evaluated as their `2n`
+/// interleaved components through [`nrm2`] (unless the `force-scalar` feature
+/// is enabled), so `cnrm2(x)` still equals `nrm2` of the component vector bit
+/// for bit.
 pub fn cnrm2<T: ComplexScalar>(x: &[T]) -> T::Real {
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use super::typed::{same_slice, same_value};
+        if let Some(z) = same_slice::<T, Complex64>(x)
+            && let Ok(components) = bytemuck::try_cast_slice::<Complex64, f64>(z)
+            && let Some(r) = same_value::<f64, T::Real>(nrm2(components))
+        {
+            return r;
+        }
+        if let Some(z) = same_slice::<T, Complex32>(x)
+            && let Ok(components) = bytemuck::try_cast_slice::<Complex32, f32>(z)
+            && let Some(r) = same_value::<f32, T::Real>(nrm2(components))
+        {
+            return r;
+        }
+    }
+
     let mut state = (T::Real::zero(), T::Real::one());
     for &z in x {
         state = nrm2_fold(nrm2_fold(state, z.real()), z.imag());
@@ -201,8 +250,13 @@ pub fn nrm2_sq<T: Real>(x: &[T]) -> T {
 
 /// SIMD-optimized L2 norm for f64.
 ///
-/// Uses NEON FMA on aarch64 and AVX2/FMA on `x86_64` for performance,
-/// with safe overflow/underflow handling.
+/// On aarch64 this is the one-pass NEON implementation of the LAPACK 3.12
+/// `dnrm2.f90` algorithm (Blue's three accumulators, no division per element)
+/// from eight elements on. On `x86_64` with AVX2/FMA it is a two-pass
+/// max-then-scaled-sum kernel; elsewhere (and for short vectors on both)
+/// a dlassq-style scaled sum of squares. All variants are overflow/underflow
+/// safe, return NaN when any element is NaN and `+Inf` when an element is
+/// infinite.
 #[inline]
 #[must_use]
 pub fn nrm2_f64(x: &[f64]) -> f64 {
@@ -214,32 +268,39 @@ pub fn nrm2_f64(x: &[f64]) -> f64 {
         return x[0].abs();
     }
 
-    // For small vectors, use simple implementation
-    if n < 64 {
-        return nrm2_f64_scaled(x);
-    }
-
-    // For larger vectors, use SIMD with overflow protection
     #[cfg(target_arch = "aarch64")]
     {
-        return nrm2_f64_simd_safe(x);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { nrm2_f64_avx2_safe(x) };
+        if n < BLUE_MIN_LEN {
+            nrm2_f64_scaled(x)
+        } else {
+            super::nrm2_blue::nrm2_f64(x)
         }
     }
 
-    #[allow(unreachable_code)]
-    nrm2_f64_scaled(x)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // For small vectors, use simple implementation
+        if n < 64 {
+            return nrm2_f64_scaled(x);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]`.
+                return unsafe { nrm2_f64_avx2_safe(x) };
+            }
+        }
+
+        nrm2_f64_scaled(x)
+    }
 }
 
 /// SIMD-optimized L2 norm for f32.
 ///
-/// Uses NEON FMA on aarch64 and AVX2/FMA on `x86_64` for performance,
-/// with safe overflow/underflow handling.
+/// The f32 counterpart of [`nrm2_f64`] (LAPACK 3.12 `snrm2.f90` algorithm on
+/// aarch64).
 #[inline]
 #[must_use]
 pub fn nrm2_f32(x: &[f32]) -> f32 {
@@ -251,26 +312,33 @@ pub fn nrm2_f32(x: &[f32]) -> f32 {
         return x[0].abs();
     }
 
-    // For small vectors, use simple implementation
-    if n < 64 {
-        return nrm2_f32_scaled(x);
-    }
-
-    // For larger vectors, use SIMD with overflow protection
     #[cfg(target_arch = "aarch64")]
     {
-        return nrm2_f32_simd_safe(x);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { nrm2_f32_avx2_safe(x) };
+        if n < BLUE_MIN_LEN {
+            nrm2_f32_scaled(x)
+        } else {
+            super::nrm2_blue::nrm2_f32(x)
         }
     }
 
-    #[allow(unreachable_code)]
-    nrm2_f32_scaled(x)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // For small vectors, use simple implementation
+        if n < 64 {
+            return nrm2_f32_scaled(x);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]`.
+                return unsafe { nrm2_f32_avx2_safe(x) };
+            }
+        }
+
+        nrm2_f32_scaled(x)
+    }
 }
 
 /// Scaled nrm2 for f64 (small-vector fallback): a dlassq-style scaled sum of
@@ -310,7 +378,7 @@ fn nrm2_f32_scaled(x: &[f32]) -> f32 {
 /// — a distinct, wrong outcome. Resolve the exceptional case directly, matching
 /// IEEE / reference DNRM2: any NaN input yields NaN; otherwise an infinity is
 /// present and the Euclidean norm is `+Inf`.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn nrm2_nonfinite_f64(x: &[f64]) -> f64 {
     if x.iter().any(|v| v.is_nan()) {
@@ -321,7 +389,7 @@ fn nrm2_nonfinite_f64(x: &[f64]) -> f64 {
 }
 
 /// f32 counterpart of [`nrm2_nonfinite_f64`]; see that function for rationale.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn nrm2_nonfinite_f32(x: &[f32]) -> f32 {
     if x.iter().any(|v| v.is_nan()) {
@@ -329,277 +397,6 @@ fn nrm2_nonfinite_f32(x: &[f32]) -> f32 {
     } else {
         f32::INFINITY
     }
-}
-
-/// NEON SIMD nrm2 for f64 with overflow protection.
-///
-/// Uses a three-phase approach to handle values across the full floating-point range:
-/// 1. Detect the range of input values
-/// 2. Scale appropriately to avoid overflow/underflow
-/// 3. Compute sum of squares using SIMD
-#[cfg(target_arch = "aarch64")]
-fn nrm2_f64_simd_safe(x: &[f64]) -> f64 {
-    use core::arch::aarch64::{
-        float64x2_t, uint64x2_t, vaddq_f64, vaddvq_f64, vandq_u64, vdupq_n_f64, vdupq_n_u64,
-        vfmaq_f64, vld1q_f64, vmaxq_f64, vmaxvq_f64, vmulq_f64,
-    };
-
-    let n = x.len();
-
-    // First pass: find maximum absolute value for scaling
-    let max_val: f64;
-    unsafe {
-        let mut max_vec = vdupq_n_f64(0.0);
-        let abs_mask = vdupq_n_u64(0x7FFF_FFFF_FFFF_FFFF); // Mask to clear sign bit
-
-        let chunks = n / 8;
-        let remainder = n % 8;
-
-        for i in 0..chunks {
-            let base = i * 8;
-            let ptr = x.as_ptr().add(base);
-
-            let x0 = vld1q_f64(ptr);
-            let x1 = vld1q_f64(ptr.add(2));
-            let x2 = vld1q_f64(ptr.add(4));
-            let x3 = vld1q_f64(ptr.add(6));
-
-            // Absolute value via bit masking
-            let abs0: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
-                core::mem::transmute::<float64x2_t, uint64x2_t>(x0),
-                abs_mask,
-            ));
-            let abs1: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
-                core::mem::transmute::<float64x2_t, uint64x2_t>(x1),
-                abs_mask,
-            ));
-            let abs2: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
-                core::mem::transmute::<float64x2_t, uint64x2_t>(x2),
-                abs_mask,
-            ));
-            let abs3: float64x2_t = core::mem::transmute::<uint64x2_t, float64x2_t>(vandq_u64(
-                core::mem::transmute::<float64x2_t, uint64x2_t>(x3),
-                abs_mask,
-            ));
-
-            max_vec = vmaxq_f64(max_vec, abs0);
-            max_vec = vmaxq_f64(max_vec, abs1);
-            max_vec = vmaxq_f64(max_vec, abs2);
-            max_vec = vmaxq_f64(max_vec, abs3);
-        }
-
-        // Reduce max_vec to scalar
-        let mut max_val_local = vmaxvq_f64(max_vec);
-
-        // Handle remainder
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let abs_xi = x[base + i].abs();
-            if abs_xi > max_val_local {
-                max_val_local = abs_xi;
-            }
-        }
-
-        max_val = max_val_local;
-    }
-
-    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
-    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
-    if !max_val.is_finite() {
-        return nrm2_nonfinite_f64(x);
-    }
-
-    if max_val == 0.0 {
-        return 0.0;
-    }
-
-    // Compute scale factor (use reciprocal for better numerical stability)
-    let scale = 1.0 / max_val;
-
-    // Second pass: compute sum of squares with scaling
-    let sum: f64;
-    unsafe {
-        let scale_vec = vdupq_n_f64(scale);
-        let mut sum_vec0 = vdupq_n_f64(0.0);
-        let mut sum_vec1 = vdupq_n_f64(0.0);
-        let mut sum_vec2 = vdupq_n_f64(0.0);
-        let mut sum_vec3 = vdupq_n_f64(0.0);
-
-        let chunks = n / 8;
-        let remainder = n % 8;
-
-        for i in 0..chunks {
-            let base = i * 8;
-            let ptr = x.as_ptr().add(base);
-
-            let x0 = vld1q_f64(ptr);
-            let x1 = vld1q_f64(ptr.add(2));
-            let x2 = vld1q_f64(ptr.add(4));
-            let x3 = vld1q_f64(ptr.add(6));
-
-            // Scale values
-            let s0 = vmulq_f64(x0, scale_vec);
-            let s1 = vmulq_f64(x1, scale_vec);
-            let s2 = vmulq_f64(x2, scale_vec);
-            let s3 = vmulq_f64(x3, scale_vec);
-
-            // Accumulate squared scaled values using FMA
-            sum_vec0 = vfmaq_f64(sum_vec0, s0, s0);
-            sum_vec1 = vfmaq_f64(sum_vec1, s1, s1);
-            sum_vec2 = vfmaq_f64(sum_vec2, s2, s2);
-            sum_vec3 = vfmaq_f64(sum_vec3, s3, s3);
-        }
-
-        // Combine accumulators
-        let sum_01 = vaddq_f64(sum_vec0, sum_vec1);
-        let sum_23 = vaddq_f64(sum_vec2, sum_vec3);
-        let sum_all = vaddq_f64(sum_01, sum_23);
-        let mut sum_local = vaddvq_f64(sum_all);
-
-        // Handle remainder
-        let base = chunks * 8;
-        for i in 0..remainder {
-            let scaled = x[base + i] * scale;
-            sum_local += scaled * scaled;
-        }
-
-        sum = sum_local;
-    }
-
-    max_val * sum.sqrt()
-}
-
-/// NEON SIMD nrm2 for f32 with overflow protection.
-#[cfg(target_arch = "aarch64")]
-fn nrm2_f32_simd_safe(x: &[f32]) -> f32 {
-    use core::arch::aarch64::{
-        float32x4_t, uint32x4_t, vaddq_f32, vaddvq_f32, vandq_u32, vdupq_n_f32, vdupq_n_u32,
-        vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32,
-    };
-
-    let n = x.len();
-
-    // First pass: find maximum absolute value for scaling
-    let max_val: f32;
-    unsafe {
-        let mut max_vec = vdupq_n_f32(0.0);
-        let abs_mask = vdupq_n_u32(0x7FFF_FFFF); // Mask to clear sign bit
-
-        let chunks = n / 16;
-        let remainder = n % 16;
-
-        for i in 0..chunks {
-            let base = i * 16;
-            let ptr = x.as_ptr().add(base);
-
-            let x0 = vld1q_f32(ptr);
-            let x1 = vld1q_f32(ptr.add(4));
-            let x2 = vld1q_f32(ptr.add(8));
-            let x3 = vld1q_f32(ptr.add(12));
-
-            // Absolute value via bit masking
-            let abs0: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
-                core::mem::transmute::<float32x4_t, uint32x4_t>(x0),
-                abs_mask,
-            ));
-            let abs1: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
-                core::mem::transmute::<float32x4_t, uint32x4_t>(x1),
-                abs_mask,
-            ));
-            let abs2: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
-                core::mem::transmute::<float32x4_t, uint32x4_t>(x2),
-                abs_mask,
-            ));
-            let abs3: float32x4_t = core::mem::transmute::<uint32x4_t, float32x4_t>(vandq_u32(
-                core::mem::transmute::<float32x4_t, uint32x4_t>(x3),
-                abs_mask,
-            ));
-
-            max_vec = vmaxq_f32(max_vec, abs0);
-            max_vec = vmaxq_f32(max_vec, abs1);
-            max_vec = vmaxq_f32(max_vec, abs2);
-            max_vec = vmaxq_f32(max_vec, abs3);
-        }
-
-        // Reduce max_vec to scalar
-        let mut max_val_local = vmaxvq_f32(max_vec);
-
-        // Handle remainder
-        let base = chunks * 16;
-        for i in 0..remainder {
-            let abs_xi = x[base + i].abs();
-            if abs_xi > max_val_local {
-                max_val_local = abs_xi;
-            }
-        }
-
-        max_val = max_val_local;
-    }
-
-    // Scaling by `1/max_val` cannot represent a non-finite maximum: `1/Inf == 0`
-    // turns `Inf·0` into NaN in the second pass. Resolve Inf/NaN inputs exactly.
-    if !max_val.is_finite() {
-        return nrm2_nonfinite_f32(x);
-    }
-
-    if max_val == 0.0 {
-        return 0.0;
-    }
-
-    // Compute scale factor
-    let scale = 1.0 / max_val;
-
-    // Second pass: compute sum of squares with scaling
-    let sum: f32;
-    unsafe {
-        let scale_vec = vdupq_n_f32(scale);
-        let mut sum_vec0 = vdupq_n_f32(0.0);
-        let mut sum_vec1 = vdupq_n_f32(0.0);
-        let mut sum_vec2 = vdupq_n_f32(0.0);
-        let mut sum_vec3 = vdupq_n_f32(0.0);
-
-        let chunks = n / 16;
-        let remainder = n % 16;
-
-        for i in 0..chunks {
-            let base = i * 16;
-            let ptr = x.as_ptr().add(base);
-
-            let x0 = vld1q_f32(ptr);
-            let x1 = vld1q_f32(ptr.add(4));
-            let x2 = vld1q_f32(ptr.add(8));
-            let x3 = vld1q_f32(ptr.add(12));
-
-            // Scale values
-            let s0 = vmulq_f32(x0, scale_vec);
-            let s1 = vmulq_f32(x1, scale_vec);
-            let s2 = vmulq_f32(x2, scale_vec);
-            let s3 = vmulq_f32(x3, scale_vec);
-
-            // Accumulate squared scaled values using FMA
-            sum_vec0 = vfmaq_f32(sum_vec0, s0, s0);
-            sum_vec1 = vfmaq_f32(sum_vec1, s1, s1);
-            sum_vec2 = vfmaq_f32(sum_vec2, s2, s2);
-            sum_vec3 = vfmaq_f32(sum_vec3, s3, s3);
-        }
-
-        // Combine accumulators
-        let sum_01 = vaddq_f32(sum_vec0, sum_vec1);
-        let sum_23 = vaddq_f32(sum_vec2, sum_vec3);
-        let sum_all = vaddq_f32(sum_01, sum_23);
-        let mut sum_local = vaddvq_f32(sum_all);
-
-        // Handle remainder
-        let base = chunks * 16;
-        for i in 0..remainder {
-            let scaled = x[base + i] * scale;
-            sum_local += scaled * scaled;
-        }
-
-        sum = sum_local;
-    }
-
-    max_val * sum.sqrt()
 }
 
 /// AVX2/FMA SIMD nrm2 for f64 with overflow protection.
@@ -662,6 +459,11 @@ unsafe fn nrm2_f64_avx2_safe(x: &[f64]) -> f64 {
     }
 
     let scale = 1.0 / max_val;
+    // `1/max_val` overflows to `+Inf` for `max_val < 2^-1024` (deep
+    // subnormals): take the scaled scalar path instead.
+    if !scale.is_finite() {
+        return nrm2_f64_scaled(x);
+    }
     let scale_vec = _mm256_set1_pd(scale);
 
     // Second pass: sum of squares with scaling
@@ -772,6 +574,11 @@ unsafe fn nrm2_f32_avx2_safe(x: &[f32]) -> f32 {
     }
 
     let scale = 1.0 / max_val;
+    // `1/max_val` overflows to `+Inf` for `max_val < 2^-128` (deep
+    // subnormals): take the scaled scalar path instead.
+    if !scale.is_finite() {
+        return nrm2_f32_scaled(x);
+    }
     let scale_vec = _mm256_set1_ps(scale);
 
     // Second pass: sum of squares with scaling
@@ -1406,3 +1213,7 @@ mod tests {
         assert!(cnrm2(&long).is_nan());
     }
 }
+
+#[cfg(test)]
+#[path = "nrm2_tests.rs"]
+mod subnormal_scale_tests;

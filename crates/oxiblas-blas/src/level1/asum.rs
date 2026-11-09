@@ -68,7 +68,7 @@ pub fn asum<T: Real>(x: &[T]) -> T {
 ///
 /// This is the comparison/summation metric used by the complex Level-1 BLAS
 /// routines `SCASUM`/`DZASUM` (sum, see [`casum`]) and `ICAMAX`/`IZAMAX`
-/// (max-index search, see [`crate::level1::iamax`] and
+/// (max-index search, see [`crate::level1::iamax()`] and
 /// [`crate::level1::iamax_strided`]). It is **not** the complex modulus
 /// `sqrt(re^2 + im^2)`; reference BLAS deliberately uses the cheaper L1-style
 /// metric, so callers implementing reference `I?AMAX` semantics need exactly

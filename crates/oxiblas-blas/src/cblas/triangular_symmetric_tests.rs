@@ -566,6 +566,120 @@ fn test_issue_7_row_major_trmm_trsm_non_square_sweep_f32() {
     sweep_tri::<f32>(cblas_strmm, cblas_strsm, 1e-4);
 }
 
+/// Orders above the 128-row diagonal blocks of the native TRSM/TRMM, both
+/// layouts (a RowMajor call is the ColMajor problem on the transposed data
+/// with `side`/`uplo` flipped), and `alpha == 1` (the scaling pass is
+/// skipped) next to other values.
+fn sweep_tri_blocked<T: TestReal>(trmm: TriFn<T>, trsm: TriFn<T>, tol: f64) {
+    let transes = [
+        CblasTranspose::NoTrans,
+        CblasTranspose::Trans,
+        CblasTranspose::ConjTrans,
+    ];
+    for layout in [CblasLayout::RowMajor, CblasLayout::ColMajor] {
+        for side in [CblasSide::Left, CblasSide::Right] {
+            for uplo in [CblasUplo::Upper, CblasUplo::Lower] {
+                for trans in transes {
+                    for diag in [CblasDiag::NonUnit, CblasDiag::Unit] {
+                        for (m, n, alpha) in [(130, 5, 1.0), (5, 133, -2.5), (70, 66, 0.5)] {
+                            let case = TriCase {
+                                layout,
+                                side,
+                                uplo,
+                                trans,
+                                diag,
+                                m,
+                                n,
+                                alpha,
+                            };
+                            check_tri_case(trmm, false, case, tol);
+                            check_tri_case(trsm, true, case, tol);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cblas_trmm_trsm_blocked_orders_both_layouts_f64() {
+    sweep_tri_blocked::<f64>(cblas_dtrmm, cblas_dtrsm, 1e-9);
+}
+
+#[test]
+fn test_cblas_trmm_trsm_blocked_orders_both_layouts_f32() {
+    sweep_tri_blocked::<f32>(cblas_strmm, cblas_strsm, 2e-3);
+}
+
+/// RowMajor on the transposed data gives the ColMajor result (both layouts
+/// describe the same logical problem), for orders spanning several blocks.
+#[test]
+fn test_cblas_dtrsm_row_major_matches_col_major_on_transposed_data() {
+    let (m, n) = (130usize, 75usize);
+    for side in [CblasSide::Left, CblasSide::Right] {
+        for uplo in [CblasUplo::Upper, CblasUplo::Lower] {
+            for trans in [CblasTranspose::NoTrans, CblasTranspose::Trans] {
+                let k = if side == CblasSide::Left { m } else { n };
+                let (lda, ldb_c, ldb_r) = (k + 1, m + 2, n + 3);
+                let a_c = store_matrix::<f64>(CblasLayout::ColMajor, k, k, lda, |i, j| {
+                    stored_tri(uplo, CblasDiag::NonUnit, i, j)
+                });
+                let a_r = store_matrix::<f64>(CblasLayout::RowMajor, k, k, lda, |i, j| {
+                    stored_tri(uplo, CblasDiag::NonUnit, i, j)
+                });
+                let bv = |i: usize, j: usize| ((5 * i + 3 * j) % 13) as f64 * 0.25 - 1.0;
+                let mut b_c = store_matrix::<f64>(CblasLayout::ColMajor, m, n, ldb_c, bv);
+                let mut b_r = store_matrix::<f64>(CblasLayout::RowMajor, m, n, ldb_r, bv);
+                // SAFETY: every buffer holds `ld * cols` (ColMajor) or
+                // `ld * rows` (RowMajor) elements with `ld` above the minimum.
+                unsafe {
+                    cblas_dtrsm(
+                        CblasLayout::ColMajor,
+                        side,
+                        uplo,
+                        trans,
+                        CblasDiag::NonUnit,
+                        m as i32,
+                        n as i32,
+                        1.0,
+                        a_c.as_ptr(),
+                        lda as i32,
+                        b_c.as_mut_ptr(),
+                        ldb_c as i32,
+                    );
+                    cblas_dtrsm(
+                        CblasLayout::RowMajor,
+                        side,
+                        uplo,
+                        trans,
+                        CblasDiag::NonUnit,
+                        m as i32,
+                        n as i32,
+                        1.0,
+                        a_r.as_ptr(),
+                        lda as i32,
+                        b_r.as_mut_ptr(),
+                        ldb_r as i32,
+                    );
+                }
+                for j in 0..n {
+                    for i in 0..m {
+                        let c = b_c[slot(CblasLayout::ColMajor, i, j, ldb_c)];
+                        let r = b_r[slot(CblasLayout::RowMajor, i, j, ldb_r)];
+                        assert!(
+                            (c - r).abs() <= 1e-12 * (1.0 + c.abs()),
+                            "{side:?}/{uplo:?}/{trans:?}: ({i},{j}) col-major {c} vs row-major {r}"
+                        );
+                    }
+                }
+                assert_padding_untouched("col-major B", CblasLayout::ColMajor, &b_c, m, n, ldb_c);
+                assert_padding_untouched("row-major B", CblasLayout::RowMajor, &b_r, m, n, ldb_r);
+            }
+        }
+    }
+}
+
 /// Reporter's repro shape: RowMajor Left/Upper/NoTrans/NonUnit, m=2, n=3,
 /// alpha=1, A=[[2,3],[5,4]] (the 5 is not referenced), lda=2, ldb=3.
 fn run_reporter_case<T: TestReal>(func: TriFn<T>, b_in: [f64; 6]) -> [f64; 6] {
@@ -762,7 +876,7 @@ const UPLOS: [CblasUplo; 2] = [CblasUplo::Upper, CblasUplo::Lower];
 
 /// Alternating NaN / Inf so both kinds of non-finite poison are exercised.
 fn poison(i: usize, j: usize) -> f64 {
-    if (i + j) % 2 == 0 {
+    if (i + j).is_multiple_of(2) {
         f64::NAN
     } else {
         f64::INFINITY
@@ -1008,8 +1122,12 @@ fn test_issue_9_cblas_ssymm_alpha_beta_zero_semantics() {
     check_symm_scalars::<f32>(cblas_ssymm, 1e-4);
 }
 
-/// SYRK / SYR2K alpha / beta / k scenarios. (40, 24) crosses the native GEMM
-/// threshold (n >= 32 and k >= 8); (5, 0) is the k == 0 case (C := beta * C).
+/// SYRK / SYR2K alpha / beta / k scenarios through the native `level3::syrk`
+/// / `level3::syr2k`. With a non-zero alpha, (40, 24) takes their blocked
+/// triangle-only kernel for every `trans` and beta, and (4, 3) their reference
+/// loops: the real-type rules of `use_blocked` in `level3/syrk.rs` and
+/// `level3/syr2k.rs` all hold from n >= 16 with k >= 16, and none below n = 6.
+/// (5, 0) is the k == 0 case (C := beta * C).
 fn check_rank_k_scalars<T: TestReal>(syrk: SyrkFn<T>, syr2k: Syr2kFn<T>, tol: f64) {
     let a_f = |i: usize, j: usize| 0.5 * ((2 * i + 3 * j) % 7) as f64 - 1.0;
     let b_f = |i: usize, j: usize| 0.25 * ((i + 5 * j) % 6) as f64 - 0.5;

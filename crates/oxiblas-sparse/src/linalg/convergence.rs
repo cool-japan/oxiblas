@@ -452,15 +452,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + PartialOrd> ConvergenceMonitor
 
     /// Checks if the solver has diverged.
     fn check_divergence(&self) -> bool {
-        if self.residual_history.len() < 2 {
+        // Needs at least two residuals: the initial one and the current one.
+        let [initial, .., current] = self.residual_history.as_slice() else {
             return false;
-        }
-
-        let initial = &self.residual_history[0];
-        let current = self
-            .residual_history
-            .last()
-            .expect("collection should be non-empty");
+        };
 
         if Scalar::abs(initial.clone()) > <T as Scalar>::epsilon() {
             Scalar::abs(current.clone()) / Scalar::abs(initial.clone())
@@ -472,15 +467,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + PartialOrd> ConvergenceMonitor
 
     /// Checks if the solver is stagnating.
     fn check_stagnation(&self) -> bool {
-        if self.residual_history.len() < 2 {
+        // Needs at least two residuals: the previous one and the current one.
+        let [.., prev, curr] = self.residual_history.as_slice() else {
             return false;
-        }
-
-        let prev = &self.residual_history[self.residual_history.len() - 2];
-        let curr = self
-            .residual_history
-            .last()
-            .expect("collection should be non-empty");
+        };
 
         if Scalar::abs(prev.clone()) > <T as Scalar>::epsilon() {
             let relative_change =

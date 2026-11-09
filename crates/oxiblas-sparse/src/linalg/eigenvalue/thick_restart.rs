@@ -1153,8 +1153,8 @@ fn vec_scale(v: &mut [f64], s: f64) {
 }
 
 /// Compute Givens rotation parameters (c, s, r) such that:
-/// [c  s] [a]   [r]
-/// [-s c] [b] = [0]
+/// \[c  s\] \[a\]   \[r\]
+/// \[-s c\] \[b\] = \[0\]
 #[inline]
 fn givens(a: f64, b: f64) -> (f64, f64, f64) {
     if b.abs() < f64::EPSILON {

@@ -714,11 +714,10 @@ fn pade_approximant<T: Field + Real + bytemuck::Zeroable>(a: &Mat<T>, order: usi
         }
     }
     a_powers.push(a_k.clone());
-    for _ in 2..=order {
-        let next = mat_mult(
-            a_powers.last().expect("collection should be non-empty"),
-            &a_powers[1],
-        );
+    for k in 2..=order {
+        // `a_powers` holds exactly `[I, A, ..., A^(k-1)]` here, so
+        // `a_powers[k - 1]` is the latest power: A^k = A^(k-1) * A.
+        let next = mat_mult(&a_powers[k - 1], &a_powers[1]);
         a_powers.push(next);
     }
     let mut num = Mat::zeros(n, n);

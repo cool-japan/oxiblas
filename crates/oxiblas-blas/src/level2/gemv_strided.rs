@@ -5,7 +5,7 @@
 //! is unrelated). This module restores that contract on top of the crate's
 //! [`MatRef`] matrix view by accepting [`StridedSlice`] / [`StridedSliceMut`]
 //! for the vectors. A unit-stride call is forwarded to the optimised
-//! contiguous [`gemv`](super::gemv) so the fast path is unchanged; otherwise a
+//! contiguous [`gemv`](super::gemv()) so the fast path is unchanged; otherwise a
 //! straightforward strided kernel is used.
 //!
 //! Negative and zero increments follow the same reference convention as the

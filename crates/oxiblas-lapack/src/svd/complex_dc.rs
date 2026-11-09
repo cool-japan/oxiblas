@@ -8,11 +8,16 @@
 //! The key insight is that complex bidiagonalization A = U · B · V^H produces
 //! a REAL bidiagonal matrix B, allowing us to reuse the real D&C algorithm.
 //!
-//! Complexity: O(n²) for the bidiagonal SVD, O(mn²) or O(m²n) for bidiagonalization.
+//! Complexity: O(mn²) for the bidiagonalization and the assembly of `U` and
+//! `Vᴴ`, and O(n³) (GEMM merges, usually much less after deflation) for the
+//! divide-and-conquer SVD of the real bidiagonal (see
+//! [`crate::svd::bidiag_dc`]).
 
 use num_traits::{One, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
+
+use super::dc_kernels::{mul_pow2, pow2_exponent, scale_pow2};
 
 /// Error type for complex divide-and-conquer SVD computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +83,20 @@ where
     /// assert!((sigma[0] - 4.0).abs() < 1e-10);
     /// assert!((sigma[1] - 3.0).abs() < 1e-10);
     /// ```
+    ///
+    /// The matrix is first scaled by a power of two (exactly) so that the
+    /// largest real or imaginary part of its entries is about one, which makes
+    /// the result independent of the magnitude of `a`; the singular values are
+    /// unscaled at the end.
+    ///
+    /// # Errors
+    ///
+    /// - [`ComplexSvdDcError::EmptyMatrix`] if `a` has no rows or no columns.
+    /// - [`ComplexSvdDcError::NotConverged`] if an entry of `a` has a NaN or
+    ///   infinite component (nothing is computed), or if the bidiagonal QR
+    ///   iteration exhausts its iteration budget.
+    /// - [`ComplexSvdDcError::SecularEquationFailed`] if a merge of the
+    ///   divide and conquer produces a non-finite singular value or vector.
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, ComplexSvdDcError> {
         let m = a.nrows();
         let n = a.ncols();
@@ -85,6 +104,42 @@ where
         if m == 0 || n == 0 {
             return Err(ComplexSvdDcError::EmptyMatrix);
         }
+
+        // Largest component magnitude (unlike the modulus it cannot overflow
+        // for finite entries); a NaN or infinite component has no finite SVD.
+        let mut anrm = T::Real::zero();
+        for j in 0..n {
+            for i in 0..m {
+                let x = a[(i, j)];
+                let (re, im) = (x.real(), x.imag());
+                if !(num_traits::Float::is_finite(re) && num_traits::Float::is_finite(im)) {
+                    return Err(ComplexSvdDcError::NotConverged);
+                }
+                anrm = num_traits::Float::max(anrm, num_traits::Float::abs(re));
+                anrm = num_traits::Float::max(anrm, num_traits::Float::abs(im));
+            }
+        }
+        let ks = pow2_exponent(anrm);
+        if ks != 0 {
+            let mut scaled: Mat<T> = Mat::zeros(m, n);
+            for j in 0..n {
+                for i in 0..m {
+                    let x = a[(i, j)];
+                    scaled[(i, j)] =
+                        T::from_real_imag(mul_pow2(x.real(), ks), mul_pow2(x.imag(), ks));
+                }
+            }
+            let mut svd = Self::compute_scaled(scaled.as_ref())?;
+            scale_pow2(&mut svd.sigma, -ks);
+            return Ok(svd);
+        }
+        Self::compute_scaled(a)
+    }
+
+    /// [`Self::compute`] for an input already scaled to entries of size one.
+    fn compute_scaled(a: MatRef<'_, T>) -> Result<Self, ComplexSvdDcError> {
+        let m = a.nrows();
+        let n = a.ncols();
 
         // Handle 1x1 case
         if m == 1 && n == 1 {
@@ -1061,12 +1116,11 @@ mod tests {
             println!();
         }
 
-        // Note: The divide-and-conquer algorithm has lower precision than Jacobi due to
-        // the secular equation solving and QR iteration. Relative error of ~0.5% is acceptable.
+        // Backward stable: the reconstruction is exact to a few ulps of ‖A‖.
         for i in 0..3 {
             for j in 0..3 {
                 let diff = (reconstructed[(i, j)] - a[(i, j)]).norm();
-                assert!(diff < 1e-2, "reconstructed[{},{}] diff = {}", i, j, diff);
+                assert!(diff < 1e-13, "reconstructed[{},{}] diff = {}", i, j, diff);
             }
         }
     }
@@ -1299,9 +1353,9 @@ mod tests {
     fn test_complex_svd_dc_across_sizes() {
         use crate::svd::ComplexSvd;
 
-        // Sizes straddle the DIRECT_THRESHOLD (25): 5, 25 use the direct shifted
-        // QR path; 26, 50, 100, 200 exercise the divide-and-conquer secular
-        // merge with deflation on the real bidiagonal matrix.
+        // Sizes straddle SMLSIZ (25): 5, 25 use the bidiagonal QR iteration;
+        // 26, 50, 100, 200 exercise the divide-and-conquer merges with
+        // deflation on the real bidiagonal matrix.
         for &n in &[5usize, 25, 26, 50, 100, 200] {
             let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ (n as u64);
             let mut a: Mat<Complex64> = Mat::zeros(n, n);
@@ -1314,6 +1368,7 @@ mod tests {
             let dc = ComplexSvdDc::compute(a.as_ref()).unwrap();
             let s_dc = dc.singular_values();
             let smax = s_dc[0].max(1.0);
+            let tol = 16.0 * n as f64 * f64::EPSILON;
 
             // Unitarity: UᴴU = I and VᴴV = I.
             let u = dc.u();
@@ -1328,11 +1383,11 @@ mod tests {
                     }
                     let expect = if i == j { 1.0 } else { 0.0 };
                     assert!(
-                        (uhu.re - expect).abs() < 1e-6 && uhu.im.abs() < 1e-6,
+                        (uhu.re - expect).abs() < tol && uhu.im.abs() < tol,
                         "n={n}: UhU[{i},{j}]={uhu}"
                     );
                     assert!(
-                        (vhv.re - expect).abs() < 1e-9 && vhv.im.abs() < 1e-9,
+                        (vhv.re - expect).abs() < tol && vhv.im.abs() < tol,
                         "n={n}: VhV[{i},{j}]={vhv}"
                     );
                 }
@@ -1347,13 +1402,13 @@ mod tests {
                 }
             }
             assert!(
-                rec_err < 1e-8 * smax,
+                rec_err < tol * smax,
                 "n={n}: reconstruction error {rec_err}"
             );
 
             for k in 1..n {
                 assert!(
-                    s_dc[k] <= s_dc[k - 1] + 1e-9 * smax,
+                    s_dc[k] <= s_dc[k - 1],
                     "n={n}: singular values not descending at {k}"
                 );
             }
@@ -1364,7 +1419,7 @@ mod tests {
                 let s_ref = reference.singular_values();
                 for k in 0..n {
                     assert!(
-                        (s_dc[k] - s_ref[k]).abs() < 1e-6 * smax,
+                        (s_dc[k] - s_ref[k]).abs() < tol * smax,
                         "n={n}: sigma[{k}] dc={} ref={}",
                         s_dc[k],
                         s_ref[k]

@@ -6,10 +6,10 @@
 
 use oxiblas_lapack::cholesky::Cholesky;
 use oxiblas_lapack::evd::{GeneralEvd, SymmetricEvd};
-use oxiblas_lapack::lu::Lu;
+use oxiblas_lapack::lu::{Lu, LuError};
 use oxiblas_lapack::qr::{Qr, QrPivot};
 use oxiblas_lapack::solve::{solve, solve_multiple};
-use oxiblas_lapack::svd::{Svd, SvdDc};
+use oxiblas_lapack::svd::{Svd, SvdDc, SvdDcError};
 use oxiblas_matrix::Mat;
 
 // ============================================================================
@@ -293,24 +293,17 @@ mod lu_tests {
     }
 
     #[test]
-    fn lu_singular_3x3_rank_deficient() {
-        // Rank 2: third row = first + second
-        // Note: LU with partial pivoting may not always detect near-singular
-        // matrices due to floating-point arithmetic. We test that either:
-        // (a) It returns an error, or
-        // (b) The determinant is near-zero.
+    fn lu_singular_3x3_rank_deficient_reports_last_pivot() {
+        // Rank 2: third row = first + second. Elimination leaves a rounding
+        // residue of about 1.1e-15 as the last pivot, below the threshold
+        // eps * 3 * max |a_i2| = 6.0e-15 of column 2, so the factorization
+        // reports the singularity at index 2 (LAPACK dgetrf, which only flags
+        // exact zeros, would return this residue as U(3,3) instead).
         let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[5.0, 7.0, 9.0]]);
-        match Lu::compute(a.as_ref()) {
-            Err(_) => {} // Correctly detected as singular
-            Ok(lu) => {
-                // If it succeeded, the determinant should be near zero
-                assert!(
-                    lu.determinant().abs() < 1e-10,
-                    "Rank-deficient matrix should have near-zero determinant, got {}",
-                    lu.determinant()
-                );
-            }
-        }
+        assert_eq!(
+            Lu::compute(a.as_ref()).map(|_| ()),
+            Err(LuError::Singular { index: 2 })
+        );
     }
 
     #[test]
@@ -391,14 +384,19 @@ mod lu_tests {
     }
 
     #[test]
-    fn lu_extreme_min_magnitude_returns_error() {
-        // Entries near f64::MIN_POSITIVE: det = MIN_POSITIVE^2 underflows to
-        // exactly 0.0, so the pivot is correctly detected as singular.
-        // Observed: Err(Singular { index: 0 }).
+    fn lu_extreme_min_magnitude_factors() {
+        // MIN_POSITIVE * I is perfectly conditioned. Each pivot is tested
+        // against eps * n * max |a_ij| of its own column (about 1e-323 here),
+        // so both are accepted (0.2.2's absolute threshold eps * n rejected
+        // them). The determinant MIN_POSITIVE^2 underflows to exactly 0.0,
+        // which is IEEE-754 underflow, not singularity: solving still works.
         let a: Mat<f64> = Mat::from_rows(&[&[f64::MIN_POSITIVE, 0.0], &[0.0, f64::MIN_POSITIVE]]);
-        if let Ok(lu) = Lu::compute(a.as_ref()) {
-            assert!(lu.determinant().is_finite());
-        }
+        let lu = Lu::compute(a.as_ref()).expect("MIN_POSITIVE * I factors");
+        assert_eq!(lu.pivot(), &[0, 1]);
+        assert_eq!(lu.determinant(), 0.0);
+        let b: Mat<f64> = Mat::from_rows(&[&[f64::MIN_POSITIVE], &[f64::MIN_POSITIVE]]);
+        let x = lu.solve(b.as_ref()).expect("dimensions match");
+        assert_eq!((x[(0, 0)], x[(1, 0)]), (1.0, 1.0));
     }
 }
 
@@ -612,16 +610,18 @@ mod cholesky_tests {
     }
 
     #[test]
-    fn cholesky_extreme_min_magnitude_no_panic() {
-        // Entries near f64::MIN_POSITIVE. Observed: Err(NotPositiveDefinite)
-        // because the algorithm's positive-definiteness tolerance
-        // (epsilon * n) is far larger than MIN_POSITIVE, so the diagonal is
-        // conservatively rejected -- a proper Err, never a panic or hang.
+    fn cholesky_extreme_min_magnitude_factors() {
+        // MIN_POSITIVE * I is positive definite: each radicand is compared
+        // with eps * n * a_jj of its own column, so both are accepted (0.2.2's
+        // absolute threshold eps * n rejected them). MIN_POSITIVE = 2^-1022,
+        // so L = 2^-511 * I exactly.
         let a: Mat<f64> = Mat::from_rows(&[&[f64::MIN_POSITIVE, 0.0], &[0.0, f64::MIN_POSITIVE]]);
-        if let Ok(chol) = Cholesky::compute(a.as_ref()) {
-            let l = chol.l_factor();
-            assert!(l[(0, 0)].is_finite() && l[(0, 0)] >= 0.0);
-        }
+        let l = Cholesky::compute(a.as_ref())
+            .expect("MIN_POSITIVE * I is positive definite")
+            .l_factor();
+        let root = f64::MIN_POSITIVE.sqrt();
+        assert_eq!(root, 2.0f64.powi(-511));
+        assert_eq!((l[(0, 0)], l[(1, 0)], l[(1, 1)]), (root, 0.0, root));
     }
 }
 
@@ -983,7 +983,8 @@ mod svd_tests {
 
     #[test]
     fn svd_dc_matches_jacobi_small() {
-        // D&C SVD on a small well-conditioned matrix should match Jacobi closely.
+        // D&C SVD on a small well-conditioned matrix matches Jacobi to a few
+        // ulps (both are backward stable and the matrix is well conditioned).
         let a: Mat<f64> = Mat::from_rows(&[&[4.0, 1.0, 0.0], &[1.0, 3.0, 1.0], &[0.0, 1.0, 2.0]]);
         let svd1 = Svd::compute(a.as_ref()).unwrap();
         let svd2 = SvdDc::compute(a.as_ref()).unwrap();
@@ -997,7 +998,7 @@ mod svd_tests {
                 (sv1[i] - sv2[i]).abs()
             };
             assert!(
-                rel_diff < 0.05,
+                rel_diff < 1e-13,
                 "SV[{}] relative mismatch: jacobi={}, dc={}, rel_diff={}",
                 i,
                 sv1[i],
@@ -1154,40 +1155,121 @@ mod svd_tests {
 
     #[test]
     fn svd_dc_nan_entry_no_panic() {
-        // Observed: Ok(..) with singular values [4.12.., NaN, NaN].
+        // `SvdDc::compute` checks its input: a matrix with a NaN entry has no
+        // finite SVD and is rejected before any work with
+        // Err(SvdDcError::NotConverged) (documented on `compute`), whatever
+        // its size.
         let a: Mat<f64> =
             Mat::from_rows(&[&[4.0, 1.0, f64::NAN], &[1.0, 3.0, 1.0], &[0.0, 1.0, 2.0]]);
-        if let Ok(svd) = SvdDc::compute(a.as_ref()) {
-            let sv = svd.singular_values();
-            assert_eq!(sv.len(), 3);
-            assert!(
-                sv.iter().any(|s| s.is_nan()),
-                "expected at least one NaN singular value, got {:?}",
-                sv
-            );
-        }
+        assert_eq!(
+            SvdDc::compute(a.as_ref()).unwrap_err(),
+            SvdDcError::NotConverged
+        );
     }
 
     #[test]
     fn svd_dc_inf_entry_no_panic() {
-        // Observed: Ok(..) with singular values [4.12.., NaN, NaN] -- the
-        // Inf entry produces NaN downstream (e.g. via inf - inf or inf/inf
-        // inside the divide-and-conquer merge), which is itself valid IEEE
-        // 754 semantics, not a crate bug.
+        // An infinite entry is rejected up front like a NaN one (see
+        // `svd_dc_nan_entry_no_panic`): Err(SvdDcError::NotConverged).
         let a: Mat<f64> = Mat::from_rows(&[
             &[4.0, 1.0, f64::INFINITY],
             &[1.0, 3.0, 1.0],
             &[0.0, 1.0, 2.0],
         ]);
-        if let Ok(svd) = SvdDc::compute(a.as_ref()) {
-            let sv = svd.singular_values();
-            assert_eq!(sv.len(), 3);
-            assert!(
-                sv.iter().any(|s| !s.is_finite()),
-                "expected at least one non-finite singular value, got {:?}",
-                sv
-            );
+        assert_eq!(
+            SvdDc::compute(a.as_ref()).unwrap_err(),
+            SvdDcError::NotConverged
+        );
+    }
+
+    /// `A = H·diag(σ)·Gᵀ` with `H`, `G` products of three Householder
+    /// reflections built from a fixed LCG.
+    fn matrix_with_sv(n: usize, sigma: &[f64], seed: u64) -> Mat<f64> {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let mut a: Mat<f64> = Mat::zeros(n, n);
+        for (i, &s) in sigma.iter().enumerate() {
+            a[(i, i)] = s;
         }
+        for _ in 0..3 {
+            let mut v: Vec<f64> = (0..n).map(|_| next()).collect();
+            let nv = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            v.iter_mut().for_each(|x| *x /= nv);
+            for j in 0..n {
+                let d: f64 = (0..n).map(|i| v[i] * a[(i, j)]).sum();
+                for i in 0..n {
+                    a[(i, j)] -= 2.0 * d * v[i];
+                }
+            }
+            let mut w: Vec<f64> = (0..n).map(|_| next()).collect();
+            let nw = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+            w.iter_mut().for_each(|x| *x /= nw);
+            for i in 0..n {
+                let d: f64 = (0..n).map(|j| a[(i, j)] * w[j]).sum();
+                for j in 0..n {
+                    a[(i, j)] -= 2.0 * d * w[j];
+                }
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn svd_dc_scale_invariant_singular_values() {
+        // The singular values are relatively accurate at every scale, in the
+        // QR path (n = 20) and the divide and conquer (n = 40).
+        for &n in &[20usize, 40] {
+            let base: Vec<f64> = (0..n).map(|i| 1.0 + (n - i) as f64 / n as f64).collect();
+            for &f in &[1e-160f64, 1e-8, 1.0, 1e160] {
+                let sigma: Vec<f64> = base.iter().map(|x| x * f).collect();
+                let a = matrix_with_sv(n, &sigma, 99);
+                let svd = SvdDc::compute(a.as_ref()).unwrap();
+                for (i, (&s, &t)) in svd.singular_values().iter().zip(&sigma).enumerate() {
+                    let rel = (s - t).abs() / t;
+                    assert!(rel < 1e-13, "n={n} f={f:e}: sigma[{i}] rel error {rel:e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn svd_dc_zero_first_column() {
+        // A zero first column puts an exact zero on the bidiagonal.
+        let a: Mat<f64> = Mat::from_rows(&[&[0.0, 1.0, 2.0], &[0.0, 3.0, 4.0], &[0.0, 5.0, 6.0]]);
+        let svd = SvdDc::compute(a.as_ref()).unwrap();
+        assert_eq!(svd.singular_values()[2], 0.0);
+        let recon = svd.reconstruct();
+        let rel_err = frobenius_diff(&a, &recon) / frobenius_norm(&a);
+        assert!(rel_err < 1e-14, "reconstruction error {rel_err}");
+    }
+
+    #[test]
+    fn svd_dc_graded_spectrum_matches_jacobi() {
+        // σ_i = 10^(-12 i / 59): every singular value agrees with Jacobi to
+        // O(n·ε·σ_max), the accuracy of any backward-stable SVD.
+        let n = 60;
+        let sigma: Vec<f64> = (0..n)
+            .map(|i| 10f64.powf(-12.0 * i as f64 / (n - 1) as f64))
+            .collect();
+        let a = matrix_with_sv(n, &sigma, 11);
+        let dc = SvdDc::compute(a.as_ref()).unwrap();
+        let jac = Svd::compute(a.as_ref()).unwrap();
+        for (i, (&s, &t)) in dc
+            .singular_values()
+            .iter()
+            .zip(jac.singular_values())
+            .enumerate()
+        {
+            assert!((s - t).abs() < 1e-13, "sigma[{i}]: dc {s:e} jacobi {t:e}");
+        }
+        let recon = dc.reconstruct();
+        let rel_err = frobenius_diff(&a, &recon) / frobenius_norm(&a);
+        assert!(rel_err < 1e-14, "reconstruction error {rel_err}");
     }
 }
 
@@ -1447,9 +1529,9 @@ mod evd_tests {
 
     #[test]
     fn general_evd_nan_entry_no_panic() {
-        // Observed: Ok(..) with eigenvalues carrying NaN imaginary parts --
-        // the 2x2 Schur/QR-algorithm closed-form solve propagates the NaN
-        // entry into the discriminant without panicking.
+        // Observed: Ok(..) with NaN eigenvalues (real and imaginary parts) --
+        // the 2x2 Schur standardization (LAPACK DLANV2) propagates the NaN
+        // entry without panicking.
         let a: Mat<f64> = Mat::from_rows(&[&[1.0, f64::NAN], &[3.0, 4.0]]);
         if let Ok(evd) = GeneralEvd::compute(a.as_ref()) {
             assert_eq!(evd.eigenvalues().len(), 2);
@@ -1464,7 +1546,8 @@ mod evd_tests {
 
     #[test]
     fn general_evd_inf_entry_no_panic() {
-        // Observed: Ok(..) with eigenvalues [+inf, -inf] (real), imag = 0.
+        // Observed: Ok(..) with NaN eigenvalues (inf - inf inside the 2x2
+        // standardization), no panic.
         let a: Mat<f64> = Mat::from_rows(&[&[1.0, f64::INFINITY], &[3.0, 4.0]]);
         if let Ok(evd) = GeneralEvd::compute(a.as_ref()) {
             assert_eq!(evd.eigenvalues().len(), 2);
@@ -1480,10 +1563,10 @@ mod evd_tests {
 
     #[test]
     fn general_evd_extreme_max_magnitude_no_panic() {
-        // Entries near f64::MAX overflow the characteristic-polynomial
-        // discriminant computation to +/-inf/NaN, which is well-defined
-        // IEEE 754 behavior, not a crash.
-        // Observed: Ok(..) with eigenvalues carrying real = inf, imag = NaN.
+        // Entries near f64::MAX: the matrix is scaled by a power of two
+        // before the Schur iteration, so nothing overflows.
+        // Observed: Ok(..) with finite real eigenvalues [MAX, MAX] (the exact
+        // MAX ± 1 round to MAX).
         let a: Mat<f64> = Mat::from_rows(&[&[f64::MAX, 1.0], &[1.0, f64::MAX]]);
         if let Ok(evd) = GeneralEvd::compute(a.as_ref()) {
             assert_eq!(evd.eigenvalues().len(), 2);
@@ -1755,16 +1838,17 @@ mod solve_tests {
     }
 
     #[test]
-    fn solve_extreme_min_magnitude_no_panic() {
-        // Entries near f64::MIN_POSITIVE: det = MIN_POSITIVE^2 underflows to
-        // exactly 0.0, so the matrix is correctly detected as singular.
-        // Observed: Err(SingularMatrix).
+    fn solve_extreme_min_magnitude_succeeds() {
+        // MIN_POSITIVE * I is perfectly conditioned and its LU pivots pass the
+        // per-column singularity test (0.2.2's absolute threshold rejected
+        // them). The determinant underflows to 0.0, but the solution
+        // x = b / MIN_POSITIVE = (2^1022, 2^1023) is finite and exact.
         let a: Mat<f64> = Mat::from_rows(&[&[f64::MIN_POSITIVE, 0.0], &[0.0, f64::MIN_POSITIVE]]);
         let b: Mat<f64> = Mat::from_rows(&[&[1.0], &[2.0]]);
-        if let Ok(x) = solve(a.as_ref(), b.as_ref()) {
-            assert!(x[(0, 0)].is_finite());
-            assert!(x[(1, 0)].is_finite());
-        }
+        let x = solve(a.as_ref(), b.as_ref()).expect("MIN_POSITIVE * I is nonsingular");
+        assert_eq!(x[(0, 0)], 2.0f64.powi(1022));
+        assert_eq!(x[(1, 0)], 2.0f64.powi(1023));
+        assert!(x[(1, 0)].is_finite());
     }
 
     #[test]

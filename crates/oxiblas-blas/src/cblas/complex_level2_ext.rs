@@ -32,13 +32,13 @@
 //! `lda < max(1, m)` (`ColMajor` GERU / GERC; `max(1, n)` for `RowMajor`),
 //! `lda < max(1, n)` (HER, HER2, TRMV, TRSV), zero increments and null
 //! pointers are a silent no-op (reference BLAS calls `xerbla`; a `void` C ABI
-//! cannot report it and unwinding across it is UB); `m == 0` / `n == 0`
-//! return immediately. The rank updates return with `A` untouched when
-//! `alpha == 0`. Otherwise, like reference BLAS, they skip the column of an
-//! exactly zero scaling element, so an Inf/NaN in the other operand cannot
-//! reach it: GERU / GERC skip the column of a zero `y(j)` (in `RowMajor`,
-//! with the operands swapped, the row of a zero `x(i)`), HER skips
-//! `x(j) == 0` and HER2 `x(j) == y(j) == 0`. HER / HER2 also set the
+//! cannot report it, and a panic reaching the `extern "C"` boundary would abort
+//! the process); `m == 0` / `n == 0` return immediately. The rank updates
+//! return with `A` untouched when `alpha == 0`. Otherwise, like reference BLAS,
+//! they skip the column of an exactly zero scaling element, so an Inf/NaN in
+//! the other operand cannot reach it: GERU / GERC skip the column of a zero
+//! `y(j)` (in `RowMajor`, with the operands swapped, the row of a zero `x(i)`),
+//! HER skips `x(j) == 0` and HER2 `x(j) == y(j) == 0`. HER / HER2 also set the
 //! imaginary part of every diagonal element of the referenced triangle to
 //! zero, a skipped column's included.
 //!

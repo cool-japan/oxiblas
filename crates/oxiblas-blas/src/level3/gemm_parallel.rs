@@ -29,13 +29,12 @@
 use super::autotune::balanced_block;
 use super::gemm::{GemmBlocking, macro_panel_multiply, op_dims, pack_a_trans_dispatch, read_op};
 use super::gemm_kernel::{GemmKernel, MicroKernelShape};
+use super::gemm_packing::{PackBuffer, PackSlot};
 use super::trsm::Trans;
-use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{MatMut, MatRef};
 use rayon::prelude::*;
-use std::sync::{Mutex, PoisonError};
 
 /// Target number of C tiles per worker thread.
 ///
@@ -281,16 +280,14 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
         .max(last_grid.tallest_rows(m, mr));
     let a_len = mc.min(max_tile_rows).div_ceil(mr) * mr * kc;
 
-    // One A~ buffer per worker of the current pool, allocated once per call.
-    // Tile tasks never re-enter rayon while holding a buffer, so each slot is
-    // only ever used by its own worker; the mutex makes even a stray thread
-    // (`current_thread_index() == None`) safe, merely serialised.
-    let workers = rayon::current_num_threads().max(1);
-    let a_bufs: Vec<Mutex<AlignedVec<T>>> = (0..workers)
-        .map(|_| Mutex::new(AlignedVec::zeros(a_len)))
-        .collect();
-    // Shared B~ of one (jc, pc) step, reused for every step.
-    let mut pack_b: AlignedVec<T> = AlignedVec::zeros(nc.div_ceil(nr) * nr * kc);
+    // Shared B~ of one (jc, pc) step, reused for every step, on loan from the
+    // calling thread's packing cache. Each tile task borrows its A~ buffer from
+    // the cache of the worker that runs it (moved out of the thread-local slot
+    // for the task, so a task stolen by a worker that is itself waiting inside
+    // another GEMM just finds the slot empty and allocates). Workers keep their
+    // A~ buffer between tasks and calls instead of every call zero-filling one
+    // buffer per worker (policy: `PACK_CACHE_MAX_BYTES`).
+    let mut pack_b = PackBuffer::<T>::take(PackSlot::B, nc.div_ceil(nr) * nr * kc);
 
     for jc in (0..n).step_by(nc) {
         let w = nc.min(n - jc);
@@ -308,8 +305,7 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
 
             // Phase 2: every tile updates its own part of C.
             tiles.par_iter_mut().with_max_len(1).for_each(|tile| {
-                let slot = rayon::current_thread_index().unwrap_or(0) % a_bufs.len();
-                let mut a_buf = a_bufs[slot].lock().unwrap_or_else(PoisonError::into_inner);
+                let mut a_buf = PackBuffer::<T>::take(PackSlot::A, a_len);
                 let rows = tile.view.nrows();
                 let cols = tile.view.ncols();
                 let b_panels = &packed_b[tile.col0 / nr * pb * nr..];

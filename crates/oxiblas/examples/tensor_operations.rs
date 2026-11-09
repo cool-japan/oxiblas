@@ -1,7 +1,8 @@
 //! Tensor operations and Einstein summation demonstration.
 //!
 //! This example demonstrates:
-//! - Einstein summation notation (einsum) with 24 supported patterns
+//! - Einstein summation notation (einsum): 22 supported patterns (21 operations;
+//!   `ij,jk->ik` and `ik,kj->ij` both denote the matrix product)
 //! - 3D tensor operations
 //! - Batched matrix multiplication
 //! - Various tensor contractions and reductions
@@ -395,7 +396,7 @@ fn main() {
     // ========================================
     // Summary of All Supported Patterns
     // ========================================
-    println!("--- Supported Einstein Summation Patterns (24 total) ---");
+    println!("--- Supported Einstein Summation Patterns (22 total) ---");
     println!("Matrix Operations:");
     println!("  • ij,jk->ik    Matrix multiplication");
     println!("  • ik,kj->ij    Alternative matmul notation");

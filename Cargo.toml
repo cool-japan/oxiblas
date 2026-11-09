@@ -23,7 +23,7 @@ exclude = ["crates/oxiblas-ffi", "fuzz"]
 [workspace.package]
 version = "0.2.3"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/cool-japan/oxiblas"
 authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
@@ -69,13 +69,6 @@ approx = "0.5"
 quickcheck = "1.1"
 quickcheck_macros = "1.2"
 faer = "0.24"
-
-# oxiblas-benchmarks' opt-in `compare-openblas` feature only (see that
-# crate's Cargo.toml comment) — never reached by any default or
-# non-default feature of a publishable crate.
-ndarray-linalg = "0.18"
-blas-src = "0.14"
-cblas-sys = "0.3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"  # Rust 2024 defaults to requiring unsafe blocks; we allow for now

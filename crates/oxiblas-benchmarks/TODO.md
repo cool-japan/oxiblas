@@ -2,10 +2,10 @@
 
 Tracking performance benchmarking improvements and comparative analysis.
 
-## Current Status (Updated 2026-03-16)
+## Current Status (Updated 2026-11-09)
 
-- **12 benchmark suites**: Level 1, Level 2, Level 3, QR, SVD, Factorization, EVD, Solve, Sparse Ops, Sparse Eigen/SVD, New Features, Comparison
-- **121 benchmark functions** across all suites
+- **15 benchmark suites**: Level 1, Level 2, Level 3, QR, SVD, Factorization, EVD, Solve, Sparse Ops, Sparse Eigen/SVD, New Features, Advanced Features, Size Variations, Precision, Comparison
+- **136 benchmark functions** across all suites (0.2.3 added the `symmetric_evd_dc_large`, `symmetric_evd_random` and `symmetric_evd_dc_random` groups to `lapack_evd` and renamed `svd_standard` to `svd_jacobi` in `lapack_svd`)
 - **1 comparison suite**: OpenBLAS comparison (optional feature)
 - **Coverage**:
   - BLAS L1/L2/L3 (complete, including Hermitian operations)
@@ -16,14 +16,14 @@ Tracking performance benchmarking improvements and comparative analysis.
   - Sparse factorizations: LU, QR, ILU0, ILUT
   - Extended precision (f16, f32, f64), tensor operations
 - **Framework**: Criterion.rs with HTML reports and statistical analysis
-- **Performance**: DGEMM 79% of OpenBLAS (large matrices), 6-15× speedup in GEMM-based ops
+- **Performance**: see [Performance](../../README.md#performance) in the root README
 
 ---
 
 ## TIER 1 - HIGH PRIORITY
 
 ### Comparison Benchmarks
-- [x] OpenBLAS comparison for BLAS operations (GEMM, GEMV, DOT, AXPY, NRM2)
+- [x] OpenBLAS comparison for BLAS operations (GEMM, TRSM, SYRK, GEMV, DOT, AXPY, NRM2), sequential and parallel GEMM (loaded with `dlopen`; see the README for why it must not be linked)
 - [ ] MKL comparison benchmarks (Intel Math Kernel Library)
 - [ ] BLIS comparison benchmarks (BLAS-like Library Instantiation Software)
 - [ ] Accelerate framework comparison (macOS)

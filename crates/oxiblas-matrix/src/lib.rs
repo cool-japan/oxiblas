@@ -59,6 +59,7 @@
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]

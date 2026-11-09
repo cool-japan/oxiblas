@@ -134,9 +134,9 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
 
     /// Computes the bidiagonal reduction with automatic algorithm selection.
     ///
-    /// For matrices with min(m,n) ≥ 64, automatically uses the blocked algorithm
-    /// for better cache efficiency and performance. Otherwise uses the unblocked
-    /// algorithm which has less overhead for small matrices.
+    /// Calls [`Self::compute_blocked`] for min(m,n) ≥ 64, otherwise
+    /// [`Self::compute`]; both apply one Householder reflection at a time
+    /// (rank-1 updates), so this changes only the loop structure.
     ///
     /// # Example
     ///
@@ -169,10 +169,11 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
         }
     }
 
-    /// Computes the bidiagonal reduction using a blocked algorithm.
-    ///
-    /// Uses block transformations for better cache utilization and to leverage
-    /// BLAS-3 operations. This is typically faster for matrices larger than ~32×32.
+    /// Computes the bidiagonal reduction in panels of columns (rows, for a wide
+    /// matrix). Each reflection is still applied to the whole trailing matrix
+    /// as a rank-1 update, as in [`Self::compute`]: no block (`WY`) form or
+    /// BLAS-3 update is built. (The GEMM-based reduction that the
+    /// divide-and-conquer SVD uses is in the `blocked_bidiag` module.)
     ///
     /// # Example
     ///
@@ -196,11 +197,12 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
         Self::compute_blocked_with_block_size(a, nb)
     }
 
-    /// Computes the bidiagonal reduction with a specified block size.
+    /// Computes the bidiagonal reduction with a specified block size (0 is treated as 1).
     pub fn compute_blocked_with_block_size(
         a: MatRef<'_, T>,
         block_size: usize,
     ) -> Result<Self, BidiagError> {
+        let block_size = block_size.max(1);
         let m = a.nrows();
         let n = a.ncols();
 
@@ -248,7 +250,7 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
         while j < n {
             let jb = nb.min(n - j);
 
-            // Process columns j to j+jb-1 as a block
+            // Process columns j to j+jb-1 (rank-1 updates, no block form)
             for jj in j..(j + jb) {
                 // Apply Householder from the left to zero column jj below diagonal
                 let (tau, beta) = householder_left(&mut work, jj, m, n);
@@ -309,7 +311,7 @@ impl<T: Field + Real + bytemuck::Zeroable> BidiagFactors<T> {
         while j < m {
             let jb = nb.min(m - j);
 
-            // Process rows j to j+jb-1 as a block
+            // Process rows j to j+jb-1 (rank-1 updates, no block form)
             for jj in j..(j + jb) {
                 // For wide matrices, first zero row jj right of diagonal
                 let (tau_p, beta_d) = householder_right_wide(&mut work, jj, m, n);

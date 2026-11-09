@@ -13,6 +13,7 @@ use oxiblas_sparse::linalg::precond::{
     GaussSeidel, Jacobi, LocalSolverType, SOR, SPAI, SPAIConfig, SSOR,
 };
 use oxiblas_sparse::ops::spmv;
+use oxiblas_sparse::test_matrices::laplacian_2d;
 
 /// Creates a 1D Poisson matrix (tridiagonal: -1, 2, -1).
 fn make_poisson_1d(n: usize) -> CsrMatrix<f64> {
@@ -366,29 +367,59 @@ fn test_ic0_effectiveness() {
 
 #[test]
 fn test_ic0_poisson_2d() {
-    // Use smaller 2D grid to avoid numerical issues
-    let grid = 6;
+    let grid = 10;
     let a = make_poisson_2d(grid);
     let n = grid * grid;
     let b: Vec<f64> = vec![1.0; n];
     let x0 = vec![0.0; n];
-    let tol = 1e-8;
+    let tol = 1e-10;
     let max_iter = 500;
 
-    // IC0 preconditioned (skip speedup comparison for small grids)
+    // Unpreconditioned baseline
+    let result_cg = cg(&a, &b, &x0, tol, max_iter).unwrap();
+
+    // IC0 preconditioned
     let ic0 = IC0::new(&a).unwrap();
     let precond = |r: &[f64]| -> Vec<f64> { ic0.apply(r) };
     let result_pcg = pcg(&a, &b, &x0, precond, tol, max_iter).unwrap();
 
     assert!(
-        result_pcg.converged,
-        "IC0 PCG should converge for Poisson 2D"
+        result_cg.converged && result_pcg.converged,
+        "CG and IC0 PCG should converge for Poisson 2D"
+    );
+    assert!(
+        result_pcg.iterations < result_cg.iterations,
+        "IC0 PCG ({}) should be faster than CG ({})",
+        result_pcg.iterations,
+        result_cg.iterations
     );
 
     let rel_res = relative_residual(&a, &result_pcg.x, &b);
     assert!(
-        rel_res < 1e-6,
+        rel_res < 1e-9,
         "IC0 Poisson 2D: residual too large: {rel_res}"
+    );
+}
+
+#[test]
+fn test_ic0_pcg_laplacian_2d_tight_tolerance() {
+    // p^T A p scales with ||r||^2, so an absolute `|p^T A p| <= eps` breakdown
+    // test fired at iteration 13 here although PCG was converging normally.
+    let a = laplacian_2d(10, 10).unwrap();
+    let n = a.nrows();
+    let b = vec![1.0; n];
+    let x0 = vec![0.0; n];
+    let tol = 1e-10;
+
+    let ic0 = IC0::new(&a).unwrap();
+    let precond = |r: &[f64]| -> Vec<f64> { ic0.apply(r) };
+    let result = pcg(&a, &b, &x0, precond, tol, 500).unwrap();
+
+    assert!(result.converged, "IC0 PCG should converge at tol = 1e-10");
+    let rel_res = relative_residual(&a, &result.x, &b);
+    assert!(
+        rel_res <= tol,
+        "true relative residual {rel_res:e} does not meet tol = {tol:e}"
     );
 }
 
@@ -753,13 +784,12 @@ fn test_preconditioner_comparison_poisson_1d() {
 
 #[test]
 fn test_preconditioner_comparison_poisson_2d() {
-    // Use smaller grid for stability
-    let grid = 5;
+    let grid = 10;
     let a = make_poisson_2d(grid);
     let n = grid * grid;
     let b: Vec<f64> = vec![1.0; n];
     let x0 = vec![0.0; n];
-    let tol = 1e-8;
+    let tol = 1e-10;
     let max_iter = 500;
 
     // Unpreconditioned baseline

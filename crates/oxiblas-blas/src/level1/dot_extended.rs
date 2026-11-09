@@ -258,6 +258,58 @@ mod tests {
         assert!((result_kahan - expected).abs() < 1e-8);
     }
 
+    /// `dot_kahan` is textbook compensated summation (Higham, Algorithm 4.2):
+    /// it returns the running sum, whose error is at most about
+    /// `2u·Σ|x_i·y_i|` (`u = ε/2`) when the products are exact. It does not
+    /// add the last compensation back, which would not change the rounded
+    /// sum anyway (that compensation is at most half a unit in its last
+    /// place). Checked against exact integer sums of terms spread over 60
+    /// binary orders of magnitude.
+    #[test]
+    fn test_dot_kahan_within_compensated_summation_bound() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 11
+        };
+        let mut cases: Vec<Vec<f64>> = Vec::new();
+        // Unit terms after 2^60 (spacing 256): the compensation of the ones
+        // is absorbed when -2^60 arrives; the result is 1024, not 1000,
+        // within the bound.
+        let big = 2f64.powi(60);
+        let mut units = vec![big];
+        units.extend(std::iter::repeat_n(1.0, 1000));
+        units.push(-big);
+        cases.push(units);
+        for _ in 0..300 {
+            let n = 2 + (next() % 200) as usize;
+            // m · 2^e with |m| < 2^20 and e <= 40: exact in f64 and in i128.
+            cases.push(
+                (0..n)
+                    .map(|_| {
+                        let m = (next() % (1 << 21)) as f64 - f64::from(1 << 20);
+                        m * 2f64.powi((next() % 41) as i32)
+                    })
+                    .collect(),
+            );
+        }
+        for x in &cases {
+            let ones = vec![1.0; x.len()];
+            let exact: i128 = x.iter().map(|&v| v as i128).sum();
+            let abs_sum: f64 = x.iter().map(|v| v.abs()).sum();
+            let got = dot_kahan(x, &ones);
+            let err = (got as i128 - exact).unsigned_abs() as f64;
+            assert!(
+                err <= 2.0 * f64::EPSILON * abs_sum,
+                "n = {}: {got} vs exact {exact} (error {err}, bound {})",
+                x.len(),
+                2.0 * f64::EPSILON * abs_sum
+            );
+        }
+    }
+
     #[test]
     fn test_dot_pairwise_basic() {
         let x = [1.0, 2.0, 3.0, 4.0];

@@ -97,10 +97,10 @@ pub unsafe extern "C" fn cblas_chemm(
     ldc: i32,
 ) {
     // Reference (x)HEMM calls xerbla and returns on a bad shape; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` read wildly out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` read wildly out of bounds.
     if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
         return;
     }
@@ -166,10 +166,10 @@ pub unsafe extern "C" fn cblas_zhemm(
     ldc: i32,
 ) {
     // Reference (x)HEMM calls xerbla and returns on a bad shape; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the internal `a.add(row + col * lda)` read wildly out of bounds.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op. Without this, `lda as usize` turns a negative `lda`
+    // into `usize::MAX` (and an undersized positive `lda` aliases columns),
+    // making the internal `a.add(row + col * lda)` read wildly out of bounds.
     if m <= 0 || n <= 0 || !symm_params_valid(layout, side, m, n, lda, ldb, ldc) {
         return;
     }
@@ -920,6 +920,9 @@ mod tests {
         let mut c = [Complex64::new(0.0, 0.0); 9];
         let mut c_ref = c;
 
+        // SAFETY: column-major NoTrans with n = 3, k = 2: `a` holds lda * k =
+        // 3 * 2 = 6 elements and `c` holds ldc * n = 3 * 3 = 9, which is all
+        // the call reads or writes.
         unsafe {
             cblas_zherk(
                 CblasLayout::ColMajor,
@@ -973,6 +976,9 @@ mod tests {
             Complex64::new(3.0, 0.0),
         ];
         let mut c_ref = c;
+        // SAFETY: column-major ConjTrans with n = 3, k = 2: `a` is k x n with
+        // lda = k, so it needs 2 * 3 = 6 elements and has 6; `c` holds ldc * n
+        // = 9 elements.
         unsafe {
             cblas_zherk(
                 CblasLayout::ColMajor,
@@ -1010,6 +1016,9 @@ mod tests {
             Complex64::new(2.0, 2.0),
         ];
         let mut c = [Complex64::new(0.0, 0.0); 9];
+        // SAFETY: row-major NoTrans with n = 3, k = 2: `a` holds n rows of lda
+        // = k = 2 elements (6) and `c` holds n rows of ldc = n = 3 elements
+        // (9), which is all the call touches.
         unsafe {
             cblas_zherk(
                 CblasLayout::RowMajor,
@@ -1067,6 +1076,8 @@ mod tests {
             Complex64::new(3.0, 0.0),
         ];
         let mut c_ref = c;
+        // SAFETY: column-major NoTrans with n = 3, k = 2: `a` and `b` hold lda
+        // * k = 6 elements each and `c` ldc * n = 9; `alpha` is a live local.
         unsafe {
             cblas_zher2k(
                 CblasLayout::ColMajor,
@@ -1139,6 +1150,12 @@ mod tests {
         let mut c = [Complex64::new(0.5, 0.5); 6];
         let mut c_native = c;
 
+        // SAFETY: `a` (m x m, lda = m: 4 elements), `b` and `c` (m x n, ld =
+        // m: 6 elements each) cover the column-major Left/Lower call with m =
+        // 2, n = 3, and `alpha` / `beta` are live locals. The views built
+        // afterwards use the same buffers, shapes and leading dimension m, so
+        // every offset `i + j * m` is in bounds; `c_native` is a separate
+        // array, so the mutable view aliases nothing.
         unsafe {
             cblas_zhemm(
                 CblasLayout::ColMajor,
@@ -1277,7 +1294,7 @@ mod tests {
 
     /// Alternating non-finite poison (NaN and Inf in both components).
     fn poison(i: usize, j: usize) -> Complex64 {
-        if (i + j) % 2 == 0 {
+        if (i + j).is_multiple_of(2) {
             c64(f64::NAN, f64::NAN)
         } else {
             c64(f64::INFINITY, f64::NEG_INFINITY)

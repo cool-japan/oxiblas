@@ -25,11 +25,26 @@
 //! // Eigenvalues are 1+0i and 3+0i
 //! ```
 
-use num_traits::{FromPrimitive, One, Zero};
+mod qr;
+mod trevc;
+
+use num_traits::{Float, Zero};
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
 use super::complex_hessenberg::ComplexHessenberg;
+use super::schur::{scale_by_pow2, scaling_exponent};
+
+pub(crate) use trevc::{complex_left_eigenvectors, complex_right_eigenvectors};
+
+/// Multiplies both components of `z` by `2^k` exactly (barring underflow).
+#[inline]
+pub(crate) fn scale_complex<T: ComplexScalar>(z: T, k: i32) -> T {
+    if k == 0 {
+        return z;
+    }
+    T::from_real_imag(scale_by_pow2(z.real(), k), scale_by_pow2(z.imag(), k))
+}
 
 /// Error type for complex Schur decomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,113 +126,58 @@ where
             return Err(ComplexSchurError::NotSquare);
         }
 
-        // Handle 1×1 case
-        if n == 1 {
-            let mut t: Mat<T> = Mat::zeros(1, 1);
-            t[(0, 0)] = a[(0, 0)];
-            let mut q: Mat<T> = Mat::zeros(1, 1);
-            q[(0, 0)] = T::one();
-            let eigenvalues = vec![a[(0, 0)]];
-            return Ok(Self {
-                q,
-                t,
-                eigenvalues,
-                n,
-            });
+        // Scale by an exact power of two so that max|a_ij| ∈ [1, 2): every
+        // threshold below then acts relative to the matrix norm, and the
+        // intermediate quantities can neither overflow nor underflow early.
+        let mut anrm = T::Real::zero();
+        for j in 0..n {
+            for i in 0..n {
+                anrm = Float::max(anrm, Scalar::abs(a[(i, j)]));
+            }
         }
-
-        // Handle 2×2 case
-        if n == 2 {
-            return Self::compute_2x2(a);
-        }
-
-        // Step 1: Reduce to upper Hessenberg form
-        let hess = ComplexHessenberg::compute(a).map_err(|_| ComplexSchurError::NotSquare)?;
-        let mut t: Mat<T> = Mat::zeros(n, n);
-        let h = hess.h();
-        for i in 0..n {
-            for j in 0..n {
-                t[(i, j)] = h[(i, j)];
+        let exponent = scaling_exponent(anrm);
+        let mut scaled: Mat<T> = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                scaled[(i, j)] = scale_complex(a[(i, j)], exponent);
             }
         }
 
-        let mut q: Mat<T> = Mat::zeros(n, n);
-        let q_hess = hess.q();
-        for i in 0..n {
+        // Reduce to upper Hessenberg form (a matrix of order <= 2 already is).
+        let (mut t, mut q) = if n >= 3 {
+            let hess = ComplexHessenberg::compute(scaled.as_ref())
+                .map_err(|_| ComplexSchurError::NotSquare)?;
+            let mut t: Mat<T> = Mat::zeros(n, n);
+            let mut q: Mat<T> = Mat::zeros(n, n);
+            let (h, qh) = (hess.h(), hess.q());
             for j in 0..n {
-                q[(i, j)] = q_hess[(i, j)];
-            }
-        }
-
-        // Step 2: Apply QR iteration with shifts to reduce to upper triangular
-        let eps = <T::Real as Scalar>::epsilon();
-        let tol = eps * T::Real::from_f64(100.0).unwrap_or(T::Real::one());
-
-        let mut p = n;
-        let mut iter_count = 0;
-        let mut stagnation_count = 0;
-
-        while p > 1 && iter_count < Self::MAX_ITERATIONS * n {
-            iter_count += 1;
-
-            // Find the active block (find largest q such that t[q, q-1] is negligible)
-            let mut q_idx = p - 1;
-            while q_idx > 0 {
-                let sub = t[(q_idx, q_idx - 1)].abs();
-                let diag_sum = t[(q_idx - 1, q_idx - 1)].abs() + t[(q_idx, q_idx)].abs();
-                if sub <= tol * (diag_sum + T::Real::one()) {
-                    t[(q_idx, q_idx - 1)] = T::zero();
-                    break;
+                for i in 0..n {
+                    t[(i, j)] = h[(i, j)];
+                    q[(i, j)] = qh[(i, j)];
                 }
-                q_idx -= 1;
             }
+            (t, q)
+        } else {
+            let mut q: Mat<T> = Mat::zeros(n, n);
+            for i in 0..n {
+                q[(i, i)] = T::one();
+            }
+            (scaled, q)
+        };
 
-            if q_idx == p - 1 {
-                // 1×1 block converged
-                p -= 1;
-                stagnation_count = 0;
-            } else {
-                // Compute Wilkinson shift from bottom 2x2 block
-                let shift = compute_wilkinson_shift(&t, p);
+        // Single-shift QR iteration down to upper triangular form. The budget
+        // allows `MAX_ITERATIONS` sweeps per row on average.
+        qr::complex_hessenberg_qr(&mut t, &mut q, Self::MAX_ITERATIONS.saturating_mul(n))?;
 
-                // Check for stagnation
-                stagnation_count += 1;
-                let actual_shift = if stagnation_count > 10 {
-                    // Exceptional shift to break stagnation
-                    stagnation_count = 0;
-                    let mag = t[(p - 1, p - 2)].abs() + t[(p - 1, p - 1)].abs();
-                    T::from_real(mag)
-                } else {
-                    shift
-                };
-
-                // Apply one QR step with shift
-                complex_qr_step(&mut t, &mut q, q_idx, p, actual_shift);
+        if exponent != 0 {
+            for j in 0..n {
+                for i in 0..=j {
+                    t[(i, j)] = scale_complex(t[(i, j)], -exponent);
+                }
             }
         }
 
-        if iter_count >= Self::MAX_ITERATIONS * n && p > 1 {
-            return Err(ComplexSchurError::NotConverged);
-        }
-
-        // Clean up small subdiagonal elements
-        for i in 1..n {
-            let sub = t[(i, i - 1)].abs();
-            let diag_sum = t[(i - 1, i - 1)].abs() + t[(i, i)].abs();
-            if sub
-                <= tol
-                    * (diag_sum + T::Real::one())
-                    * T::Real::from_f64(10.0).unwrap_or(T::Real::one())
-            {
-                t[(i, i - 1)] = T::zero();
-            }
-        }
-
-        // Extract eigenvalues from diagonal
-        let mut eigenvalues = Vec::with_capacity(n);
-        for i in 0..n {
-            eigenvalues.push(t[(i, i)]);
-        }
+        let eigenvalues = (0..n).map(|i| t[(i, i)]).collect();
 
         Ok(Self {
             q,
@@ -227,133 +187,15 @@ where
         })
     }
 
-    /// Computes Schur decomposition for a 2×2 matrix.
-    fn compute_2x2(a: MatRef<'_, T>) -> Result<Self, ComplexSchurError> {
-        let a00 = a[(0, 0)];
-        let a01 = a[(0, 1)];
-        let a10 = a[(1, 0)];
-        let a11 = a[(1, 1)];
+    /// The Schur vectors as an owned-matrix reference (crate-internal).
+    pub(crate) fn q_mat(&self) -> &Mat<T> {
+        &self.q
+    }
 
-        // Compute eigenvalues of 2×2 matrix
-        let trace = a00 + a11;
-        let det = a00 * a11 - a01 * a10;
-
-        // λ = (trace ± sqrt(trace² - 4*det)) / 2
-        let two = T::one() + T::one();
-        let four = two + two;
-        let disc = trace * trace - four * det;
-        let disc_sqrt = complex_sqrt(disc);
-
-        let lambda1 = (trace + disc_sqrt) / two;
-        let _lambda2 = (trace - disc_sqrt) / two;
-
-        // For Schur decomposition, we need to find an eigenvector for lambda1
-        // Then extend to a unitary basis
-        let eps = T::Real::epsilon();
-
-        // If a10 is negligible, matrix is already upper triangular
-        if a10.abs() < eps {
-            let mut q: Mat<T> = Mat::zeros(2, 2);
-            q[(0, 0)] = T::one();
-            q[(1, 1)] = T::one();
-
-            let mut t: Mat<T> = Mat::zeros(2, 2);
-            for i in 0..2 {
-                for j in 0..2 {
-                    t[(i, j)] = a[(i, j)];
-                }
-            }
-
-            let eigenvalues = vec![a00, a11];
-            return Ok(Self {
-                q,
-                t,
-                eigenvalues,
-                n: 2,
-            });
-        }
-
-        // Find eigenvector for lambda1: (A - lambda1*I) * v = 0
-        // From first row: (a00 - lambda1) * v0 + a01 * v1 = 0
-        // From second row: a10 * v0 + (a11 - lambda1) * v1 = 0
-        let d0 = a00 - lambda1;
-        let d1 = a11 - lambda1;
-
-        // Choose the row with larger magnitude for numerical stability
-        let row0_mag = d0.abs_sq() + a01.abs_sq();
-        let row1_mag = a10.abs_sq() + d1.abs_sq();
-
-        let (v0, v1) = if row0_mag >= row1_mag && a01.abs() > eps {
-            // v0 * d0 + v1 * a01 = 0  =>  v1 = -v0 * d0 / a01
-            (T::one(), T::zero() - d0 / a01)
-        } else if a10.abs() > eps {
-            // v0 * a10 + v1 * d1 = 0  =>  v0 = -v1 * d1 / a10
-            (T::zero() - d1 / a10, T::one())
-        } else {
-            // Degenerate case: use standard basis
-            (T::one(), T::zero())
-        };
-
-        // Normalize first eigenvector
-        let norm_sq = v0.abs_sq() + v1.abs_sq();
-        let norm = <T::Real as Real>::sqrt(norm_sq);
-        let u0 = if norm > eps {
-            (v0 / T::from_real(norm), v1 / T::from_real(norm))
-        } else {
-            (T::one(), T::zero())
-        };
-
-        // Second column of Q is orthogonal to first: u1 = [-conj(u0.1), conj(u0.0)]
-        let u1 = (T::zero() - u0.1.conj(), u0.0.conj());
-
-        // Build Q (columns are eigenvectors)
-        let mut q: Mat<T> = Mat::zeros(2, 2);
-        q[(0, 0)] = u0.0;
-        q[(1, 0)] = u0.1;
-        q[(0, 1)] = u1.0;
-        q[(1, 1)] = u1.1;
-
-        // Build T = Q^H * A * Q
-        let mut t: Mat<T> = Mat::zeros(2, 2);
-
-        // Compute Q^H * A
-        let mut qha: Mat<T> = Mat::zeros(2, 2);
-        for i in 0..2 {
-            for j in 0..2 {
-                let mut sum = T::zero();
-                for k in 0..2 {
-                    sum = sum + q[(k, i)].conj() * a[(k, j)];
-                }
-                qha[(i, j)] = sum;
-            }
-        }
-
-        // Compute (Q^H * A) * Q
-        for i in 0..2 {
-            for j in 0..2 {
-                let mut sum = T::zero();
-                for k in 0..2 {
-                    sum = sum + qha[(i, k)] * q[(k, j)];
-                }
-                t[(i, j)] = sum;
-            }
-        }
-
-        // Clean up small subdiagonal
-        let hundred: T::Real =
-            <T::Real as FromPrimitive>::from_f64(100.0).unwrap_or(<T::Real as One>::one());
-        if t[(1, 0)].abs() < eps * hundred {
-            t[(1, 0)] = T::zero();
-        }
-
-        let eigenvalues = vec![t[(0, 0)], t[(1, 1)]];
-
-        Ok(Self {
-            q,
-            t,
-            eigenvalues,
-            n: 2,
-        })
+    /// The triangular Schur factor as an owned-matrix reference
+    /// (crate-internal).
+    pub(crate) fn t_mat(&self) -> &Mat<T> {
+        &self.t
     }
 
     /// Returns the unitary matrix Q (Schur vectors).
@@ -407,238 +249,33 @@ where
         a
     }
 
-    /// Verifies the Schur decomposition: ||A - Q T Q^H|| / ||A||.
+    /// Verifies the Schur decomposition: ||A - Q T Q^H||_F / ||A||_F
+    /// (the absolute residual ||A - Q T Q^H||_F when A is zero).
     pub fn residual(&self, a: MatRef<'_, T>) -> T::Real {
         let n = self.n;
         let reconstructed = self.reconstruct();
 
-        // Compute ||A - reconstructed||_F
-        let mut diff_norm_sq = T::Real::zero();
-        let mut a_norm_sq = T::Real::zero();
+        // ||A - reconstructed||_F and ||A||_F, accumulated with `hypot` so that
+        // neither squares of tiny entries underflow nor squares of huge ones
+        // overflow: the ratio is then scale-invariant.
+        let mut diff_norm = T::Real::zero();
+        let mut a_norm = T::Real::zero();
 
         for i in 0..n {
             for j in 0..n {
                 let diff = a[(i, j)] - reconstructed[(i, j)];
-                diff_norm_sq = diff_norm_sq + diff.abs_sq();
-                a_norm_sq = a_norm_sq + a[(i, j)].abs_sq();
+                diff_norm = <T::Real as Real>::hypot(diff_norm, diff.abs());
+                a_norm = <T::Real as Real>::hypot(a_norm, a[(i, j)].abs());
             }
         }
 
-        if a_norm_sq < T::Real::epsilon() {
-            return diff_norm_sq;
+        // A zero matrix has no relative scale: report the absolute residual.
+        if a_norm == T::Real::zero() {
+            return diff_norm;
         }
 
-        <T::Real as Real>::sqrt(diff_norm_sq / a_norm_sq)
+        diff_norm / a_norm
     }
-}
-
-/// Computes the square root of a complex number.
-fn complex_sqrt<T: Field + ComplexScalar>(z: T) -> T
-where
-    T::Real: Real,
-{
-    let (re, im) = (z.real(), z.imag());
-    let mag = <T::Real as Real>::sqrt(re * re + im * im);
-
-    if mag < T::Real::epsilon() {
-        return T::zero();
-    }
-
-    let two = T::Real::one() + T::Real::one();
-    let r = <T::Real as Real>::sqrt((mag + re) / two);
-    let i = if im >= T::Real::zero() {
-        <T::Real as Real>::sqrt((mag - re) / two)
-    } else {
-        -<T::Real as Real>::sqrt((mag - re) / two)
-    };
-
-    T::from_real_imag(r, i)
-}
-
-/// Computes the Wilkinson shift from the bottom 2x2 block.
-fn compute_wilkinson_shift<T: Field + ComplexScalar + bytemuck::Zeroable>(t: &Mat<T>, p: usize) -> T
-where
-    T::Real: Real,
-{
-    if p < 2 {
-        return t[(p - 1, p - 1)];
-    }
-
-    let h11 = t[(p - 2, p - 2)];
-    let h12 = t[(p - 2, p - 1)];
-    let h21 = t[(p - 1, p - 2)];
-    let h22 = t[(p - 1, p - 1)];
-
-    // Compute eigenvalues of 2x2 block
-    let trace = h11 + h22;
-    let det = h11 * h22 - h12 * h21;
-
-    let two = T::one() + T::one();
-    let four = two + two;
-    let disc = trace * trace - four * det;
-    let disc_sqrt = complex_sqrt(disc);
-
-    let half = T::one() / two;
-    let lambda1 = half * (trace + disc_sqrt);
-    let lambda2 = half * (trace - disc_sqrt);
-
-    // Choose eigenvalue closer to h22
-    let diff1 = lambda1 - h22;
-    let diff2 = lambda2 - h22;
-
-    if diff1.abs_sq() < diff2.abs_sq() {
-        lambda1
-    } else {
-        lambda2
-    }
-}
-
-/// Applies one implicit QR step with shift (Francis single-shift algorithm).
-///
-/// For a Hessenberg matrix H[start:end, start:end], this performs one iteration
-/// of the implicit shifted QR algorithm with shift σ.
-fn complex_qr_step<T: Field + ComplexScalar + bytemuck::Zeroable>(
-    h: &mut Mat<T>,
-    q: &mut Mat<T>,
-    start: usize,
-    end: usize,
-    shift: T,
-) where
-    T::Real: Real,
-{
-    let n = h.nrows();
-
-    // Step 1: Create initial rotation to introduce the bulge
-    // Compute first column of (H - σI): x = [h[start,start] - σ, h[start+1,start], 0, ...]
-    let x0 = h[(start, start)] - shift;
-    let x1 = h[(start + 1, start)];
-
-    let (c, s) = givens_rotation_complex(x0, x1);
-
-    // Apply G_0 from left and right
-    apply_givens_left(h, c, s, start, start, n);
-    apply_givens_right(h, c, s, start, 0, end.min(start + 3));
-    apply_givens_right_to_q(q, c, s, start, n);
-
-    // Step 2: Chase the bulge down the subdiagonal
-    for k in start..(end - 2) {
-        // The bulge is at position (k+2, k)
-        // Create rotation to zero h[k+2, k] using rows k+1 and k+2
-        let a = h[(k + 1, k)];
-        let b = h[(k + 2, k)];
-
-        let (c, s) = givens_rotation_complex(a, b);
-
-        // Apply rotation from left to rows k+1 and k+2
-        apply_givens_left(h, c, s, k + 1, k, n);
-
-        // Apply rotation from right to columns k+1 and k+2
-        let row_end = end.min(k + 5);
-        apply_givens_right(h, c, s, k + 1, 0, row_end);
-
-        // Accumulate Q
-        apply_givens_right_to_q(q, c, s, k + 1, n);
-
-        // Explicitly zero the bulge (clean up numerical noise)
-        h[(k + 2, k)] = T::zero();
-    }
-}
-
-/// Apply Givens rotation from the left: H := G^H * H
-/// G^H = [[c, s*], [-s, c]] (c is real)
-#[inline]
-fn apply_givens_left<T: Field + ComplexScalar>(
-    h: &mut Mat<T>,
-    c: T,
-    s: T,
-    row: usize,
-    col_start: usize,
-    col_end: usize,
-) where
-    T::Real: Real,
-{
-    for j in col_start..col_end {
-        let t1 = h[(row, j)];
-        let t2 = h[(row + 1, j)];
-        h[(row, j)] = c * t1 + s.conj() * t2;
-        h[(row + 1, j)] = (T::zero() - s) * t1 + c * t2;
-    }
-}
-
-/// Apply Givens rotation from the right: H := H * G
-/// G = [[c, -s*], [s, c]] (c is real)
-#[inline]
-fn apply_givens_right<T: Field + ComplexScalar>(
-    h: &mut Mat<T>,
-    c: T,
-    s: T,
-    col: usize,
-    row_start: usize,
-    row_end: usize,
-) where
-    T::Real: Real,
-{
-    for i in row_start..row_end {
-        let t1 = h[(i, col)];
-        let t2 = h[(i, col + 1)];
-        h[(i, col)] = t1 * c + t2 * s;
-        h[(i, col + 1)] = (T::zero() - t1) * s.conj() + t2 * c;
-    }
-}
-
-/// Apply Givens rotation to Q: Q := Q * G
-#[inline]
-fn apply_givens_right_to_q<T: Field + ComplexScalar>(
-    q: &mut Mat<T>,
-    c: T,
-    s: T,
-    col: usize,
-    n: usize,
-) where
-    T::Real: Real,
-{
-    for i in 0..n {
-        let t1 = q[(i, col)];
-        let t2 = q[(i, col + 1)];
-        q[(i, col)] = t1 * c + t2 * s;
-        q[(i, col + 1)] = (T::zero() - t1) * s.conj() + t2 * c;
-    }
-}
-
-/// Computes Givens rotation for complex numbers.
-/// Returns (c, s) such that G^H * [a; b] = [r; 0] where G^H = [[c, s*], [-s, c]].
-/// Here c is real (stored as complex with zero imaginary part).
-///
-/// The rotation satisfies: -s * a + c * b = 0, which gives s = c * b / a.
-/// With c = |a| / r, we get s = |a| * b / (r * a) = conj(a) * b / (|a| * r).
-fn givens_rotation_complex<T: Field + ComplexScalar>(a: T, b: T) -> (T, T)
-where
-    T::Real: Real,
-{
-    let b_norm = b.abs();
-
-    if b_norm < T::Real::epsilon() {
-        return (T::one(), T::zero());
-    }
-
-    let a_norm = a.abs();
-    let r = <T::Real as Real>::sqrt(a_norm * a_norm + b_norm * b_norm);
-
-    if r < T::Real::epsilon() {
-        return (T::one(), T::zero());
-    }
-
-    // c is real: c = |a| / r
-    let c = T::from_real(a_norm / r);
-
-    // s = conj(a) * b / (|a| * r) = conj(a/|a|) * b / r
-    let s = if a_norm > T::Real::epsilon() {
-        a.conj() * b / T::from_real(a_norm * r)
-    } else {
-        b / T::from_real(r)
-    };
-
-    (c, s)
 }
 
 #[cfg(test)]

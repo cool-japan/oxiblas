@@ -37,6 +37,7 @@ pub mod strassen;
 pub mod symm;
 pub mod syr2k;
 pub mod syrk;
+mod tri_gemm;
 pub mod trmm;
 pub mod trsm;
 
@@ -79,5 +80,5 @@ pub use syrk::{SyrkError, syrk, syrk_new};
 pub use trmm::{TrmmDiag, TrmmError, TrmmSide, TrmmTrans, TrmmUplo, trmm, trmm_in_place};
 pub use trsm::{
     Diag, Side, Trans, Uplo, trsm, trsm_c32, trsm_c32_in_place, trsm_c64, trsm_c64_in_place,
-    trsm_in_place,
+    trsm_in_place, trsm_in_place_with_par, trsm_with_par,
 };

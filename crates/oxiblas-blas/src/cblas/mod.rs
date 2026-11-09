@@ -1,4 +1,20 @@
-//! CBLAS-compatible interface for BLAS-TESTER compatibility.
+//! CBLAS-compatible C ABI.
+//!
+//! The `cblas_*` functions are `extern "C"` entry points that follow the
+//! semantics of reference CBLAS for valid calls. They are not a drop-in
+//! replacement for every part of the reference library:
+//!
+//! - There is no `cblas_xerbla`. Invalid arguments (negative dimensions,
+//!   undersized leading dimensions, null pointers, ...) make the call a silent
+//!   no-op instead of raising an error.
+//! - The enum arguments (`CblasLayout`, `CblasTranspose`, ...) are Rust
+//!   `#[repr(C)]` enums, so a value outside the set defined in `cblas.h` is
+//!   undefined behaviour.
+//! - The `i?amax` routines return `i32`, whereas `cblas.h` declares their
+//!   return type as `CBLAS_INDEX`.
+//!
+//! Netlib's CBLAS error-exit tests pass out-of-range enum values and expect
+//! `cblas_xerbla`, so they are not supported.
 //!
 //! Split into modules:
 //! - `types`: Common CBLAS types and enums

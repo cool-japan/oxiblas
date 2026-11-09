@@ -1,14 +1,50 @@
 //! Memory-mapped matrix storage.
 //!
 //! This module provides memory-mapped matrices for working with large datasets
-//! that may not fit in RAM, or for sharing matrices between processes.
+//! that may not fit in RAM, and for persisting matrices on disk.
 //!
 //! # Features
 //!
 //! - **Large matrix support**: Work with matrices larger than available RAM
-//! - **Process sharing**: Multiple processes can map the same file
+//! - **Read-only sharing**: Several read-only [`MmapMat`] mappings of one file
+//!   (in this or other processes) may coexist, provided nobody modifies the
+//!   file while any of them is alive; concurrent writers are not supported
+//!   (see [Soundness requirements](#soundness-requirements))
 //! - **Persistence**: Matrix data persists on disk
 //! - **Zero-copy**: No data copying when opening existing matrices
+//!
+//! # Soundness requirements
+//!
+//! The constructors in this module are safe functions, but a memory map hands
+//! out ordinary Rust references (`&T`, `&mut T`, [`MatRef`], [`MatMut`]) into
+//! the file's pages, so soundness depends on conditions this module cannot
+//! check. **While a value returned by [`MmapMat::open`],
+//! [`MmapMatMut::create`], [`MmapMatMut::open`], [`MmapBuilder::from_mat`] or
+//! [`MmapBuilder::from_slice`] is alive, and for the duration of a
+//! [`write_mat`] call, the caller must guarantee that:**
+//!
+//! 1. **Nothing else modifies the file.** No other process, and no other
+//!    mapping or file handle in this process, may write to the file or change
+//!    its length. In particular, never open the same path twice while either
+//!    handle is an [`MmapMatMut`]: the two handles would hand out aliasing
+//!    `&T` / `&mut T` (or two `&mut T`) to one element, which is undefined
+//!    behaviour. The `memmap2` mapping this module is built on makes any
+//!    concurrent modification of a mapped file undefined behaviour, and
+//!    truncating a mapped file makes later accesses fault (`SIGBUS` on Unix,
+//!    which kills the process) instead of returning an error.
+//! 2. **`T` is one of the supported element types**: `f32`, `f64`,
+//!    `Complex<f32>`, `Complex<f64>`, `i32` or `i64`, for which every bit
+//!    pattern read from the file is a valid value. The element type recorded
+//!    in the file header is matched against `T` using only
+//!    `core::any::type_name` and `size_of`, and [`Scalar`] is not sealed, so
+//!    a user-defined type whose name contains, say, `f64` and whose size is 8
+//!    passes that check. Reading arbitrary file bytes as such a type is
+//!    undefined behaviour unless it, too, is valid for every bit pattern.
+//!
+//! Mapping failures, short or corrupt headers, element-type mismatches and
+//! files too small for their header dimensions *are* detected and reported
+//! as [`MmapError`]; only the two conditions above are the caller's
+//! responsibility.
 //!
 //! # File Format
 //!
@@ -315,18 +351,24 @@ impl Header {
 
         Ok(Header {
             magic,
-            version: u64::from_le_bytes(bytes[8..16].try_into().expect("slice is exactly 8 bytes")),
-            elem_type: u64::from_le_bytes(
-                bytes[16..24].try_into().expect("slice is exactly 8 bytes"),
-            ),
-            nrows: u64::from_le_bytes(bytes[24..32].try_into().expect("slice is exactly 8 bytes")),
-            ncols: u64::from_le_bytes(bytes[32..40].try_into().expect("slice is exactly 8 bytes")),
-            row_stride: u64::from_le_bytes(
-                bytes[40..48].try_into().expect("slice is exactly 8 bytes"),
-            ),
+            version: read_u64_le(bytes, 8),
+            elem_type: read_u64_le(bytes, 16),
+            nrows: read_u64_le(bytes, 24),
+            ncols: read_u64_le(bytes, 32),
+            row_stride: read_u64_le(bytes, 40),
             _padding: [0; 16],
         })
     }
+}
+
+/// Reads the little-endian `u64` stored at `bytes[offset..offset + 8]`.
+///
+/// [`Header::from_bytes`] checks `bytes.len() >= HEADER_SIZE` first, so every
+/// header field it reads is in range.
+fn read_u64_le(bytes: &[u8], offset: usize) -> u64 {
+    let mut field = [0u8; 8];
+    field.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(field)
 }
 
 /// Computes the row stride with padding for alignment.
@@ -364,8 +406,12 @@ fn compute_row_stride<T>(nrows: usize) -> Result<usize, MmapError> {
 
 /// A read-only memory-mapped matrix.
 ///
-/// This type maps a matrix file into memory for read-only access. Changes to
-/// the underlying file by other processes may be visible.
+/// This type maps a matrix file into memory for read-only access and hands
+/// out references into the mapping. The file must not change while it is
+/// mapped: modifying or truncating it (from another process, or through
+/// another handle in this process) is undefined behaviour, not merely a way
+/// to observe new values. See the module-level
+/// [soundness requirements](self#soundness-requirements).
 pub struct MmapMat<T: Scalar> {
     mmap: Mmap,
     nrows: usize,
@@ -377,6 +423,18 @@ pub struct MmapMat<T: Scalar> {
 impl<T: Scalar> MmapMat<T> {
     /// Opens an existing memory-mapped matrix file for reading.
     ///
+    /// # Soundness
+    ///
+    /// This function is safe to call, but the returned value is only sound to
+    /// use while the caller upholds the module-level
+    /// [soundness requirements](self#soundness-requirements):
+    /// - nothing may write to or truncate the file while the returned
+    ///   `MmapMat` (or any reference or view borrowed from it) is alive: no
+    ///   other process, and no [`MmapMatMut`] or other handle on the same path
+    ///   in this process;
+    /// - `T` must be one of the supported element types (`f32`, `f64`,
+    ///   `Complex<f32>`, `Complex<f64>`, `i32`, `i64`).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -385,6 +443,15 @@ impl<T: Scalar> MmapMat<T> {
     /// - The element type doesn't match `T`
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MmapError> {
         let file = File::open(path)?;
+        // SAFETY: `MmapOptions::map` is unsafe because using the mapping is UB
+        // if the file is modified or truncated (by this or another process)
+        // while it is mapped. Nothing here prevents that (no lock, no private
+        // copy): this relies on nobody writing to or truncating the file for
+        // the lifetime of the returned `MmapMat`, including a `MmapMatMut`
+        // opened on the same path in this process, which the documentation of
+        // this function and of the module makes the caller's obligation. The
+        // mapped length is not trusted: `from_bytes` / `validate_layout` below
+        // check it before any element access.
         let mmap = unsafe { MmapOptions::new().map(&file)? };
 
         // Read and validate header
@@ -430,6 +497,13 @@ impl<T: Scalar> MmapMat<T> {
     /// Returns a pointer to the first element.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
+        // SAFETY: `MmapMat` is only constructed by `open`, after
+        // `Header::from_bytes` (rejects maps shorter than `HEADER_SIZE`) and
+        // `validate_layout` (requires at least
+        // `HEADER_SIZE + row_stride * ncols * size_of::<T>()` bytes) passed,
+        // and neither the map nor the dimensions change afterwards. So the
+        // `HEADER_SIZE`-byte offset stays within the mapping (at most one
+        // past its end, when the data region is empty).
         unsafe { self.mmap.as_ptr().add(HEADER_SIZE).cast() }
     }
 
@@ -446,6 +520,18 @@ impl<T: Scalar> MmapMat<T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         if row < self.nrows && col < self.ncols {
+            // SAFETY: the indices were bounds-checked just above, and
+            // `validate_layout` (run by `open`) proved `row_stride >= nrows`
+            // and room for `row_stride * ncols` elements after the header, so
+            // offset `row + col * row_stride < row_stride * ncols` is in
+            // bounds. The data starts `HEADER_SIZE` (64) bytes into a
+            // page-aligned map, so it is aligned for every `T` that
+            // `ElementType::from_type` accepts (size, hence alignment, at most
+            // 16). The `&T` borrows `self`, which keeps the map alive. Reading
+            // file bytes as `T` assumes every bit pattern is a valid `T` (true
+            // for the float/complex types; only checked by the `type_name`
+            // heuristic in `from_type`) and that the file is not modified
+            // while mapped (see `open`).
             Some(unsafe { &*self.as_ptr().add(row + col * self.row_stride) })
         } else {
             None
@@ -475,14 +561,22 @@ impl<T: Scalar> core::ops::Index<(usize, usize)> for MmapMat<T> {
     #[inline]
     fn index(&self, (row, col): (usize, usize)) -> &Self::Output {
         assert!(row < self.nrows && col < self.ncols, "Index out of bounds");
+        // SAFETY: the `assert!` above bounds-checks the indices and
+        // `validate_layout` (run by `open`) puts offset
+        // `row + col * row_stride` inside the mapping; alignment, bit
+        // validity and the no-concurrent-modification assumption are as in
+        // `MmapMat::get`.
         unsafe { &*self.as_ptr().add(row + col * self.row_stride) }
     }
 }
 
 /// A mutable memory-mapped matrix.
 ///
-/// This type maps a matrix file into memory for read-write access. Changes
-/// are automatically synced to the file.
+/// This type maps a matrix file into memory for read-write access. Writes go
+/// to a shared mapping of the file, so the operating system writes them back
+/// without an explicit write call; use [`flush`](Self::flush) to make them
+/// durable. The mapping must be the only access to the file while it lives:
+/// see the module-level [soundness requirements](self#soundness-requirements).
 pub struct MmapMatMut<T: Scalar> {
     mmap: MmapMut,
     nrows: usize,
@@ -495,6 +589,20 @@ impl<T: Scalar> MmapMatMut<T> {
     /// Creates a new memory-mapped matrix file.
     ///
     /// The file is created with the specified dimensions and initialized to zeros.
+    /// An existing file at `path` is truncated and overwritten.
+    ///
+    /// # Soundness
+    ///
+    /// This function is safe to call, but the returned value is only sound to
+    /// use while the caller upholds the module-level
+    /// [soundness requirements](self#soundness-requirements):
+    /// - the returned `MmapMatMut` must be the only access to the file while
+    ///   it is alive: no other process, and no other [`MmapMat`] /
+    ///   `MmapMatMut` or other handle on the same path in this process, may
+    ///   map, write to or truncate it (in particular, the file must not be
+    ///   mapped elsewhere when this call truncates it);
+    /// - `T` must be one of the supported element types (`f32`, `f64`,
+    ///   `Complex<f32>`, `Complex<f64>`, `i32`, `i64`).
     ///
     /// # Errors
     ///
@@ -532,6 +640,15 @@ impl<T: Scalar> MmapMatMut<T> {
         file.set_len(total_size as u64)?;
 
         // Map the file
+        // SAFETY: same contract as in `MmapMat::open`: using the mapping is UB
+        // if the file is modified or truncated while mapped. The file was just
+        // created, truncated and sized through `file`, but nothing prevents
+        // another process, or another `MmapMat`/`MmapMatMut` opened on the
+        // same path, from touching it for the lifetime of the returned value;
+        // this relies on that not happening, which the documentation of this
+        // function and of the module makes the caller's obligation. The mapped
+        // length is re-checked by `validate_layout` below before anything is
+        // written through it.
         let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
 
         // Write header
@@ -561,6 +678,18 @@ impl<T: Scalar> MmapMatMut<T> {
 
     /// Opens an existing memory-mapped matrix file for reading and writing.
     ///
+    /// # Soundness
+    ///
+    /// This function is safe to call, but the returned value is only sound to
+    /// use while the caller upholds the module-level
+    /// [soundness requirements](self#soundness-requirements):
+    /// - the returned `MmapMatMut` must be the only access to the file while
+    ///   it is alive: no other process, and no other [`MmapMat`] /
+    ///   `MmapMatMut` or other handle on the same path in this process, may
+    ///   map, write to or truncate it (two handles would alias `&T` / `&mut T`);
+    /// - `T` must be one of the supported element types (`f32`, `f64`,
+    ///   `Complex<f32>`, `Complex<f64>`, `i32`, `i64`).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -570,6 +699,13 @@ impl<T: Scalar> MmapMatMut<T> {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MmapError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
+        // SAFETY: same contract as in `MmapMat::open`: this relies on nobody
+        // else (another process, or another `MmapMat`/`MmapMatMut` on the same
+        // path in this process) accessing, writing to or truncating the file
+        // while this writable mapping lives, which nothing here enforces and
+        // the documentation makes the caller's obligation. The mapped length
+        // is checked by `from_bytes` / `validate_layout` below before any
+        // element access.
         let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
 
         // Read and validate header
@@ -616,12 +752,21 @@ impl<T: Scalar> MmapMatMut<T> {
     /// Returns a pointer to the first element.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
+        // SAFETY: `MmapMatMut` is only constructed by `create` and `open`,
+        // both of which ran `validate_layout` on the mapping (requiring at
+        // least `HEADER_SIZE + row_stride * ncols * size_of::<T>()` bytes)
+        // with the same dimensions they store, and neither the map nor the
+        // dimensions change afterwards. So the `HEADER_SIZE`-byte offset
+        // stays within the mapping (at most one past its end).
         unsafe { self.mmap.as_ptr().add(HEADER_SIZE).cast() }
     }
 
     /// Returns a mutable pointer to the first element.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
+        // SAFETY: as in `as_ptr`: `validate_layout` (run by `create` and
+        // `open`) guarantees the mapping holds at least `HEADER_SIZE` bytes,
+        // so the offset stays within it (at most one past its end).
         unsafe { self.mmap.as_mut_ptr().add(HEADER_SIZE).cast() }
     }
 
@@ -649,6 +794,13 @@ impl<T: Scalar> MmapMatMut<T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         if row < self.nrows && col < self.ncols {
+            // SAFETY: the indices were bounds-checked just above, and
+            // `validate_layout` (run by `create` and `open`) puts offset
+            // `row + col * row_stride` inside the mapping, aligned for `T`
+            // (see `MmapMat::get`). The bytes are zero-filled by `create` or
+            // come from the file; reading them as `T` relies on the bit
+            // validity and no-concurrent-modification assumptions noted in
+            // `MmapMat::get` / `MmapMat::open`.
             Some(unsafe { &*self.as_ptr().add(row + col * self.row_stride) })
         } else {
             None
@@ -659,6 +811,12 @@ impl<T: Scalar> MmapMatMut<T> {
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut T> {
         if row < self.nrows && col < self.ncols {
+            // SAFETY: bounds-checked, in bounds and aligned exactly as in
+            // `get`. The `&mut T` borrows `self` mutably, so no other
+            // reference to the element exists through this `MmapMatMut`;
+            // exclusivity against other mappings of the same file (in this or
+            // another process) is NOT enforced and is relied upon (see
+            // `open`).
             Some(unsafe { &mut *self.as_mut_ptr().add(row + col * self.row_stride) })
         } else {
             None
@@ -669,6 +827,12 @@ impl<T: Scalar> MmapMatMut<T> {
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
         assert!(row < self.nrows && col < self.ncols, "Index out of bounds");
+        // SAFETY: the `assert!` above bounds-checks the indices, and
+        // `validate_layout` (run by `create` and `open`) puts offset
+        // `row + col * row_stride` inside the writable mapping, aligned for
+        // `T` (see `MmapMat::get`). `&mut self` excludes other references
+        // through this value; concurrent access through other mappings of the
+        // same file is relied upon not to happen (see `open`).
         unsafe {
             *self.as_mut_ptr().add(row + col * self.row_stride) = value;
         }
@@ -735,6 +899,11 @@ impl<T: Scalar> core::ops::Index<(usize, usize)> for MmapMatMut<T> {
     #[inline]
     fn index(&self, (row, col): (usize, usize)) -> &Self::Output {
         assert!(row < self.nrows && col < self.ncols, "Index out of bounds");
+        // SAFETY: the `assert!` above bounds-checks the indices and
+        // `validate_layout` (run by `create` and `open`) puts offset
+        // `row + col * row_stride` inside the mapping; alignment, bit
+        // validity and the no-concurrent-modification assumption are as in
+        // `MmapMat::get`.
         unsafe { &*self.as_ptr().add(row + col * self.row_stride) }
     }
 }
@@ -743,6 +912,12 @@ impl<T: Scalar> core::ops::IndexMut<(usize, usize)> for MmapMatMut<T> {
     #[inline]
     fn index_mut(&mut self, (row, col): (usize, usize)) -> &mut Self::Output {
         assert!(row < self.nrows && col < self.ncols, "Index out of bounds");
+        // SAFETY: the `assert!` above bounds-checks the indices and
+        // `validate_layout` (run by `create` and `open`) puts offset
+        // `row + col * row_stride` inside the writable mapping (alignment and
+        // bit validity as in `MmapMat::get`). The `&mut T` borrows `self`
+        // mutably; exclusivity against other mappings of the same file is
+        // relied upon, not enforced (see `open`).
         unsafe { &mut *self.as_mut_ptr().add(row + col * self.row_stride) }
     }
 }
@@ -765,6 +940,18 @@ impl<T: Scalar> MmapBuilder<T> {
     }
 
     /// Creates a new memory-mapped matrix file from a Mat.
+    ///
+    /// # Soundness
+    ///
+    /// The returned value comes from [`MmapMatMut::create`] and carries the
+    /// same obligations: it must be the only access to the file while it is
+    /// alive, and `T` must be a supported element type (see the module-level
+    /// [soundness requirements](self#soundness-requirements)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the builder's dimensions differ from `mat`'s, or if
+    /// [`MmapMatMut::create`] or the final flush fails.
     pub fn from_mat<P: AsRef<Path>>(
         self,
         path: P,
@@ -787,6 +974,18 @@ impl<T: Scalar> MmapBuilder<T> {
     }
 
     /// Creates a new memory-mapped matrix file from a flat slice (column-major).
+    ///
+    /// # Soundness
+    ///
+    /// The returned value comes from [`MmapMatMut::create`] and carries the
+    /// same obligations: it must be the only access to the file while it is
+    /// alive, and `T` must be a supported element type (see the module-level
+    /// [soundness requirements](self#soundness-requirements)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `data.len()` differs from `nrows * ncols`, or if
+    /// [`MmapMatMut::create`] or the final flush fails.
     pub fn from_slice<P: AsRef<Path>>(
         self,
         path: P,
@@ -818,6 +1017,18 @@ impl<T: Scalar> MmapBuilder<T> {
 }
 
 /// Utility function to write a Mat directly to a memory-mapped file.
+///
+/// # Soundness
+///
+/// This maps the file with [`MmapMatMut::create`] for the duration of the
+/// call, so for that duration it must be the only access to the file (no
+/// other mapping, handle or process may map, write to or truncate it), and `T`
+/// must be a supported element type (see the module-level
+/// [soundness requirements](self#soundness-requirements)).
+///
+/// # Errors
+///
+/// Returns an error if [`MmapMatMut::create`] or the final flush fails.
 pub fn write_mat<T: Scalar, P: AsRef<Path>>(path: P, mat: &MatRef<'_, T>) -> Result<(), MmapError> {
     let mut mmat = MmapMatMut::create(path, mat.nrows(), mat.ncols())?;
     mmat.copy_from(mat);
@@ -826,6 +1037,9 @@ pub fn write_mat<T: Scalar, P: AsRef<Path>>(path: P, mat: &MatRef<'_, T>) -> Res
 }
 
 /// Utility function to read dimensions from a memory-mapped matrix file without mapping the data.
+///
+/// This reads the header with ordinary file I/O (no memory map), so it has no
+/// soundness requirements.
 pub fn read_dimensions<P: AsRef<Path>>(path: P) -> Result<(usize, usize), MmapError> {
     let mut file = File::open(path)?;
     let mut header_bytes = [0u8; HEADER_SIZE];

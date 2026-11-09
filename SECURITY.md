@@ -44,4 +44,4 @@ In scope: all crates published from this workspace
 
 Out of scope: `oxiblas-benchmarks` (an unpublished, `publish = false`
 development-only crate) and vulnerabilities that require enabling its
-opt-in `compare-openblas` feature, which links a system OpenBLAS.
+opt-in `compare-openblas` feature, which loads a system OpenBLAS at run time.

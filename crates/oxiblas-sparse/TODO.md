@@ -44,7 +44,7 @@ Sparse matrix operations and solvers.
 
 ### Current Status
 - [x] Sparse Cholesky
-- [x] Sparse LU (with ILU0)
+- [x] Sparse LU (with ILU0) — 0.2.3: `SparseLU` row swaps did not swap the multipliers already computed (wrong solutions after any swap past the first step), and `ILU0::apply` divided by the multipliers twice; both fixed, with scale-invariant pivot tests
 - [x] Sparse QR (Givens-based)
 - [x] Sparse QR (column ordering + Givens, SparseQr with least squares solve) (v0.2.0)
 
@@ -60,6 +60,8 @@ Sparse matrix operations and solvers.
 ---
 
 ## Iterative Solvers
+
+*0.2.3: until 0.2.3 the GMRES family restarted after every step, several solvers used absolute breakdown thresholds or reported convergence from a drifted residual, and `block_gmres`, `minres`/`pminres`, `ptfqmr`, `idrs`/`pidrs`, `bicgstab`/`tfqmr` and `block_cg`/`block_pcg` had solver-specific bugs. All are fixed: breakdown tests are relative and decided by the true residual, `gmres`, `pgmres`, `fgmres`, `block_gmres`, `idrs`, `pidrs`, `qmr` and `pminres` confirm convergence with it, and systems far from unit scale are rescaled (see the CHANGELOG).*
 
 ### Current Status
 - [x] CG (Conjugate Gradient)
@@ -83,6 +85,8 @@ Sparse matrix operations and solvers.
 ---
 
 ## Preconditioners
+
+*0.2.3: `IC(0)` dropped the coupling terms of its elimination, `ICT` never updated off-diagonal entries or created fill-in, the Chebyshev polynomial recurrence was wrong, and most setups used absolute thresholds. All are fixed; setups are scale-invariant (see the CHANGELOG).*
 
 ### Current Status
 - [x] ILU(0)

@@ -29,7 +29,9 @@ sometimes constrain the shape of an acceptable change more than usual.
 
 ## Code quality requirements
 
-These are enforced in review and, where practical, in CI:
+These are enforced in review. The GitHub Actions workflows are disabled (see
+`.github/README-internal.md`), so run the checks locally before sending a
+change:
 
 - **No warnings.** `cargo clippy --workspace --exclude oxiblas-benchmarks
   --all-targets -- -D warnings` must be clean. `msrv` in `clippy.toml`
@@ -56,7 +58,10 @@ These are enforced in review and, where practical, in CI:
   (SIMD kernels, raw-pointer matrix views, memory-mapped I/O, CBLAS ABI
   entry points). Every `unsafe fn` needs a `# Safety` doc section stating
   its preconditions, and every `unsafe { ... }` block needs a `// SAFETY:`
-  comment justifying why the preconditions hold at that call site. Prefer
+  comment justifying why the preconditions hold at that call site
+  (`clippy::undocumented_unsafe_blocks` enforces this in `oxiblas-blas`,
+  `oxiblas-matrix`, `oxiblas-lapack`, `oxiblas-sparse` and `oxiblas-ndarray`;
+  `oxiblas-core` still has undocumented blocks). Prefer
   a safe API with a validated constructor (see `Mat::from_slice` /
   `checked_dim_mul`) over an unchecked one where the two are not
   meaningfully different in performance.
@@ -69,15 +74,34 @@ These are enforced in review and, where practical, in CI:
 - `cargo test --doc --workspace --exclude oxiblas-benchmarks` for doctests
 - New public-facing behavior needs a unit test; bug fixes need a regression
   test that fails without the fix.
+- Four SVD tests that compare with the one-sided Jacobi `Svd` are too slow for
+  debug builds and are ignored there; run them with `--release`, or with
+  `--run-ignored all` under nextest.
 
-Avoid `--all-features` unless you are specifically working on the optional
-`compare-openblas` benchmark comparison — it requires a system OpenBLAS
-install and is not part of the normal development loop.
+`--all-features` builds and passes on stable, but it turns on `force-scalar`,
+which replaces the GEMM micro-kernels with the scalar one (and, on aarch64,
+the NEON DOT, NRM2, GEMV and TRSM/TRMM kernels with portable code), so it
+does not replace the default run above.
+To cover other configurations, select features explicitly, for example
+`--features parallel`, or `--features runtime-tuning` on `oxiblas-blas`.
+`oxiblas-core`'s `sve-nightly` needs a nightly toolchain only together with
+`-C target-feature=+sve`; `lib.rs` then declares the `stdarch_aarch64_sve`
+feature gate. That configuration is compile-checked, but has not run on SVE
+hardware.
+
+`crates/oxiblas-blas/src/level3/trsm/tri_kernel_neon.rs` is generated: edit
+`crates/oxiblas-blas/tools/gen_tri_kernel_neon.py` and regenerate it with the
+command in the file's header instead of editing it by hand.
+
+The optional `compare-openblas` benchmark links no BLAS crate. It loads an
+OpenBLAS shared library when it runs, and is not part of the normal development
+loop.
 
 ## Commit / PR process
 
 - Keep commits focused; describe the *why*, not just the *what*.
-- Update `CHANGELOG.md` under `[Unreleased]` for user-visible changes.
+- Update `CHANGELOG.md` for user-visible changes, under the section of the
+  next release (currently `## [0.2.3] - Unreleased`).
 - Do not bump the crate version yourself; maintainers handle releases.
 - Security-relevant issues should go through `SECURITY.md`, not a public
   PR/issue, until a fix is ready.

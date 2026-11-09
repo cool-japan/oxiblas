@@ -1284,18 +1284,37 @@ mod tests {
                     assert_ne!(backend, ComplexSimdBackend::Scalar);
                 }
             }
+            // With `std` the level comes from runtime detection, so check it
+            // against the CPU (same rule as `detect_simd_level_raw`): AVX-512F,
+            // or AVX2 with FMA, must select a 256-bit or wider level and a
+            // complex SIMD kernel. A CPU with only SSE (for example Rosetta 2,
+            // which stops at SSE4.2) has no complex kernel and must fall back
+            // to scalar.
             #[cfg(all(target_arch = "x86_64", feature = "std"))]
             {
-                // The dev/CI host for this crate exposes at least AVX2 (256-bit).
-                assert!(
-                    level >= SimdLevel::Simd256,
-                    "expected >= Simd256 on x86_64, got {level:?}"
-                );
-                assert_ne!(
-                    backend,
-                    ComplexSimdBackend::Scalar,
-                    "complex SIMD dispatch fell back to scalar on a SIMD-capable x86_64 CPU"
-                );
+                let wide = is_x86_feature_detected!("avx512f")
+                    || (is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"));
+                if wide {
+                    assert!(
+                        level >= SimdLevel::Simd256,
+                        "expected >= Simd256 on an AVX2/FMA x86_64 CPU, got {level:?}"
+                    );
+                    assert_ne!(
+                        backend,
+                        ComplexSimdBackend::Scalar,
+                        "complex SIMD dispatch fell back to scalar on an AVX2/FMA x86_64 CPU"
+                    );
+                } else {
+                    assert!(
+                        level <= SimdLevel::Simd128,
+                        "expected <= Simd128 on an x86_64 CPU without AVX2/FMA, got {level:?}"
+                    );
+                    assert_eq!(
+                        backend,
+                        ComplexSimdBackend::Scalar,
+                        "an x86_64 CPU without AVX2/FMA has no complex SIMD kernel"
+                    );
+                }
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -1314,6 +1333,21 @@ mod tests {
                 "unexpected SIMD level {level:?} on a non-x86_64/aarch64 target"
             );
             assert_eq!(backend, ComplexSimdBackend::Scalar);
+        }
+
+        // With `max-simd-128` the level is capped at 128 bits: aarch64 keeps its
+        // NEON complex kernel, while x86_64 has no 128-bit complex kernel and
+        // falls back to scalar.
+        #[cfg(all(feature = "max-simd-128", not(feature = "force-scalar")))]
+        {
+            assert!(
+                level <= SimdLevel::Simd128,
+                "max-simd-128 must cap the SIMD level, got {level:?}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(backend, ComplexSimdBackend::Scalar);
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(backend, ComplexSimdBackend::Simd128);
         }
 
         // When scalar is explicitly forced, the dispatch must honor it.

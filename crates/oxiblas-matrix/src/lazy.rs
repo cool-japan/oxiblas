@@ -961,6 +961,14 @@ mod tests {
 
     struct CountingAllocator;
 
+    // SAFETY: every method passes its arguments unchanged to `System` (which
+    // implements `GlobalAlloc` correctly) and returns `System`'s result as is,
+    // so the size, alignment and ownership contracts are exactly `System`'s.
+    // The only extra work touches the two `const`-initialized, drop-free
+    // `Cell` thread-locals above: on native-TLS targets std stores such a key
+    // as a plain `#[thread_local]` static, so `with` neither allocates (no
+    // re-entry into this allocator) nor panics, and the `u64` counter cannot
+    // realistically overflow, so no method unwinds.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             if ALLOC_ACTIVE.with(Cell::get) {

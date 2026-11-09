@@ -457,6 +457,10 @@ fn extract_upper_triangular<T: Scalar + Clone + Field>(work: &[Vec<T>], n: usize
         col_ptrs[j + 1] = values.len();
     }
 
+    // SAFETY: `col_ptrs` has `n + 1` entries, `col_ptrs[0] == 0`, and
+    // `col_ptrs[j + 1]` is the running `values.len()`, so it is
+    // non-decreasing; `row_indices` and `values` are only pushed together;
+    // every row index is `i <= j < n`, the matrix's row count.
     unsafe { CscMatrix::new_unchecked(n, n, col_ptrs, row_indices, values) }
 }
 
@@ -519,6 +523,11 @@ fn permute_columns<T: Scalar + Clone + Field>(a: &CscMatrix<T>, perm: &[usize]) 
         col_ptrs[new_j + 1] = values.len();
     }
 
+    // SAFETY: `col_ptrs` has `n + 1` entries, `col_ptrs[0] == 0`, and
+    // `col_ptrs[new_j + 1]` is the running `values.len()` (non-decreasing);
+    // `row_indices` and `values` are only pushed together; the row indices
+    // are copied unchanged from `a`, so they are `< a.nrows() == m` by `a`'s
+    // `CscMatrix` invariant (`perm` is only used as a bounds-checked index).
     unsafe { CscMatrix::new_unchecked(m, n, col_ptrs, row_indices, values) }
 }
 
@@ -686,8 +695,8 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> SparseQRGivens<T> {
 /// Computes a Givens rotation to zero out an element.
 ///
 /// Given (a, b), computes (c, s) such that:
-/// [c  s][a]   [r]
-/// [-s c][b] = [0]
+/// \[c  s\]\[a\]   \[r\]
+/// \[-s c\]\[b\] = \[0\]
 fn givens_rotation<T: Scalar<Real = T> + Clone + Field + Real>(a: T, b: T) -> (T, T, T) {
     if Scalar::abs(b.clone()) <= <T as Scalar>::epsilon() {
         return (T::one(), T::zero(), a);
@@ -736,6 +745,10 @@ fn dense_to_csr_upper<T: Scalar + Clone + Field>(
         row_ptrs[i + 1] = values.len();
     }
 
+    // SAFETY: `row_ptrs` has `m + 1` entries, `row_ptrs[0] == 0`, and
+    // `row_ptrs[i + 1]` is the running `values.len()` (non-decreasing);
+    // `col_indices` and `values` are only pushed together; every column is
+    // a loop index `j` of `i..n`, so `< n`.
     unsafe { CsrMatrix::new_unchecked(m, n, row_ptrs, col_indices, values) }
 }
 

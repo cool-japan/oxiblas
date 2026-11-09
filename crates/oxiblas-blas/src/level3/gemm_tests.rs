@@ -1142,3 +1142,75 @@ fn test_issue_4_fitted_blocking_matches_reference() {
         }
     }
 }
+
+/// A `rows x cols` matrix of distinct values.
+fn distinct<T: Field + bytemuck::Zeroable>(rows: usize, cols: usize) -> Mat<T> {
+    let mut m: Mat<T> = Mat::zeros(rows, cols);
+    for j in 0..cols {
+        for i in 0..rows {
+            m[(i, j)] = T::from_f64((i * cols + j) as f64 + 1.0).unwrap_or_else(T::one);
+        }
+    }
+    m
+}
+
+/// The element-wise fallback of `pack_a_trans_dispatch` (taken for a view
+/// whose rows are not adjacent, here a `transpose()` view) writes through a
+/// raw pointer, so a short buffer must panic in every build profile, not only
+/// with `debug_assertions` (release builds used to write past the buffer).
+#[test]
+#[should_panic(expected = "A packing buffer too small")]
+fn pack_a_trans_dispatch_fallback_rejects_short_buffer() {
+    let store = distinct::<f64>(4, 9);
+    let a = store.as_ref().transpose();
+    assert_ne!(
+        a.col_stride(),
+        1,
+        "the fallback needs a non-unit column stride"
+    );
+    // op(A) = A is 9 x 4: ceil(9 / 8) * 8 * 4 = 64 elements are needed.
+    let mut pack: AlignedVec<f64> = AlignedVec::zeros(63);
+    pack_a_trans_dispatch(&a, Trans::NoTrans, 0, 0, 9, 4, &mut pack, 8);
+}
+
+/// As above for `pack_b_trans_dispatch`, through the complex `ConjTrans`
+/// fallback (contiguous storage, but conjugated element-wise reads).
+#[test]
+#[should_panic(expected = "B packing buffer too small")]
+fn pack_b_trans_dispatch_fallback_rejects_short_buffer() {
+    let b = distinct::<Complex64>(9, 4);
+    // op(B) = Bᴴ is 4 x 9: ceil(9 / 8) * 8 * 4 = 64 elements are needed.
+    let mut pack: AlignedVec<Complex64> = AlignedVec::zeros(63);
+    pack_b_trans_dispatch(&b.as_ref(), Trans::ConjTrans, 0, 0, 4, 9, &mut pack, 8);
+}
+
+/// With exactly the required length the fallbacks fill every slot
+/// (zero-padded micro-panels) and read through both strides.
+#[test]
+fn pack_trans_dispatch_fallbacks_fill_exact_buffers() {
+    let store = distinct::<f64>(4, 9);
+    let a = store.as_ref().transpose();
+    let mut pack: AlignedVec<f64> = AlignedVec::filled(64, f64::NAN);
+    pack_a_trans_dispatch(&a, Trans::NoTrans, 0, 0, 9, 4, &mut pack, 8);
+    for p in 0..4 {
+        for ii in 0..16 {
+            let got = pack[(ii / 8) * 32 + p * 8 + ii % 8];
+            let want = if ii < 9 { a[(ii, p)] } else { 0.0 };
+            assert_eq!(got.to_bits(), want.to_bits(), "A slot ({ii}, {p})");
+        }
+    }
+    let b = distinct::<Complex64>(9, 4);
+    let mut pack: AlignedVec<Complex64> = AlignedVec::filled(64, Complex64::new(f64::NAN, 0.0));
+    pack_b_trans_dispatch(&b.as_ref(), Trans::ConjTrans, 0, 0, 4, 9, &mut pack, 8);
+    for p in 0..4 {
+        for jj in 0..16 {
+            let got = pack[(jj / 8) * 32 + p * 8 + jj % 8];
+            let want = if jj < 9 {
+                b[(jj, p)].conj()
+            } else {
+                Complex64::new(0.0, 0.0)
+            };
+            assert_eq!(got, want, "B slot ({p}, {jj})");
+        }
+    }
+}

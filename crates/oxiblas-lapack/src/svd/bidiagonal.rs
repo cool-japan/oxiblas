@@ -5,6 +5,7 @@
 //! - Σ is m×n diagonal (singular values, non-negative, descending)
 //! - V is n×n orthogonal (right singular vectors)
 
+use oxiblas_blas::level1::{axpy, dot};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -50,6 +51,19 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
 
     /// Computes the full SVD of matrix A using one-sided Jacobi algorithm.
     ///
+    /// The Jacobi sweeps rotate pairs of the `n` columns, `O(m · n²)` work per
+    /// sweep, and give `V`, the singular values and the columns of `U` for the
+    /// singular values above `100 · eps`. The other columns of `U` (those of
+    /// the zero singular values, and the `m − n` trailing columns of a tall
+    /// matrix) complete it to an `m × m` orthogonal matrix: column `j` is the
+    /// normalized component, orthogonal to the columns before it, of the first
+    /// standard basis vector `e_b` (in increasing `b`) not already in their
+    /// span. The completion is reorthogonalized when needed (the DGKS
+    /// criterion), so `U` is orthogonal to working precision, and it costs
+    /// `O(m²)` per column. For a tall matrix the completion dominates,
+    /// `O(m³)` in total; it needs no further work beyond the Jacobi sweeps
+    /// for a square or wide matrix of full rank.
+    ///
     /// # Example
     ///
     /// ```
@@ -91,45 +105,42 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
             return Ok(Self { u, sigma, vt, m, n });
         }
 
-        // Copy A into working matrix B (we'll work on B to get V, then compute U)
-        let mut b = Mat::zeros(m, n);
-        for i in 0..m {
-            for j in 0..n {
-                b[(i, j)] = a[(i, j)];
+        // Working copies with contiguous columns: B = A (m×n, column j at
+        // b[j*m..]) is rotated into U·Σ, and V (n×n, column j at v[j*n..])
+        // accumulates the rotations.
+        let mut b = vec![T::zero(); m * n];
+        for j in 0..n {
+            for i in 0..m {
+                b[j * m + i] = a[(i, j)];
             }
         }
-
-        // Initialize V as identity
-        let mut v = Mat::zeros(n, n);
+        let mut v = vec![T::zero(); n * n];
         for i in 0..n {
-            v[(i, i)] = T::one();
+            v[i * n + i] = T::one();
         }
 
         let eps = <T as Scalar>::epsilon();
         let tol = eps * T::from_f64(100.0).unwrap_or(T::one());
-
-        // One-sided Jacobi: Apply Jacobi rotations to columns of B to diagonalize B^T*B
-        // After convergence, columns of B are orthogonal (and are U*Σ), V accumulates rotations
+        let two = T::from_f64(2.0).unwrap_or(T::one());
         let k = m.min(n);
 
+        // One-sided Jacobi: rotate pairs of columns of B until they are
+        // mutually orthogonal (B^T B diagonal); V accumulates the rotations.
         for _sweep in 0..Self::MAX_SWEEPS {
             let mut converged = true;
 
-            // Sweep through all column pairs (i, j) with i < j
-            // Only sweep up to min(m,n) for the first index since we can have at most k singular values
             for i in 0..n {
                 for j in (i + 1)..n {
-                    // Compute B[:, i]^T * B[:, j] and norms
+                    let (bi, bj) = column_pair(&mut b, m, i, j);
+
+                    // B[:, i]^T B[:, j] and the squared norms
                     let mut dot_ij = T::zero();
                     let mut norm_i_sq = T::zero();
                     let mut norm_j_sq = T::zero();
-
-                    for row in 0..m {
-                        let bi = b[(row, i)];
-                        let bj = b[(row, j)];
-                        dot_ij = dot_ij + bi * bj;
-                        norm_i_sq = norm_i_sq + bi * bi;
-                        norm_j_sq = norm_j_sq + bj * bj;
+                    for (&x, &y) in bi.iter().zip(bj.iter()) {
+                        dot_ij = dot_ij + x * y;
+                        norm_i_sq = norm_i_sq + x * x;
+                        norm_j_sq = norm_j_sq + y * y;
                     }
 
                     // Check if rotation is needed
@@ -139,13 +150,9 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
                     if off_diag > threshold {
                         converged = false;
 
-                        // Compute Jacobi rotation to zero dot_ij
-                        // We want to find angle θ such that after rotation, columns are orthogonal
-                        // The 2x2 Gram matrix is [[norm_i_sq, dot_ij], [dot_ij, norm_j_sq]]
-                        // Jacobi rotation diagonalizes this
-
-                        let tau = (norm_j_sq - norm_i_sq)
-                            / (T::from_f64(2.0).unwrap_or(T::one()) * dot_ij);
+                        // Jacobi rotation diagonalizing the 2x2 Gram matrix
+                        // [[norm_i_sq, dot_ij], [dot_ij, norm_j_sq]]
+                        let tau = (norm_j_sq - norm_i_sq) / (two * dot_ij);
                         let t = if tau >= T::zero() {
                             T::one() / (tau + Real::sqrt(T::one() + tau * tau))
                         } else {
@@ -154,21 +161,9 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
                         let c = T::one() / Real::sqrt(T::one() + t * t);
                         let s = c * t;
 
-                        // Apply rotation to columns i and j of B
-                        for row in 0..m {
-                            let bi = b[(row, i)];
-                            let bj = b[(row, j)];
-                            b[(row, i)] = c * bi - s * bj;
-                            b[(row, j)] = s * bi + c * bj;
-                        }
-
-                        // Accumulate rotation into V
-                        for row in 0..n {
-                            let vi = v[(row, i)];
-                            let vj = v[(row, j)];
-                            v[(row, i)] = c * vi - s * vj;
-                            v[(row, j)] = s * vi + c * vj;
-                        }
+                        rotate(bi, bj, c, s);
+                        let (vi, vj) = column_pair(&mut v, n, i, j);
+                        rotate(vi, vj, c, s);
                     }
                 }
             }
@@ -178,21 +173,16 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
             }
         }
 
-        // Now columns of B are orthogonal. The singular values are the norms of columns.
-        // For an m×n matrix, we have min(m,n) singular values.
-        // We need to find the columns with the largest norms.
-
-        // Compute norms of all columns
+        // The columns of B are now orthogonal; their norms are the singular
+        // values. Sort the columns by norm (descending).
         let mut col_norms: Vec<(usize, T)> = Vec::with_capacity(n);
         for j in 0..n {
             let mut norm_sq = T::zero();
-            for row in 0..m {
-                norm_sq = norm_sq + b[(row, j)] * b[(row, j)];
+            for &x in &b[j * m..(j + 1) * m] {
+                norm_sq = norm_sq + x * x;
             }
             col_norms.push((j, Real::sqrt(norm_sq)));
         }
-
-        // Sort columns by norm (descending)
         col_norms.sort_by(|a, b| {
             if b.1 > a.1 {
                 core::cmp::Ordering::Greater
@@ -203,120 +193,55 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
             }
         });
 
-        // Extract singular values and construct U
+        // Singular values, and the columns of U (column j at u[j*m..]) for
+        // the singular values above `tol`.
         let mut sigma = vec![T::zero(); k];
-        let mut u = Mat::zeros(m, m);
-
+        let mut u = vec![T::zero(); m * m];
         for i in 0..k {
             let (col_idx, norm) = col_norms[i];
             sigma[i] = norm;
-
             if norm > tol {
                 for row in 0..m {
-                    u[(row, i)] = b[(row, col_idx)] / norm;
+                    u[i * m + row] = b[col_idx * m + row] / norm;
                 }
-            } else {
-                // Zero singular value - will be filled by Gram-Schmidt below
             }
         }
 
-        // Complete U to full orthogonal matrix using Gram-Schmidt
+        // Complete U to an orthogonal matrix: first the columns of the zero
+        // singular values (against the columns before them), then the m - k
+        // trailing columns.
+        let mut completion = BasisCompletion::new(m, tol);
         for col in 0..k {
             if sigma[col] <= tol {
-                // Find a standard basis vector orthogonal to existing columns
-                for basis in 0..m {
-                    u[(basis, col)] = T::one();
+                completion.fill(&mut u, col);
+            }
+        }
+        for col in k..m {
+            completion.fill(&mut u, col);
+        }
 
-                    // Orthogonalize against previous columns
-                    for j in 0..col {
-                        let mut dot = T::zero();
-                        for row in 0..m {
-                            dot = dot + u[(row, col)] * u[(row, j)];
-                        }
-                        for row in 0..m {
-                            u[(row, col)] = u[(row, col)] - dot * u[(row, j)];
-                        }
-                    }
-
-                    // Normalize
-                    let mut norm_sq = T::zero();
-                    for row in 0..m {
-                        norm_sq = norm_sq + u[(row, col)] * u[(row, col)];
-                    }
-                    let norm = Real::sqrt(norm_sq);
-                    if norm > tol {
-                        for row in 0..m {
-                            u[(row, col)] = u[(row, col)] / norm;
-                        }
-                        break;
-                    }
-                    // Reset and try next basis vector
-                    for row in 0..m {
-                        u[(row, col)] = T::zero();
-                    }
-                }
+        let mut u_mat = Mat::zeros(m, m);
+        for j in 0..m {
+            for i in 0..m {
+                u_mat[(i, j)] = u[j * m + i];
             }
         }
 
-        // Fill remaining columns of U using Gram-Schmidt
-        for i in k..m {
-            for basis in 0..m {
-                u[(basis, i)] = T::one();
-
-                // Orthogonalize against all previous columns
-                for j in 0..i {
-                    let mut dot = T::zero();
-                    for row in 0..m {
-                        dot = dot + u[(row, i)] * u[(row, j)];
-                    }
-                    for row in 0..m {
-                        u[(row, i)] = u[(row, i)] - dot * u[(row, j)];
-                    }
-                }
-
-                // Normalize
-                let mut norm_sq = T::zero();
-                for row in 0..m {
-                    norm_sq = norm_sq + u[(row, i)] * u[(row, i)];
-                }
-                let norm = Real::sqrt(norm_sq);
-                if norm > tol {
-                    for row in 0..m {
-                        u[(row, i)] = u[(row, i)] / norm;
-                    }
-                    break;
-                }
-                // Reset and try next basis vector
-                for row in 0..m {
-                    u[(row, i)] = T::zero();
-                }
-            }
-        }
-
-        // Construct V^T with columns reordered according to col_norms
-        // V^T[i, :] should correspond to sigma[i]
+        // V^T with its rows in the order of the sorted singular values
         let mut vt = Mat::zeros(n, n);
-
-        // First k rows of V^T correspond to the k singular values
-        for i in 0..k {
-            let (col_idx, _) = col_norms[i];
+        for (i, &(col_idx, _)) in col_norms.iter().enumerate() {
             for j in 0..n {
-                vt[(i, j)] = v[(j, col_idx)];
+                vt[(i, j)] = v[col_idx * n + j];
             }
         }
 
-        // Fill remaining rows of V^T with orthogonal complement
-        for i in k..n {
-            let (col_idx, _) = col_norms[i];
-            for j in 0..n {
-                vt[(i, j)] = v[(j, col_idx)];
-            }
-        }
-
-        // Singular values are already sorted descending from col_norms extraction
-        // No need for additional sorting
-
-        Ok(Self { u, sigma, vt, m, n })
+        Ok(Self {
+            u: u_mat,
+            sigma,
+            vt,
+            m,
+            n,
+        })
     }
 
     /// Returns the singular values (sorted in descending order).
@@ -429,6 +354,121 @@ impl<T: Field + Real + bytemuck::Zeroable> Svd<T> {
         }
 
         pinv
+    }
+}
+
+/// Returns mutable views of the columns `i < j` of the column-major buffer
+/// `data`, whose columns have length `len`.
+fn column_pair<T>(data: &mut [T], len: usize, i: usize, j: usize) -> (&mut [T], &mut [T]) {
+    let (head, tail) = data.split_at_mut(j * len);
+    (&mut head[i * len..(i + 1) * len], &mut tail[..len])
+}
+
+/// Applies the plane rotation `(x, y) <- (c·x − s·y, s·x + c·y)` to two
+/// columns.
+fn rotate<T: Field>(x: &mut [T], y: &mut [T], c: T, s: T) {
+    for (xi, yi) in x.iter_mut().zip(y.iter_mut()) {
+        let (p, q) = (*xi, *yi);
+        *xi = c * p - s * q;
+        *yi = s * p + c * q;
+    }
+}
+
+/// Completes `U` with the columns the Jacobi iteration does not provide: those
+/// of the zero singular values, and the `m − k` trailing columns of a tall
+/// matrix.
+///
+/// Column `col` becomes the normalized residual, against the columns
+/// `0..col`, of the first standard basis vector `e_b` (in increasing `b`)
+/// whose residual norm exceeds `tol` — the basis chosen by the previous
+/// releases, which only differs from this one by rounding. The residual is
+/// computed by classical Gram–Schmidt; the coefficients `u_jᵀ e_b = u_j[b]` of
+/// the first pass are read off row `b`. When that pass removes more than half
+/// of the squared norm, a second pass follows (the DGKS criterion used by
+/// ARPACK, "twice is enough"), so every new column is orthogonal to the
+/// previous ones to working precision.
+///
+/// A candidate is tried at most once: once taken, or once found inside the
+/// span of the columns `0..col` (residual norm at or below `tol`), it lies in
+/// the span of every later prefix of columns and can never qualify again. A
+/// try costs `O(m)` per column already present, so completing `c` columns
+/// costs `O(m² · c)` when few candidates are dependent and `O(m³)` at most.
+/// The previous releases restarted the scan at `e_0` for every column and
+/// orthogonalized every candidate from scratch (`O(m⁴)` for a tall matrix),
+/// in a single pass that left the completed columns orthogonal to the leading
+/// ones only to about `1e-11` for a 300 × 31 matrix.
+struct BasisCompletion<T> {
+    m: usize,
+    tol: T,
+    /// `1/√2`: a residual norm below it triggers the second pass.
+    reorth_threshold: T,
+    /// `retired[b]`: `e_b` has been taken or found dependent.
+    retired: Vec<bool>,
+    /// Residual of the current candidate.
+    residual: Vec<T>,
+    /// Gram–Schmidt coefficients of the current pass.
+    coef: Vec<T>,
+}
+
+impl<T: Field + Real> BasisCompletion<T> {
+    fn new(m: usize, tol: T) -> Self {
+        Self {
+            m,
+            tol,
+            // Without the constant every candidate gets the second pass.
+            reorth_threshold: T::from_f64(core::f64::consts::FRAC_1_SQRT_2).unwrap_or(T::one()),
+            retired: vec![false; m],
+            residual: vec![T::zero(); m],
+            coef: Vec::with_capacity(m),
+        }
+    }
+
+    /// Fills column `col` of the column-major `m × m` buffer `u`, whose
+    /// columns `0..col` are final and whose column `col` is zero. The column
+    /// stays zero only when no candidate qualifies, which requires non-finite
+    /// entries in the columns `0..col`.
+    fn fill(&mut self, u: &mut [T], col: usize) {
+        let m = self.m;
+        let (prev, rest) = u.split_at_mut(col * m);
+        let target = &mut rest[..m];
+        for b in 0..m {
+            if self.retired[b] {
+                continue;
+            }
+            self.retired[b] = true;
+
+            // First pass: r = e_b − Σ_j (u_jᵀ e_b) u_j, with u_jᵀ e_b = u_j[b].
+            let r = &mut self.residual;
+            for x in r.iter_mut() {
+                *x = T::zero();
+            }
+            r[b] = T::one();
+            for u_j in prev.chunks_exact(m) {
+                axpy(-u_j[b], u_j, r);
+            }
+
+            let mut norm = Real::sqrt(dot(r, r));
+
+            // DGKS criterion (as in ARPACK): when the projection removed more
+            // than half of the squared norm (‖r‖ < ‖e_b‖/√2), the first pass
+            // may have lost orthogonality, so project once more ("twice is
+            // enough"): r −= Σ_j (u_jᵀ r) u_j.
+            if !(norm >= self.reorth_threshold) {
+                self.coef.clear();
+                self.coef
+                    .extend(prev.chunks_exact(m).map(|u_j| dot(u_j, r)));
+                for (u_j, &c) in prev.chunks_exact(m).zip(&self.coef) {
+                    axpy(-c, u_j, r);
+                }
+                norm = Real::sqrt(dot(r, r));
+            }
+            if norm > self.tol {
+                for (t, &x) in target.iter_mut().zip(r.iter()) {
+                    *t = x / norm;
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -623,3 +663,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bidiagonal_tests.rs"]
+mod completion_tests;

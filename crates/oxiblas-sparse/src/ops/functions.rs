@@ -2,6 +2,7 @@
 //!
 //! 🤖 Generated with [SplitRS](https://github.com/cool-japan/splitrs)
 
+use super::row_order::{SortedRow, merge_scaled_rows};
 use super::types::*;
 use crate::csc::CscMatrix;
 use crate::csr::CsrMatrix;
@@ -214,11 +215,22 @@ pub fn spmm_sparse<T: Scalar + Clone + Field>(a: &CsrMatrix<T>, b: &CsrMatrix<T>
         }
         row_ptrs.push(values.len());
     }
+    // SAFETY: `row_ptrs` starts at 0 and gets the running `values.len()`
+    // pushed once per row, so it has `m + 1` non-decreasing entries ending at
+    // nnz; `col_indices` and `values` are only pushed together, so their
+    // lengths match; every pushed column is the loop index `j` of `0..n`,
+    // strictly increasing within a row, so it is `< n` and never repeats.
     unsafe { CsrMatrix::new_unchecked(m, n, row_ptrs, col_indices, values) }
 }
 /// Sparse matrix addition: C = alpha * A + beta * B
 ///
-/// Both inputs are in CSR format.
+/// Both inputs are in CSR format. Their rows need not be sorted by column;
+/// the rows of the result are sorted and duplicate-free. Entries whose
+/// magnitude is at most `T::epsilon()` are dropped.
+///
+/// # Panics
+///
+/// Panics if the shapes of `a` and `b` differ.
 pub fn spadd<T: Scalar + Clone + Field>(
     alpha: T,
     a: &CsrMatrix<T>,
@@ -233,77 +245,42 @@ pub fn spadd<T: Scalar + Clone + Field>(
     let mut col_indices = Vec::new();
     let mut values = Vec::new();
     row_ptrs.push(0);
+    // The merge needs ascending columns; `SortedRow` sorts a copy of any row
+    // that is not already sorted.
+    let (mut a_row, mut b_row) = (SortedRow::new(), SortedRow::new());
     for i in 0..m {
-        let a_start = a.row_ptrs()[i];
-        let a_end = a.row_ptrs()[i + 1];
-        let b_start = b.row_ptrs()[i];
-        let b_end = b.row_ptrs()[i + 1];
-        let mut a_idx = a_start;
-        let mut b_idx = b_start;
-        while a_idx < a_end || b_idx < b_end {
-            let a_col = if a_idx < a_end {
-                Some(a.col_indices()[a_idx])
-            } else {
-                None
-            };
-            let b_col = if b_idx < b_end {
-                Some(b.col_indices()[b_idx])
-            } else {
-                None
-            };
-            match (a_col, b_col) {
-                (Some(ac), Some(bc)) if ac < bc => {
-                    let val = alpha.clone() * a.values()[a_idx].clone();
-                    if Scalar::abs(val.clone()) > T::epsilon() {
-                        col_indices.push(ac);
-                        values.push(val);
-                    }
-                    a_idx += 1;
-                }
-                (Some(ac), Some(bc)) if ac > bc => {
-                    let val = beta.clone() * b.values()[b_idx].clone();
-                    if Scalar::abs(val.clone()) > T::epsilon() {
-                        col_indices.push(bc);
-                        values.push(val);
-                    }
-                    b_idx += 1;
-                }
-                (Some(ac), Some(_bc)) => {
-                    let val = alpha.clone() * a.values()[a_idx].clone()
-                        + beta.clone() * b.values()[b_idx].clone();
-                    if Scalar::abs(val.clone()) > T::epsilon() {
-                        col_indices.push(ac);
-                        values.push(val);
-                    }
-                    a_idx += 1;
-                    b_idx += 1;
-                }
-                (Some(ac), None) => {
-                    let val = alpha.clone() * a.values()[a_idx].clone();
-                    if Scalar::abs(val.clone()) > T::epsilon() {
-                        col_indices.push(ac);
-                        values.push(val);
-                    }
-                    a_idx += 1;
-                }
-                (None, Some(bc)) => {
-                    let val = beta.clone() * b.values()[b_idx].clone();
-                    if Scalar::abs(val.clone()) > T::epsilon() {
-                        col_indices.push(bc);
-                        values.push(val);
-                    }
-                    b_idx += 1;
-                }
-                (None, None) => break,
-            }
-        }
+        merge_scaled_rows(
+            &alpha,
+            a_row.get(a, i),
+            &beta,
+            b_row.get(b, i),
+            &mut col_indices,
+            &mut values,
+        );
         row_ptrs.push(values.len());
     }
+    // SAFETY: `row_ptrs` starts at 0 and gets the running `values.len()`
+    // pushed once per row: `m + 1` non-decreasing entries ending at nnz.
+    // `merge_scaled_rows` pushes columns and values together, and for two
+    // strictly ascending rows it emits each column at most once, in ascending
+    // order, so no row repeats a column. Every column is copied from `a` or
+    // `b`, which have `n` columns (asserted above) and satisfy the CSR
+    // contract, so it is `< n`.
     unsafe { CsrMatrix::new_unchecked(m, n, row_ptrs, col_indices, values) }
 }
 /// Computes the transpose of a CSR matrix, returning CSR.
+///
+/// The rows of the result are sorted by column.
 pub fn transpose_csr<T: Scalar + Clone>(a: &CsrMatrix<T>) -> CsrMatrix<T> {
     let csc = a.to_csc();
+    // SAFETY: `a` satisfies the CSR contract (`row_ptrs[0] == 0` and
+    // `row_ptrs[nrows] == nnz`), so `csr_to_csc` visits each of its nnz entries
+    // exactly once: the result has `a.ncols() + 1` column pointers starting at
+    // 0, never decreasing and ending at nnz, and every one of the nnz slots
+    // holds a real row index `< a.nrows()`, with no `(row, col)` repeated (or
+    // it is `CscMatrix::zeros`, all pointers 0). Read as the CSR of the
+    // `a.ncols() x a.nrows()` transpose, that is exactly the CSR contract,
+    // with columns sorted within each row.
     unsafe {
         CsrMatrix::new_unchecked(
             a.ncols(),
@@ -351,6 +328,10 @@ pub fn from_diagonal<T: Scalar + Clone + Field>(diag: &[T]) -> CsrMatrix<T> {
         }
         row_ptrs.push(values.len());
     }
+    // SAFETY: `row_ptrs` starts at 0 and gets the running `values.len()`
+    // pushed once per diagonal entry, so it has `n + 1` non-decreasing
+    // entries ending at nnz; `col_indices` and `values` are only pushed
+    // together; row `i` holds at most the single column `i < diag.len() == n`.
     unsafe { CsrMatrix::new_unchecked(n, n, row_ptrs, col_indices, values) }
 }
 /// Applies `y := beta * y` (or zeroes `y` outright when `beta` is numerically
@@ -652,6 +633,9 @@ pub fn scale<T: Scalar + Clone + Field>(alpha: T, a: &CsrMatrix<T>) -> CsrMatrix
         .iter()
         .map(|v| alpha.clone() * v.clone())
         .collect();
+    // SAFETY: `row_ptrs` and `col_indices` are copied unchanged from `a` and
+    // `values` maps `a.values()` element-wise (same length), with `a`'s
+    // dimensions, so the CSR contract holds because it holds for `a`.
     unsafe {
         CsrMatrix::new_unchecked(
             a.nrows(),
@@ -763,7 +747,8 @@ pub fn rank1_update_no_fill<T: Scalar + Clone + Field>(
 ///
 /// # Returns
 ///
-/// New sparse matrix with the rank-1 update applied.
+/// New sparse matrix with the rank-1 update applied. The rows of `a` need not
+/// be sorted by column; the rows of the result are sorted.
 pub fn rank1_update<T: Scalar + Clone + Field>(
     a: &CsrMatrix<T>,
     alpha: T,
@@ -779,15 +764,17 @@ pub fn rank1_update<T: Scalar + Clone + Field>(
     let mut col_indices = Vec::new();
     let mut values = Vec::new();
     row_ptrs.push(0);
+    // The column cursor below needs ascending columns; `SortedRow` sorts a
+    // copy of any row that is not already sorted.
+    let mut a_row = SortedRow::new();
     for i in 0..m {
         let xi = x[i].clone();
-        let a_start = a.row_ptrs()[i];
-        let a_end = a.row_ptrs()[i + 1];
-        let mut a_idx = a_start;
+        let (a_cols, a_vals) = a_row.get(a, i);
+        let mut a_idx = 0;
         for j in 0..n {
             let outer_val = alpha.clone() * xi.clone() * y[j].clone();
-            let a_val = if a_idx < a_end && a.col_indices()[a_idx] == j {
-                let v = a.values()[a_idx].clone();
+            let a_val = if a_idx < a_cols.len() && a_cols[a_idx] == j {
+                let v = a_vals[a_idx].clone();
                 a_idx += 1;
                 v
             } else {
@@ -801,6 +788,11 @@ pub fn rank1_update<T: Scalar + Clone + Field>(
         }
         row_ptrs.push(values.len());
     }
+    // SAFETY: `row_ptrs` starts at 0 and gets the running `values.len()`
+    // pushed once per row: `m + 1` non-decreasing entries ending at nnz.
+    // `col_indices` and `values` are only pushed together, and every pushed
+    // column is the loop index `j` of `0..n`, strictly increasing within a
+    // row, so it is `< n` and never repeats.
     unsafe { CsrMatrix::new_unchecked(m, n, row_ptrs, col_indices, values) }
 }
 /// Computes the sum of absolute values of matrix elements.
@@ -1065,10 +1057,15 @@ pub fn spmv_auto<T: Scalar + Clone + Field>(
     y: &mut [T],
 ) {
     if core::any::TypeId::of::<T>() == core::any::TypeId::of::<f64>() {
+        // SAFETY: `T` is `f64` (TypeId check above): identity cast, a `Copy` read of `alpha`.
         let alpha = unsafe { *(&alpha as *const T as *const f64) };
+        // SAFETY: `T` is `f64` (TypeId check above): identity cast, same layout and borrow as `a`.
         let a = unsafe { &*(a as *const CsrMatrix<T> as *const CsrMatrix<f64>) };
+        // SAFETY: `T` is `f64` (TypeId check above): identity cast, same ptr/len/lifetime as `x`.
         let x = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f64, x.len()) };
+        // SAFETY: `T` is `f64` (TypeId check above): identity cast, a `Copy` read of `beta`.
         let beta = unsafe { *(&beta as *const T as *const f64) };
+        // SAFETY: `T` is `f64` (TypeId check above): identity cast of `y`, now shadowed: no alias.
         let y = unsafe { core::slice::from_raw_parts_mut(y.as_mut_ptr() as *mut f64, y.len()) };
         #[cfg(feature = "parallel")]
         {
@@ -1082,10 +1079,15 @@ pub fn spmv_auto<T: Scalar + Clone + Field>(
         }
     }
     if core::any::TypeId::of::<T>() == core::any::TypeId::of::<f32>() {
+        // SAFETY: `T` is `f32` (TypeId check above): identity cast, a `Copy` read of `alpha`.
         let alpha = unsafe { *(&alpha as *const T as *const f32) };
+        // SAFETY: `T` is `f32` (TypeId check above): identity cast, same layout and borrow as `a`.
         let a = unsafe { &*(a as *const CsrMatrix<T> as *const CsrMatrix<f32>) };
+        // SAFETY: `T` is `f32` (TypeId check above): identity cast, same ptr/len/lifetime as `x`.
         let x = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const f32, x.len()) };
+        // SAFETY: `T` is `f32` (TypeId check above): identity cast, a `Copy` read of `beta`.
         let beta = unsafe { *(&beta as *const T as *const f32) };
+        // SAFETY: `T` is `f32` (TypeId check above): identity cast of `y`, now shadowed: no alias.
         let y = unsafe { core::slice::from_raw_parts_mut(y.as_mut_ptr() as *mut f32, y.len()) };
         #[cfg(feature = "parallel")]
         {
@@ -1165,6 +1167,13 @@ where
         values.extend(row_vals);
         row_ptrs.push(values.len());
     }
+    // SAFETY: `row_results` holds exactly one `(row_cols, row_vals)` pair per
+    // row (`(0..m)` mapped and collected in order), so `row_ptrs` gets 0 plus
+    // `m` running `values.len()` values: `m + 1` non-decreasing entries ending
+    // at nnz. Each pair was built by pushing column and value together, so
+    // `col_indices` and `values` stay equal in length, and every column is a
+    // loop index `j` of `0..n`, strictly increasing within a row, so it is
+    // `< n` and never repeats.
     unsafe { CsrMatrix::new_unchecked(m, n, row_ptrs, col_indices, values) }
 }
 /// Automatic sparse matrix-matrix multiply dispatch.

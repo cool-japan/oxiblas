@@ -8,18 +8,27 @@
 //! For an m×n matrix with nnz non-zeros:
 //! - `values` has length nnz
 //! - `row_indices` has length nnz
-//! - `col_ptrs` has length n+1
+//! - `col_ptrs` has length n+1, starts at 0, never decreases and ends at nnz
+//!
+//! Column `j` owns the entries `col_ptrs[j]..col_ptrs[j + 1]`. Within a column
+//! the row indices are distinct but need not be sorted; see
+//! [`CscMatrix::new_unchecked`] for the full contract.
 
+use crate::csr::first_duplicate_index;
 use oxiblas_core::scalar::{Field, Scalar};
+use std::collections::HashSet;
 
 /// Error type for CSC matrix operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CscError {
-    /// Invalid column pointer array length.
+    /// Invalid column pointer array: its length is not `ncols + 1` (then
+    /// `expected` is `ncols + 1`, saturating at `usize::MAX`), its first entry
+    /// is not 0 (`expected` is 0), or its last entry is not the number of
+    /// stored entries (`expected` is that number).
     InvalidColPtrs {
-        /// Expected length.
+        /// Expected length or value.
         expected: usize,
-        /// Actual length.
+        /// Actual length or value.
         actual: usize,
     },
     /// Mismatched array lengths.
@@ -39,6 +48,11 @@ pub enum CscError {
     /// Column pointers not monotonically increasing.
     InvalidColPtrOrder,
     /// Duplicate entry at same position.
+    ///
+    /// A given `(row, col)` position must be represented by at most one entry
+    /// (as for [`crate::csr::CsrError::DuplicateEntry`]): [`CscMatrix::get`]
+    /// returns the first match in a column, so a second entry would be
+    /// silently ignored. Row indices within a column need *not* be sorted.
     DuplicateEntry {
         /// Row of duplicate.
         row: usize,
@@ -53,7 +67,8 @@ impl core::fmt::Display for CscError {
             Self::InvalidColPtrs { expected, actual } => {
                 write!(
                     f,
-                    "Invalid col_ptrs length: expected {expected}, got {actual}"
+                    "Invalid col_ptrs (length must be ncols + 1, first entry 0, last entry nnz): \
+                     expected {expected}, got {actual}"
                 )
             }
             Self::LengthMismatch {
@@ -114,7 +129,15 @@ impl<T: Scalar + Clone> CscMatrix<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the input is invalid.
+    /// Returns an error unless the input satisfies the whole contract
+    /// documented on [`CscMatrix::new_unchecked`]:
+    /// - [`CscError::InvalidColPtrs`] if `col_ptrs.len() != ncols + 1`,
+    ///   `col_ptrs[0] != 0` or `col_ptrs[ncols] != values.len()`
+    /// - [`CscError::LengthMismatch`] if `values` and `row_indices` differ in
+    ///   length
+    /// - [`CscError::InvalidColPtrOrder`] if `col_ptrs` decreases somewhere
+    /// - [`CscError::InvalidRowIndex`] if a row index is `>= nrows`
+    /// - [`CscError::DuplicateEntry`] if a column lists a row twice
     pub fn new(
         nrows: usize,
         ncols: usize,
@@ -122,10 +145,11 @@ impl<T: Scalar + Clone> CscMatrix<T> {
         row_indices: Vec<usize>,
         values: Vec<T>,
     ) -> Result<Self, CscError> {
-        // Validate col_ptrs length
-        if col_ptrs.len() != ncols + 1 {
+        // Validate col_ptrs length (`ncols + 1` itself must not overflow).
+        let expected_len = ncols.checked_add(1);
+        if expected_len != Some(col_ptrs.len()) {
             return Err(CscError::InvalidColPtrs {
-                expected: ncols + 1,
+                expected: expected_len.unwrap_or(usize::MAX),
                 actual: col_ptrs.len(),
             });
         }
@@ -145,6 +169,16 @@ impl<T: Scalar + Clone> CscMatrix<T> {
             }
         }
 
+        // Validate col_ptrs[0] == 0: otherwise the entries before it belong to
+        // no column (and with `ncols == 0`, `col_ptrs == [nnz]` would smuggle
+        // in `nnz` such entries).
+        if col_ptrs[0] != 0 {
+            return Err(CscError::InvalidColPtrs {
+                expected: 0,
+                actual: col_ptrs[0],
+            });
+        }
+
         // Validate col_ptrs[ncols] equals nnz
         let nnz = values.len();
         if col_ptrs[ncols] != nnz {
@@ -161,6 +195,18 @@ impl<T: Scalar + Clone> CscMatrix<T> {
             }
         }
 
+        // Validate that no column lists a row twice (order-independent, as
+        // in `CsrMatrix::new`: columns need not be sorted).
+        let mut seen_rows = HashSet::new();
+        for col in 0..ncols {
+            let start = col_ptrs[col];
+            let end = col_ptrs[col + 1];
+
+            if let Some(row) = first_duplicate_index(&row_indices[start..end], &mut seen_rows) {
+                return Err(CscError::DuplicateEntry { row, col });
+            }
+        }
+
         Ok(Self {
             nrows,
             ncols,
@@ -174,11 +220,26 @@ impl<T: Scalar + Clone> CscMatrix<T> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure:
+    /// The caller must ensure the CSC contract that [`CscMatrix::new`]
+    /// checks. Structurally, with `nnz = values.len()`:
     /// - `col_ptrs.len() == ncols + 1`
-    /// - `values.len() == row_indices.len()`
-    /// - `col_ptrs` is monotonically increasing
-    /// - All row indices are < nrows
+    /// - `col_ptrs[0] == 0` and `col_ptrs[ncols] == nnz`
+    /// - `col_ptrs` never decreases (`col_ptrs[j] <= col_ptrs[j + 1]`)
+    /// - `row_indices.len() == nnz`
+    /// - every row index is `< nrows`
+    ///
+    /// Logically:
+    /// - no column lists the same row twice (each `(row, col)` position has
+    ///   at most one entry)
+    ///
+    /// Row indices within a column need **not** be sorted: the methods of
+    /// this type and the format conversions accept unsorted columns.
+    ///
+    /// Every method of `CscMatrix` and every function in this crate relies on
+    /// this contract: column `j` is read as `col_ptrs[j]..col_ptrs[j + 1]` and
+    /// row indices are used to index vectors of length `nrows`. Violating it
+    /// can therefore cause panics or silently wrong results here, and `unsafe`
+    /// code elsewhere may rely on it for memory safety.
     #[inline]
     pub unsafe fn new_unchecked(
         nrows: usize,
@@ -399,11 +460,29 @@ impl<T: Scalar + Clone> CscMatrix<T> {
     }
 
     /// Returns the transpose of this matrix.
+    ///
+    /// The result is `ncols x nrows`, with row indices sorted within each
+    /// column.
     pub fn transpose(&self) -> Self {
-        // Transpose of CSC is equivalent to CSR with swapped interpretation
-        // Then convert back to CSC
+        // The CSR arrays of A are exactly the CSC arrays of A^T: row `i` of A
+        // is column `i` of A^T, and its column indices are A^T's row indices.
         let csr = self.to_csr();
-        csr.to_csc()
+        // SAFETY: `self` satisfies the CSC contract, so `csc_to_csr` returns
+        // `row_ptrs` of length `nrows + 1` that start at 0, never decrease and
+        // end at nnz, with every one of the nnz slots filled by exactly one
+        // entry of `self` (column index `< ncols`, no `(row, col)` repeated).
+        // Read as the CSC of the `ncols x nrows` transpose, these are column
+        // pointers of length `new_ncols + 1` with the same bounds, row indices
+        // `< new_nrows`, and no repeated row within a column.
+        unsafe {
+            Self::new_unchecked(
+                self.ncols,
+                self.nrows,
+                csr.row_ptrs().to_vec(),
+                csr.col_indices().to_vec(),
+                csr.values().to_vec(),
+            )
+        }
     }
 
     /// Scales all values by a scalar.
@@ -448,6 +527,24 @@ impl<T: Scalar + Clone> CscMatrix<T> {
 
         true
     }
+}
+
+/// Test helper: asserts that `m`'s raw parts satisfy the CSC contract, by
+/// re-validating them with [`CscMatrix::new`].
+#[cfg(test)]
+pub(crate) fn assert_valid_csc<T: Scalar + Clone>(m: &CscMatrix<T>) {
+    let rebuilt = CscMatrix::new(
+        m.nrows(),
+        m.ncols(),
+        m.col_ptrs().to_vec(),
+        m.row_indices().to_vec(),
+        m.values().to_vec(),
+    );
+    assert!(
+        rebuilt.is_ok(),
+        "matrix violates the CSC contract: {:?}",
+        rebuilt.err()
+    );
 }
 
 // Note: `CscMatrix` deliberately does not implement `std::ops::Index`
@@ -688,5 +785,105 @@ mod tests {
         // Stored entries still read back.
         assert_eq!(csc.get_or_zero(0, 0), 1.0);
         assert_eq!(csc.get_or_zero(2, 2), 5.0);
+    }
+
+    // --- Regression: `new` must validate as strictly as `CsrMatrix::new` -----
+    //
+    // `CscMatrix::new` accepted duplicate row indices within a column (which
+    // `get` silently mis-resolves, exactly as for CSR) and never checked
+    // `col_ptrs[0] == 0`, so `ncols == 0` with `col_ptrs == [nnz]` smuggled in
+    // entries that belong to no column.
+
+    #[test]
+    fn test_csc_duplicate_entry_rejected() {
+        // Column 0 lists row 1 twice.
+        let result = CscMatrix::new(3, 1, vec![0, 3], vec![1, 1, 2], vec![1.0f64, 2.0, 3.0]);
+        assert_eq!(
+            result.unwrap_err(),
+            CscError::DuplicateEntry { row: 1, col: 0 }
+        );
+    }
+
+    #[test]
+    fn test_csc_duplicate_entry_rejected_non_adjacent() {
+        // Column 1 stores rows [2, 1, 2]: the two `2`s are a duplicate.
+        let result = CscMatrix::new(
+            3,
+            2,
+            vec![0, 1, 4],
+            vec![0, 2, 1, 2],
+            vec![1.0f64, 2.0, 3.0, 4.0],
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            CscError::DuplicateEntry { row: 2, col: 1 }
+        );
+    }
+
+    #[test]
+    fn test_csc_unsorted_and_cross_column_repeats_accepted() {
+        // Rows within a column need not be sorted, and the same row index may
+        // appear in different columns.
+        let csc = CscMatrix::new(
+            3,
+            2,
+            vec![0, 2, 4],
+            vec![2, 0, 0, 1],
+            vec![1.0f64, 2.0, 3.0, 4.0],
+        )
+        .expect("unsorted but duplicate-free columns are valid");
+        assert_eq!(csc.get(2, 0), Some(&1.0));
+        assert_eq!(csc.get(0, 0), Some(&2.0));
+        assert_eq!(csc.get(0, 1), Some(&3.0));
+    }
+
+    #[test]
+    fn test_csc_zero_cols_with_entries_rejected() {
+        let result = CscMatrix::new(3, 0, vec![2], vec![0, 1], vec![1.0f64, 2.0]);
+        assert_eq!(
+            result.unwrap_err(),
+            CscError::InvalidColPtrs {
+                expected: 0,
+                actual: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_csc_first_col_ptr_must_be_zero() {
+        let result = CscMatrix::new(3, 2, vec![1, 2, 2], vec![0, 1], vec![1.0f64, 2.0]);
+        assert_eq!(
+            result.unwrap_err(),
+            CscError::InvalidColPtrs {
+                expected: 0,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn test_csc_col_ptrs_length_overflow_is_an_error() {
+        // `ncols + 1` overflows `usize`: an error, not a panic.
+        let result = CscMatrix::<f64>::new(1, usize::MAX, vec![], vec![], vec![]);
+        assert!(matches!(result, Err(CscError::InvalidColPtrs { .. })));
+    }
+
+    #[test]
+    fn test_csc_transpose_satisfies_contract() {
+        let csc = CscMatrix::new(3, 2, vec![0, 2, 3], vec![2, 0, 1], vec![1.0f64, 2.0, 3.0])
+            .expect("valid CSC");
+        let t = csc.transpose();
+        let rebuilt = CscMatrix::new(
+            t.nrows(),
+            t.ncols(),
+            t.col_ptrs().to_vec(),
+            t.row_indices().to_vec(),
+            t.values().to_vec(),
+        );
+        assert!(rebuilt.is_ok());
+        assert_eq!(t.shape(), (2, 3));
+        assert_eq!(t.get(0, 2), Some(&1.0));
+        assert_eq!(t.get(0, 0), Some(&2.0));
+        assert_eq!(t.get(1, 1), Some(&3.0));
     }
 }

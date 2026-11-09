@@ -5,15 +5,48 @@
 //! preconditioned variant, with `M^{-1}` and its transpose `M^{-T}`), combined
 //! with Freund's quasi-minimal residual smoothing of the BiCG residuals.
 
-use super::helpers::{dot, norm};
+use super::helpers::{dot, norm, true_residual_norm};
+use super::scaling::{Operator, PrecondScaling, SystemScaling};
 use super::types::{IterativeError, QmrResult};
 use crate::csr::CsrMatrix;
-use crate::ops::{spmv, spmv_transpose};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
-/// Solver function. See module documentation for details.
+/// QMR (two-sided Lanczos / BiCG with quasi-minimal residual smoothing) for
+/// general `A`; uses products with both `A` and `Aᵀ`.
+///
+/// Converges when the quasi-residual `tau` and then the true residual both
+/// satisfy `<= tol·‖b‖` (overflow-safe norms; see the [module
+/// documentation](super) for systems far from unit scale).
+///
+/// # Breakdown
+///
+/// Both BiCG breakdowns are detected with scale-invariant Cauchy–Schwarz tests
+/// (`|p̃ᵀAp| <= eps·‖p̃‖·‖Ap‖`, `|r̃ᵀr| <= eps·‖r̃‖·‖r‖`); the true residual then
+/// decides between a converged result and [`IterativeError::Breakdown`].
 pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    tol: T,
+    max_iter: usize,
+) -> Result<QmrResult<T>, IterativeError> {
+    let scaling = SystemScaling::for_rhs(a, b);
+    let mut result = qmr_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        tol,
+        max_iter,
+    )?;
+    scaling.solution(&mut result.x);
+    result.residual_norm = scaling.residual(result.residual_norm);
+    scaling.residuals(&mut result.residual_history);
+    Ok(result)
+}
+
+/// [`qmr`] on the (rescaled) system `a x = b`.
+fn qmr_scaled<T: Scalar<Real = T> + Clone + Field + Real>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     tol: T,
@@ -40,7 +73,7 @@ pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
 
     // Initial residual: r0 = b - A*x0
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -111,9 +144,9 @@ pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
         //   q       = A   * p
         //   q_tilde = A^T * p_tilde
         let mut q = vec![T::zero(); n];
-        spmv(T::one(), a, &p, T::zero(), &mut q);
+        a.apply(&p, &mut q);
         let mut q_tilde = vec![T::zero(); n];
-        spmv_transpose(T::one(), a, &p_tilde, T::zero(), &mut q_tilde);
+        a.apply_transpose(&p_tilde, &mut q_tilde);
 
         // sigma = <p_tilde, A p> = <p_tilde, q>
         let sigma = dot(&p_tilde, &q);
@@ -258,8 +291,61 @@ pub fn qmr<T: Scalar<Real = T> + Clone + Field + Real>(
 /// * `left_precond_transpose` - applies `M1^{-T}`
 /// * `right_precond` - applies `M2^{-1}`
 /// * `right_precond_transpose` - applies `M2^{-T}`
+///
+/// The residual history records the left-preconditioned quasi-residual
+/// `‖M1⁻¹ r‖`-like quantities that QMR minimizes. Norms are overflow-safe; for
+/// a system far from unit scale the preconditioners receive vectors of the
+/// rescaled system and must be linear, and each preconditioner and its
+/// transpose are rescaled by one common power of four (see the [module
+/// documentation](super)).
 pub fn pqmr<T, FL, FLT, FR, FRT>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    left_precond: FL,
+    left_precond_transpose: FLT,
+    right_precond: FR,
+    right_precond_transpose: FRT,
+    tol: T,
+    max_iter: usize,
+) -> Result<QmrResult<T>, IterativeError>
+where
+    T: Scalar<Real = T> + Clone + Field + Real,
+    FL: Fn(&[T]) -> Vec<T>,
+    FLT: Fn(&[T]) -> Vec<T>,
+    FR: Fn(&[T]) -> Vec<T>,
+    FRT: Fn(&[T]) -> Vec<T>,
+{
+    let scaling = SystemScaling::for_rhs(a, b);
+    // M1^{-1} and M1^{-T} (and M2^{-1} and M2^{-T}) must be scaled alike, or
+    // the dual sequence would not use the transpose of B.
+    let left_scaling = PrecondScaling::new();
+    let right_scaling = PrecondScaling::new();
+    let mut result = pqmr_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        |v: &[T]| left_scaling.finish(v, left_precond(v)),
+        |v: &[T]| left_scaling.finish(v, left_precond_transpose(v)),
+        |v: &[T]| right_scaling.finish(v, right_precond(v)),
+        |v: &[T]| right_scaling.finish(v, right_precond_transpose(v)),
+        tol,
+        max_iter,
+    )?;
+    scaling.solution(&mut result.x);
+    result.residual_norm = scaling.residual(result.residual_norm);
+    // The history is in units of γ1·M1⁻¹ applied to the rescaled residual.
+    scaling.residuals(&mut result.residual_history);
+    let left_gain = left_scaling.factor();
+    for value in result.residual_history.iter_mut() {
+        *value = *value / left_gain;
+    }
+    Ok(result)
+}
+
+/// [`pqmr`] on the (rescaled) system `a x = b`.
+fn pqmr_scaled<T, FL, FLT, FR, FRT>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     left_precond: FL,
@@ -297,7 +383,7 @@ where
 
     // Initial residual: r0 = b - A*x0
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -370,14 +456,14 @@ where
         // q = B p = M1^{-1} A M2^{-1} p
         let p_right = right_precond(&p);
         let mut ap = vec![T::zero(); n];
-        spmv(T::one(), a, &p_right, T::zero(), &mut ap);
+        a.apply(&p_right, &mut ap);
         let q = left_precond(&ap);
 
         // q_tilde = B^T p_tilde = M2^{-T} A^T M1^{-T} p_tilde
         // (correct transpose preconditioner solves on the dual side).
         let pt_left_t = left_precond_transpose(&p_tilde);
         let mut atpt = vec![T::zero(); n];
-        spmv_transpose(T::one(), a, &pt_left_t, T::zero(), &mut atpt);
+        a.apply_transpose(&pt_left_t, &mut atpt);
         let q_tilde = right_precond_transpose(&atpt);
 
         let sigma = dot(&p_tilde, &q);
@@ -488,25 +574,11 @@ where
     })
 }
 
-/// Compute the true residual norm ||b - A x||.
-fn true_residual_norm<T: Scalar<Real = T> + Clone + Field + Real>(
-    a: &CsrMatrix<T>,
-    b: &[T],
-    x: &[T],
-) -> T {
-    let n = a.nrows();
-    let mut r_final = vec![T::zero(); n];
-    spmv(T::one(), a, x, T::zero(), &mut r_final);
-    for i in 0..n {
-        r_final[i] = b[i].clone() - r_final[i].clone();
-    }
-    norm(&r_final)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::csr::CsrMatrix;
+    use crate::ops::spmv;
 
     /// Strongly diagonally-dominant non-symmetric matrix:
     /// A = [10 1 0; 2 10 1; 0 2 10]

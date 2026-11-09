@@ -1,14 +1,61 @@
 //! MINRES (Minimum Residual) and Preconditioned MINRES solvers.
 
-use super::helpers::{dot, norm};
+use super::helpers::{breakdown, converged_true_residual, dot, negligible_norm, norm};
+use super::scaling::{Operator, PrecondScaling, SystemScaling};
 use super::types::{IterativeError, MinresResult};
 use crate::csr::CsrMatrix;
-use crate::ops::spmv;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
-/// Solver function. See module documentation for details.
+/// Maps a result of the rescaled system back to the original one.
+fn unscale_minres<T: Scalar<Real = T> + Clone + Field + Real>(
+    scaling: &SystemScaling<T>,
+    mut result: MinresResult<T>,
+) -> MinresResult<T> {
+    scaling.solution(&mut result.x);
+    result.residual_norm = scaling.residual(result.residual_norm);
+    scaling.residuals(&mut result.residual_history);
+    result
+}
+
+/// MINRES for symmetric (possibly indefinite) `A`.
+///
+/// Converges when the recursive residual estimate `|eta|` satisfies
+/// `<= tol·‖b‖`. Norms (including the Lanczos column norms and the rotated
+/// diagonal) are overflow-safe; see the [module documentation](super) for
+/// systems far from unit scale.
+///
+/// # Breakdown
+///
+/// The entries of each Lanczos column `(beta_k, alpha_k, beta_{k+1})` are
+/// judged against that column's norm `‖A v_k‖` (scale-invariant):
+/// * `beta_{k+1}` negligible: the Krylov subspace is invariant and the
+///   recurrence cannot continue;
+/// * the rotated diagonal `rho` negligible: the projected tridiagonal matrix is
+///   singular on an invariant subspace.
+///
+/// Either way the true residual `‖b − A x‖` decides: a converged result if it
+/// meets `tol·‖b‖`, [`IterativeError::Breakdown`] otherwise.
 pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    tol: T,
+    max_iter: usize,
+) -> Result<MinresResult<T>, IterativeError> {
+    let scaling = SystemScaling::for_rhs(a, b);
+    let result = minres_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        tol,
+        max_iter,
+    )?;
+    Ok(unscale_minres(&scaling, result))
+}
+
+/// [`minres`] on the (rescaled) system `a x = b`.
+fn minres_scaled<T: Scalar<Real = T> + Clone + Field + Real>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     tol: T,
@@ -28,7 +75,7 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
 
     // r = b - A*x0
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -57,8 +104,10 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
         v[i] = r[i].clone() / beta1.clone();
     }
 
-    // Lanczos scalars
-    let mut beta = beta1.clone();
+    // Lanczos scalars. `beta` is the off-diagonal entry coupling the current
+    // Lanczos vector to the previous one; there is none before the first
+    // column (beta1 only enters through the right-hand side `eta`).
+    let mut beta = T::zero();
 
     // Givens rotation parameters (need two previous rotations)
     // c = cosine, s = sine
@@ -77,7 +126,7 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
     for k in 0..max_iter {
         // Lanczos step: compute v_new = A*v - alpha*v - beta*v_old
         let mut v_new = vec![T::zero(); n];
-        spmv(T::one(), a, &v, T::zero(), &mut v_new);
+        a.apply(&v, &mut v_new);
 
         let alpha = dot(&v, &v_new);
 
@@ -88,6 +137,11 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
         }
 
         let beta_new = norm(&v_new);
+
+        // ||A v|| = ||(beta, alpha, beta_new)|| in exact arithmetic: the scale
+        // against which the entries of this Lanczos column are judged
+        // (overflow-safe, summed as alpha² + beta² + beta_new²).
+        let column_norm = norm(&[alpha.clone(), beta.clone(), beta_new.clone()]);
 
         // =====================================
         // QR factorization update via Givens rotations
@@ -116,27 +170,36 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
         // Compute new Givens rotation to eliminate beta_new
         // [c  s] [r1      ]   [rho]
         // [-s c] [beta_new] = [0  ]
-        let rho = Real::sqrt(r1.clone() * r1.clone() + beta_new.clone() * beta_new.clone());
+        // (rho = ||(r1, beta_new)||, overflow-safe)
+        let rho = norm(&[r1.clone(), beta_new.clone()]);
 
-        let c_new: T;
-        let s_new: T;
-        if Scalar::abs(rho.clone()) <= <T as Scalar>::epsilon() {
-            c_new = T::one();
-            s_new = T::zero();
-        } else {
-            c_new = r1.clone() / rho.clone();
-            s_new = beta_new.clone() / rho.clone();
+        // rho negligible implies beta_new negligible as well: the projected
+        // tridiagonal matrix is singular on an invariant Krylov subspace.
+        if negligible_norm(rho.clone(), column_norm.clone()) {
+            if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                return Ok(MinresResult {
+                    x,
+                    iterations: k,
+                    residual_norm,
+                    converged: true,
+                    residual_history,
+                });
+            }
+            return Err(breakdown(
+                k,
+                "rotated diagonal negligible relative to ||A v|| (singular projected system)",
+            ));
         }
+
+        let c_new = r1.clone() / rho.clone();
+        let s_new = beta_new.clone() / rho.clone();
 
         // Update direction vector: w_new = (v - r3*w_oold - r2*w_old) / rho
         // Here w is w_old from prev iteration, w_old is w_oold from prev iteration
         let mut w_new = vec![T::zero(); n];
-        if Scalar::abs(rho.clone()) > <T as Scalar>::epsilon() {
-            for i in 0..n {
-                w_new[i] =
-                    (v[i].clone() - r3.clone() * w_old[i].clone() - r2.clone() * w[i].clone())
-                        / rho.clone();
-            }
+        for i in 0..n {
+            w_new[i] = (v[i].clone() - r3.clone() * w_old[i].clone() - r2.clone() * w[i].clone())
+                / rho.clone();
         }
 
         // Update right-hand side and solution
@@ -164,15 +227,21 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
             });
         }
 
-        // Check for breakdown
-        if Scalar::abs(beta_new.clone()) <= <T as Scalar>::epsilon() {
-            return Ok(MinresResult {
-                x,
-                iterations: k + 1,
-                residual_norm: res_norm,
-                converged: true,
-                residual_history,
-            });
+        // Lanczos breakdown: the Krylov subspace is (numerically) invariant
+        if negligible_norm(beta_new.clone(), column_norm) {
+            if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                return Ok(MinresResult {
+                    x,
+                    iterations: k + 1,
+                    residual_norm,
+                    converged: true,
+                    residual_history,
+                });
+            }
+            return Err(breakdown(
+                k,
+                "Lanczos breakdown: beta negligible relative to ||A v|| (invariant subspace)",
+            ));
         }
 
         // Prepare for next iteration
@@ -191,7 +260,7 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
 
     // Compute final residual
     let mut r_final = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r_final);
+    a.apply(&x, &mut r_final);
     for i in 0..n {
         r_final[i] = b[i].clone() - r_final[i].clone();
     }
@@ -206,9 +275,47 @@ pub fn minres<T: Scalar<Real = T> + Clone + Field + Real>(
     })
 }
 
-/// Solver function. See module documentation for details.
+/// Preconditioned MINRES; `precond` applies `M^{-1}` for a symmetric positive
+/// definite `M`.
+///
+/// Runs the Lanczos process in the `M^{-1}` inner product (`v = M^{-1} p`,
+/// `alpha = vᵀ A v`) and converges when the true residual satisfies
+/// `‖b − A x‖ <= tol·‖b‖`. Norms are overflow-safe; for a system far from
+/// unit scale `precond` receives vectors of the rescaled system and must be
+/// linear (see the [module documentation](super)).
+///
+/// # Breakdown
+///
+/// Same scale-invariant rules as [`minres`]; additionally a negative
+/// `M^{-1}`-norm reveals a preconditioner that is not positive definite.
 pub fn pminres<T, F>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    precond: F,
+    tol: T,
+    max_iter: usize,
+) -> Result<MinresResult<T>, IterativeError>
+where
+    T: Scalar<Real = T> + Clone + Field + Real,
+    F: Fn(&[T]) -> Vec<T>,
+{
+    let scaling = SystemScaling::for_rhs(a, b);
+    let precond_scaling = PrecondScaling::new();
+    let result = pminres_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        |r: &[T]| precond_scaling.finish(r, precond(r)),
+        tol,
+        max_iter,
+    )?;
+    Ok(unscale_minres(&scaling, result))
+}
+
+/// [`pminres`] on the (rescaled) system `a x = b`.
+fn pminres_scaled<T, F>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     precond: F,
@@ -233,7 +340,7 @@ where
 
     // r = b - A*x0
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -269,11 +376,10 @@ where
     // genuine SPD preconditioner ry is strictly positive; ry <= 0 is a real
     // breakdown (the preconditioner is not positive definite w.r.t. r).
     let ry = dot(&r, &y);
+    // Sign test (scale-invariant). The true residual of x0 is already known to
+    // exceed the tolerance, so this is a genuine breakdown.
     if ry <= T::zero() {
-        return Err(IterativeError::Breakdown {
-            iteration: 0,
-            description: "Preconditioner not positive definite".to_string(),
-        });
+        return Err(breakdown(0, "Preconditioner not positive definite"));
     }
     let beta1 = Real::sqrt(ry);
 
@@ -289,8 +395,10 @@ where
         p[i] = r[i].clone() / beta1.clone();
     }
 
-    // Lanczos scalars
-    let mut beta = beta1.clone();
+    // Lanczos scalars. `beta` couples the current Lanczos vector to the
+    // previous one; there is none before the first column (beta1 only enters
+    // through the right-hand side `eta`).
+    let mut beta = T::zero();
 
     // Givens rotation parameters (need two previous rotations)
     let mut c = T::one();
@@ -309,11 +417,12 @@ where
         // Preconditioned Lanczos step
         // Compute A * v
         let mut av = vec![T::zero(); n];
-        spmv(T::one(), a, &v, T::zero(), &mut av);
+        a.apply(&v, &mut av);
 
-        // alpha = v^T * A * v = (M^{-1} r)^T * A * (M^{-1} r) / beta^2
-        // But we compute it as: alpha = <p, Av> where p = M*v
-        let alpha = dot(&p, &av);
+        // alpha = v^T * A * v, the Lanczos coefficient of M^{-1} A in the
+        // M-inner product (v = M^{-1} p). Note <p, A v> = v^T M A v would be
+        // wrong for any M other than the identity.
+        let alpha = dot(&v, &av);
 
         // Update: av = A*v - alpha*p - beta*p_old
         // This maintains the relation that p holds M*v
@@ -326,13 +435,17 @@ where
 
         // beta_new = sqrt(av^T * y) = sqrt(av^T * M^{-1} * av)
         let avy = dot(&av, &y);
+        // Sign test (scale-invariant); the true residual of the current x was
+        // checked at the end of the previous iteration and exceeds the tolerance.
         if avy < T::zero() {
-            return Err(IterativeError::Breakdown {
-                iteration: k,
-                description: "Preconditioner not positive definite".to_string(),
-            });
+            return Err(breakdown(k, "Preconditioner not positive definite"));
         }
         let beta_new = Real::sqrt(avy);
+
+        // ||A v||_{M^{-1}} = ||(beta, alpha, beta_new)|| in exact arithmetic:
+        // the scale against which the entries of this Lanczos column are judged
+        // (overflow-safe, summed as alpha² + beta² + beta_new²).
+        let column_norm = norm(&[alpha.clone(), beta.clone(), beta_new.clone()]);
 
         // =====================================
         // QR factorization update (same as unpreconditioned)
@@ -347,27 +460,35 @@ where
         let r2 = s_old.clone() * alpha.clone() + c_oold.clone() * c_old.clone() * beta.clone();
         let r3 = s_oold.clone() * beta.clone();
 
-        // Compute new rotation
-        let rho = Real::sqrt(r1.clone() * r1.clone() + beta_new.clone() * beta_new.clone());
+        // Compute new rotation (rho = ||(r1, beta_new)||, overflow-safe)
+        let rho = norm(&[r1.clone(), beta_new.clone()]);
 
-        let c_new: T;
-        let s_new: T;
-        if Scalar::abs(rho.clone()) <= <T as Scalar>::epsilon() {
-            c_new = T::one();
-            s_new = T::zero();
-        } else {
-            c_new = r1.clone() / rho.clone();
-            s_new = beta_new.clone() / rho.clone();
+        // rho negligible implies beta_new negligible as well: the projected
+        // tridiagonal matrix is singular on an invariant Krylov subspace.
+        if negligible_norm(rho.clone(), column_norm.clone()) {
+            if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                return Ok(MinresResult {
+                    x,
+                    iterations: k,
+                    residual_norm,
+                    converged: true,
+                    residual_history,
+                });
+            }
+            return Err(breakdown(
+                k,
+                "rotated diagonal negligible relative to ||A v|| (singular projected system)",
+            ));
         }
+
+        let c_new = r1.clone() / rho.clone();
+        let s_new = beta_new.clone() / rho.clone();
 
         // Update direction vector
         let mut w_new = vec![T::zero(); n];
-        if Scalar::abs(rho.clone()) > <T as Scalar>::epsilon() {
-            for i in 0..n {
-                w_new[i] =
-                    (v[i].clone() - r3.clone() * w_old[i].clone() - r2.clone() * w[i].clone())
-                        / rho.clone();
-            }
+        for i in 0..n {
+            w_new[i] = (v[i].clone() - r3.clone() * w_old[i].clone() - r2.clone() * w[i].clone())
+                / rho.clone();
         }
 
         // Update solution
@@ -380,7 +501,7 @@ where
 
         // Compute actual residual for convergence check
         let mut r_curr = vec![T::zero(); n];
-        spmv(T::one(), a, &x, T::zero(), &mut r_curr);
+        a.apply(&x, &mut r_curr);
         for i in 0..n {
             r_curr[i] = b[i].clone() - r_curr[i].clone();
         }
@@ -397,14 +518,14 @@ where
             });
         }
 
-        if Scalar::abs(beta_new.clone()) <= <T as Scalar>::epsilon() {
-            return Ok(MinresResult {
-                x,
-                iterations: k + 1,
-                residual_norm: res_norm,
-                converged: true,
-                residual_history,
-            });
+        // Lanczos breakdown: the Krylov subspace is (numerically) invariant.
+        // `res_norm` is the true residual and was just found to exceed the
+        // tolerance, so the breakdown is genuine.
+        if negligible_norm(beta_new.clone(), column_norm) {
+            return Err(breakdown(
+                k,
+                "Lanczos breakdown: beta negligible relative to ||A v|| (invariant subspace)",
+            ));
         }
 
         // Prepare for next iteration
@@ -425,7 +546,7 @@ where
 
     // Final residual
     let mut r_final = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r_final);
+    a.apply(&x, &mut r_final);
     for i in 0..n {
         r_final[i] = b[i].clone() - r_final[i].clone();
     }

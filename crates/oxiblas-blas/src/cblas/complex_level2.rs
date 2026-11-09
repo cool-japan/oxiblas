@@ -101,11 +101,12 @@ pub unsafe extern "C" fn cblas_cgemv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
-    // increment would likewise alias every element of `x`/`y` onto element 0.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the `a.add(row + col * lda)` indexing below run
+    // out of bounds; a zero increment would likewise alias every element of
+    // `x`/`y` onto element 0.
     if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
         return;
     }
@@ -181,11 +182,12 @@ pub unsafe extern "C" fn cblas_zgemv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
-    // increment would likewise alias every element of `x`/`y` onto element 0.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the `a.add(row + col * lda)` indexing below run
+    // out of bounds; a zero increment would likewise alias every element of
+    // `x`/`y` onto element 0.
     if m <= 0 || n <= 0 || !gemv_params_valid(layout, m, n, lda) {
         return;
     }
@@ -333,11 +335,12 @@ pub unsafe extern "C" fn cblas_chemv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
-    // increment would likewise alias every element of `x`/`y` onto element 0.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the `a.add(row + col * lda)` indexing below run
+    // out of bounds; a zero increment would likewise alias every element of
+    // `x`/`y` onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) {
         return;
     }
@@ -411,11 +414,12 @@ pub unsafe extern "C" fn cblas_zhemv(
     incy: i32,
 ) {
     // Reference BLAS calls xerbla and returns on a bad shape; a void C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op instead. Without this, `lda as usize` turns a negative `lda` into
-    // `usize::MAX` (and an undersized positive `lda` aliases columns), making
-    // the `a.add(row + col * lda)` indexing below run out of bounds; a zero
-    // increment would likewise alias every element of `x`/`y` onto element 0.
+    // cannot surface an error code and a panic reaching it would abort the
+    // process, so we no-op instead. Without this, `lda as usize` turns a
+    // negative `lda` into `usize::MAX` (and an undersized positive `lda`
+    // aliases columns), making the `a.add(row + col * lda)` indexing below run
+    // out of bounds; a zero increment would likewise alias every element of
+    // `x`/`y` onto element 0.
     if n <= 0 || !square_lda_valid(n, lda) {
         return;
     }
@@ -528,6 +532,10 @@ mod tests {
         let mut y = [Complex64::new(0.0, 0.0); 2];
         let alpha = Complex64::new(1.0, 0.0);
         let beta = Complex64::new(0.0, 0.0);
+        // SAFETY: `a` holds the 2 x 2 column-major matrix with lda = 2 (4
+        // elements), `x` and `y` hold 2 elements each with unit increments,
+        // and `alpha` / `beta` are live locals, so every pointer covers what
+        // this 2 x 2 call reads or writes.
         unsafe {
             cblas_zgemv(
                 CblasLayout::ColMajor,
@@ -562,6 +570,10 @@ mod tests {
         let mut y = [Complex64::new(0.0, 0.0); 2];
         let alpha = Complex64::new(1.0, 0.0);
         let beta = Complex64::new(0.0, 0.0);
+        // SAFETY: `a` holds the 2 x 2 column-major matrix with lda = 2 (4
+        // elements), `x` and `y` hold 2 elements each with unit increments,
+        // and `alpha` / `beta` are live locals, so every pointer covers what
+        // this 2 x 2 call reads or writes.
         unsafe {
             cblas_zgemv(
                 CblasLayout::ColMajor,
@@ -600,6 +612,11 @@ mod tests {
         let mut y_ref = y;
         let alpha = Complex64::new(1.0, 0.5);
         let beta = Complex64::new(0.5, 0.0);
+        // SAFETY: `a` holds a 2 x 2 column-major matrix with lda = 2 (4
+        // elements), `x`, `y` and `y_ref` hold 2 elements each (unit
+        // increments) and `alpha` / `beta` are live locals. `MatRef::new` gets
+        // the same 4-element buffer with row stride 2, so every offset `i + 2
+        // * j` with `i, j < 2` is in bounds, and `a` outlives the view.
         unsafe {
             cblas_zhemv(
                 CblasLayout::ColMajor,
@@ -647,6 +664,10 @@ mod tests {
         let beta = Complex64::new(0.0, 0.0);
         let mut y_col = [Complex64::new(0.0, 0.0); 2];
         let mut y_row = [Complex64::new(0.0, 0.0); 2];
+        // SAFETY: both A buffers hold a 2 x 2 matrix with leading dimension 2
+        // (4 elements), `x`, `y_col` and `y_row` hold 2 elements each with
+        // unit increments, and `alpha` / `beta` are live locals, so every
+        // pointer covers what each 2 x 2 call reads or writes.
         unsafe {
             cblas_zhemv(
                 CblasLayout::ColMajor,

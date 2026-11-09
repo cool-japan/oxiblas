@@ -19,14 +19,11 @@
 //! # Consumption status (important)
 //!
 //! [`SimdCapabilities`], [`KernelSelector`] and [`SimdDispatcher`] form a
-//! capability-detection and dispatch *toolkit*.  As of this revision the actual
-//! GEMM microkernel selection in `oxiblas-blas`
-//! (`level3::gemm_kernel::GemmKernel`) still performs its own inline
-//! `is_x86_feature_detected!` probing and does **not** yet delegate to
-//! [`KernelSelector`].  This module therefore must not be described as the thing
-//! that *drives* kernel selection today — it only *recommends* one.  Wiring the
-//! BLAS GEMM path (and its `force-scalar` / `max-simd-*` gating) through
-//! [`KernelSelector`] is tracked as a follow-up; see the crate TODO.
+//! capability-detection and dispatch *toolkit*.  The GEMM micro-kernels in
+//! `oxiblas-blas` (`level3::gemm_kernel`) take their kind from
+//! [`KernelSelector::select`] and clamp it to the `force-scalar` / `max-simd-*`
+//! ceiling.  The other BLAS kernels do their own dispatch and do not consult
+//! this module.
 //!
 //! What this module *does* authoritatively provide is the single source of truth
 //! for CPU SIMD capability detection (respecting the `force-scalar`,
@@ -95,7 +92,10 @@ pub struct SimdCapabilities {
     // ------------------------------------------------------------------
     // Memory topology
     // ------------------------------------------------------------------
-    /// Size of a single cache line in bytes (typically 64).
+    /// Cache line size in bytes that this crate assumes: the compile-time
+    /// [`CACHE_LINE_SIZE`](crate::memory::CACHE_LINE_SIZE), not a value detected
+    /// on the running CPU. It is 128 on aarch64, chosen for Apple cores (many
+    /// other aarch64 cores use 64-byte lines), and 64 elsewhere.
     pub cache_line_bytes: usize,
     /// Width of the widest supported SIMD vector in bytes.
     pub vector_width_bytes: usize,
@@ -170,7 +170,7 @@ impl SimdCapabilities {
             has_neon: false,
             has_sve: false,
             has_simd128: false,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes,
         }
     }
@@ -206,7 +206,7 @@ impl SimdCapabilities {
             has_neon: false,
             has_sve: false,
             has_simd128: false,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes,
         }
     }
@@ -242,7 +242,7 @@ impl SimdCapabilities {
             has_neon: true,
             has_sve,
             has_simd128: false,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes,
         }
     }
@@ -266,7 +266,7 @@ impl SimdCapabilities {
             has_neon: false,
             has_sve: false,
             has_simd128,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes,
         }
     }
@@ -288,7 +288,7 @@ impl SimdCapabilities {
             has_neon: false,
             has_sve: false,
             has_simd128: false,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes: 8,
         }
     }
@@ -1263,7 +1263,7 @@ mod tests {
             has_neon: value,
             has_sve: value,
             has_simd128: value,
-            cache_line_bytes: 64,
+            cache_line_bytes: crate::memory::CACHE_LINE_SIZE,
             vector_width_bytes: width,
         }
     }
@@ -1300,6 +1300,17 @@ mod tests {
         assert!(!scalar.has_simd128);
         assert_eq!(scalar.vector_width_bytes, 8);
         assert_eq!(scalar.optimal_level(), SimdLevel::Scalar);
+    }
+
+    #[test]
+    fn test_simd_caps_cache_line_matches_crate_constant() {
+        use crate::memory::CACHE_LINE_SIZE;
+        assert_eq!(simd_caps().cache_line_bytes, CACHE_LINE_SIZE);
+        // limited_to must keep the value at every ceiling.
+        for ceiling in [usize::MAX, 32, 16, 0] {
+            let c = caps_uniform(true, 64).limited_to(ceiling);
+            assert_eq!(c.cache_line_bytes, CACHE_LINE_SIZE);
+        }
     }
 
     // ------------------------------------------------------------------

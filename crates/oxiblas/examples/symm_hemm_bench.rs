@@ -293,7 +293,9 @@ fn bench_hemm(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
         opt_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let opt_median = opt_times[n_samples / 2];
 
-        // Complex HEMM has 8 real flops per complex multiply-add: 8 * n^3
+        // Nominal count: 8 real flops per complex multiply-add, 8·n³ (the usual
+        // convention). From order 64 `hemm_c64` runs the 3M method (three real
+        // GEMMs), which executes about 6·n³, so its G/s are effective rates.
         let flops = 8.0 * (n as f64).powi(3);
         let naive_gflops = flops / naive_median / 1e9;
         let opt_gflops = flops / opt_median / 1e9;
@@ -320,5 +322,7 @@ fn main() {
     bench_hemm(&sizes, 2, 5);
 
     println!();
-    println!("Note: SYMM uses 2n³ flops, HEMM uses 8n³ flops (complex).");
+    println!("Note: SYMM uses 2n³ flops. HEMM is counted at the nominal 8n³ real flops");
+    println!("      of a complex product; the optimized HEMM runs the 3M method (three");
+    println!("      real GEMMs, about 6n³ flops), so its G/s are effective rates.");
 }

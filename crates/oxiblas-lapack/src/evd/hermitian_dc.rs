@@ -1,15 +1,38 @@
 //! Hermitian Eigenvalue Decomposition using Divide-and-Conquer.
 //!
-//! Uses Householder tridiagonalization followed by the divide-and-conquer algorithm.
-//! This is typically faster than the QR algorithm for large matrices.
-//!
 //! For Hermitian matrices (A = A^H), all eigenvalues are real and eigenvectors form
-//! a unitary matrix.
+//! a unitary matrix. The pipeline mirrors LAPACK `ZHEEVD`:
+//!
+//! 1. a matrix whose norm is tiny or huge is scaled by a power of two into the
+//!    safe range (exact; the eigenvalues are scaled back at the end);
+//! 2. Householder reduction to a *real* symmetric tridiagonal `T` (`ZHETRD`):
+//!    complex reflectors `Q` followed by the unitary diagonal phase scaling `D`
+//!    that makes the off-diagonal real, `A = (Q·D)·T·(Q·D)ᴴ` (the reduction
+//!    shared with [`HermitianEvd`](super::HermitianEvd));
+//! 3. Cuppen's divide and conquer on `T` in the real type `T::Real` (`DSTEDC`,
+//!    the solver of [`SymmetricEvdDc`](super::SymmetricEvdDc)): Gu-Eisenstat
+//!    deflation, a `DLAED4`-style secular-equation solver that reports
+//!    non-convergence, Löwner-formula eigenvectors and GEMM merges, giving
+//!    `T = Z·Λ·Zᵀ` with a real orthogonal `Z`;
+//! 4. back-transformation `V = (Q·D)·Z` (`ZUNMTR`; complex times real as in
+//!    `ZLACRM`): one real GEMM on the stacked real and imaginary parts of
+//!    `Q·D`.
+//!
+//! For `Complex64` and `Complex32` the merges and the back-transformation run
+//! through the `oxiblas_blas` GEMM. Other complex scalar types (none in this
+//! workspace) use the same reduction followed by the implicit QR iteration.
 
-use super::hermitian_tridiag::tridiagonalize_hermitian;
+use core::any::Any;
+
+use num_complex::{Complex32, Complex64};
 use num_traits::{FromPrimitive, One, Zero};
+use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{ComplexScalar, Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
+
+use super::dc_merge::{DcError, stedc};
+use super::hermitian_tridiag::tridiagonalize_hermitian;
+use super::sym_kernels::{BlasMatMul, MatMul};
 
 /// Error type for divide-and-conquer Hermitian eigendecomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +60,23 @@ impl core::fmt::Display for HermitianEvdDcError {
 
 impl std::error::Error for HermitianEvdDcError {}
 
+impl From<DcError> for HermitianEvdDcError {
+    fn from(e: DcError) -> Self {
+        match e {
+            DcError::NotConverged => Self::NotConverged,
+            DcError::SecularEquationFailed => Self::SecularEquationFailed,
+        }
+    }
+}
+
 /// Hermitian eigenvalue decomposition using divide-and-conquer.
 ///
 /// Computes A = U·D·U^H where U contains unitary eigenvectors and D is real diagonal.
 /// For Hermitian matrices (A = A^H), all eigenvalues are real.
 ///
-/// The divide-and-conquer algorithm is typically faster than QR for large matrices.
+/// As in LAPACK, divide-and-conquer overtakes the QR algorithm
+/// ([`HermitianEvd`](super::HermitianEvd)) on large matrices because almost
+/// all of its eigenvector work is matrix multiplication.
 #[derive(Debug, Clone)]
 pub struct HermitianEvdDc<T: Scalar> {
     /// Eigenvalues (sorted in ascending order) - always real.
@@ -53,11 +87,13 @@ pub struct HermitianEvdDc<T: Scalar> {
     n: usize,
 }
 
-/// Threshold for switching to direct QR algorithm.
-const DC_THRESHOLD: usize = 100;
+/// Leaf size of the real divide and conquer: blocks of at most this many rows
+/// go to the QR iteration (LAPACK `SMLSIZ`, as in `SymmetricEvdDc`). The merge
+/// is exact at every size, so this only trades speed.
+const SMLSIZ: usize = 25;
 
-/// Maximum iterations for secular equation solver.
-const MAX_SECULAR_ITER: usize = 100;
+/// Iteration limit, per row, of the QR iteration of the generic fallback.
+const QR_MAX_ITER: usize = 100;
 
 impl<T: Field + ComplexScalar + bytemuck::Zeroable> HermitianEvdDc<T>
 where
@@ -67,7 +103,9 @@ where
     ///
     /// # Arguments
     ///
-    /// * `a` - Hermitian matrix (only upper triangle is used)
+    /// * `a` - Hermitian matrix. Only the upper triangle is read, and the
+    ///   imaginary parts of its diagonal are ignored (taken as zero, as in
+    ///   LAPACK `ZHEEVD`).
     ///
     /// # Example
     ///
@@ -88,6 +126,16 @@ where
     /// assert!((eigs[0] - 1.0).abs() < 1e-10);
     /// assert!((eigs[1] - 4.0).abs() < 1e-10);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`HermitianEvdDcError::EmptyMatrix`] or
+    /// [`HermitianEvdDcError::NotSquare`] for an empty or non-square `a`;
+    /// [`HermitianEvdDcError::NotConverged`] if the upper triangle of `a` has
+    /// a non-finite (NaN or infinite) entry, or the QR iteration on a leaf
+    /// block does not converge;
+    /// [`HermitianEvdDcError::SecularEquationFailed`] if a secular equation of
+    /// a merge does not converge within its iteration limit.
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, HermitianEvdDcError> {
         let n = a.nrows();
 
@@ -96,6 +144,9 @@ where
         }
         if n != a.ncols() {
             return Err(HermitianEvdDcError::NotSquare);
+        }
+        if !upper_triangle_is_finite(a) {
+            return Err(HermitianEvdDcError::NotConverged);
         }
 
         // Handle trivial case
@@ -110,33 +161,17 @@ where
             });
         }
 
-        // Copy Hermitian matrix (use upper triangle, conjugate for lower)
-        let mut work: Mat<T> = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in i..n {
-                let val = a[(i, j)];
-                work[(i, j)] = val;
-                work[(j, i)] = val.conj();
-            }
+        let mut work = hermitian_from_upper(a);
+        let mut eigenvalues = Vec::new();
+        let mut eigenvectors: Mat<T> = Mat::zeros(n, n);
+        match with_complex_backend(&mut work, &mut eigenvalues, &mut eigenvectors) {
+            Some(result) => result?,
+            None => qr_pipeline(&mut work, &mut eigenvalues, &mut eigenvectors)?,
         }
-
-        // Initialize eigenvector matrix to identity
-        let mut u: Mat<T> = Mat::zeros(n, n);
-        for i in 0..n {
-            u[(i, i)] = T::one();
-        }
-
-        // Tridiagonalize: A = (Q·D) * T * (Q·D)^H with T real symmetric tridiagonal.
-        // `u` receives Q·D (the accumulated reflectors folded with the diagonal phase
-        // correction D) so the D&C solver below yields the correct eigenvectors Q·D·V.
-        let (diag, off_diag) = tridiagonalize_hermitian(&mut work, &mut u, n);
-
-        // Apply divide-and-conquer algorithm to real tridiagonal matrix
-        let eigenvalues = divide_and_conquer(diag, off_diag, &mut u, n)?;
 
         Ok(Self {
             eigenvalues,
-            eigenvectors: u,
+            eigenvectors,
             n,
         })
     }
@@ -180,236 +215,240 @@ where
     }
 }
 
-/// Divide-and-conquer algorithm for real symmetric tridiagonal matrices.
-fn divide_and_conquer<T: Field + ComplexScalar + bytemuck::Zeroable>(
-    mut diag: Vec<T::Real>,
-    mut off_diag: Vec<T::Real>,
-    u: &mut Mat<T>,
-    n: usize,
-) -> Result<Vec<T::Real>, HermitianEvdDcError>
+/// `true` when every entry of the upper triangle of `a` (the part that is
+/// read) has finite real and imaginary parts.
+fn upper_triangle_is_finite<T: ComplexScalar>(a: MatRef<'_, T>) -> bool
 where
     T::Real: Real,
 {
-    if n <= DC_THRESHOLD {
-        // Use QR algorithm for small matrices
-        return qr_algorithm(diag, off_diag, u, n);
-    }
-
-    // Split point
-    let mid = n / 2;
-
-    // Extract the connecting element
-    let rho = off_diag[mid - 1];
-    off_diag[mid - 1] = T::Real::zero();
-
-    // Modify diagonal at split point (secular equation formulation)
-    diag[mid - 1] = diag[mid - 1] - rho;
-    diag[mid] = diag[mid] - rho;
-
-    // Extract subproblems
-    let diag1: Vec<T::Real> = diag[..mid].to_vec();
-    let off_diag1: Vec<T::Real> = off_diag[..(mid - 1)].to_vec();
-    let diag2: Vec<T::Real> = diag[mid..].to_vec();
-    let off_diag2: Vec<T::Real> = off_diag[mid..].to_vec();
-
-    // Solve subproblems recursively
-    let mut u1: Mat<T> = Mat::zeros(mid, mid);
-    let mut u2: Mat<T> = Mat::zeros(n - mid, n - mid);
-    for i in 0..mid {
-        u1[(i, i)] = T::one();
-    }
-    for i in 0..(n - mid) {
-        u2[(i, i)] = T::one();
-    }
-
-    let mut d1 = divide_and_conquer(diag1, off_diag1, &mut u1, mid)?;
-    let mut d2 = divide_and_conquer(diag2, off_diag2, &mut u2, n - mid)?;
-
-    // Merge results
-    merge_eigenvalues(&mut d1, &mut d2, &mut u1, &mut u2, u, rho, n, mid)
+    let n = a.nrows();
+    (0..n).all(|j| {
+        (0..=j).all(|i| {
+            let z = a[(i, j)];
+            num_traits::Float::is_finite(z.real()) && num_traits::Float::is_finite(z.imag())
+        })
+    })
 }
 
-/// Merges two sets of eigenvalues/eigenvectors using the secular equation.
-fn merge_eigenvalues<T: Field + ComplexScalar + bytemuck::Zeroable>(
-    d1: &mut [T::Real],
-    d2: &mut [T::Real],
-    u1: &mut Mat<T>,
-    u2: &mut Mat<T>,
-    u: &mut Mat<T>,
-    rho: T::Real,
-    n: usize,
-    mid: usize,
-) -> Result<Vec<T::Real>, HermitianEvdDcError>
+/// The full Hermitian matrix defined by the upper triangle of `a`, with a real
+/// diagonal (`ZHETRD` takes the imaginary parts of the diagonal as zero).
+fn hermitian_from_upper<T: ComplexScalar + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Mat<T>
 where
     T::Real: Real,
 {
-    // Construct z vector (last row of U1, first row of U2)
-    let mut z: Vec<T::Real> = vec![T::Real::zero(); n];
-    for i in 0..mid {
-        z[i] = u1[(mid - 1, i)].real();
-    }
-    for i in 0..(n - mid) {
-        z[mid + i] = u2[(0, i)].real();
-    }
-
-    // Combine and sort eigenvalues with indices
-    let mut d: Vec<T::Real> = vec![T::Real::zero(); n];
-    let mut perm: Vec<usize> = vec![0; n];
-    for i in 0..mid {
-        d[i] = d1[i];
-        perm[i] = i;
-    }
-    for i in 0..(n - mid) {
-        d[mid + i] = d2[i];
-        perm[mid + i] = mid + i;
-    }
-
-    // Sort eigenvalues and track permutations
-    for i in 1..n {
-        let key_d = d[i];
-        let key_z = z[i];
-        let key_p = perm[i];
-        let mut j = i;
-        while j > 0 && d[j - 1] > key_d {
-            d[j] = d[j - 1];
-            z[j] = z[j - 1];
-            perm[j] = perm[j - 1];
-            j -= 1;
+    let n = a.nrows();
+    let mut work: Mat<T> = Mat::zeros(n, n);
+    for j in 0..n {
+        for i in 0..j {
+            let val = a[(i, j)];
+            work[(i, j)] = val;
+            work[(j, i)] = val.conj();
         }
-        d[j] = key_d;
-        z[j] = key_z;
-        perm[j] = key_p;
+        work[(j, j)] = T::from_real(a[(j, j)].real());
     }
+    work
+}
 
-    // Solve secular equation for each eigenvalue
-    let mut lambda: Vec<T::Real> = vec![T::Real::zero(); n];
-    let eps = <T::Real as Scalar>::epsilon() * T::Real::from_f64(100.0).unwrap_or(T::Real::one());
+/// The largest power of two not above `x` (`1` unless `x` is positive and
+/// finite).
+fn pow2_below<R: Real>(x: R) -> R {
+    let two = R::one() + R::one();
+    let mut s = R::one();
+    if !(x > R::zero()) || !num_traits::Float::is_finite(x) {
+        return s;
+    }
+    let mut guard = 0;
+    while s * two <= x && guard < 1 << 14 {
+        s = s * two;
+        guard += 1;
+    }
+    while s > x && guard < 1 << 14 {
+        s = s / two;
+        guard += 1;
+    }
+    s
+}
 
-    for k in 0..n {
-        // Find eigenvalue in interval (d[k], d[k+1])
-        let lo = d[k];
-        let hi = if k < n - 1 {
-            d[k + 1]
-        } else {
-            d[k] + rho.abs() + T::Real::one()
-        };
-
-        let mut lam = (lo + hi) / (T::Real::one() + T::Real::one());
-
-        // Newton iteration for secular equation
-        for _ in 0..MAX_SECULAR_ITER {
-            let mut f = rho;
-            let mut df = T::Real::zero();
-
-            for i in 0..n {
-                let diff = d[i] - lam;
-                if diff.abs() > eps {
-                    f = f + z[i] * z[i] / diff;
-                    df = df + z[i] * z[i] / (diff * diff);
-                }
-            }
-
-            if f.abs() < eps {
-                break;
-            }
-
-            let delta = f / df;
-            lam = lam + delta;
-
-            // Clamp to interval
-            if lam <= lo {
-                lam = lo + eps;
-            }
-            if lam >= hi && k < n - 1 {
-                lam = hi - eps;
-            }
-
-            if delta.abs() < eps * lam.abs() {
-                break;
+/// Scales the Hermitian matrix `a` (full storage) by a power of two into the
+/// safe range of LAPACK `ZHEEVD` (max-norm in `[sqrt(smlnum), sqrt(1/smlnum)]`,
+/// `smlnum = safmin / eps`) so the reduction neither overflows nor loses
+/// accuracy to underflow; returns the factor (`1` when the norm is already in
+/// range or zero).
+///
+/// The eigenvalues of the scaled matrix are divided by the factor afterwards;
+/// the eigenvectors are unchanged. A power of two makes both steps exact.
+fn scale_into_safe_range<T: ComplexScalar>(a: &mut Mat<T>) -> T::Real
+where
+    T::Real: Real,
+{
+    let n = a.nrows();
+    let mut anrm = T::Real::zero();
+    for j in 0..n {
+        for i in 0..=j {
+            let v = Scalar::abs(a[(i, j)]);
+            if v > anrm {
+                anrm = v;
             }
         }
-
-        lambda[k] = lam;
     }
-
-    // Compute eigenvectors using the secular equation solution
-    let mut v: Mat<T> = Mat::zeros(n, n);
-    for k in 0..n {
-        let lam = lambda[k];
-        let mut norm_sq = T::Real::zero();
-
+    let one = T::Real::one();
+    let two = one + one;
+    let smlnum = <T::Real as Scalar>::min_positive() / <T::Real as Scalar>::epsilon();
+    let rmin = <T::Real as Real>::sqrt(smlnum);
+    let rmax = <T::Real as Real>::sqrt(one / smlnum);
+    let sigma = if anrm > T::Real::zero() && anrm < rmin {
+        two * pow2_below(rmin / anrm)
+    } else if anrm > rmax && num_traits::Float::is_finite(anrm) {
+        one / (two * pow2_below(anrm / rmax))
+    } else {
+        return one;
+    };
+    for j in 0..n {
         for i in 0..n {
-            let diff = d[i] - lam;
-            let vi = if diff.abs() > eps {
-                z[i] / diff
-            } else {
-                T::Real::one()
-            };
-            v[(i, k)] = T::from_real(vi);
-            norm_sq = norm_sq + vi * vi;
-        }
-
-        // Normalize
-        if norm_sq > T::Real::zero() {
-            let norm = Real::sqrt(norm_sq);
-            for i in 0..n {
-                v[(i, k)] = v[(i, k)] / T::from_real(norm);
-            }
+            let z = a[(i, j)];
+            a[(i, j)] = T::from_real_imag(z.real() * sigma, z.imag() * sigma);
         }
     }
-
-    // Transform eigenvectors back
-    // Apply U1 and U2 blocks
-    let mut u_temp: Mat<T> = Mat::zeros(n, n);
-
-    // Build the block diagonal matrix of U1 and U2
-    for i in 0..mid {
-        for j in 0..mid {
-            u_temp[(i, j)] = u1[(i, j)];
-        }
-    }
-    for i in 0..(n - mid) {
-        for j in 0..(n - mid) {
-            u_temp[(mid + i, mid + j)] = u2[(i, j)];
-        }
-    }
-
-    // Multiply: U_new = U_old * u_temp * V
-    // First: temp2 = u_temp * V (permuted)
-    let mut temp2: Mat<T> = Mat::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            let mut sum = T::zero();
-            for k in 0..n {
-                sum = sum + u_temp[(i, k)] * v[(k, j)];
-            }
-            temp2[(i, j)] = sum;
-        }
-    }
-
-    // Then: U = U_old * temp2
-    let mut u_new: Mat<T> = Mat::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            let mut sum = T::zero();
-            for k in 0..n {
-                sum = sum + u[(i, k)] * temp2[(k, j)];
-            }
-            u_new[(i, j)] = sum;
-        }
-    }
-
-    // Copy back to u
-    for i in 0..n {
-        for j in 0..n {
-            u[(i, j)] = u_new[(i, j)];
-        }
-    }
-
-    Ok(lambda)
+    sigma
 }
 
-/// QR algorithm for small real symmetric tridiagonal matrices.
+/// Divides the eigenvalues of the scaled matrix by the scaling factor.
+fn unscale<R: Real>(values: &mut [R], sigma: R) {
+    if sigma != R::one() {
+        for v in values.iter_mut() {
+            *v = *v / sigma;
+        }
+    }
+}
+
+/// Runs [`dc_pipeline`] with the `oxiblas_blas` GEMM when `T` is `Complex64`
+/// or `Complex32`, by downcasting the owned buffers (as
+/// `sym_kernels::with_gemm_backend` does for the real drivers; no `unsafe`).
+///
+/// Returns `None` for any other complex scalar type: the real divide and
+/// conquer needs a real type with `Field` and `bytemuck::Zeroable`, which the
+/// public bounds do not promise for a general `T::Real`.
+fn with_complex_backend<T>(
+    work: &mut Mat<T>,
+    values: &mut Vec<T::Real>,
+    vectors: &mut Mat<T>,
+) -> Option<Result<(), HermitianEvdDcError>>
+where
+    T: Field + ComplexScalar + bytemuck::Zeroable,
+    T::Real: Real,
+{
+    if let (Some(w), Some(v), Some(z)) = (
+        (work as &mut dyn Any).downcast_mut::<Mat<Complex64>>(),
+        (values as &mut dyn Any).downcast_mut::<Vec<f64>>(),
+        (vectors as &mut dyn Any).downcast_mut::<Mat<Complex64>>(),
+    ) {
+        return Some(dc_pipeline::<Complex64, f64, BlasMatMul>(w, v, z));
+    }
+    if let (Some(w), Some(v), Some(z)) = (
+        (work as &mut dyn Any).downcast_mut::<Mat<Complex32>>(),
+        (values as &mut dyn Any).downcast_mut::<Vec<f32>>(),
+        (vectors as &mut dyn Any).downcast_mut::<Mat<Complex32>>(),
+    ) {
+        return Some(dc_pipeline::<Complex32, f32, BlasMatMul>(w, v, z));
+    }
+    None
+}
+
+/// The divide-and-conquer pipeline (`ZHEEVD`) for the complex type `C` with
+/// real type `R` and matrix-product back end `G`.
+///
+/// `work` holds the full Hermitian matrix (real diagonal) and is overwritten;
+/// on success `values` holds the eigenvalues in ascending order and the
+/// columns of `vectors` (`n × n`) the corresponding orthonormal eigenvectors.
+fn dc_pipeline<C, R, G>(
+    work: &mut Mat<C>,
+    values: &mut Vec<R>,
+    vectors: &mut Mat<C>,
+) -> Result<(), HermitianEvdDcError>
+where
+    C: Field + ComplexScalar<Real = R> + bytemuck::Zeroable,
+    R: Field + Real + bytemuck::Zeroable,
+    G: MatMul<R>,
+{
+    let n = work.nrows();
+    let sigma = scale_into_safe_range(work);
+    // A = (Q·D)·T·(Q·D)ᴴ with T real symmetric tridiagonal; `qd` = Q·D.
+    let mut qd: Mat<C> = Mat::eye(n);
+    let (mut d, mut e) = tridiagonalize_hermitian(work, &mut qd, n);
+    // T = Z·Λ·Zᵀ: eigenvalues ascending, Z real orthogonal.
+    let mut z: Mat<R> = Mat::zeros(n, n);
+    stedc::<R, G>(&mut d, &mut e, &mut z, SMLSIZ, Par::Seq)?;
+    back_transform::<C, R, G>(&qd, &z, vectors);
+    unscale(&mut d, sigma);
+    *values = d;
+    Ok(())
+}
+
+/// `v = qd·z` for complex `qd` and real `z` (`n × n`), as one real GEMM on the
+/// stacked parts: `[Re v; Im v] = [Re qd; Im qd]·z` (LAPACK `ZLACRM`).
+///
+/// Every output entry is a real dot product of `n` terms, so the product is
+/// as accurate as a complex one at half its cost.
+fn back_transform<C, R, G>(qd: &Mat<C>, z: &Mat<R>, v: &mut Mat<C>)
+where
+    C: Field + ComplexScalar<Real = R> + bytemuck::Zeroable,
+    R: Field + Real + bytemuck::Zeroable,
+    G: MatMul<R>,
+{
+    let n = qd.nrows();
+    let mut stacked: Mat<R> = Mat::zeros(2 * n, n);
+    for j in 0..n {
+        for i in 0..n {
+            let x = qd[(i, j)];
+            stacked[(i, j)] = x.real();
+            stacked[(n + i, j)] = x.imag();
+        }
+    }
+    let mut product: Mat<R> = Mat::zeros(2 * n, n);
+    G::gemm(
+        false,
+        false,
+        R::one(),
+        stacked.as_ref(),
+        z.as_ref(),
+        R::zero(),
+        product.as_mut(),
+        Par::Seq,
+    );
+    for j in 0..n {
+        for i in 0..n {
+            v[(i, j)] = C::from_real_imag(product[(i, j)], product[(n + i, j)]);
+        }
+    }
+}
+
+/// Pipeline for complex scalar types without a GEMM back end (none in this
+/// workspace): the same scaling and reduction, then the implicit QR iteration
+/// on the real tridiagonal, accumulating its rotations into `Q·D`.
+fn qr_pipeline<T>(
+    work: &mut Mat<T>,
+    values: &mut Vec<T::Real>,
+    vectors: &mut Mat<T>,
+) -> Result<(), HermitianEvdDcError>
+where
+    T: Field + ComplexScalar + bytemuck::Zeroable,
+    T::Real: Real,
+{
+    let n = work.nrows();
+    let sigma = scale_into_safe_range(work);
+    let mut qd: Mat<T> = Mat::eye(n);
+    let (d, e) = tridiagonalize_hermitian(work, &mut qd, n);
+    let mut eigs = qr_algorithm(d, e, &mut qd, n)?;
+    unscale(&mut eigs, sigma);
+    *values = eigs;
+    *vectors = qd;
+    Ok(())
+}
+
+/// Implicit QR iteration (Wilkinson shift) on the real symmetric tridiagonal
+/// `tridiag(off_diag, diag, off_diag)`, applying its rotations to the columns
+/// of the complex `u`; returns the eigenvalues in ascending order (columns of
+/// `u` sorted alike). Used by [`qr_pipeline`] only.
 fn qr_algorithm<T: Field + ComplexScalar + bytemuck::Zeroable>(
     mut diag: Vec<T::Real>,
     mut off_diag: Vec<T::Real>,
@@ -424,7 +463,7 @@ where
     }
 
     let eps = <T::Real as Scalar>::epsilon() * T::Real::from_f64(100.0).unwrap_or(T::Real::one());
-    let max_iter = 100 * n;
+    let max_iter = QR_MAX_ITER * n;
 
     let mut m = n - 1;
     let mut iter = 0;
@@ -887,3 +926,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "hermitian_dc_tests.rs"]
+mod accuracy_tests;

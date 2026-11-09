@@ -1,14 +1,70 @@
 //! Block GMRES solver for multiple right-hand sides.
 
-use super::helpers::{block_inner_prod_gmres, block_qr_gmres, solve_block_ls_gmres};
+use super::helpers::{
+    block_inner_prod_gmres, block_qr_gmres, negligible_norm, solve_block_ls_gmres,
+};
+use super::scaling::{Operator, SystemScaling};
 use super::types::{BlockGmresResult, IterativeError};
 use crate::csr::CsrMatrix;
-use crate::ops::spmv;
+use crate::linalg::precond::tolerance::norm2;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
-/// Solver function. See module documentation for details.
+/// Overflow-safe Frobenius norm of a block of vectors (or of a small dense
+/// block), summed column by column.
+fn frobenius_norm<T: Scalar<Real = T> + Clone + Field + Real>(block: &[Vec<T>]) -> T {
+    norm2(block.iter().flat_map(|column| column.iter().copied()))
+}
+
+/// Restarted block GMRES(`restart`) for `A X = B` with `p = b.len()`
+/// right-hand sides (`x0` must have one initial guess per right-hand side).
+///
+/// Convergence is checked on the true residual at the end of every cycle:
+/// `‖B − A X‖_F <= tol·‖B‖_F` (overflow-safe norms; for a system far from unit
+/// scale all right-hand sides are rescaled by one common factor, see the
+/// [module documentation](super)). `iterations` counts block Arnoldi steps.
+///
+/// # Breakdown
+///
+/// The block Arnoldi process stops early when the new sub-diagonal block is
+/// negligible relative to `‖A V_k‖_F`, the norm it was derived from
+/// (scale-invariant). The cycle is then folded into `X` and the true residual
+/// decides between convergence and a restart.
 pub fn block_gmres<T>(
     a: &CsrMatrix<T>,
+    b: &[Vec<T>],
+    x0: &[Vec<T>],
+    restart: usize,
+    tol: T,
+    max_iter: usize,
+) -> Result<BlockGmresResult<T>, IterativeError>
+where
+    T: Scalar<Real = T> + Clone + Field + Real,
+{
+    let scaling = SystemScaling::for_rhs_block(a, b);
+    let b_hat: Vec<Vec<T>> = b.iter().map(|bk| scaling.rhs(bk).into_owned()).collect();
+    let x0_hat: Vec<Vec<T>> = x0
+        .iter()
+        .map(|xk| scaling.initial_guess(xk).into_owned())
+        .collect();
+    let mut result = block_gmres_scaled(
+        &scaling.operator(a),
+        &b_hat,
+        &x0_hat,
+        restart,
+        tol,
+        max_iter,
+    )?;
+    for x in result.x.iter_mut() {
+        scaling.solution(x);
+    }
+    result.residual_norm = scaling.residual(result.residual_norm);
+    scaling.residuals(&mut result.residual_history);
+    Ok(result)
+}
+
+/// [`block_gmres`] on the (rescaled) systems `a X = B`.
+fn block_gmres_scaled<T>(
+    a: &Operator<'_, T>,
     b: &[Vec<T>],
     x0: &[Vec<T>],
     restart: usize,
@@ -56,29 +112,17 @@ where
     let mut r: Vec<Vec<T>> = (0..p).map(|_| vec![T::zero(); n]).collect();
 
     for j in 0..p {
-        spmv(T::one(), a, &x[j], T::zero(), &mut r[j]);
+        a.apply(&x[j], &mut r[j]);
         for i in 0..n {
             r[j][i] = b[j][i].clone() - r[j][i].clone();
         }
     }
 
-    // Compute B norm (Frobenius)
-    let mut b_norm_sq = T::zero();
-    for bj in b {
-        for bi in bj {
-            b_norm_sq = b_norm_sq + bi.clone() * bi.clone();
-        }
-    }
-    let b_norm = Real::sqrt(b_norm_sq);
+    // Compute B norm (Frobenius, overflow-safe)
+    let b_norm = frobenius_norm(b);
 
     // Compute initial residual norm
-    let mut r_norm_sq = T::zero();
-    for rj in &r {
-        for ri in rj {
-            r_norm_sq = r_norm_sq + ri.clone() * ri.clone();
-        }
-    }
-    let mut r_norm = Real::sqrt(r_norm_sq);
+    let mut r_norm = frobenius_norm(&r);
     let mut residual_history = vec![r_norm.clone()];
 
     if r_norm <= tol.clone() * b_norm.clone() {
@@ -103,11 +147,9 @@ where
         // V is a vector of block columns (each is p vectors of length n)
         let mut v: Vec<Vec<Vec<T>>> = vec![v1];
 
-        // H is block upper Hessenberg: (restart+1) x restart blocks, each p x p
-        let mut h: Vec<Vec<Vec<Vec<T>>>> = Vec::with_capacity(restart + 1);
-        for _ in 0..=restart {
-            h.push(Vec::with_capacity(restart));
-        }
+        // Block upper Hessenberg matrix stored column by column:
+        // h_cols[k][i] is the p x p block H_{i,k} for i = 0..=k+1.
+        let mut h_cols: Vec<Vec<Vec<Vec<T>>>> = Vec::with_capacity(restart);
 
         // Block Arnoldi iteration
         let mut k = 0;
@@ -115,14 +157,16 @@ where
             // W = A * V_k (p matrix-vector products)
             let mut w: Vec<Vec<T>> = (0..p).map(|_| vec![T::zero(); n]).collect();
             for j in 0..p {
-                spmv(T::one(), a, &v[k][j], T::zero(), &mut w[j]);
+                a.apply(&v[k][j], &mut w[j]);
             }
+            // ||A V_k||_F: the norm the new sub-diagonal block is derived from
+            let w_norm = frobenius_norm(&w);
 
             // Block MGS orthogonalization
+            let mut h_col: Vec<Vec<Vec<T>>> = Vec::with_capacity(k + 2);
             for i in 0..=k {
                 // H[i][k] = V_i^T * W (p x p block)
                 let h_ik = block_inner_prod_gmres(&v[i], &w, p);
-                h[i].push(h_ik.clone());
 
                 // W = W - V_i * H[i][k]
                 for jw in 0..p {
@@ -133,27 +177,22 @@ where
                         }
                     }
                 }
+                h_col.push(h_ik);
             }
 
             // QR factorization of W to get V_{k+1} and H[k+1][k]
             let (v_new, h_new) = block_qr_gmres(&w, n, p);
+            let h_norm = frobenius_norm(&h_new);
 
-            // Check for breakdown
-            let mut h_norm_sq = T::zero();
-            for hi in &h_new {
-                for hv in hi {
-                    h_norm_sq = h_norm_sq + hv.clone() * hv.clone();
-                }
-            }
-            let h_norm = Real::sqrt(h_norm_sq);
-
-            h[k + 1].push(h_new);
+            h_col.push(h_new);
+            h_cols.push(h_col);
             v.push(v_new);
 
             k += 1;
             total_iter += 1;
 
-            if h_norm < <T as Scalar>::epsilon() {
+            // Block breakdown: the Krylov block space is (numerically) invariant
+            if negligible_norm(h_norm, w_norm) {
                 break;
             }
         }
@@ -168,22 +207,11 @@ where
 
         let mut h_full: Vec<Vec<T>> = vec![vec![T::zero(); m_cols]; m_rows];
 
-        for col_block in 0..k {
-            for row_block in 0..=k.min(col_block + 1) {
-                if row_block < h.len() && col_block < h[row_block].len() {
-                    let block = &h[row_block][col_block];
-                    for bi in 0..p {
-                        for bj in 0..p {
-                            let row = row_block * p + bi;
-                            let col = col_block * p + bj;
-                            if row < m_rows
-                                && col < m_cols
-                                && bi < block.len()
-                                && bj < block[bi].len()
-                            {
-                                h_full[row][col] = block[bi][bj].clone();
-                            }
-                        }
+        for (col_block, h_col) in h_cols.iter().enumerate() {
+            for (row_block, block) in h_col.iter().enumerate() {
+                for (bi, block_row) in block.iter().enumerate() {
+                    for (bj, value) in block_row.iter().enumerate() {
+                        h_full[row_block * p + bi][col_block * p + bj] = value.clone();
                     }
                 }
             }
@@ -218,19 +246,13 @@ where
 
         // Recompute residual
         for j in 0..p {
-            spmv(T::one(), a, &x[j], T::zero(), &mut r[j]);
+            a.apply(&x[j], &mut r[j]);
             for i in 0..n {
                 r[j][i] = b[j][i].clone() - r[j][i].clone();
             }
         }
 
-        r_norm_sq = T::zero();
-        for rj in &r {
-            for ri in rj {
-                r_norm_sq = r_norm_sq + ri.clone() * ri.clone();
-            }
-        }
-        r_norm = Real::sqrt(r_norm_sq);
+        r_norm = frobenius_norm(&r);
         residual_history.push(r_norm.clone());
 
         if r_norm <= tol.clone() * b_norm.clone() {

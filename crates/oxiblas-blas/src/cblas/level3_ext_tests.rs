@@ -1499,9 +1499,9 @@ fn sweep_tri<T: ComplexL3>(solve: bool) {
                                 tri_case::<T>(solve, layout, side, uplo, trans, diag, shape, alpha);
                             }
                         }
-                        // Large orders reach the GEMM-backed TRMM (>= 32) and
-                        // the blocked complex TRSM (>= 64).
-                        let big = if solve { 66 } else { 34 };
+                        // Order 130 spans two 128-row diagonal blocks of the
+                        // native TRMM/TRSM (in-place 3M-GEMM update between them).
+                        let big = 130;
                         let shape = if side == CblasSide::Left {
                             (big, 3)
                         } else {

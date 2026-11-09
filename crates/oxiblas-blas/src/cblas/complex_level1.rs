@@ -68,7 +68,7 @@ pub unsafe extern "C" fn cblas_cscal(
     // complex multiply by 1 + 0i is not an identity for non-finite input
     // ((inf + 0i)(1 + 0i) = inf + NaN i). A null operand would be
     // dereferenced unconditionally by the loop below; a C ABI cannot surface
-    // an error (unwinding across it would be UB), so it no-ops.
+    // an error (a panic reaching it would abort the process), so it no-ops.
     if n <= 0 || incx <= 0 || alpha.is_null() || x.is_null() {
         return;
     }
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn cblas_zscal(
     // complex multiply by 1 + 0i is not an identity for non-finite input
     // ((inf + 0i)(1 + 0i) = inf + NaN i). A null operand would be
     // dereferenced unconditionally by the loop below; a C ABI cannot surface
-    // an error (unwinding across it would be UB), so it no-ops.
+    // an error (a panic reaching it would abort the process), so it no-ops.
     if n <= 0 || incx <= 0 || alpha.is_null() || x.is_null() {
         return;
     }
@@ -252,9 +252,9 @@ pub unsafe extern "C" fn cblas_caxpy(
     // RETURN` -- y is never touched for alpha == 0 on any stride (NaN/Inf in
     // x cannot leak in and signed zeros in y survive). A null operand would
     // be dereferenced unconditionally by the loop below; a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops. A
-    // zero increment is valid (Netlib 3.12): the reference loop re-uses x[0]
-    // (incx == 0) or accumulates every term into y[0] (incy == 0).
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses x[0] (incx == 0) or accumulates every term into y[0] (incy == 0).
     if n <= 0 || alpha.is_null() || x.is_null() || y.is_null() {
         return;
     }
@@ -304,9 +304,9 @@ pub unsafe extern "C" fn cblas_zaxpy(
     // RETURN` -- y is never touched for alpha == 0 on any stride (NaN/Inf in
     // x cannot leak in and signed zeros in y survive). A null operand would
     // be dereferenced unconditionally by the loop below; a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops. A
-    // zero increment is valid (Netlib 3.12): the reference loop re-uses x[0]
-    // (incx == 0) or accumulates every term into y[0] (incy == 0).
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses x[0] (incx == 0) or accumulates every term into y[0] (incy == 0).
     if n <= 0 || alpha.is_null() || x.is_null() || y.is_null() {
         return;
     }
@@ -371,10 +371,10 @@ pub unsafe extern "C" fn cblas_ccopy(
 ) {
     // `n <= 0` is a no-op, as in the reference. A null operand would be
     // dereferenced unconditionally by the loops below and a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops too.
-    // A zero increment is valid (Netlib 3.12): the reference loop re-uses
-    // element 0 on every iteration (e.g. LAPACK's `zcopy(n, zero, 0, x, 1)`
-    // broadcast).
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses element 0 on every iteration (e.g. LAPACK's
+    // `zcopy(n, zero, 0, x, 1)` broadcast).
     if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
@@ -415,10 +415,10 @@ pub unsafe extern "C" fn cblas_zcopy(
 ) {
     // `n <= 0` is a no-op, as in the reference. A null operand would be
     // dereferenced unconditionally by the loops below and a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops too.
-    // A zero increment is valid (Netlib 3.12): the reference loop re-uses
-    // element 0 on every iteration (e.g. LAPACK's `zcopy(n, zero, 0, x, 1)`
-    // broadcast).
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses element 0 on every iteration (e.g. LAPACK's
+    // `zcopy(n, zero, 0, x, 1)` broadcast).
     if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
@@ -427,6 +427,16 @@ pub unsafe extern "C" fn cblas_zcopy(
 
 unsafe fn copy_c<T: Copy>(n: usize, x: *const T, incx: isize, y: *mut T, incy: isize) {
     if incx == 1 && incy == 1 {
+        // `n` elements spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<T>(n) {
+            return;
+        }
+        // SAFETY: unit strides; the callers reject null operands, `x` holds `n`
+        // readable and `y` `n` writable elements that do not overlap (caller
+        // contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let xs = std::slice::from_raw_parts(x, n);
         let ys = std::slice::from_raw_parts_mut(y, n);
         level1::copy(xs, ys);
@@ -475,10 +485,10 @@ pub unsafe extern "C" fn cblas_cswap(
 ) {
     // `n <= 0` is a no-op, as in the reference. A null operand would be
     // dereferenced unconditionally by the loops below and a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops too.
-    // A zero increment is valid (Netlib 3.12): with inc = 0 the reference
-    // loop swaps against element 0 on every iteration, and the final values
-    // follow the reference loop order.
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): with inc = 0 the
+    // reference loop swaps against element 0 on every iteration, and the final
+    // values follow the reference loop order.
     if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
@@ -519,10 +529,10 @@ pub unsafe extern "C" fn cblas_zswap(
 ) {
     // `n <= 0` is a no-op, as in the reference. A null operand would be
     // dereferenced unconditionally by the loops below and a C ABI cannot
-    // surface an error (unwinding across it would be UB), so it no-ops too.
-    // A zero increment is valid (Netlib 3.12): with inc = 0 the reference
-    // loop swaps against element 0 on every iteration, and the final values
-    // follow the reference loop order.
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): with inc = 0 the
+    // reference loop swaps against element 0 on every iteration, and the final
+    // values follow the reference loop order.
     if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
@@ -531,6 +541,16 @@ pub unsafe extern "C" fn cblas_zswap(
 
 unsafe fn swap_c<T: Copy>(n: usize, x: *mut T, incx: isize, y: *mut T, incy: isize) {
     if incx == 1 && incy == 1 {
+        // `n` elements spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts_mut`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<T>(n) {
+            return;
+        }
+        // SAFETY: unit strides; the callers reject null operands, `x` and `y` each
+        // hold `n` readable and writable elements, without overlap (caller
+        // contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let xs = std::slice::from_raw_parts_mut(x, n);
         let ys = std::slice::from_raw_parts_mut(y, n);
         level1::swap(xs, ys);
@@ -783,6 +803,9 @@ mod tests {
     fn test_cblas_zscal() {
         let alpha = Complex64::new(2.0, 1.0);
         let mut x = [Complex64::new(1.0, 1.0), Complex64::new(0.0, -2.0)];
+        // SAFETY: `alpha` is a live local `Complex64`; `x` is a local array of
+        // 2 `Complex64`, matching `n = 2` with `incx = 1`, and is exclusively
+        // borrowed through `as_mut_ptr`.
         unsafe {
             cblas_zscal(2, &alpha, x.as_mut_ptr(), 1);
         }
@@ -795,6 +818,8 @@ mod tests {
     #[test]
     fn test_cblas_zdscal() {
         let mut x = [Complex64::new(1.0, -2.0), Complex64::new(3.0, 4.0)];
+        // SAFETY: `x` is a local array of 2 `Complex64`, matching `n = 2` with
+        // `incx = 1`, and is exclusively borrowed through `as_mut_ptr`.
         unsafe {
             cblas_zdscal(2, 0.5, x.as_mut_ptr(), 1);
         }
@@ -812,6 +837,10 @@ mod tests {
             Complex64::new(9.0, 9.0),
             Complex64::new(0.0, 0.0),
         ];
+        // SAFETY: `alpha` is a live local `Complex64`; `x` is a local array of
+        // 2 (`n = 2`, `incx = 1`) and `y` one of 3, where `incy = 2` touches
+        // only `y[0]` and `y[2]`, both in bounds; `y` is exclusively borrowed
+        // and does not alias `x`.
         unsafe {
             cblas_zaxpy(2, &alpha, x.as_ptr(), 1, y.as_mut_ptr(), 2);
         }
@@ -835,6 +864,9 @@ mod tests {
             Complex64::new(1.0, -1.0),
         ];
         let mut y_ref = y;
+        // SAFETY: `alpha` is a live local `Complex64`; `x` and `y` are local
+        // arrays of 3 `Complex64` each (`n = 3`, unit increments); `y` is
+        // exclusively borrowed and does not alias `x`.
         unsafe {
             cblas_zaxpy(3, &alpha, x.as_ptr(), 1, y.as_mut_ptr(), 1);
         }
@@ -848,12 +880,17 @@ mod tests {
     fn test_cblas_zcopy_zswap() {
         let x = [Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
         let mut y = [Complex64::new(0.0, 0.0); 2];
+        // SAFETY: `x` and `y` are distinct local arrays of 2 `Complex64` each
+        // (`n = 2`, unit increments); `y` is exclusively borrowed.
         unsafe {
             cblas_zcopy(2, x.as_ptr(), 1, y.as_mut_ptr(), 1);
         }
         assert_eq!(y, x);
         let mut a = [Complex64::new(1.0, 0.0), Complex64::new(2.0, 0.0)];
         let mut b = [Complex64::new(3.0, 0.0), Complex64::new(4.0, 0.0)];
+        // SAFETY: `a` and `b` are distinct local arrays of 2 `Complex64` each
+        // (`n = 2`, unit increments), so the two exclusive borrows do not
+        // alias.
         unsafe {
             cblas_zswap(2, a.as_mut_ptr(), 1, b.as_mut_ptr(), 1);
         }
@@ -865,10 +902,14 @@ mod tests {
     fn test_cblas_dznrm2() {
         // z = [3+4i] -> |z| = 5 ; [3+4i, 0] -> 5
         let x = [Complex64::new(3.0, 4.0), Complex64::new(0.0, 0.0)];
+        // SAFETY: `x` is a local array of 2 `Complex64`, matching `n = 2` with
+        // `incx = 1`.
         let r = unsafe { cblas_dznrm2(2, x.as_ptr(), 1) };
         assert!((r - 5.0).abs() < 1e-12);
         // [1+1i, 1+1i] -> sqrt(1+1+1+1) = 2
         let y = [Complex64::new(1.0, 1.0), Complex64::new(1.0, 1.0)];
+        // SAFETY: `y` is a local array of 2 `Complex64`, matching `n = 2` with
+        // `incx = 1`.
         let r2 = unsafe { cblas_dznrm2(2, y.as_ptr(), 1) };
         assert!((r2 - 2.0).abs() < 1e-12);
     }
@@ -876,6 +917,8 @@ mod tests {
     #[test]
     fn test_cblas_dzasum() {
         let x = [Complex64::new(1.0, -2.0), Complex64::new(-3.0, 4.0)];
+        // SAFETY: `x` is a local array of 2 `Complex64`, matching `n = 2` with
+        // `incx = 1`.
         let r = unsafe { cblas_dzasum(2, x.as_ptr(), 1) };
         // |1|+|−2| + |−3|+|4| = 1+2+3+4 = 10
         assert!((r - 10.0).abs() < 1e-12);
@@ -888,6 +931,8 @@ mod tests {
             Complex64::new(3.0, -3.0), // 6
             Complex64::new(0.0, 5.0),  // 5
         ];
+        // SAFETY: `x` is a local array of 3 `Complex64`, matching `n = 3` with
+        // `incx = 1`.
         let idx = unsafe { cblas_izamax(3, x.as_ptr(), 1) };
         assert_eq!(idx, 1);
     }

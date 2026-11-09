@@ -615,7 +615,7 @@ mod tests {
         assert!(blocking.kc > 0, "KC must be > 0");
         assert!(blocking.nc > 0, "NC must be > 0");
         assert!(
-            blocking.mc % shape.mr == 0 || blocking.mc == dim,
+            blocking.mc.is_multiple_of(shape.mr) || blocking.mc == dim,
             "MC must be aligned to MR or equal to the dimension"
         );
     }
@@ -631,7 +631,7 @@ mod tests {
         assert!(blocking.kc > 0, "KC must be > 0");
         assert!(blocking.nc > 0, "NC must be > 0");
         assert!(
-            blocking.mc % shape.mr == 0 || blocking.mc == dim,
+            blocking.mc.is_multiple_of(shape.mr) || blocking.mc == dim,
             "MC must be aligned to MR or equal to the dimension"
         );
     }

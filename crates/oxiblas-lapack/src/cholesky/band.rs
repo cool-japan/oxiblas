@@ -20,7 +20,7 @@
 //!     [ 0   0  a2  d3]
 //! ```
 
-use num_traits::{FromPrimitive, One};
+use crate::lu::tolerance::{finite_max, into_pivot_tolerances};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
 /// Error returned when band Cholesky decomposition fails.
@@ -87,6 +87,10 @@ impl std::error::Error for BandCholeskyError {}
 /// the same bandwidth as A.
 ///
 /// The storage format follows LAPACK's DPBTRF convention.
+///
+/// [`BandCholeskyError::NotPositiveDefinite`] is reported when the radicand
+/// `a_jj - Σ l_jk²` of column `j` is at or below `eps · n · a_jj`, the original
+/// diagonal entry (a NaN, infinite or negative one counts as 0).
 #[derive(Clone, Debug)]
 pub struct BandCholesky<T: Scalar> {
     /// The L factor in band storage.
@@ -145,6 +149,11 @@ impl<T: Field + Real> BandCholesky<T> {
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the finite diagonal entries of A (band row 0).
+        let col_tol =
+            into_pivot_tolerances(n, (0..n).map(|j| finite_max([ab[j * ldab]])).collect());
+
         // Copy to work array
         let mut ab_work = ab.to_vec();
 
@@ -168,10 +177,8 @@ impl<T: Field + Real> BandCholesky<T> {
             // A[j,j] is at ab[0 + j*ldab]
             let diag = ab_work[j * ldab] - sum;
 
-            // Check for positive definiteness
-            let tol = <T as Scalar>::epsilon()
-                * <T as FromPrimitive>::from_usize(n).unwrap_or(<T as One>::one());
-            if diag <= tol {
+            // Check for positive definiteness (a NaN radicand propagates)
+            if diag <= col_tol[j] {
                 return Err(BandCholeskyError::NotPositiveDefinite { index: j });
             }
 

@@ -294,12 +294,11 @@ pub fn auto_solve_f64(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> SolveResult<f64
     }
 
     // Try Cholesky first if matrix looks SPD
-    if is_likely_spd_f64(&a) {
-        if let Ok(chol) = Cholesky::compute_auto(a) {
-            if let Ok(x) = chol.solve(b) {
-                return Ok(x);
-            }
-        }
+    if is_likely_spd_f64(&a)
+        && let Ok(chol) = Cholesky::compute_auto(a)
+        && let Ok(x) = chol.solve(b)
+    {
+        return Ok(x);
     }
 
     // Fall back to LU
@@ -334,12 +333,11 @@ pub fn auto_solve_f32(a: MatRef<'_, f32>, b: MatRef<'_, f32>) -> SolveResult<f32
     }
 
     // Try Cholesky first if matrix looks SPD
-    if is_likely_spd_f32(&a) {
-        if let Ok(chol) = Cholesky::compute_auto(a) {
-            if let Ok(x) = chol.solve(b) {
-                return Ok(x);
-            }
-        }
+    if is_likely_spd_f32(&a)
+        && let Ok(chol) = Cholesky::compute_auto(a)
+        && let Ok(x) = chol.solve(b)
+    {
+        return Ok(x);
     }
 
     // Fall back to LU

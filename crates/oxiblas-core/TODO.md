@@ -4,7 +4,7 @@ Core traits and SIMD abstractions for OxiBLAS.
 
 ## Scalar Traits
 
-- [x] Extended precision (f128) support via `twofloat` (QuadFloat)
+- [x] Extended precision (f128) support via `twofloat` (QuadFloat) — 0.2.3: division, `recip` and negative `powi` were only double precision (twofloat 0.8.4 forms the residual without FMA) and are now FMA-based double-double; the elementary functions are still twofloat's, 12 to 23 digits in spot checks (see the root TODO.md backlog)
 - [x] Half precision (f16) support via `half` crate
 - [x] Better complex number ergonomics (C32, C64, c32, c64, ComplexExt, ToComplex)
 - [x] Scalar trait specialization for performance
@@ -39,14 +39,15 @@ Core traits and SIMD abstractions for OxiBLAS.
   - [x] Avx512Features for feature detection
 - [x] ARM SVE support (scalable vector extension)
   - [x] SveSupport with vector length detection
-  - [x] SveF64, SveF32 scalable vector types
+  - [ ] SveF64, SveF32 scalable vector types: not expressible in current Rust (sizeless types cannot be struct fields, see `simd/aarch64.rs`); SVE is exposed through the free-function kernels below
   - [x] sve_dot_f64, sve_dot_f32 optimized dot products
   - [x] sve_axpy_f64 optimized AXPY
+  - [x] `sve-nightly` builds: `lib.rs` declares `feature(stdarch_aarch64_sve)` under `cfg(all(feature = "sve-nightly", target_arch = "aarch64", target_feature = "sve"))` (0.2.3; compile-checked on nightly with `-C target-feature=+sve`, not run on SVE hardware)
 
 ### Optimizations
 - [x] FMA (fused multiply-add) utilization - all platforms
 - [x] Prefetch hints (prefetch_read, prefetch_write with locality)
-- [x] Cache line alignment utilities (CACHE_LINE_SIZE = 64)
+- [x] Cache line alignment utilities (`CACHE_LINE_SIZE`: 128 on aarch64, chosen for Apple cores, 64 elsewhere; `SimdCapabilities::cache_line_bytes` reports the same value since 0.2.3)
 - [x] SIMD horizontal operations (reduce_sum, reduce_max, reduce_min)
 
 ## Parallelism

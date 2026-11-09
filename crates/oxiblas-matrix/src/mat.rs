@@ -60,14 +60,21 @@ use oxiblas_core::scalar::Scalar;
 /// so that a release-mode wraparound multiplication can never silently
 /// produce an under-sized buffer hidden behind the raw-pointer views
 /// (`as_ptr`/`as_mut_ptr`, `MatRef`/`MatMut`) that this type hands out.
+///
+/// # Panics
+///
+/// Panics if `a * b` overflows `usize`. Such a buffer could never be
+/// allocated anyway, so a clear panic is strictly better than a wrapped,
+/// under-sized length.
 #[inline]
 fn checked_dim_mul(a: usize, b: usize, what: &str) -> usize {
-    a.checked_mul(b).unwrap_or_else(|| {
-        panic!(
+    match a.checked_mul(b) {
+        Some(product) => product,
+        None => panic!(
             "Mat: {what} overflow ({a} * {b} exceeds usize::MAX); requested \
              matrix dimensions are too large to allocate"
-        )
-    })
+        ),
+    }
 }
 
 /// Computes the padded row stride (elements per column, i.e. the leading
@@ -142,6 +149,10 @@ pub struct Mat<T: Scalar, A: Alloc = Global> {
 
 impl<T: Scalar> Mat<T> {
     /// Creates a new matrix filled with zeros.
+    ///
+    /// # Panics
+    /// Panics if the padded buffer size (`row_stride * ncols`) overflows
+    /// `usize`.
     pub fn zeros(nrows: usize, ncols: usize) -> Self
     where
         T: bytemuck::Zeroable,
@@ -158,6 +169,10 @@ impl<T: Scalar> Mat<T> {
     }
 
     /// Creates a new matrix filled with a specific value.
+    ///
+    /// # Panics
+    /// Panics if the padded buffer size (`row_stride * ncols`) overflows
+    /// `usize`.
     pub fn filled(nrows: usize, ncols: usize, value: T) -> Self {
         let row_stride = compute_row_stride::<T>(nrows);
         let total = checked_dim_mul(row_stride, ncols, "buffer size (row_stride * ncols)");
@@ -173,7 +188,8 @@ impl<T: Scalar> Mat<T> {
     /// Creates a new matrix from a flat slice in column-major order.
     ///
     /// # Panics
-    /// Panics if the slice length doesn't match `nrows * ncols`.
+    /// Panics if the slice length doesn't match `nrows * ncols`, or if
+    /// `nrows * ncols` or the padded buffer size overflows `usize`.
     pub fn from_slice(nrows: usize, ncols: usize, data: &[T]) -> Self
     where
         T: bytemuck::Zeroable,
@@ -218,6 +234,10 @@ impl<T: Scalar> Mat<T> {
     }
 
     /// Creates a new matrix from a 2D array (row-major input).
+    ///
+    /// # Panics
+    /// Panics if the rows do not all have the same length, or if the padded
+    /// buffer size overflows `usize`.
     pub fn from_rows(rows: &[&[T]]) -> Self
     where
         T: bytemuck::Zeroable,
@@ -253,6 +273,9 @@ impl<T: Scalar> Mat<T> {
     }
 
     /// Creates an identity matrix.
+    ///
+    /// # Panics
+    /// Panics if the padded `n x n` buffer size overflows `usize`.
     pub fn eye(n: usize) -> Self
     where
         T: bytemuck::Zeroable,
@@ -265,6 +288,10 @@ impl<T: Scalar> Mat<T> {
     }
 
     /// Creates a diagonal matrix from a slice.
+    ///
+    /// # Panics
+    /// Panics if the padded `n x n` buffer size (`n = diagonal.len()`)
+    /// overflows `usize`.
     pub fn diag(diagonal: &[T]) -> Self
     where
         T: bytemuck::Zeroable,
@@ -284,6 +311,10 @@ impl<T: Scalar> Mat<T> {
 // indexing, or view logic below needs to special-case `Global`.
 impl<T: Scalar, A: Alloc> Mat<T, A> {
     /// Creates a new matrix filled with zeros using the specified allocator.
+    ///
+    /// # Panics
+    /// Panics if the padded buffer size (`row_stride * ncols`) overflows
+    /// `usize`.
     pub fn zeros_in(nrows: usize, ncols: usize, alloc: A) -> Self
     where
         T: bytemuck::Zeroable,
@@ -300,6 +331,10 @@ impl<T: Scalar, A: Alloc> Mat<T, A> {
     }
 
     /// Creates a new matrix filled with a specific value using the specified allocator.
+    ///
+    /// # Panics
+    /// Panics if the padded buffer size (`row_stride * ncols`) overflows
+    /// `usize`.
     pub fn filled_in(nrows: usize, ncols: usize, value: T, alloc: A) -> Self {
         let row_stride = compute_row_stride::<T>(nrows);
         let total = checked_dim_mul(row_stride, ncols, "buffer size (row_stride * ncols)");
@@ -477,6 +512,10 @@ impl<T: Scalar, A: Alloc> Mat<T, A> {
     }
 
     /// Resizes the matrix, filling new elements with zeros.
+    ///
+    /// # Panics
+    /// Panics if the new padded buffer size (`row_stride * new_ncols`)
+    /// overflows `usize`.
     pub fn resize(&mut self, new_nrows: usize, new_ncols: usize)
     where
         T: bytemuck::Zeroable,
@@ -864,6 +903,12 @@ mod tests {
         }
 
         unsafe fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            // SAFETY: our caller upholds `Alloc::deallocate`'s contract for
+            // `CustomTestAlloc` (`ptr` came from this allocator's `allocate` /
+            // `allocate_zeroed` with this `layout` and is not yet freed). Both
+            // of those forward unchanged to `Global`, so `ptr` is a live
+            // `Global` allocation made with this `layout`, which is exactly
+            // what `Global::deallocate` requires.
             unsafe { Global.deallocate(ptr, layout) }
         }
     }

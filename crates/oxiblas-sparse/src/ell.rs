@@ -153,14 +153,14 @@ pub struct EllMatrix<T: Scalar> {
     ncols: usize,
     /// Maximum number of non-zeros per row (width of data/indices arrays).
     width: usize,
-    /// Data array: data[row][k] is the k-th non-zero value in row.
+    /// Data array: `data[row][k]` is the k-th non-zero value in row.
     data: Vec<Vec<T>>,
-    /// Column indices: indices[row][k] is the column of data[row][k].
+    /// Column indices: `indices[row][k]` is the column of `data[row][k]`.
     indices: Vec<Vec<usize>>,
 }
 
 /// Sentinel value for invalid/padding column indices.
-const INVALID_INDEX: usize = usize::MAX;
+pub(crate) const INVALID_INDEX: usize = usize::MAX;
 
 impl<T: Scalar + Clone> EllMatrix<T> {
     /// Creates a new ELL matrix from raw components.
@@ -455,6 +455,11 @@ impl<T: Scalar + Clone> EllMatrix<T> {
     }
 
     /// Converts to CSR format.
+    ///
+    /// Entries whose magnitude is at most `T::epsilon()` are dropped. A row
+    /// that stores the same column more than once (which [`EllMatrix::new`]
+    /// accepts, and `matvec` treats as a sum) yields a single CSR entry
+    /// holding the sum. The CSR rows are sorted by column.
     pub fn to_csr(&self) -> crate::csr::CsrMatrix<T>
     where
         T: Field,
@@ -464,10 +469,9 @@ impl<T: Scalar + Clone> EllMatrix<T> {
         let mut row_ptrs = vec![0usize; self.nrows + 1];
         let mut col_indices = Vec::new();
         let mut values = Vec::new();
+        let mut row_entries: Vec<(usize, T)> = Vec::new();
 
         for row in 0..self.nrows {
-            let mut row_entries: Vec<(usize, T)> = Vec::new();
-
             for k in 0..self.width {
                 let col = self.indices[row][k];
                 if col != INVALID_INDEX {
@@ -478,17 +482,18 @@ impl<T: Scalar + Clone> EllMatrix<T> {
                 }
             }
 
-            // Sort by column index
-            row_entries.sort_by_key(|(col, _)| *col);
-
-            for (col, val) in row_entries {
-                col_indices.push(col);
-                values.push(val);
-            }
+            // Sort by column index, summing repeated columns.
+            crate::csr::push_summed_run(&mut row_entries, &mut col_indices, &mut values);
             row_ptrs[row + 1] = values.len();
         }
 
-        // Safety: we constructed valid CSR data
+        // SAFETY: `row_ptrs` starts as `nrows + 1` zeros and `row_ptrs[row +
+        // 1]` is set to the running `values.len()` after each row, so it starts
+        // at 0, never decreases and ends at nnz. Columns and values are pushed
+        // together; every column is a non-sentinel index of `self`, which
+        // `EllMatrix::new` (or the `new_unchecked` contract) keeps `< ncols`;
+        // `push_summed_run` makes each row strictly ascending, so no row repeats
+        // a column.
         unsafe {
             crate::csr::CsrMatrix::new_unchecked(
                 self.nrows,
@@ -573,7 +578,10 @@ impl<T: Scalar + Clone> EllMatrix<T> {
             indices.push(row_indices);
         }
 
-        // Safety: we constructed valid ELL data
+        // SAFETY: `data` and `indices` have `nrows` rows of exactly `width`
+        // entries each (filled up to `width`, then padded); every non-padding
+        // index is a loop column `j < ncols`, and padding uses the
+        // `INVALID_INDEX` sentinel.
         unsafe { Self::new_unchecked(nrows, ncols, width, data, indices) }
     }
 
@@ -590,32 +598,51 @@ impl<T: Scalar + Clone> EllMatrix<T> {
     where
         T: Field,
     {
+        let width = match max_width {
+            Some(max_w) => {
+                // Check if any row exceeds max_width
+                let row_ptrs = csr.row_ptrs();
+                for row in 0..csr.nrows() {
+                    let row_nnz = row_ptrs[row + 1] - row_ptrs[row];
+                    if row_nnz > max_w {
+                        return Err(EllError::TooManyNonZeros {
+                            row,
+                            nnz: row_nnz,
+                            max_nnz: max_w,
+                        });
+                    }
+                }
+                max_w
+            }
+            None => Self::csr_max_row_nnz(csr),
+        };
+
+        Ok(Self::from_csr_padded(csr, width))
+    }
+
+    /// Returns the largest number of stored entries in any row of `csr`
+    /// (`0` for a matrix without rows).
+    fn csr_max_row_nnz(csr: &crate::csr::CsrMatrix<T>) -> usize {
+        let row_ptrs = csr.row_ptrs();
+        (0..csr.nrows())
+            .map(|i| row_ptrs[i + 1] - row_ptrs[i])
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Builds the ELL layout of `csr` with every row padded to `width`.
+    ///
+    /// `width` must be at least [`Self::csr_max_row_nnz`] of `csr`; both
+    /// callers guarantee that (`from_csr` rejects narrower widths, and
+    /// `transpose` widens to the longest row), so this step cannot fail.
+    fn from_csr_padded(csr: &crate::csr::CsrMatrix<T>, width: usize) -> Self
+    where
+        T: Field,
+    {
         let (nrows, ncols) = csr.shape();
         let row_ptrs = csr.row_ptrs();
         let csr_indices = csr.col_indices();
         let csr_values = csr.values();
-
-        // Find max row width
-        let actual_max: usize = (0..nrows)
-            .map(|i| row_ptrs[i + 1] - row_ptrs[i])
-            .max()
-            .unwrap_or(0);
-
-        let width = max_width.unwrap_or(actual_max);
-
-        // Check if any row exceeds max_width
-        if let Some(max_w) = max_width {
-            for row in 0..nrows {
-                let row_nnz = row_ptrs[row + 1] - row_ptrs[row];
-                if row_nnz > max_w {
-                    return Err(EllError::TooManyNonZeros {
-                        row,
-                        nnz: row_nnz,
-                        max_nnz: max_w,
-                    });
-                }
-            }
-        }
 
         // Build data and indices
         let mut data = Vec::with_capacity(nrows);
@@ -644,13 +671,13 @@ impl<T: Scalar + Clone> EllMatrix<T> {
             indices.push(row_indices);
         }
 
-        Ok(Self {
+        Self {
             nrows,
             ncols,
             width,
             data,
             indices,
-        })
+        }
     }
 
     /// Scales all values by a scalar.
@@ -679,10 +706,10 @@ impl<T: Scalar + Clone> EllMatrix<T> {
         // Convert to CSR, transpose, convert back
         let csr = self.to_csr();
         let csr_t = csr.transpose();
-        Self::from_csr(&csr_t, Some(self.width)).unwrap_or_else(|_| {
-            // If width is insufficient, use actual max
-            Self::from_csr(&csr_t, None).expect("CSR transpose should be valid")
-        })
+        // Keep this matrix's width unless a transposed row (an original
+        // column) holds more entries, in which case widen to the longest one.
+        let width = self.width.max(Self::csr_max_row_nnz(&csr_t));
+        Self::from_csr_padded(&csr_t, width)
     }
 }
 
@@ -902,5 +929,76 @@ mod tests {
         assert_eq!(ell.ncols(), 3);
         assert_eq!(ell.width(), 0);
         assert_eq!(ell.nnz(), 0);
+    }
+
+    /// Regression: `EllMatrix::new` accepts a row that stores one column twice
+    /// (which `matvec` treats as a sum), and `to_csr` used to copy both entries
+    /// into the CSR via `new_unchecked`, violating its no-duplicate contract.
+    #[test]
+    fn test_ell_to_csr_sums_duplicate_columns() {
+        let data = vec![vec![1.0f64, 2.0], vec![3.0, 0.0]];
+        let indices = vec![vec![1, 1], vec![0, INVALID_INDEX]];
+        let ell = EllMatrix::new(2, 3, 2, data, indices).expect("valid ELL");
+
+        let csr = ell.to_csr();
+        crate::csr::assert_valid_csr(&csr);
+        assert_eq!(csr.get(0, 1), Some(&3.0));
+        assert_eq!(csr.get(1, 0), Some(&3.0));
+        assert_eq!(csr.nnz(), 2);
+
+        let x = [1.0, 10.0, 100.0];
+        let mut y_ell = [0.0; 2];
+        ell.matvec(&x, &mut y_ell);
+        let mut y_csr = [0.0; 2];
+        crate::ops::spmv(1.0, &csr, &x, 0.0, &mut y_csr);
+        assert_eq!(y_ell, y_csr);
+    }
+
+    /// Regression: `transpose` used to retry `from_csr(.., None)` behind an
+    /// `.expect` when a column of `self` held more entries than `self.width`.
+    /// It now widens directly to the longest transposed row.
+    #[test]
+    fn test_ell_transpose_widens_for_long_column() {
+        // Every row holds one entry (width 1) but column 0 holds three.
+        let data = vec![vec![1.0f64], vec![2.0], vec![3.0]];
+        let indices = vec![vec![0], vec![0], vec![0]];
+        let ell = EllMatrix::new(3, 3, 1, data, indices).expect("valid ELL");
+
+        let ell_t = ell.transpose();
+        assert_eq!(ell_t.width(), 3);
+        assert_eq!(ell_t.data()[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(ell_t.indices()[0], vec![0, 1, 2]);
+        for row in 1..3 {
+            assert_eq!(ell_t.data()[row], vec![0.0; 3]);
+            assert_eq!(ell_t.indices()[row], vec![INVALID_INDEX; 3]);
+        }
+
+        // Transposing back keeps the (now sufficient) width of 3.
+        let back = ell_t.transpose();
+        assert_eq!(back.width(), 3);
+        let (dense, dense_back) = (ell.to_dense(), back.to_dense());
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(dense[(i, j)], dense_back[(i, j)]);
+            }
+        }
+    }
+
+    /// When every column fits, `transpose` keeps `self.width` even if it is
+    /// wider than needed (exactly as the `from_csr(.., Some(width))` path did).
+    #[test]
+    fn test_ell_transpose_keeps_width_when_columns_fit() {
+        let data = vec![vec![1.0f64, 0.0, 0.0], vec![2.0, 3.0, 0.0]];
+        let indices = vec![
+            vec![2, INVALID_INDEX, INVALID_INDEX],
+            vec![0, 2, INVALID_INDEX],
+        ];
+        let ell = EllMatrix::new(2, 3, 3, data, indices).expect("valid ELL");
+
+        let ell_t = ell.transpose();
+        assert_eq!(ell_t.shape(), (3, 2));
+        assert_eq!(ell_t.width(), 3);
+        assert_eq!(ell_t.data()[2], vec![1.0, 3.0, 0.0]);
+        assert_eq!(ell_t.indices()[2], vec![0, 1, INVALID_INDEX]);
     }
 }

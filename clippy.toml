@@ -3,4 +3,4 @@
 # `msrv` must track `[workspace.package] rust-version` in Cargo.toml so
 # clippy does not suggest APIs/idioms unavailable on the crate's declared
 # minimum supported Rust version.
-msrv = "1.85"
+msrv = "1.89"

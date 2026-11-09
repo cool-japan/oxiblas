@@ -32,12 +32,12 @@
 //! Every routine validates before touching memory: negative dimensions or
 //! band counts, `lda < kl + ku + 1` (`k + 1`) and zero increments are a
 //! silent no-op (reference BLAS calls `xerbla`; a `void` C ABI cannot report
-//! it and unwinding across it is UB), as are null pointers; `m == 0` /
-//! `n == 0` return immediately. The y-update routines (GBMV, SBMV, HBMV) then
-//! apply the reference prologue on the caller's `y`: `alpha == 0 && beta ==
-//! 1` returns with `y` untouched, `y := beta*y` (zero-filled without being
-//! read when `beta == 0`), and `alpha == 0` returns without reading `A` or
-//! `x`.
+//! it, and a panic reaching the `extern "C"` boundary would abort the process),
+//! as are null pointers; `m == 0` / `n == 0` return immediately. The y-update
+//! routines (GBMV, SBMV, HBMV) then apply the reference prologue on the
+//! caller's `y`: `alpha == 0 && beta == 1` returns with `y` untouched,
+//! `y := beta*y` (zero-filled without being read when `beta == 0`), and
+//! `alpha == 0` returns without reading `A` or `x`.
 //!
 //! # Known deviations from reference BLAS
 //!

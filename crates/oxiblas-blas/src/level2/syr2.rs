@@ -155,6 +155,19 @@ pub fn syr2<T: Real>(
 ///
 /// Returns alpha * x * y^T + alpha * y * x^T as a fully symmetric matrix.
 ///
+/// The lower triangle is computed by [`syr2`] with [`Syr2Uplo::Lower`] on a zero
+/// matrix, so it has the reference `?syr2` semantics (`A[i,j] = 0 + x[i] *
+/// (alpha * y[j]) + y[i] * (alpha * x[j])`, evaluated left to right), and the
+/// strictly upper triangle mirrors it, `A[j,i] = A[i,j]`. In particular:
+///
+/// * A column with `x[j] == 0` and `y[j] == 0` is skipped and stays zero, so an
+///   infinite or NaN neighbour cannot reach it. Like the reference this is order
+///   dependent: `x = [0, Inf]`, `y = [0, 1]` gives `A[1,0] = A[0,1] = 0`, but
+///   `x = [Inf, 0]`, `y = [1, 0]` gives `A[1,0] = NaN` (from
+///   `y[1] * (alpha * x[0]) = 0 * Inf`), mirrored into `A[0,1]`.
+/// * Every entry is accumulated onto `+0`, so a `-0` result (a sum of `-0`
+///   products) is stored as `+0`.
+///
 /// # Arguments
 ///
 /// * `alpha` - The scalar alpha
@@ -184,12 +197,14 @@ pub fn syr2_new<T: Real + bytemuck::Zeroable>(
         return Ok(a);
     }
 
-    // Create full symmetric matrix
-    for i in 0..n {
-        for j in 0..=i {
-            let val = alpha * (x[i] * y[j] + y[i] * x[j]);
-            a[(i, j)] = val;
-            a[(j, i)] = val;
+    // Reference-semantics lower triangle. `a` is `n x n` and both vectors have
+    // length `n`, so this cannot fail; an error would be propagated as is.
+    syr2(Syr2Uplo::Lower, alpha, x, y, a.as_mut())?;
+
+    // Mirror the strictly lower triangle into the upper one.
+    for j in 0..n {
+        for i in (j + 1)..n {
+            a[(j, i)] = a[(i, j)];
         }
     }
 
@@ -515,5 +530,63 @@ mod tests {
         let mut a = Mat::from_rows(&[&[1.0f64, 9.0], &[1.0, 1.0]]);
         syr2(Syr2Uplo::Lower, 1.0, &[1.0, 1.0], &[e / 2.0, e], a.as_mut()).unwrap();
         assert_eq!(a[(1, 0)], 1.0 + e);
+    }
+
+    /// `syr2_new` builds its lower triangle with `syr2(Lower, ..)` on a zero matrix,
+    /// so the reference zero-column skip applies: for `x = [0, Inf]`, `y = [0, 1]`
+    /// column 0 is skipped, `A[1,0]` stays `0` and is mirrored into `A[0,1]`. (The
+    /// old direct product `alpha * (x[1] * y[0] + y[1] * x[0]) = Inf * 0 + 0` made
+    /// both NaN.)
+    #[test]
+    fn test_syr2_new_skips_zero_column() {
+        let inf = f64::INFINITY;
+
+        let a = syr2_new(1.0, &[0.0, inf], &[0.0, 1.0]).unwrap();
+        assert_eq!((a[(0, 0)], a[(1, 0)], a[(0, 1)]), (0.0, 0.0, 0.0));
+        assert_eq!(a[(1, 1)], inf);
+
+        // The lower-triangle semantics are order dependent, as in the reference:
+        // with x = [Inf, 0], y = [1, 0] column 0 is not skipped and A[1,0] picks up
+        // `y[1] * (alpha * x[0]) = 0 * Inf` (NaN, mirrored), while the skipped
+        // column 1 stays zero.
+        let a = syr2_new(1.0, &[inf, 0.0], &[1.0, 0.0]).unwrap();
+        assert_eq!(a[(0, 0)], inf);
+        assert!(a[(1, 0)].is_nan() && a[(0, 1)].is_nan());
+        assert_eq!(a[(1, 1)], 0.0);
+    }
+
+    /// Every lower entry of `syr2_new` is `(0 + p1) + p2` (a skipped column stays
+    /// `+0`), so a `-0` sum of products is stored as `+0`. The old direct products
+    /// kept the `-0`.
+    #[test]
+    fn test_syr2_new_negative_zero_product_is_positive_zero() {
+        let a = syr2_new(-1.0, &[1.0f64, 0.0], &[1.0, 0.0]).unwrap();
+        assert_eq!(a[(0, 0)], -2.0);
+        for (i, j) in [(1, 0), (0, 1), (1, 1)] {
+            assert_eq!(a[(i, j)].to_bits(), 0.0f64.to_bits(), "({i},{j})");
+        }
+    }
+
+    /// `syr2_new` equals `syr2(Lower, ..)` on a zero matrix bit for bit (reference
+    /// temps and evaluation order), mirrored into the upper triangle; mismatched
+    /// lengths still report `DimensionMismatchY`.
+    #[test]
+    fn test_syr2_new_matches_lower_syr2_on_zero_matrix() {
+        let x = [1.25f64, -0.3, 0.0, 2.0e-3, 7.5];
+        let y = [0.5f64, 0.0, 0.0, -4.25, 1.0e-3];
+        let alpha = -0.37;
+        let a = syr2_new(alpha, &x, &y).unwrap();
+        let mut lower: Mat<f64> = Mat::zeros(5, 5);
+        syr2(Syr2Uplo::Lower, alpha, &x, &y, lower.as_mut()).unwrap();
+        for j in 0..5 {
+            for i in j..5 {
+                assert_eq!(a[(i, j)].to_bits(), lower[(i, j)].to_bits(), "({i},{j})");
+                assert_eq!(a[(j, i)].to_bits(), lower[(i, j)].to_bits(), "({j},{i})");
+            }
+        }
+        assert_eq!(
+            syr2_new(alpha, &x, &y[..4]).map(|m| m.nrows()),
+            Err(Syr2Error::DimensionMismatchY)
+        );
     }
 }

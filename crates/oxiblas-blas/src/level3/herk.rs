@@ -50,6 +50,17 @@ impl core::fmt::Display for HerkError {
 
 impl std::error::Error for HerkError {}
 
+/// The two operations HERK performs, decoded once from the public [`Trans`]
+/// argument (whose third variant, `Trans::Trans`, HERK rejects), so the
+/// private helpers can never be handed the invalid one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerkOp {
+    /// `C = α·A·Aᴴ + β·C` (`Trans::NoTrans`), A is n×k.
+    NoTrans,
+    /// `C = α·Aᴴ·A + β·C` (`Trans::ConjTrans`), A is k×n.
+    ConjTrans,
+}
+
 /// Performs the Hermitian rank-k update.
 ///
 /// C = α·A·A^H + β·C (when trans = `NoTrans`)
@@ -100,9 +111,11 @@ pub fn herk<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
 ) -> Result<(), HerkError> {
     // Validate transpose option - only NoTrans and ConjTrans are valid for HERK
-    if trans == Trans::Trans {
-        return Err(HerkError::InvalidTrans);
-    }
+    let op = match trans {
+        Trans::NoTrans => HerkOp::NoTrans,
+        Trans::ConjTrans => HerkOp::ConjTrans,
+        Trans::Trans => return Err(HerkError::InvalidTrans),
+    };
 
     // Reference (Z/C)HERK declare BOTH α and β as REAL scalars: the update
     // C = α·A·Aᴴ + β·C is Hermitian only when both scalars are real. This crate is
@@ -120,20 +133,19 @@ pub fn herk<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 
     // Determine k and validate A dimensions
-    let k = match trans {
-        Trans::NoTrans => {
+    let k = match op {
+        HerkOp::NoTrans => {
             if a.nrows() != n {
                 return Err(HerkError::DimensionMismatch);
             }
             a.ncols()
         }
-        Trans::ConjTrans => {
+        HerkOp::ConjTrans => {
             if a.ncols() != n {
                 return Err(HerkError::DimensionMismatch);
             }
             a.nrows()
         }
-        Trans::Trans => unreachable!(), // Already checked above
     };
 
     // Handle empty cases
@@ -153,9 +165,9 @@ pub fn herk<T: Field + GemmKernel + bytemuck::Zeroable>(
     // alpha == 0 never reads A (C := beta * C), so it stays on the naive path.
     const GEMM_THRESHOLD: usize = 32;
     if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
-        herk_via_gemm(uplo, trans, alpha, a, beta, c, n, k)
+        herk_via_gemm(uplo, op, alpha, a, beta, c, n, k)
     } else {
-        herk_naive(uplo, trans, alpha, a, beta, c, n, k)
+        herk_naive(uplo, op, alpha, a, beta, c, n, k)
     }
 }
 
@@ -205,7 +217,7 @@ fn write_herk_triangle<T: Field>(
 /// has no effect on real numbers. This uses the same optimization as SYRK.
 fn herk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     uplo: Uplo,
-    trans: Trans,
+    op: HerkOp,
     alpha: T,
     a: MatRef<'_, T>,
     beta: T,
@@ -216,8 +228,8 @@ fn herk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Create transposed/conjugate-transposed copy based on trans mode and compute
     // `temp = α·A·Aᴴ` (or `α·Aᴴ·A`). For real types, A^H = A^T.
     let mut temp: Mat<T> = Mat::zeros(n, n);
-    match trans {
-        Trans::NoTrans => {
+    match op {
+        HerkOp::NoTrans => {
             // A is n×k, compute A·A^H via A^T (k×n).
             let mut a_t: Mat<T> = Mat::zeros(k, n);
             for i in 0..n {
@@ -228,7 +240,7 @@ fn herk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             gemm(alpha, a, a_t.as_ref(), T::zero(), temp.as_mut());
         }
-        Trans::ConjTrans => {
+        HerkOp::ConjTrans => {
             // A is k×n, compute A^H·A via A^H (n×k).
             let mut a_h: Mat<T> = Mat::zeros(n, k);
             for i in 0..k {
@@ -238,7 +250,6 @@ fn herk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             gemm(alpha, a_h.as_ref(), a, T::zero(), temp.as_mut());
         }
-        Trans::Trans => unreachable!(),
     }
 
     // Copy triangle with beta scaling, honouring the β==0 / real-diagonal invariants.
@@ -250,7 +261,7 @@ fn herk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// Naive HERK implementation for small matrices.
 fn herk_naive<T: Field>(
     uplo: Uplo,
-    trans: Trans,
+    op: HerkOp,
     alpha: T,
     a: MatRef<'_, T>,
     beta: T,
@@ -297,8 +308,8 @@ fn herk_naive<T: Field>(
 
     // Compute C += alpha * A * A^H or C += alpha * A^H * A (skipped when alpha == 0).
     if alpha != T::zero() {
-        match trans {
-            Trans::NoTrans => {
+        match op {
+            HerkOp::NoTrans => {
                 // C += alpha * A * A^H
                 // C[i,j] += alpha * sum_l A[i,l] * conj(A[j,l])
                 match uplo {
@@ -326,7 +337,7 @@ fn herk_naive<T: Field>(
                     }
                 }
             }
-            Trans::ConjTrans => {
+            HerkOp::ConjTrans => {
                 // C += alpha * A^H * A
                 // C[i,j] += alpha * sum_l conj(A[l,i]) * A[l,j]
                 match uplo {
@@ -356,7 +367,6 @@ fn herk_naive<T: Field>(
                     }
                 }
             }
-            Trans::Trans => unreachable!(),
         }
     }
 

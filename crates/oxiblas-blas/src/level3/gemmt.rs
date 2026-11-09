@@ -17,12 +17,15 @@
 //!
 //! # Performance Notes
 //!
-//! For large matrices, this operation uses optimized GEMM kernels and then
-//! extracts the required triangle. For small matrices, a direct computation
-//! avoiding unnecessary work is used.
+//! Larger problems run on the triangle-only blocked kernel shared with SYRK
+//! and SYR2K: the GEMM packers read `op(A)` / `op(B)` in place (transposed
+//! operands through their transposed fast paths) and the GEMM micro-kernel
+//! computes only the micro-tiles that meet the `uplo` triangle, accumulating
+//! straight into C (no `n × n` temporary). Small problems use a direct loop
+//! over the triangle.
 
-use crate::level3::gemm::gemm_transposed;
 use crate::level3::gemm_kernel::GemmKernel;
+use crate::level3::tri_gemm::{KSegment, tri_update};
 use crate::level3::trsm::{Trans, Uplo};
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatMut, MatRef};
@@ -140,64 +143,45 @@ pub fn gemmt<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // Choose strategy based on matrix size
-    const GEMM_THRESHOLD: usize = 32;
-
-    if n >= GEMM_THRESHOLD && k >= 8 {
-        gemmt_via_gemm(uplo, trans_a, trans_b, alpha, a, b, beta, c, n)
+    // alpha == 0 never reads A or B (C := beta * C on the triangle); both paths
+    // honour that, the naive one is simply cheaper for it.
+    if alpha != T::zero() && use_blocked::<T>(n, k, beta == T::zero()) {
+        tri_update(
+            uplo,
+            alpha,
+            &[KSegment::new(a, trans_a, b, trans_b)],
+            beta,
+            c,
+        );
+        Ok(())
     } else {
         gemmt_naive(uplo, trans_a, trans_b, alpha, a, b, beta, c, n, k)
     }
 }
 
-/// GEMMT via optimized GEMM for larger matrices.
-fn gemmt_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
-    uplo: Uplo,
-    trans_a: Trans,
-    trans_b: Trans,
-    alpha: T,
-    a: MatRef<'_, T>,
-    b: MatRef<'_, T>,
-    beta: T,
-    mut c: MatMut<'_, T>,
-    n: usize,
-) -> Result<(), GemmtError> {
-    // Compute the full n x n product using the transpose-aware GEMM entry
-    // point. This reads op(A)/op(B) in place while packing (zero-copy for real
-    // types), so the previous behavior of materializing two transposed copies
-    // of A and B is no longer needed.
-    let mut temp: Mat<T> = Mat::zeros(n, n);
-    gemm_transposed(trans_a, trans_b, alpha, a, b, T::zero(), temp.as_mut());
-
-    // Copy triangle to C with beta scaling
-    match uplo {
-        Uplo::Lower => {
-            for j in 0..n {
-                for i in j..n {
-                    let val = if beta == T::zero() {
-                        temp[(i, j)]
-                    } else {
-                        temp[(i, j)] + beta * c[(i, j)]
-                    };
-                    c.set(i, j, val);
-                }
-            }
-        }
-        Uplo::Upper => {
-            for j in 0..n {
-                for i in 0..=j {
-                    let val = if beta == T::zero() {
-                        temp[(i, j)]
-                    } else {
-                        temp[(i, j)] + beta * c[(i, j)]
-                    };
-                    c.set(i, j, val);
-                }
-            }
-        }
+/// Whether [`gemmt`] runs the blocked triangle-only kernel (otherwise the
+/// dot-product loops of `gemmt_naive`) for an `n × n` C and inner dimension
+/// `k`.
+///
+/// Chosen from the time of the blocked kernel over the time of the loops,
+/// measured on an Apple M3 (one thread, f64, f32, Complex64 and Complex32,
+/// several transpose pairs). With `beta == 0` (`beta_is_zero`) the kernel
+/// wins for real types from `k >= 8` at `n = 6` (0.53-0.62), from `k >= 2`
+/// at `n = 8..12` (0.62-0.91) and for every `k` from `n = 16` (0.33-0.73 at
+/// `k = 1`); for complex types from `k >= 8` at `n = 8` (0.73-0.78), from
+/// `k >= 4` at `n = 16` (0.57-0.76) and for every `k` from `n = 32`
+/// (0.50-0.86 at `k = 1`). With `beta != 0`, which costs the kernel an extra
+/// pass over the triangle, the real kernel still wins for every `k` from
+/// `n = 16` (0.15-0.86; f64, `beta = 0.5`, `n = 16..64`); the smaller real
+/// shapes, and the complex types (not measured with `beta != 0`), keep the
+/// rule from before the blocked kernel existed.
+fn use_blocked<T: Field>(n: usize, k: usize, beta_is_zero: bool) -> bool {
+    match (T::is_real(), beta_is_zero) {
+        (true, true) => (n >= 6 && k >= 8) || (n >= 8 && k >= 2) || n >= 16,
+        (true, false) => n >= 16,
+        (false, true) => (n >= 8 && k >= 8) || (n >= 16 && k >= 4) || n >= 32,
+        (false, false) => n >= 32 && k >= 8,
     }
-
-    Ok(())
 }
 
 /// Direct GEMMT computation for small matrices.
@@ -750,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_gemmt_larger() {
-        // Test with a larger matrix to trigger GEMM path
+        // Test with a larger matrix to take the blocked path
         let n = 40;
         let k = 10;
         let mut a = Mat::<f64>::zeros(n, k);

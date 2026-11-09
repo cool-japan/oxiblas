@@ -22,9 +22,10 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 
 ### Optimizations
 - [x] SIMD optimization for axpy (NEON/AVX2 with FMA, 8-16x unrolling)
-- [x] SIMD optimization for nrm2 (Blue's algorithm for overflow/underflow protection)
+- [x] SIMD optimization for nrm2 (Blue's algorithm for overflow/underflow protection) — 0.2.3: on aarch64, vectors of 8 or more elements use a one-pass NEON port of LAPACK 3.12 `dnrm2` (Blue's constants); the NEON and AVX2 paths returned Inf/NaN when the largest entry was below `2^-1024` (f64) or `2^-128` (f32), fixed
 - [x] Blocked dot product for large vectors (block size 1024/2048)
 - [x] Parallel variants for large vectors (axpy_par, dot_par, nrm2_par, asum_par, scal_par with Rayon)
+- [x] NEON DOT on aarch64 (0.2.3) - 8 FMA accumulators, a pairwise tree and a two-level sum for `dot` (f64/f32), `dot_f64`/`dot_f32`, the `dot_par` chunks and the unit-stride `cblas_?dot`; `force-scalar` keeps the generic `dot` on the portable loop; x86_64 unchanged
 
 ---
 
@@ -64,6 +65,8 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] Parallel gemv for large matrices - 8-way unrolling for NoTrans, 4-way for Trans/ConjTrans, tree-based parallel reduction, parallel beta scaling
 - [x] SIMD-optimized trsv - blocked algorithm with 4-way unrolling (TRSV_BLOCK_SIZE=64)
 - [x] Fused operations (gemv + add) - gemv_add, gemv_add_inplace, gemv_sum2 with blocked variants
+- [x] NEON GEMV on aarch64 (0.2.3) - column-major f64/f32 views at every size (axpy form over 8 columns for NoTrans, 4-column dot form for Trans/ConjTrans); `gemv_with_par` splits disjoint ranges of `y` and is bitwise equal to the sequential call; the unit-stride `cblas_?gemv` route to it; `force-scalar` and other views keep the portable code; x86_64 unchanged
+- [x] Strided views in the f64 NoTrans SIMD GEMV (0.2.3) - views with `col_stride != 1` and `m*n > 4096` were read wrongly on NEON and AVX2; they take the stride-aware path
 
 ---
 
@@ -73,7 +76,7 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] gemm (general matrix-matrix) - AVX2/NEON optimized
 - [x] trsm (triangular solve)
 - [x] trmm (triangular multiply)
-- [x] symm (symmetric matrix-matrix) - GEMM-optimized for n >= 32
+- [x] symm (symmetric matrix-matrix) - GEMM-optimized when the order of A (`m` for `Side::Left`, `n` for `Side::Right`) is at least 32
 - [x] hemm (Hermitian matrix-matrix) - 3M GEMM optimization available
 - [x] syrk (symmetric rank-k)
 - [x] herk (Hermitian rank-k)
@@ -93,17 +96,20 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 - [x] Optimized blocking parameters for Apple Silicon L2 - f64: MC=512, KC=256 (1 MB pack_a fits in 4+ MB L2), f32: MC=512, KC=512
 - [x] Macro-panel multiply prefetching - prefetch next A micro-panel while computing current, 128-byte cache line aware for Apple Silicon
 - [x] Unified optimized packing in GEMM - using pack_a_optimized/pack_b_optimized with 4-way unrolling and software prefetching
-- [x] TRMM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular operations
-- [x] TRSM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular solve operations
-- [x] SYMM via GEMM optimization - expands symmetric matrix to full dense and uses optimized GEMM for n >= 32
+- [x] TRMM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular operations — 0.2.3: dropped with the triangle-only rewrite; diagonal blocks of order 128 go through packed tile kernels and the off-diagonal blocks through in-place GEMMs with GEMM's own blocking
+- [x] TRSM-specific blocking parameters - smaller MC=256, KC=128 for f64 to reduce overhead in triangular solve operations — 0.2.3: dropped with the TRSM rewrite (same structure as TRMM: packed diagonal blocks with reciprocals, in-place GEMM updates)
+- [x] SYMM via GEMM optimization - expands symmetric matrix to full dense and uses optimized GEMM when the order of A is at least 32
 - [x] Balanced GEMM blocking (0.2.3, #4) - `balanced_block` fits every MC/KC/NC target to the problem: a dimension that fits is one block, a larger one is split into the fewest near-equal MR/NR/8-aligned blocks (no `[252, 4]`-style tails that re-pack A)
 - [x] 2D (M×N) parallel GEMM driver (0.2.3, #16) - `level3/gemm_parallel.rs` (feature `parallel`), tiles aligned to the micro-tile grid, bitwise equal to `Par::Seq`; gate 128³ total / 80³ per thread
 - [x] NEON small-GEMM dispatch on aarch64 (0.2.3, #16) - `gemm_small` sends f32/f64 problems with m, n >= 4 and column-major operands to the 4×4 NEON kernels
 - [x] Blocked GEMM honours `col_stride` of NoTrans operands (0.2.3) - strided views such as `MatRef::transpose()` were read with a unit column stride by the fast packers
+- [x] GEMM per-call overhead (0.2.3) - per-thread packing buffers (at most `PACK_CACHE_MAX_BYTES` = 8 MiB cached per thread), an `MR × NR` scratch tile for edges, the micro-kernel resolved once per call (`GemmKernel::micro_kernel_dispatch`), packers specialized for the compile-time MR/NR, NEON register transposes for the f64/f32 B panels; transposed real operands packed in place
+- [x] Triangle-only SYRK/SYR2K/GEMMT (0.2.3) - `level3/tri_gemm.rs` computes only the micro-tiles that meet the referenced triangle, on the GEMM packers and micro-kernel (no full GEMM, no temporaries); naive/blocked switch re-measured per routine
+- [x] Blocked TRSM and triangle-only TRMM (0.2.3) - diagonal blocks of order 128 packed once (TRSM with reciprocals) and solved or multiplied by register-tiled kernels (NEON for f32/f64, generated by `tools/gen_tri_kernel_neon.py`), off-diagonal blocks as in-place GEMMs on views; `trsm_with_par`/`trsm_in_place_with_par` for an explicit `Par`
 
 ### Complex Optimizations
 - [x] Optimized complex gemm (3M method) - uses real GEMM kernels for large matrices
-- [x] Complex trsm optimization - trsm_c64/trsm_c32 using 3M GEMM for off-diagonal updates
+- [x] Complex trsm optimization - trsm_c64/trsm_c32 using 3M GEMM for off-diagonal updates (0.2.3: on views, in the same blocked driver as the real TRSM)
 - [x] Interleaved complex storage support - complex_interleaved module with conversions, dotc, axpy, scal, nrm2 for interleaved format
 
 ### Recently Added Variants
@@ -134,13 +140,13 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 ### Phase 1 - Core Optimizations
 - [x] HEMM 3M GEMM optimization - enabled for n >= 64, uses 3 real GEMMs instead of 4
 - [x] GEMV asymmetric blocking - increased MC=128, KC=512 for better cache utilization
-- [x] DTRSM recursive blocking - divide-and-conquer for matrices >= 256, 2x better cache locality
+- [x] DTRSM recursive blocking - divide-and-conquer for matrices >= 256, 2x better cache locality — 0.2.3: replaced by the blocked TRSM (diagonal blocks of order 128 packed once with reciprocals, register-tiled kernels, one in-place GEMM per off-diagonal block)
 - [x] AVX2 micro-kernel tuning - 4-way loop unrolling and software prefetching
 - [x] Auto-tuning integration - automatic blocking parameter selection for matrices >= 512
 
 ### Phase 2 - Advanced Optimizations
 - [x] SIMD GEMV inner loop - explicit NEON/AVX2 vectorization with FMA for f64
-- [x] Parallel recursive DTRSM - Par::Rayon for GEMM updates when m,n >= 128
+- [x] Parallel recursive DTRSM - Par::Rayon for GEMM updates when m,n >= 128 — 0.2.3: removed; with the `parallel` feature this ran `trsm` on the Rayon pool without being asked. `trsm`/`trsm_in_place` are sequential, and `trsm_with_par`/`trsm_in_place_with_par` split the right-hand sides into panels for an explicit `Par` (bitwise equal to sequential)
 - [x] Larger GEMM micro-kernel (8x6) - AVX2: 12 ymm accumulators, NEON: 24 registers with 2-way unrolling
 - [x] Packing buffer reuse - main GEMM buffers already reused across iterations
 - [x] f32 AVX2 micro-kernel tuning - 4-way loop unrolling with software prefetching
@@ -149,12 +155,14 @@ BLAS (Basic Linear Algebra Subprograms) implementations.
 
 ## Performance Targets
 
+No MKL comparison exists yet: the `comparison` bench measures OpenBLAS only, and the "Current" figures once listed here were never measured. Against OpenBLAS 0.3.30 on an Apple M3 (2026-11-09), see [Performance](../../README.md#performance) in the root README.
+
 | Operation | Size | Current | Target | Notes |
 |-----------|------|---------|--------|-------|
-| dgemm | 1000x1000 | ~80% MKL | 95% MKL | Micro-kernel tuning |
-| sgemm | 1000x1000 | ~75% MKL | 90% MKL | FMA utilization |
-| dgemv | 10000x10000 | ~75% MKL | 85% MKL | Improved blocking (MC=128, KC=512) |
-| dtrsm | 1000x1000 | ~75% MKL | 85% MKL | Recursive blocking for >= 256 |
+| dgemm | 1000x1000 | not measured | 95% MKL | Micro-kernel tuning |
+| sgemm | 1000x1000 | not measured | 90% MKL | FMA utilization |
+| dgemv | 10000x10000 | not measured | 85% MKL | Improved blocking (MC=128, KC=512) |
+| dtrsm | 1000x1000 | not measured | 85% MKL | Recursive blocking for >= 256 (replaced by the 0.2.3 blocked TRSM) |
 
 ---
 

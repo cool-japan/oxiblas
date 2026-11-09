@@ -34,10 +34,11 @@
 //!
 //! Every routine validates before touching memory: a negative `n`, a zero
 //! increment and null pointers are a silent no-op (reference BLAS calls
-//! `xerbla`; a `void` C ABI cannot report it and unwinding across it is UB);
-//! `n == 0` returns immediately. The packed length `n*(n+1)/2` is formed with
-//! checked arithmetic, and a length whose byte size would overflow — which no
-//! real buffer can have — is treated as invalid. SPMV / HPMV then apply the
+//! `xerbla`; a `void` C ABI cannot report it, and a panic reaching the
+//! `extern "C"` boundary would abort the process); `n == 0` returns
+//! immediately. The packed length `n*(n+1)/2` is formed with checked
+//! arithmetic, and a length whose byte size would overflow — which no real
+//! buffer can have — is treated as invalid. SPMV / HPMV then apply the
 //! reference y-update prologue on the caller's `y` (`alpha == 0 && beta ==
 //! 1`: untouched; `y := beta*y`, zero-filled without being read when `beta ==
 //! 0`; `alpha == 0`: `AP` and `x` are never read). The rank updates return

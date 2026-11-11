@@ -15,19 +15,13 @@
 //! The element A\[i,j\] (with max(0, j-ku) ≤ i ≤ min(n-1, j+kl)) is stored at:
 //! band[kl + ku + i - j, j]
 
-use num_traits::{FromPrimitive, One};
+use super::tolerance::{finite_max, into_pivot_tolerances};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
 /// Helper to get absolute value using Scalar trait
 #[inline]
 fn scalar_abs<T: Scalar>(x: T) -> T::Real {
     Scalar::abs(x)
-}
-
-/// Helper to get epsilon using Scalar trait
-#[inline]
-fn scalar_epsilon<T: Scalar>() -> T::Real {
-    <T as Scalar>::epsilon()
 }
 
 /// Error returned when band LU decomposition fails.
@@ -95,6 +89,12 @@ impl std::error::Error for BandLuError {}
 /// - U is upper triangular band with bandwidth ku + kl (due to fill-in)
 ///
 /// The storage format follows LAPACK's DGBTRF convention.
+///
+/// The pivot of column `j` is treated as zero, and reported as
+/// [`BandLuError::Singular`], when its magnitude is at most `eps · n · s_j`,
+/// where `s_j = max_i |a_ij|` is taken over the finite stored band entries of
+/// column `j` of the input. Scaling the columns by powers of two therefore
+/// changes neither the pivots nor the outcome.
 #[derive(Clone, Debug)]
 pub struct BandLu<T: Scalar> {
     /// Combined L and U factors in band storage.
@@ -108,7 +108,7 @@ pub struct BandLu<T: Scalar> {
     ku: usize,
     /// Leading dimension of band storage array.
     ldab: usize,
-    /// Pivot indices: row i was swapped with row pivot[i].
+    /// Pivot indices: row i was swapped with row `pivot[i]`.
     pivot: Vec<usize>,
 }
 
@@ -139,9 +139,9 @@ impl<T: Field + Real> BandLu<T> {
     ///
     /// Band storage (ldab = 2*1+1+1 = 4, for fill-in space at top):
     /// Row 0:  *   *   *   *   (fill-in space)
-    /// Row 1: u0  u1  u2   *   (super-diagonal)
+    /// Row 1:  *  u0  u1  u2   (super-diagonal: A[j-1, j] in column j)
     /// Row 2: d0  d1  d2  d3   (main diagonal)
-    /// Row 3: l0  l1  l2   *   (sub-diagonal)
+    /// Row 3: l0  l1  l2   *   (sub-diagonal: A[j+1, j] in column j)
     /// ```
     ///
     /// # Errors
@@ -175,6 +175,22 @@ impl<T: Field + Real> BandLu<T> {
                 actual: ab.len(),
             });
         }
+
+        // Per-column singularity thresholds `eps · n · max_i |a_ij|` over the
+        // finite stored band entries of each column, read before the
+        // factorization. Only positions holding matrix entries count, never
+        // the fill-in rows or the unused corners of the band storage.
+        let col_tol = into_pivot_tolerances(
+            n,
+            (0..n)
+                .map(|j| {
+                    finite_max(
+                        (j.saturating_sub(ku)..=(j + kl).min(n - 1))
+                            .map(|i| scalar_abs(ab[band_idx(ldab, kl, ku, i, j)])),
+                    )
+                })
+                .collect(),
+        );
 
         // Copy to work array.
         let mut ab_work = ab.to_vec();
@@ -224,11 +240,10 @@ impl<T: Field + Real> BandLu<T> {
             // Singularity test. LAPACK reports an *exactly* zero pivot; we keep the
             // slightly stronger near-zero guard used across this crate so a solve
             // against a numerically singular band matrix fails loudly instead of
-            // dividing by an (almost) zero pivot. A NaN pivot fails the `> tol`
-            // comparison and is therefore reported/propagated, never clamped.
-            let tol = scalar_epsilon::<T>()
-                * <T::Real as FromPrimitive>::from_usize(n).unwrap_or(<T::Real as One>::one());
-            if pivot_val <= tol {
+            // dividing by an (almost) zero pivot. The threshold is relative to
+            // the scale of column j (see above). A NaN pivot fails the `<=`
+            // comparison and therefore propagates, never clamped.
+            if pivot_val <= col_tol[j] {
                 return Err(BandLuError::Singular { index: j });
             }
 

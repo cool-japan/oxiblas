@@ -2,11 +2,21 @@
 //!
 //! Computes eigenvalues and eigenvectors of general (possibly non-symmetric) matrices.
 //! Unlike symmetric EVD, eigenvalues may be complex even for real matrices.
+//!
+//! The decomposition follows LAPACK `DGEEV`: the matrix is scaled by an exact
+//! power of two, reduced to standardized real Schur form `A = Q·T·Qᵀ`, the
+//! eigenvectors of `T` are computed by back-substitution (`DTREVC`, with
+//! perturbation of near-singular pivots and overflow-safe rescaling), and
+//! transformed back with `Q`.
 
+use num_traits::Float;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
-use super::schur::{Eigenvalue, Schur, SchurError};
+use super::schur::{
+    Eigenvalue, Schur, SchurError, left_eigenvectors_raw, right_eigenvectors_raw, scale_by_pow2,
+    scaling_exponent, starts_block,
+};
 
 /// Error type for general eigenvalue decomposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,18 +58,41 @@ impl From<SchurError> for GeneralEvdError {
 /// and eigenvectors are computed from the Schur decomposition.
 ///
 /// Right eigenvectors satisfy: A * v = λ * v
-/// Left eigenvectors satisfy: u^H * A = λ * u^H (or equivalently A^T * u = λ * u)
+/// Left eigenvectors satisfy: u^H * A = λ * u^H (for a real matrix this is
+/// A^T * u = conj(λ) * u, i.e. A^T * u = λ * u when λ is real)
+///
+/// # Eigenvector layout
+///
+/// Eigenvalue `k` (`eigenvalues()[k]`) owns column `k` of the eigenvector
+/// matrices: its right eigenvector is
+/// `v_k = eigenvectors_real()[:, k] + i·eigenvectors_imag()[:, k]` and its
+/// left eigenvector is
+/// `u_k = left_eigenvectors_real()[:, k] + i·left_eigenvectors_imag()[:, k]`.
+///
+/// - A real eigenvalue has a real eigenvector (the imaginary column is zero).
+/// - A complex-conjugate pair occupies two consecutive positions `k, k + 1`,
+///   listed as `a + bi` (`b > 0`) then `a − bi`. The eigenvectors of the
+///   second member are the conjugates of those of the first: columns `k` and
+///   `k + 1` of the real parts are equal, and the imaginary parts are negated.
+///
+/// Every eigenvector has unit Euclidean norm, and a complex eigenvector is
+/// scaled so that its component of largest modulus is real and positive (as
+/// LAPACK `DGEEV`). This layout differs from LAPACK's packed `VR`/`VL`
+/// storage, where a pair's real and imaginary parts share one matrix.
+///
+/// Eigenvalues are listed in the order of the diagonal of the real Schur
+/// form computed by [`Schur`].
 #[derive(Debug, Clone)]
 pub struct GeneralEvd<T: Scalar> {
     /// Eigenvalues (may be complex).
     eigenvalues: Vec<Eigenvalue<T>>,
-    /// Right eigenvectors (stored column-wise). Only real parts for complex eigenvectors.
+    /// Real parts of the right eigenvectors, one column per eigenvalue.
     eigenvectors_real: Option<Mat<T>>,
-    /// Imaginary parts of right eigenvectors for complex eigenvalues.
+    /// Imaginary parts of the right eigenvectors, one column per eigenvalue.
     eigenvectors_imag: Option<Mat<T>>,
-    /// Left eigenvectors (stored column-wise). Only real parts for complex eigenvectors.
+    /// Real parts of the left eigenvectors, one column per eigenvalue.
     left_eigenvectors_real: Option<Mat<T>>,
-    /// Imaginary parts of left eigenvectors for complex eigenvalues.
+    /// Imaginary parts of the left eigenvectors, one column per eigenvalue.
     left_eigenvectors_imag: Option<Mat<T>>,
     /// Matrix dimension.
     n: usize,
@@ -87,25 +120,25 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
     /// assert!((sum - 5.0).abs() < 1e-10); // trace = 1 + 4 = 5
     /// ```
     pub fn eigenvalues_only(a: MatRef<'_, T>) -> Result<Self, GeneralEvdError> {
-        let schur = Schur::compute(a)?;
-        let n = a.nrows();
-        let eigenvalues = schur.eigenvalues().to_vec();
-
+        let (schur, exponent) = Self::scaled_schur(a)?;
         Ok(Self {
-            eigenvalues,
+            eigenvalues: Self::unscaled_eigenvalues(&schur, exponent),
             eigenvectors_real: None,
             eigenvectors_imag: None,
             left_eigenvectors_real: None,
             left_eigenvectors_imag: None,
-            n,
+            n: a.nrows(),
         })
     }
 
     /// Computes eigenvalues and right eigenvectors of a general matrix.
     ///
-    /// For complex eigenvalue pairs, the eigenvectors are stored as consecutive
-    /// columns: v_real and v_imag such that the eigenvector for λ = a + bi is
-    /// v_real + i*v_imag, and for λ = a - bi is v_real - i*v_imag.
+    /// The eigenvector of `eigenvalues()[k]` is
+    /// `eigenvectors_real()[:, k] + i·eigenvectors_imag()[:, k]` (see the
+    /// [type-level documentation](GeneralEvd#eigenvector-layout)). For a
+    /// complex pair `λ = a ± bi` at positions `k, k + 1` the eigenvector of
+    /// `a + bi` is `v_real + i·v_imag` and that of `a − bi` is
+    /// `v_real − i·v_imag`.
     ///
     /// # Example
     ///
@@ -121,30 +154,27 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
     /// let evd = GeneralEvd::compute(a.as_ref()).unwrap();
     /// let vr = evd.eigenvectors_real().unwrap();
     ///
-    /// // For real eigenvalues, eigenvector imaginary parts are zero
+    /// // A * v_k = λ_k * v_k for every eigenpair (both eigenvalues are real here).
+    /// for (k, lambda) in evd.eigenvalues().iter().enumerate() {
+    ///     for i in 0..2 {
+    ///         let av = a[(i, 0)] * vr[(0, k)] + a[(i, 1)] * vr[(1, k)];
+    ///         assert!((av - lambda.real * vr[(i, k)]).abs() < 1e-12);
+    ///     }
+    /// }
+    /// assert!(evd.verify(a.as_ref()) < 1e-12);
     /// ```
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, GeneralEvdError> {
-        let schur = Schur::compute(a)?;
-        let n = a.nrows();
-        let eigenvalues = schur.eigenvalues().to_vec();
-
-        // Compute right eigenvectors from Schur form
-        let (vr, vi) = Self::compute_eigenvectors_from_schur(&schur);
-
-        Ok(Self {
-            eigenvalues,
-            eigenvectors_real: Some(vr),
-            eigenvectors_imag: Some(vi),
-            left_eigenvectors_real: None,
-            left_eigenvectors_imag: None,
-            n,
-        })
+        Self::compute_with_vectors(a, false)
     }
 
     /// Computes eigenvalues, right eigenvectors, and left eigenvectors of a general matrix.
     ///
     /// Right eigenvectors satisfy: A * v = λ * v
-    /// Left eigenvectors satisfy: u^H * A = λ * u^H (or equivalently A^T * u = λ * u)
+    /// Left eigenvectors satisfy: u^H * A = λ * u^H (for a real matrix,
+    /// A^T * u = conj(λ) * u)
+    ///
+    /// Both are paired with the eigenvalue of the same index (see the
+    /// [type-level documentation](GeneralEvd#eigenvector-layout)).
     ///
     /// # Example
     ///
@@ -160,170 +190,92 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
     /// let evd = GeneralEvd::compute_full(a.as_ref()).unwrap();
     /// let vr = evd.eigenvectors_real().unwrap();
     /// let vl = evd.left_eigenvectors_real().unwrap();
+    ///
+    /// // u_k^T * A = λ_k * u_k^T (real eigenvalues)
+    /// for (k, lambda) in evd.eigenvalues().iter().enumerate() {
+    ///     for j in 0..2 {
+    ///         let ua = vl[(0, k)] * a[(0, j)] + vl[(1, k)] * a[(1, j)];
+    ///         assert!((ua - lambda.real * vl[(j, k)]).abs() < 1e-12);
+    ///     }
+    /// }
+    /// # let _ = vr;
     /// ```
     pub fn compute_full(a: MatRef<'_, T>) -> Result<Self, GeneralEvdError> {
+        Self::compute_with_vectors(a, true)
+    }
+
+    /// Validates `a`, scales it by an exact power of two so that
+    /// `max|a_ij| ∈ [1, 2)` (no-op for a zero or non-finite maximum) and
+    /// computes the Schur decomposition of the scaled matrix. Returns the
+    /// decomposition and the scaling exponent `k` (the matrix decomposed is
+    /// `2^k·A`).
+    fn scaled_schur(a: MatRef<'_, T>) -> Result<(Schur<T>, i32), GeneralEvdError> {
         let n = a.nrows();
-        if n == 0 {
+        if n == 0 || a.ncols() == 0 {
             return Err(GeneralEvdError::EmptyMatrix);
         }
         if a.ncols() != n {
             return Err(GeneralEvdError::NotSquare);
         }
-
-        // Compute Schur decomposition for A
-        let schur = Schur::compute(a)?;
-        let eigenvalues = schur.eigenvalues().to_vec();
-
-        // Compute right eigenvectors from Schur form of A
-        let (vr, vi) = Self::compute_eigenvectors_from_schur(&schur);
-
-        // Compute left eigenvectors from Schur form of A^T
-        // Left eigenvectors of A are right eigenvectors of A^T
-        let mut at = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in 0..n {
-                at[(i, j)] = a[(j, i)];
+        let mut anrm = T::zero();
+        for j in 0..n {
+            for i in 0..n {
+                anrm = Float::max(anrm, Scalar::abs(a[(i, j)]));
             }
         }
-        let schur_t = Schur::compute(at.as_ref())?;
-        let (vl, vl_i) = Self::compute_eigenvectors_from_schur(&schur_t);
-
-        Ok(Self {
-            eigenvalues,
-            eigenvectors_real: Some(vr),
-            eigenvectors_imag: Some(vi),
-            left_eigenvectors_real: Some(vl),
-            left_eigenvectors_imag: Some(vl_i),
-            n,
-        })
+        let exponent = scaling_exponent(anrm);
+        if exponent == 0 {
+            return Ok((Schur::compute(a)?, 0));
+        }
+        let mut scaled = Mat::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                scaled[(i, j)] = scale_by_pow2(a[(i, j)], exponent);
+            }
+        }
+        Ok((Schur::compute(scaled.as_ref())?, exponent))
     }
 
-    /// Computes eigenvectors from Schur decomposition.
-    fn compute_eigenvectors_from_schur(schur: &Schur<T>) -> (Mat<T>, Mat<T>) {
-        let n = schur.t().nrows();
-        let t = schur.t();
-        let q = schur.q();
-        let eigenvalues = schur.eigenvalues();
+    /// Eigenvalues of `A` from the Schur decomposition of `2^exponent·A`.
+    fn unscaled_eigenvalues(schur: &Schur<T>, exponent: i32) -> Vec<Eigenvalue<T>> {
+        schur
+            .eigenvalues()
+            .iter()
+            .map(|e| {
+                Eigenvalue::complex(
+                    scale_by_pow2(e.real, -exponent),
+                    scale_by_pow2(e.imag, -exponent),
+                )
+            })
+            .collect()
+    }
 
-        let mut vr = Mat::zeros(n, n);
-        let mut vi = Mat::zeros(n, n);
-        let eps = <T as Scalar>::epsilon() * T::from_f64(100.0).unwrap_or(T::one());
+    /// Shared implementation of [`compute`](Self::compute) and
+    /// [`compute_full`](Self::compute_full).
+    fn compute_with_vectors(a: MatRef<'_, T>, want_left: bool) -> Result<Self, GeneralEvdError> {
+        let (schur, exponent) = Self::scaled_schur(a)?;
+        let t = schur.t_mat();
+        let q = schur.q_mat();
 
-        // Process eigenvalues
-        let mut col = 0;
-        let mut ev_idx = 0;
+        let right = right_eigenvectors_raw(t);
+        let (vr, vi) = back_transform_split(q, t, &right);
 
-        while ev_idx < eigenvalues.len() && col < n {
-            if eigenvalues[ev_idx].is_real() {
-                // Real eigenvalue - solve (T - λI)x = 0 by back substitution
-                let lambda = eigenvalues[ev_idx].real;
-                let mut x = vec![T::zero(); n];
-                x[col] = T::one();
+        let (left_re, left_im) = if want_left {
+            let left = left_eigenvectors_raw(t);
+            let (ur, ui) = back_transform_split(q, t, &left);
+            (Some(ur), Some(ui))
+        } else {
+            (None, None)
+        };
 
-                // Back substitution for upper triangular system
-                for i in (0..col).rev() {
-                    let mut sum = T::zero();
-                    for j in (i + 1)..=col {
-                        sum = sum + t[(i, j)] * x[j];
-                    }
-                    let diag = t[(i, i)] - lambda;
-                    if Scalar::abs(diag) > eps {
-                        x[i] = -sum / diag;
-                    }
-                }
-
-                // Normalize
-                let mut norm_sq = T::zero();
-                for i in 0..n {
-                    norm_sq = norm_sq + x[i] * x[i];
-                }
-                let norm = Real::sqrt(norm_sq);
-                if norm > eps {
-                    for i in 0..n {
-                        x[i] = x[i] / norm;
-                    }
-                }
-
-                // Transform back: v = Q * x
-                for i in 0..n {
-                    let mut sum = T::zero();
-                    for j in 0..n {
-                        sum = sum + q[(i, j)] * x[j];
-                    }
-                    vr[(i, col)] = sum;
-                    vi[(i, col)] = T::zero();
-                }
-
-                col += 1;
-                ev_idx += 1;
-            } else {
-                // Complex conjugate pair
-                let real_part = eigenvalues[ev_idx].real;
-                let imag_part = Scalar::abs(eigenvalues[ev_idx].imag);
-
-                // For 2×2 block with complex eigenvalues, compute eigenvector
-                // The block is at position (col, col) to (col+1, col+1)
-                let mut xr = vec![T::zero(); n];
-                let mut xi = vec![T::zero(); n];
-
-                // Simple approach: use (1, (λ - t11)/t12) as basis
-                if col + 1 < n {
-                    let t11 = t[(col, col)];
-                    let t12 = t[(col, col + 1)];
-
-                    xr[col] = T::one();
-                    xi[col] = T::zero();
-
-                    if Scalar::abs(t12) > eps {
-                        // (λ - t11) / t12 where λ = real_part + i*imag_part
-                        // Real part: (real_part - t11) / t12
-                        // Imag part: imag_part / t12
-                        xr[col + 1] = (real_part - t11) / t12;
-                        xi[col + 1] = imag_part / t12;
-                    } else {
-                        xr[col + 1] = T::zero();
-                        xi[col + 1] = T::one();
-                    }
-
-                    // Normalize
-                    let mut norm_sq = T::zero();
-                    for i in 0..n {
-                        norm_sq = norm_sq + xr[i] * xr[i] + xi[i] * xi[i];
-                    }
-                    let norm = Real::sqrt(norm_sq);
-                    if norm > eps {
-                        for i in 0..n {
-                            xr[i] = xr[i] / norm;
-                            xi[i] = xi[i] / norm;
-                        }
-                    }
-
-                    // Transform back: v = Q * x
-                    for i in 0..n {
-                        let mut sum_r = T::zero();
-                        let mut sum_i = T::zero();
-                        for j in 0..n {
-                            sum_r = sum_r + q[(i, j)] * xr[j];
-                            sum_i = sum_i + q[(i, j)] * xi[j];
-                        }
-                        // First column: v_real
-                        vr[(i, col)] = sum_r;
-                        vi[(i, col)] = sum_i;
-                        // Second column: v_real (same real part for conjugate)
-                        vr[(i, col + 1)] = sum_r;
-                        vi[(i, col + 1)] = -sum_i; // conjugate
-                    }
-
-                    col += 2;
-                    ev_idx += 2;
-                } else {
-                    col += 1;
-                    ev_idx += 1;
-                }
-            }
-        }
-
-        (vr, vi)
+        Ok(Self {
+            eigenvalues: Self::unscaled_eigenvalues(&schur, exponent),
+            eigenvectors_real: Some(vr),
+            eigenvectors_imag: Some(vi),
+            left_eigenvectors_real: left_re,
+            left_eigenvectors_imag: left_im,
+            n: a.nrows(),
+        })
     }
 
     /// Returns the eigenvalues.
@@ -341,19 +293,26 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
         self.eigenvalues.iter().all(|e| e.is_real())
     }
 
-    /// Returns the real parts of eigenvectors (if computed).
+    /// Returns the real parts of the right eigenvectors (if computed).
+    ///
+    /// Column `k` belongs to `eigenvalues()[k]` (see the
+    /// [type-level documentation](GeneralEvd#eigenvector-layout)).
     pub fn eigenvectors_real(&self) -> Option<MatRef<'_, T>> {
         self.eigenvectors_real.as_ref().map(|m| m.as_ref())
     }
 
-    /// Returns the imaginary parts of right eigenvectors (if computed).
+    /// Returns the imaginary parts of the right eigenvectors (if computed).
+    ///
+    /// Column `k` belongs to `eigenvalues()[k]`; it is zero for a real
+    /// eigenvalue.
     pub fn eigenvectors_imag(&self) -> Option<MatRef<'_, T>> {
         self.eigenvectors_imag.as_ref().map(|m| m.as_ref())
     }
 
     /// Returns the real parts of left eigenvectors (if computed).
     ///
-    /// Left eigenvectors satisfy: u^H * A = λ * u^H
+    /// Left eigenvectors satisfy: u^H * A = λ * u^H; column `k` belongs to
+    /// `eigenvalues()[k]`.
     pub fn left_eigenvectors_real(&self) -> Option<MatRef<'_, T>> {
         self.left_eigenvectors_real.as_ref().map(|m| m.as_ref())
     }
@@ -371,21 +330,21 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
             .count()
     }
 
-    /// Verifies the eigenvalue decomposition: A * v ≈ λ * v for real eigenvalues.
-    /// Returns the maximum residual norm.
+    /// Verifies the eigenvalue decomposition: A * v ≈ λ * v for every
+    /// eigenpair, real or complex (with `v = v_real + i·v_imag`).
+    ///
+    /// Returns the maximum residual norm `‖A·v_k − λ_k·v_k‖₂` (the
+    /// eigenvectors have unit norm), or zero when no eigenvectors were
+    /// computed.
     pub fn verify(&self, a: MatRef<'_, T>) -> T {
-        if self.eigenvectors_real.is_none() {
+        // Every constructor sets the real and imaginary eigenvector parts
+        // together, so either both are present or neither is.
+        let (Some(vr), Some(vi)) = (
+            self.eigenvectors_real.as_ref(),
+            self.eigenvectors_imag.as_ref(),
+        ) else {
             return T::zero();
-        }
-
-        let vr = self
-            .eigenvectors_real
-            .as_ref()
-            .expect("value should be present");
-        let vi = self
-            .eigenvectors_imag
-            .as_ref()
-            .expect("value should be present");
+        };
         let mut max_residual = T::zero();
 
         for (col, eigenvalue) in self.eigenvalues.iter().enumerate() {
@@ -447,6 +406,129 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralEvd<T> {
 
         max_residual
     }
+}
+
+/// Back-transforms the raw eigenvectors `x` of the standardized Schur factor
+/// `t` (LAPACK column layout, see `trevc_right`) to eigenvectors `Q·x` of the
+/// original matrix, normalizes them (unit Euclidean norm; a complex
+/// eigenvector is rotated so that its largest component is real and
+/// positive), and returns them in the per-eigenvalue split layout of
+/// [`GeneralEvd`]: `(real parts, imaginary parts)`.
+fn back_transform_split<T: Field + Real + bytemuck::Zeroable>(
+    q: &Mat<T>,
+    t: &Mat<T>,
+    x: &Mat<T>,
+) -> (Mat<T>, Mat<T>) {
+    let n = t.nrows();
+    // v = Q·x, skipping the structurally zero entries of x.
+    let mut v = Mat::zeros(n, n);
+    for col in 0..n {
+        for j in 0..n {
+            let xj = x[(j, col)];
+            if xj == T::zero() {
+                continue;
+            }
+            for i in 0..n {
+                v[(i, col)] = v[(i, col)] + q[(i, j)] * xj;
+            }
+        }
+    }
+
+    let mut re = Mat::zeros(n, n);
+    let mut im = Mat::zeros(n, n);
+    let mut part_re = vec![T::zero(); n];
+    let mut part_im = vec![T::zero(); n];
+    let mut k = 0;
+    while k < n {
+        if starts_block(t, k) {
+            for i in 0..n {
+                part_re[i] = v[(i, k)];
+                part_im[i] = v[(i, k + 1)];
+            }
+            normalize_complex(&mut part_re, &mut part_im);
+            for i in 0..n {
+                re[(i, k)] = part_re[i];
+                im[(i, k)] = part_im[i];
+                re[(i, k + 1)] = part_re[i];
+                im[(i, k + 1)] = -part_im[i];
+            }
+            k += 2;
+        } else {
+            for i in 0..n {
+                part_re[i] = v[(i, k)];
+            }
+            normalize_real(&mut part_re);
+            for i in 0..n {
+                re[(i, k)] = part_re[i];
+            }
+            k += 1;
+        }
+    }
+    (re, im)
+}
+
+/// Scales `v` to unit Euclidean norm (no-op for a zero or non-finite vector).
+fn normalize_real<T: Field + Real>(v: &mut [T]) {
+    let big = v
+        .iter()
+        .fold(T::zero(), |acc, &x| Float::max(acc, Scalar::abs(x)));
+    if !(big > T::zero()) || !Float::is_finite(big) {
+        return;
+    }
+    let sum = v.iter().fold(T::zero(), |acc, &x| {
+        let s = x / big;
+        acc + s * s
+    });
+    let inv = T::one() / (big * Real::sqrt(sum));
+    for x in v.iter_mut() {
+        *x = *x * inv;
+    }
+}
+
+/// Scales the complex vector `re + i·im` to unit Euclidean norm and rotates
+/// it so that its component of largest modulus is real and positive (no-op
+/// for a zero or non-finite vector).
+fn normalize_complex<T: Field + Real>(re: &mut [T], im: &mut [T]) {
+    let big = re
+        .iter()
+        .chain(im.iter())
+        .fold(T::zero(), |acc, &x| Float::max(acc, Scalar::abs(x)));
+    if !(big > T::zero()) || !Float::is_finite(big) {
+        return;
+    }
+    let mut sum = T::zero();
+    for (&r, &i) in re.iter().zip(im.iter()) {
+        let (sr, si) = (r / big, i / big);
+        sum = sum + sr * sr + si * si;
+    }
+    let inv = T::one() / (big * Real::sqrt(sum));
+    for (r, i) in re.iter_mut().zip(im.iter_mut()) {
+        *r = *r * inv;
+        *i = *i * inv;
+    }
+    // Rotate the largest component onto the positive real axis.
+    let mut kmax = 0;
+    let mut best = T::zero();
+    for (k, (&r, &i)) in re.iter().zip(im.iter()).enumerate() {
+        let mag = r * r + i * i;
+        if mag > best {
+            best = mag;
+            kmax = k;
+        }
+    }
+    let modulus = Real::hypot(re[kmax], im[kmax]);
+    if !(modulus > T::zero()) {
+        return;
+    }
+    let (c, s) = (re[kmax] / modulus, im[kmax] / modulus);
+    // z ← z·(c − i·s)
+    for (r, i) in re.iter_mut().zip(im.iter_mut()) {
+        let (zr, zi) = (*r, *i);
+        *r = zr * c + zi * s;
+        *i = zi * c - zr * s;
+    }
+    re[kmax] = modulus;
+    im[kmax] = T::zero();
 }
 
 #[cfg(test)]
@@ -641,61 +723,40 @@ mod tests {
 
     #[test]
     fn test_general_evd_full_verify_left_eigenvector_property() {
-        // Test that left eigenvectors satisfy: u^T * A = λ * u^T
-        // Since left eigenvectors of A are right eigenvectors of A^T,
-        // the eigenvalue correspondence may differ.
-        // We verify that each left eigenvector u satisfies A^T * u = λ * u
-        // for SOME eigenvalue λ.
+        // Left eigenvectors satisfy u^T * A = λ * u^T (real eigenvalues here),
+        // and column k of the left eigenvectors belongs to eigenvalues()[k] —
+        // the same index as the right eigenvector, because both are computed
+        // from one Schur decomposition of A.
         let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]);
 
         let evd = GeneralEvd::compute_full(a.as_ref()).unwrap();
         let vl = evd.left_eigenvectors_real().unwrap();
         let eigenvalues = evd.eigenvalues();
 
-        // Collect all eigenvalue real parts
-        let lambda_values: Vec<f64> = eigenvalues.iter().map(|e| e.real).collect();
-
-        // Left eigenvector exists and has approximately right dimension
         assert!(
             vl.nrows() == 2 && vl.ncols() == 2,
             "Left eigenvector matrix should be 2x2"
         );
 
-        // For each left eigenvector column, find the corresponding eigenvalue
-        for col in 0..2 {
-            let norm = (vl[(0, col)] * vl[(0, col)] + vl[(1, col)] * vl[(1, col)]).sqrt();
-            if norm < 1e-10 {
-                continue; // Skip zero eigenvectors
-            }
+        for (col, lambda) in eigenvalues.iter().enumerate() {
+            assert_eq!(lambda.imag, 0.0);
+            let u0 = vl[(0, col)];
+            let u1 = vl[(1, col)];
+            let norm = (u0 * u0 + u1 * u1).sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-12,
+                "left eigenvector {col} norm {norm}"
+            );
 
-            // Normalize the eigenvector for better numerical comparison
-            let u0 = vl[(0, col)] / norm;
-            let u1 = vl[(1, col)] / norm;
-
-            // Compute A^T * u (using normalized eigenvector)
+            // (A^T * u)_j = (u^T * A)_j
             let at_u0 = a[(0, 0)] * u0 + a[(1, 0)] * u1;
             let at_u1 = a[(0, 1)] * u0 + a[(1, 1)] * u1;
-
-            // Find which eigenvalue this eigenvector corresponds to
-            // For normalized u, A^T * u = λ * u means |A^T * u - λ * u| should be small
-            let mut min_residual = f64::MAX;
-            for &lambda in &lambda_values {
-                let diff0 = (at_u0 - lambda * u0).abs();
-                let diff1 = (at_u1 - lambda * u1).abs();
-                let residual = (diff0 * diff0 + diff1 * diff1).sqrt();
-                min_residual = min_residual.min(residual);
-            }
-
-            // For a unit eigenvector, the residual should be small relative to eigenvalue magnitude
-            let max_lambda = lambda_values.iter().map(|l| l.abs()).fold(0.0, f64::max);
-            let tol = 0.5 * max_lambda.max(1.0); // Relative tolerance based on eigenvalue scale
-
+            let residual =
+                ((at_u0 - lambda.real * u0).powi(2) + (at_u1 - lambda.real * u1).powi(2)).sqrt();
             assert!(
-                min_residual < tol,
-                "Left eigenvector column {} has min residual {} > tolerance {}",
-                col,
-                min_residual,
-                tol
+                residual < 1e-13,
+                "Left eigenvector column {col} (λ = {}) has residual {residual}",
+                lambda.real
             );
         }
     }
@@ -741,5 +802,26 @@ mod tests {
             approx_eq(eig_sum, trace, 1e-8),
             "eigenvalue real-part sum {eig_sum} != trace {trace}"
         );
+    }
+
+    /// `verify` reads both eigenvector parts through one `let … else` (no
+    /// `expect`): without eigenvectors it reports a zero residual, with them
+    /// it evaluates the residual. A multiple of the identity is used so that
+    /// every unit eigenvector is exact for every eigenvalue; this pins the
+    /// branch structure of `verify`, not the accuracy of the eigensolver.
+    #[test]
+    fn test_general_evd_verify_with_and_without_eigenvectors() {
+        let a = Mat::from_rows(&[&[2.5f64, 0.0], &[0.0, 2.5]]);
+
+        let values_only = GeneralEvd::eigenvalues_only(a.as_ref()).expect("evd");
+        assert!(values_only.eigenvectors_real().is_none());
+        assert!(values_only.eigenvectors_imag().is_none());
+        assert_eq!(values_only.verify(a.as_ref()), 0.0);
+
+        let full = GeneralEvd::compute(a.as_ref()).expect("evd");
+        assert!(full.eigenvectors_real().is_some());
+        assert!(full.eigenvectors_imag().is_some());
+        let residual = full.verify(a.as_ref());
+        assert!(residual < 1e-12, "residual too large: {residual}");
     }
 }

@@ -1,6 +1,9 @@
 //! SYRK/SYR2K benchmark
 //!
-//! Compares naive vs optimized (GEMM-based) symmetric rank-k and rank-2k updates.
+//! Compares naive vs optimized symmetric rank-k and rank-2k updates. The
+//! optimized `syrk` / `syr2k` run a triangle-only blocked kernel (the GEMM
+//! packers and micro-kernel, restricted to the tiles of the stored triangle)
+//! and fall back to reference loops for small shapes.
 
 use oxiblas::prelude::*;
 use oxiblas_blas::level3::syr2k::syr2k;
@@ -213,9 +216,8 @@ fn bench_syrk(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
         opt_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let opt_median = opt_times[n_samples / 2];
 
-        // SYRK has n²k flops (half of GEMM due to symmetry, but we compute full)
-        // Using 2 * n² * k for comparison with GEMM-like operation
-        let flops = 2.0 * (n as f64) * (n as f64) * (k as f64);
+        // SYRK has n²k flops (half of GEMM due to symmetry)
+        let flops = (n as f64) * (n as f64) * (k as f64);
         let naive_gflops = flops / naive_median / 1e9;
         let opt_gflops = flops / opt_median / 1e9;
         let speedup = naive_median / opt_median;
@@ -304,8 +306,8 @@ fn bench_syr2k(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
         opt_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
         let opt_median = opt_times[n_samples / 2];
 
-        // SYR2K has 2×n²k flops (two matrix products)
-        let flops = 4.0 * (n as f64) * (n as f64) * (k as f64);
+        // SYR2K has 2×n²k flops (two products, each on one triangle of C)
+        let flops = 2.0 * (n as f64) * (n as f64) * (k as f64);
         let naive_gflops = flops / naive_median / 1e9;
         let opt_gflops = flops / opt_median / 1e9;
         let speedup = naive_median / opt_median;
@@ -322,7 +324,8 @@ fn main() {
     println!("   OxiBLAS SYRK/SYR2K Benchmark");
     println!("==============================================");
     println!();
-    println!("SYRK/SYR2K optimized by using optimized GEMM kernel.");
+    println!("SYRK/SYR2K use a triangle-only blocked kernel (GEMM packers and micro-kernel,");
+    println!("only the tiles of the stored triangle; reference loops for small shapes).");
     println!("SYRK: C = α·A·A^T + β·C (or A^T·A variant)");
     println!("SYR2K: C = α·A·B^T + α·B·A^T + β·C (or transposed variant)");
 
@@ -332,5 +335,5 @@ fn main() {
     bench_syr2k(&sizes, 2, 5);
 
     println!();
-    println!("Note: Flop counts are 2n²k for SYRK, 4n²k for SYR2K.");
+    println!("Note: Flop counts are n²k for SYRK, 2n²k for SYR2K.");
 }

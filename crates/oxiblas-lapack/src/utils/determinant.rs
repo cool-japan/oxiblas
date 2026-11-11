@@ -43,13 +43,15 @@ impl From<LuError> for DetError {
 /// the behavior of reference LAPACK/numpy-style consumers, which rely on
 /// `det(a) == 0` as the standard idiom for testing singularity.
 ///
-/// Internally, `Lu::compute` reports a zero/near-zero pivot as
-/// [`LuError::Singular`]. Rather than propagating that as a hard failure,
-/// this function treats it as the honest numerical answer: a zero pivot
-/// in Gaussian elimination means the (partially reduced) matrix has a
-/// linearly dependent column, so the determinant of that submatrix — and
-/// therefore of the original matrix — is exactly zero, without needing to
-/// complete the rest of the factorization.
+/// Internally, `Lu::compute` reports [`LuError::Singular`] when a pivot is
+/// at or below its per-column relative tolerance `eps · n · max_i |a_ij|`
+/// (taken over the original column `j`; see the LU module documentation).
+/// Rather than propagating that as a hard failure, this function returns
+/// `0.0`: such a pivot means the matrix is singular to working precision,
+/// so its determinant is *numerically* zero. It is not necessarily zero
+/// mathematically — `[[1, 1], [1, 1 + 2⁻⁵²]]` has determinant `2⁻⁵²`, but
+/// its second pivot `2⁻⁵²` is below the tolerance `eps · 2 · (1 + 2⁻⁵²)`,
+/// so `det` returns `0.0`.
 ///
 /// # Arguments
 ///
@@ -57,7 +59,8 @@ impl From<LuError> for DetError {
 ///
 /// # Returns
 ///
-/// The determinant det(A). This is exactly `0.0` for singular matrices.
+/// The determinant det(A). This is exactly `0.0` for matrices that LU
+/// factorization reports as (numerically) singular.
 ///
 /// # Errors
 ///
@@ -88,10 +91,10 @@ impl From<LuError> for DetError {
 pub fn det<T: Field + bytemuck::Zeroable>(a: MatRef<'_, T>) -> Result<T, DetError> {
     match Lu::compute(a) {
         Ok(lu) => Ok(lu.determinant()),
-        // A zero/near-zero pivot means the matrix (or the remaining Schur
-        // complement) has a linearly dependent column, so the determinant
-        // is exactly zero by construction. This is the correct, honest
-        // value — not an error condition — for a square matrix.
+        // A pivot at or below the LU per-column relative tolerance means the
+        // matrix is singular to working precision: its determinant is
+        // numerically zero (the honest value, not an error condition, for a
+        // square matrix), although not necessarily zero mathematically.
         Err(LuError::Singular { .. }) => Ok(T::zero()),
         // Genuine structural errors (non-square input, etc.) still propagate.
         Err(e) => Err(e.into()),

@@ -695,7 +695,13 @@ impl<T: Scalar + Clone> BscMatrix<T> {
             indptr.push(data.len());
         }
 
-        // Safety: we constructed valid BSR data
+        // SAFETY: the block sizes are `self`'s (nonzero, and every block in
+        // `self.data` has that shape, as `BscMatrix::new` checks). Every block
+        // row index is `< mb` (`BscMatrix::new`), so the loop over `0..mb`
+        // consumes all sorted entries: `indptr` gets 0 plus one running
+        // `data.len()` per block row (`mb + 1` non-decreasing entries ending at
+        // `data.len()`), and `indices` / `data` are pushed together with block
+        // columns `bj < nb`. That is the `BsrMatrix::new_unchecked` contract.
         unsafe {
             BsrMatrix::new_unchecked(
                 self.nrows,
@@ -761,6 +767,11 @@ impl<T: Scalar + Clone> BscMatrix<T> {
     }
 
     /// Converts to CSC format.
+    ///
+    /// Entries whose magnitude is at most `T::epsilon()` are dropped. A block
+    /// column that lists the same block row more than once (which
+    /// [`BscMatrix::new`] accepts, and `matvec` treats as a sum) yields single
+    /// CSC entries holding the sums. The CSC columns are sorted by row.
     pub fn to_csc(&self) -> crate::csc::CscMatrix<T>
     where
         T: Field,
@@ -770,6 +781,7 @@ impl<T: Scalar + Clone> BscMatrix<T> {
         let mut col_ptrs = vec![0usize; self.ncols + 1];
         let mut row_indices = Vec::new();
         let mut values = Vec::new();
+        let mut col_entries: Vec<(usize, T)> = Vec::new();
 
         for col in 0..self.ncols {
             let bj = col / self.block_cols;
@@ -777,8 +789,6 @@ impl<T: Scalar + Clone> BscMatrix<T> {
 
             let block_start = self.indptr[bj];
             let block_end = self.indptr[bj + 1];
-
-            let mut col_entries: Vec<(usize, T)> = Vec::new();
 
             for k in block_start..block_end {
                 let bi = self.indices[k];
@@ -795,17 +805,17 @@ impl<T: Scalar + Clone> BscMatrix<T> {
                 }
             }
 
-            // Sort by row
-            col_entries.sort_by_key(|(row, _)| *row);
-
-            for (row, val) in col_entries {
-                row_indices.push(row);
-                values.push(val);
-            }
+            // Sort by row, summing repeated rows.
+            crate::csr::push_summed_run(&mut col_entries, &mut row_indices, &mut values);
             col_ptrs[col + 1] = values.len();
         }
 
-        // Safety: we constructed valid CSC data
+        // SAFETY: `col_ptrs` starts as `ncols + 1` zeros and `col_ptrs[col +
+        // 1]` is set to the running `values.len()` after each column, so it
+        // starts at 0, never decreases and ends at nnz. Rows and values are
+        // pushed together; every row is checked `< nrows` above;
+        // `push_summed_run` makes each column strictly ascending, so no column
+        // repeats a row.
         unsafe {
             crate::csc::CscMatrix::new_unchecked(
                 self.nrows,
@@ -1353,5 +1363,24 @@ mod tests {
         // Block column 1 contains block (1, 1)
         let col1_blocks: Vec<_> = bsc.col_block_iter(1).map(|(bi, _)| bi).collect();
         assert_eq!(col1_blocks, vec![1]);
+    }
+
+    /// Regression: `BscMatrix::new` accepts a block column that lists one
+    /// block row twice (which `matvec` treats as a sum), and `to_csc` used to
+    /// copy both blocks' entries into the CSC via `new_unchecked`, violating
+    /// its no-duplicate contract.
+    #[test]
+    fn test_bsc_to_csc_sums_duplicate_blocks() {
+        let b1 = DenseBlock::new(2, 1, vec![1.0f64, 2.0]);
+        let b2 = DenseBlock::new(2, 1, vec![10.0, 0.0]);
+        // 4x1 matrix, 2x1 blocks: block row 1 listed twice in block column 0.
+        let bsc = BscMatrix::new(4, 1, 2, 1, vec![0, 2], vec![1, 1], vec![b1, b2]).expect("valid");
+
+        let csc = bsc.to_csc();
+        crate::csc::assert_valid_csc(&csc);
+        assert_eq!(csc.get(2, 0), Some(&11.0));
+        assert_eq!(csc.get(3, 0), Some(&2.0));
+        assert_eq!(csc.nnz(), 2);
+        assert_eq!(bsc.mul_vec(&[1.0]), vec![0.0, 0.0, 11.0, 2.0]);
     }
 }

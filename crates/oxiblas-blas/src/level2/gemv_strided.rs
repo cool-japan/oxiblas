@@ -5,7 +5,7 @@
 //! is unrelated). This module restores that contract on top of the crate's
 //! [`MatRef`] matrix view by accepting [`StridedSlice`] / [`StridedSliceMut`]
 //! for the vectors. A unit-stride call is forwarded to the optimised
-//! contiguous [`gemv`](super::gemv) so the fast path is unchanged; otherwise a
+//! contiguous [`gemv`](super::gemv()) so the fast path is unchanged; otherwise a
 //! straightforward strided kernel is used.
 //!
 //! Negative and zero increments follow the same reference convention as the
@@ -24,6 +24,9 @@ use crate::level1::{StridedSlice, StridedSliceMut};
 /// increments via the strided views. Reference BLAS requires the vector
 /// increments to be non-zero, but a zero increment is handled coherently here
 /// (it aliases logical element 0, matching the Level 1 routines).
+///
+/// As in reference BLAS, an empty `A` (`m == 0` or `n == 0`) is a quick return
+/// that leaves `y` untouched (it is not scaled by `beta`).
 ///
 /// # Panics
 ///
@@ -48,6 +51,12 @@ pub fn gemv_strided<T: Field>(
         "x length must match number of columns of op(A)"
     );
     assert_eq!(y.len(), rows, "y length must match number of rows of op(A)");
+
+    // Reference quick return: for an empty A (m == 0 or n == 0) y is left
+    // untouched -- not even beta-scaled or zero-filled.
+    if m == 0 || n == 0 {
+        return;
+    }
 
     // Fast path: both vectors unit-stride -> optimised contiguous kernel.
     if let (Some(xc), Some(yc)) = (x.as_contiguous(), y.as_contiguous_mut()) {
@@ -242,5 +251,72 @@ mod tests {
         assert!((ybuf[0] - 22.0).abs() < 1e-12);
         assert!((ybuf[1] - -9.0).abs() < 1e-12, "gap element untouched");
         assert!((ybuf[2] - 42.0).abs() < 1e-12);
+    }
+
+    // Issue #13: reference ?GEMV quick-returns when m == 0 or n == 0, leaving y
+    // untouched (no beta scaling / zero-fill).
+
+    #[test]
+    fn test_issue_13_gemv_strided_empty_a_unit_stride_leaves_y_untouched() {
+        // A is 0x1, op(A) = A^T is 1x0: x is empty, y has one element.
+        let a: Mat<f64> = Mat::zeros(0, 1);
+        let x: [f64; 0] = [];
+        let mut y = [1.0f64];
+        gemv_strided(
+            GemvTrans::Trans,
+            1.0,
+            a.as_ref(),
+            StridedSlice::from_slice(&x),
+            0.5,
+            StridedSliceMut::from_slice(&mut y),
+        );
+        assert_eq!(y, [1.0]);
+
+        let mut y = [f64::NAN];
+        gemv_strided(
+            GemvTrans::Trans,
+            1.0,
+            a.as_ref(),
+            StridedSlice::from_slice(&x),
+            0.0,
+            StridedSliceMut::from_slice(&mut y),
+        );
+        assert!(
+            y[0].is_nan(),
+            "beta = 0 must not zero-fill y when A is empty"
+        );
+    }
+
+    #[test]
+    fn test_issue_13_gemv_strided_empty_a_stride2_leaves_y_untouched() {
+        // Same shapes, but with stride-2 views so the strided kernel (not the
+        // contiguous fast path) is the code under test.
+        let a: Mat<f64> = Mat::zeros(0, 1);
+        let xbuf: [f64; 0] = [];
+        let mut ybuf = [1.0f64, -9.0];
+        gemv_strided(
+            GemvTrans::Trans,
+            1.0,
+            a.as_ref(),
+            view(&xbuf, 0, 2),
+            0.5,
+            view_mut(&mut ybuf, 1, 2),
+        );
+        assert_eq!(ybuf, [1.0, -9.0]);
+
+        // n == 0, NoTrans: A is 2x0, x empty, y has two elements at stride 2.
+        let a: Mat<f64> = Mat::zeros(2, 0);
+        let mut ybuf = [f64::NAN, -9.0, 3.0];
+        gemv_strided(
+            GemvTrans::NoTrans,
+            1.0,
+            a.as_ref(),
+            view(&xbuf, 0, 2),
+            0.0,
+            view_mut(&mut ybuf, 2, 2),
+        );
+        assert!(ybuf[0].is_nan());
+        assert_eq!(ybuf[1], -9.0);
+        assert_eq!(ybuf[2], 3.0);
     }
 }

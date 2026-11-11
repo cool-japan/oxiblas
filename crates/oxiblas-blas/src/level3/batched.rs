@@ -511,10 +511,14 @@ pub fn gemm_strided_batched<T: Field + GemmKernel + bytemuck::Zeroable>(
         let c_offset = i * stride_c;
 
         // Create matrix views into the strided buffers.
-        // SAFETY: We validated buffer sizes and strides above.
         // SAFETY: We validated buffer sizes and strides above; each view stays
         // within its slice's bounds for the duration of this borrow.
         let a_ref = unsafe { MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda) };
+        // SAFETY: `ldb >= b_rows` and `b.len() >= stride_b * (batch_count - 1)
+        // + ldb * b_cols` (with `stride_b >= ldb * b_cols` when batch_count > 1)
+        // were validated above, so `b[b_offset..]` holds at least `ldb * b_cols`
+        // elements and every offset `i + j * ldb` with `i < b_rows`,
+        // `j < b_cols` lies inside it; `b` outlives the view.
         let b_ref = unsafe { MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb) };
         // SAFETY: as above; the validated `stride_c`/`ldc` keep the `m x n`
         // view inside `c[c_offset..]` and the batch slots are disjoint.
@@ -653,6 +657,11 @@ pub fn gemm_strided_batched_parallel<T: Field + GemmKernel + bytemuck::Zeroable>
         // SAFETY: We validated buffer sizes and strides above; each view stays
         // within its slice's bounds for the duration of this borrow.
         let a_ref = unsafe { MatRef::new(a[a_offset..].as_ptr(), a_rows, a_cols, lda) };
+        // SAFETY: `ldb >= b_rows` and `b.len() >= stride_b * (batch_count - 1)
+        // + ldb * b_cols` (with `stride_b >= ldb * b_cols` when batch_count > 1)
+        // were validated above, so `b[b_offset..]` holds at least `ldb * b_cols`
+        // elements and every offset `i + j * ldb` with `i < b_rows`,
+        // `j < b_cols` lies inside it; `b` is only read, by every task.
         let b_ref = unsafe { MatRef::new(b[b_offset..].as_ptr(), b_rows, b_cols, ldb) };
 
         // SAFETY: Each iteration writes to a disjoint region of c.
@@ -995,9 +1004,24 @@ fn execute_single_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
 ) {
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0, so skip the
+        // transposed copies as well and only apply beta.
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
+}
+
+/// `C = beta * C`, never reading C when `beta == 0` (the `alpha == 0` exit).
+fn scale_by_beta<T: Field>(c: &mut MatMut<'_, T>, beta: T) {
+    if beta == T::zero() {
+        c.fill_zero();
+    } else if beta != T::one() {
+        c.scale(beta);
+    }
 }
 
 /// Executes a single `Complex64` GEMM with optional (conjugate) transpose on
@@ -1016,6 +1040,10 @@ fn execute_single_gemm_c64(
     beta: Complex64,
     c: &mut MatMut<'_, Complex64>,
 ) {
+    if alpha == Complex64::new(0.0, 0.0) {
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm3m_c64(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());
@@ -1033,6 +1061,10 @@ fn execute_single_gemm_c32(
     beta: Complex32,
     c: &mut MatMut<'_, Complex32>,
 ) {
+    if alpha == Complex32::new(0.0, 0.0) {
+        scale_by_beta(c, beta);
+        return;
+    }
     let a_op = prepare_operand(a, trans_a);
     let b_op = prepare_operand(b, trans_b);
     gemm3m_c32(alpha, a_op.as_view(), b_op.as_view(), beta, c.rb_mut());

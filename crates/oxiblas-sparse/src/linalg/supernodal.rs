@@ -871,6 +871,14 @@ fn permute_symmetric<T: Scalar + Clone + Field>(
         col_ptrs[new_j + 1] = values.len();
     }
 
+    // SAFETY: `col_ptrs` has `n + 1` entries, `col_ptrs[0] == 0`, and
+    // `col_ptrs[new_j + 1]` is the running `values.len()` (non-decreasing);
+    // `row_indices` and `values` are only pushed together. Every row index
+    // is a value of `perm_inv`, so the `< n` bound relies on the caller: the
+    // only caller, `SupernodalCholesky::new`, builds `perm_inv` as
+    // `vec![0; n]` (with `n > 0`) and sets `perm_inv[p] = i` for each
+    // position `i` of the length-`n` ordering, so all entries are `< n`.
+    // This function does not check that itself.
     unsafe { CscMatrix::new_unchecked(n, n, col_ptrs, row_indices, values) }
 }
 

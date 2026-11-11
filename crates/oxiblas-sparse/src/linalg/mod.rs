@@ -48,8 +48,8 @@ pub use eigenvalue::{
 pub use iterative::{
     BlockCgResult, BlockGmresResult, CgResult, FgmresResult, GmresResult, IdrSResult,
     IterativeError, MinresResult, QmrResult, TfqmrResult, bicgstab, block_cg, block_gmres,
-    block_pcg, cg, fgmres, fgmres_ir, gmres, idrs, minres, pgmres, pidrs, pminres, pqmr, ptfqmr,
-    qmr, tfqmr,
+    block_pcg, cg, fgmres, fgmres_ir, gmres, idrs, minres, pcg, pgmres, pidrs, pminres, pqmr,
+    ptfqmr, qmr, tfqmr,
 };
 pub use lu::{ILU0, ILUT, ILUTP, SparseLU, SparseLUError};
 pub use multifrontal_cholesky::{MultifrontalCholesky, MultifrontalError};
@@ -100,7 +100,7 @@ pub mod prelude {
     pub use super::iterative::{
         BlockCgResult, BlockGmresResult, CgResult, FgmresResult, GmresResult, IdrSResult,
         IterativeError, MinresResult, QmrResult, TfqmrResult, bicgstab, block_cg, block_gmres,
-        block_pcg, cg, fgmres, fgmres_ir, gmres, idrs, minres, pgmres, pidrs, pminres, pqmr,
+        block_pcg, cg, fgmres, fgmres_ir, gmres, idrs, minres, pcg, pgmres, pidrs, pminres, pqmr,
         ptfqmr, qmr, tfqmr,
     };
     pub use super::lu::{ILU0, ILUT, ILUTP, SparseLU, SparseLUError};

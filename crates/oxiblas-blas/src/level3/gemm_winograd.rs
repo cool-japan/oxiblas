@@ -48,6 +48,18 @@ pub fn gemm_winograd<T>(
     assert_eq!(c.nrows(), m, "Output rows must match A rows");
     assert_eq!(c.ncols(), n, "Output cols must match B cols");
 
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0 (the row and
+        // column factors below would fold NaN/Inf into C): C = beta * C, and
+        // C is not read when beta == 0.
+        if beta == T::zero() {
+            c.fill_zero();
+        } else if beta != T::one() {
+            c.scale(beta);
+        }
+        return;
+    }
+
     // Winograd algorithm requires even k
     if k % 2 != 0 {
         // Fall back to standard algorithm for odd k
@@ -174,7 +186,7 @@ pub fn gemm_winograd_blocked<T>(
     assert_eq!(b.nrows(), k);
     assert_eq!(c.nrows(), m);
     assert_eq!(c.ncols(), n);
-    assert!(block_size % 2 == 0, "Block size must be even");
+    assert!(block_size.is_multiple_of(2), "Block size must be even");
 
     // Scale C by beta first
     if beta == T::zero() {
@@ -189,6 +201,11 @@ pub fn gemm_winograd_blocked<T>(
                 c[(i, j)] *= beta;
             }
         }
+    }
+
+    if alpha == T::zero() {
+        // Reference BLAS reads neither A nor B when alpha == 0.
+        return;
     }
 
     // Apply Winograd to blocks
@@ -561,6 +578,46 @@ mod tests {
                 let diff: f32 = c_winograd[(i, j)] - c_standard[(i, j)];
                 assert!(diff.abs() < 1e-5, "f32 mismatch at ({}, {})", i, j);
             }
+        }
+    }
+
+    /// Asserts every element of `c` equals `expected` exactly.
+    fn assert_all_eq(c: &Mat<f64>, expected: f64, what: &str) {
+        for j in 0..c.ncols() {
+            for i in 0..c.nrows() {
+                assert_eq!(
+                    c[(i, j)].to_bits(),
+                    expected.to_bits(),
+                    "{what} ({i},{j}): got {}",
+                    c[(i, j)]
+                );
+            }
+        }
+    }
+
+    // Issue #9: alpha == 0 must not read A/B (even k takes Winograd's
+    // formula, odd k the standard fallback); beta == 0 must not read C.
+    #[test]
+    fn test_issue_9_winograd_alpha_zero_ignores_nan_operands() {
+        for &(m, k, n) in &[(6usize, 4usize, 5usize), (6, 5, 5), (12, 10, 9)] {
+            let a: Mat<f64> = Mat::filled(m, k, f64::NAN);
+            let b: Mat<f64> = Mat::filled(k, n, f64::INFINITY);
+
+            let mut c: Mat<f64> = Mat::filled(m, n, 2.0);
+            gemm_winograd(0.0, a.as_ref(), b.as_ref(), 0.5, &mut c.as_mut());
+            assert_all_eq(&c, 1.0, "winograd alpha=0 beta=0.5");
+
+            let mut c: Mat<f64> = Mat::filled(m, n, f64::NAN);
+            gemm_winograd(0.0, a.as_ref(), b.as_ref(), 0.0, &mut c.as_mut());
+            assert_all_eq(&c, 0.0, "winograd alpha=0 beta=0");
+
+            let mut c: Mat<f64> = Mat::filled(m, n, 2.0);
+            gemm_winograd_blocked(0.0, a.as_ref(), b.as_ref(), 0.5, &mut c.as_mut(), 4);
+            assert_all_eq(&c, 1.0, "winograd_blocked alpha=0 beta=0.5");
+
+            let mut c: Mat<f64> = Mat::filled(m, n, f64::NAN);
+            gemm_winograd_blocked(0.0, a.as_ref(), b.as_ref(), 0.0, &mut c.as_mut(), 4);
+            assert_all_eq(&c, 0.0, "winograd_blocked alpha=0 beta=0");
         }
     }
 }

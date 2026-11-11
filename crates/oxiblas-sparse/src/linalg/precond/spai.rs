@@ -1,5 +1,6 @@
 //! SPAI (Sparse Approximate Inverse) preconditioner.
 
+use super::tolerance::{finite_max_abs, pivot_tolerance};
 use super::types::PreconditionerError;
 use crate::csr::CsrMatrix;
 use oxiblas_core::scalar::{Field, Scalar};
@@ -102,6 +103,18 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
     /// # Errors
     ///
     /// Returns error if matrix is not square.
+    ///
+    /// # Scale invariance
+    ///
+    /// Every threshold is relative: the least-squares residual
+    /// `A m_j − e_j` is dimensionless, the Tikhonov term of the normal
+    /// equations is relative to their largest diagonal entry, pivots of the
+    /// small dense solves follow the per-column rule of the crate's dense LU,
+    /// a column of `A` is skipped as a candidate only when it is exactly
+    /// zero, and an entry of `m_j` is dropped only when it is at or below
+    /// `eps` times the largest entry of `m_j`. So `s·A` gives the same
+    /// sparsity pattern and, for a power-of-two `s`, exactly `1/s` times the
+    /// approximate inverse of `A`.
     pub fn new(a: &CsrMatrix<T>, config: SPAIConfig) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -251,7 +264,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
         // At least one non-zero must be permitted per column.
         let max_nnz = config.max_nnz_per_col.max(1);
         let max_iter = config.max_iterations;
-        let drop_tol = T::from_f64(1e-14).unwrap_or(T::zero());
+        // Residual entries below this are treated as zero when collecting
+        // candidates. The residual `A m_j − e_j` is dimensionless (relative to
+        // `‖e_j‖ = 1`), so this fixed threshold is a relative one.
+        let residual_drop_tol = T::from_f64(1e-14).unwrap_or(T::zero());
 
         // Solve the least-squares problem on the initial pattern.
         let mut solved = Self::solve_reduced(a, orig_j, &j_set);
@@ -278,7 +294,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
                 &solved.i_set,
                 &solved.residual,
                 col_norm_sq,
-                &drop_tol,
+                &residual_drop_tol,
             );
 
             match candidate {
@@ -297,11 +313,15 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
         }
 
         // Assemble the sparse column from the final solution, dropping numerical
-        // zeros so that the reported sparsity reflects the true support.
+        // zeros so that the reported sparsity reflects the true support. The
+        // entries of m_j scale like A⁻¹, so "numerically zero" is judged
+        // relative to the largest entry of the column (exact zeros included).
+        let value_drop_tol =
+            <T as Scalar>::epsilon() * finite_max_abs(solved.m_hat.iter().cloned());
         let mut result = Vec::new();
         for (local_k, &k) in j_set.iter().enumerate() {
             let val = solved.m_hat[local_k].clone();
-            if Scalar::abs(val.clone()) > drop_tol {
+            if Scalar::abs(val.clone()) > value_drop_tol {
                 result.push((k, val));
             }
         }
@@ -390,8 +410,11 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
             ate[k] = sum;
         }
 
-        // Small Tikhonov regularization for numerical robustness of the solve.
-        let reg = T::from_f64(1e-12).unwrap_or(T::zero());
+        // Small Tikhonov regularization for numerical robustness of the solve,
+        // relative to the largest diagonal entry of A^T A (the largest squared
+        // column norm of A(I, J)) so that it scales with the problem.
+        let ata_scale = finite_max_abs((0..n_k).map(|k| ata[k + k * n_k].clone()));
+        let reg = T::from_f64(1e-12).unwrap_or(T::zero()) * ata_scale;
         for k in 0..n_k {
             ata[k + k * n_k] = ata[k + k * n_k].clone() + reg.clone();
         }
@@ -429,13 +452,16 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
     /// `(r^T A_{.,c})^2 / ||A_{.,c}||^2`. The index with the largest reduction is
     /// returned (ties broken by smallest index for determinism). Returns `None`
     /// when no candidate can further reduce the residual.
+    ///
+    /// `residual_drop_tol` is the (dimensionless) magnitude below which a
+    /// residual entry is treated as zero.
     fn best_candidate(
         a: &CsrMatrix<T>,
         j_set: &[usize],
         i_set: &[usize],
         residual: &[T],
         col_norm_sq: &[T],
-        drop_tol: &T,
+        residual_drop_tol: &T,
     ) -> Option<usize> {
         use std::collections::HashMap;
 
@@ -445,7 +471,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
         let mut dots: HashMap<usize, T> = HashMap::new();
         for (local_i, &row) in i_set.iter().enumerate() {
             let r_i = residual[local_i].clone();
-            if Scalar::abs(r_i.clone()) <= *drop_tol {
+            if Scalar::abs(r_i.clone()) <= *residual_drop_tol {
                 continue;
             }
             let start = a.row_ptrs()[row];
@@ -470,8 +496,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
         let mut best: Option<(usize, T)> = None;
         for c in candidates {
             let denom = col_norm_sq[c].clone();
-            if Scalar::abs(denom.clone()) <= *drop_tol {
-                // Empty/near-zero column cannot reduce the residual.
+            if denom == T::zero() {
+                // An empty (all-zero) column cannot reduce the residual. A
+                // tiny but nonzero column is a valid candidate: its score is
+                // bounded by ||r||^2 (Cauchy–Schwarz), whatever its scale.
                 continue;
             }
             let dot = dots[&c].clone();
@@ -489,10 +517,20 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
     }
 
     /// Solve a small dense linear system using Gaussian elimination.
+    ///
+    /// `a` is column-major. A pivot is treated as zero (its column is skipped
+    /// and the matching unknown left at zero) when it is at or below
+    /// `eps · n · s_k`, `s_k` being the largest finite magnitude of column `k`
+    /// of `a` (the per-column rule of the crate's dense LU; rows are swapped,
+    /// columns never move).
     fn solve_small_system(a: &[T], b: &[T], n: usize) -> Vec<T> {
         if n == 0 {
             return Vec::new();
         }
+
+        let col_tol: Vec<T> = (0..n)
+            .map(|k| pivot_tolerance(n, finite_max_abs(a[k * n..(k + 1) * n].iter().cloned())))
+            .collect();
 
         // Copy to working arrays
         let mut aug = vec![T::zero(); n * (n + 1)];
@@ -526,9 +564,9 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
                 }
             }
 
-            // Check for zero pivot
+            // Check for a (numerically) zero pivot
             let pivot = aug[k * (n + 1) + k].clone();
-            if Scalar::abs(pivot.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+            if Scalar::abs(pivot.clone()) <= col_tol[k] {
                 continue;
             }
 
@@ -551,7 +589,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SPAI<T> {
             }
 
             let diag = aug[i * (n + 1) + i].clone();
-            if Scalar::abs(diag.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+            if Scalar::abs(diag.clone()) > col_tol[i] {
                 x[i] = sum / diag;
             }
         }

@@ -1,16 +1,56 @@
 //! TRSM: Triangular solve for matrices.
 //!
 //! Solves A·X = α·B or X·A = α·B where A is triangular.
+//!
+//! The private `tri_*` modules hold the blocked machinery shared with TRMM
+//! ([`mod@crate::level3::trmm`]): the canonical-problem driver, the packing of
+//! diagonal blocks and right-hand sides, and the register-tiled kernels.
 
 pub mod complex32;
 pub mod complex64;
 pub mod generic;
+pub(crate) mod tri_driver;
+mod tri_kernel;
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+mod tri_kernel_neon;
+mod tri_pack;
 pub mod types;
+
+#[cfg(test)]
+mod tri_test_util;
+#[cfg(test)]
+mod tri_tests;
+#[cfg(test)]
+mod tri_trmm_tests;
 
 pub use complex32::{trsm_c32, trsm_c32_in_place};
 pub use complex64::{trsm_c64, trsm_c64_in_place};
-pub use generic::{trsm, trsm_in_place};
+pub use generic::{trsm, trsm_in_place, trsm_in_place_with_par, trsm_with_par};
 pub use types::{Diag, Side, Trans, TrsmError, Uplo};
+
+/// Validates the shapes of a TRSM call: `A` must be square and match the relevant
+/// dimension of the `m x n` right-hand side (`m` for `Side::Left`, `n` for
+/// `Side::Right`). Reference ?TRSM checks this before anything else, so it also
+/// applies when `alpha == 0` and the solve itself is skipped.
+fn check_trsm_dims(
+    side: Side,
+    a_rows: usize,
+    a_cols: usize,
+    m: usize,
+    n: usize,
+) -> Result<(), TrsmError> {
+    if a_rows != a_cols {
+        return Err(TrsmError::NotSquare);
+    }
+    let expected = match side {
+        Side::Left => m,
+        Side::Right => n,
+    };
+    if a_rows != expected {
+        return Err(TrsmError::DimensionMismatch);
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -429,8 +469,8 @@ mod tests {
 
     #[test]
     fn test_trsm_c64_large_blocked() {
-        // Test blocked algorithm with larger matrix (> 64)
-        let n = 100;
+        // Test the blocked algorithm: order 150 spans two 128-row diagonal blocks
+        let n = 150;
         let m = 80;
 
         // Create a lower triangular matrix with 2 on diagonal
@@ -474,5 +514,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Issue #9 class: reference ?TRSM with alpha == 0 sets B := 0 without reading A or B
+    // (so NaN / Inf in either operand cannot leak, and even a singular A is accepted), after
+    // the shapes have been validated.
+
+    #[test]
+    fn test_issue_9_trsm_alpha_zero_zero_fills_without_reading_a_or_b() {
+        for side in [Side::Left, Side::Right] {
+            for uplo in [Uplo::Lower, Uplo::Upper] {
+                for trans in [Trans::NoTrans, Trans::Trans] {
+                    for diag in [Diag::NonUnit, Diag::Unit] {
+                        // B is 2x3; A is 2x2 (Left) or 3x3 (Right).
+                        let ka = if side == Side::Left { 2 } else { 3 };
+                        let a: Mat<f64> = Mat::filled(ka, ka, f64::NAN);
+                        let b: Mat<f64> = Mat::filled(2, 3, f64::INFINITY);
+                        let x = trsm(side, uplo, trans, diag, 0.0, a.as_ref(), b.as_ref())
+                            .expect("alpha == 0 never inspects A");
+                        for j in 0..3 {
+                            for i in 0..2 {
+                                assert!(
+                                    x[(i, j)] == 0.0,
+                                    "{side:?}/{uplo:?}/{trans:?}/{diag:?}: x[{i},{j}] = {}",
+                                    x[(i, j)]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_trsm_alpha_zero_accepts_singular_a_but_validates_shapes() {
+        let singular = Mat::from_rows(&[&[0.0f64, 1.0], &[0.0, 0.0]]);
+        let b = Mat::from_rows(&[&[f64::NAN, 1.0], &[2.0, f64::NAN]]);
+        let x = trsm(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            0.0,
+            singular.as_ref(),
+            b.as_ref(),
+        )
+        .expect("A is never read for alpha == 0, so singularity is irrelevant");
+        assert!(x[(0, 0)] == 0.0 && x[(0, 1)] == 0.0 && x[(1, 0)] == 0.0 && x[(1, 1)] == 0.0);
+
+        // Shapes are validated first, as in the reference.
+        let wrong = Mat::from_rows(&[&[1.0f64, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]]);
+        let r = trsm(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            0.0,
+            wrong.as_ref(),
+            b.as_ref(),
+        );
+        assert!(matches!(r, Err(TrsmError::DimensionMismatch)));
+        let rect = Mat::from_rows(&[&[1.0f64, 0.0, 0.0], &[0.0, 1.0, 0.0]]);
+        let r = trsm(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            0.0,
+            rect.as_ref(),
+            b.as_ref(),
+        );
+        assert!(matches!(r, Err(TrsmError::NotSquare)));
+    }
+
+    #[test]
+    fn test_issue_9_trsm_c64_alpha_zero_zero_fills_without_reading_a_or_b() {
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        let inf = Complex64::new(f64::INFINITY, f64::NEG_INFINITY);
+        for side in [Side::Left, Side::Right] {
+            for trans in [Trans::NoTrans, Trans::ConjTrans] {
+                let ka = if side == Side::Left { 2 } else { 3 };
+                let a: Mat<Complex64> = Mat::filled(ka, ka, nan);
+                let b: Mat<Complex64> = Mat::filled(2, 3, inf);
+                let x = trsm_c64(
+                    side,
+                    Uplo::Lower,
+                    trans,
+                    Diag::NonUnit,
+                    Complex64::new(0.0, 0.0),
+                    a.as_ref(),
+                    b.as_ref(),
+                )
+                .expect("alpha == 0 never inspects A");
+                for j in 0..3 {
+                    for i in 0..2 {
+                        assert!(x[(i, j)] == Complex64::new(0.0, 0.0), "{:?}", x[(i, j)]);
+                    }
+                }
+            }
+        }
+        let singular: Mat<Complex64> = Mat::zeros(2, 2);
+        let b: Mat<Complex64> = Mat::filled(2, 3, inf);
+        let x = trsm_c64(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            Complex64::new(0.0, 0.0),
+            singular.as_ref(),
+            b.as_ref(),
+        );
+        assert!(x.is_ok(), "singular A must be accepted for alpha == 0");
+        let wrong: Mat<Complex64> = Mat::zeros(3, 3);
+        let r = trsm_c64(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            Complex64::new(0.0, 0.0),
+            wrong.as_ref(),
+            b.as_ref(),
+        );
+        assert!(matches!(r, Err(TrsmError::DimensionMismatch)));
+    }
+
+    #[test]
+    fn test_issue_9_trsm_c32_alpha_zero_zero_fills_without_reading_a_or_b() {
+        let nan = Complex32::new(f32::NAN, f32::NAN);
+        let inf = Complex32::new(f32::INFINITY, f32::NEG_INFINITY);
+        for side in [Side::Left, Side::Right] {
+            for trans in [Trans::NoTrans, Trans::ConjTrans] {
+                let ka = if side == Side::Left { 2 } else { 3 };
+                let a: Mat<Complex32> = Mat::filled(ka, ka, nan);
+                let b: Mat<Complex32> = Mat::filled(2, 3, inf);
+                let x = trsm_c32(
+                    side,
+                    Uplo::Lower,
+                    trans,
+                    Diag::NonUnit,
+                    Complex32::new(0.0, 0.0),
+                    a.as_ref(),
+                    b.as_ref(),
+                )
+                .expect("alpha == 0 never inspects A");
+                for j in 0..3 {
+                    for i in 0..2 {
+                        assert!(x[(i, j)] == Complex32::new(0.0, 0.0), "{:?}", x[(i, j)]);
+                    }
+                }
+            }
+        }
+        let singular: Mat<Complex32> = Mat::zeros(2, 2);
+        let b: Mat<Complex32> = Mat::filled(2, 3, inf);
+        let x = trsm_c32(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            Complex32::new(0.0, 0.0),
+            singular.as_ref(),
+            b.as_ref(),
+        );
+        assert!(x.is_ok(), "singular A must be accepted for alpha == 0");
+        let wrong: Mat<Complex32> = Mat::zeros(3, 3);
+        let r = trsm_c32(
+            Side::Left,
+            Uplo::Upper,
+            Trans::NoTrans,
+            Diag::NonUnit,
+            Complex32::new(0.0, 0.0),
+            wrong.as_ref(),
+            b.as_ref(),
+        );
+        assert!(matches!(r, Err(TrsmError::DimensionMismatch)));
     }
 }

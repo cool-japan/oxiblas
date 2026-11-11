@@ -15,7 +15,7 @@ Matrix types and storage formats for OxiBLAS.
 
 ### Future Enhancements
 - [x] Custom allocator support (Mat<T, A> with Alloc trait)
-- [x] Memory-mapped matrices - `MmapMat`, `MmapMatMut`, `MmapBuilder` with column-major storage
+- [x] Memory-mapped matrices - `MmapMat`, `MmapMatMut`, `MmapBuilder` with column-major storage — 0.2.3: the safe constructors document the two conditions they cannot check (no other writer or truncation while mapped; a supported element type); making them `unsafe` or bounding the element type by a sealed `Pod`-style trait is a v0.3.0 item in the root TODO.md
 - [x] Lazy evaluation for element-wise ops - `lazy.rs` with `Expr` trait, expression types (Add, Sub, Mul, Scale, Transpose, Conj, Hermitian), FMA and GEMM fusion, simplification optimizations
 - [x] Copy-on-write semantics - `CowMat<T>` with Arc-based sharing, O(1) clone, copy-on-write mutation
 

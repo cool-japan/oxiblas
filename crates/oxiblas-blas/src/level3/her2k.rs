@@ -9,7 +9,9 @@
 //! - For `Trans::ConjTrans`: C = α·A^H·B + conj(α)·B^H·A + β·C where A, B are k×n, C is n×n
 //!
 //! Only the specified triangle (upper or lower) of C is updated.
-//! The diagonal of C is always real.
+//! Whenever C is updated its diagonal is made real. As in reference (Z/C)HER2K,
+//! `(alpha == 0 || k == 0) && beta == 1` is a quick return that leaves C completely
+//! untouched (even a non-real diagonal).
 //!
 //! # Note
 //!
@@ -48,6 +50,17 @@ impl core::fmt::Display for Her2kError {
 }
 
 impl std::error::Error for Her2kError {}
+
+/// The two operations HER2K performs, decoded once from the public [`Trans`]
+/// argument (whose third variant, `Trans::Trans`, HER2K rejects), so the
+/// private helpers can never be handed the invalid one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Her2kOp {
+    /// `C = α·A·Bᴴ + conj(α)·B·Aᴴ + β·C` (`Trans::NoTrans`), A and B are n×k.
+    NoTrans,
+    /// `C = α·Aᴴ·B + conj(α)·Bᴴ·A + β·C` (`Trans::ConjTrans`), A and B are k×n.
+    ConjTrans,
+}
 
 /// Performs the Hermitian rank-2k update.
 ///
@@ -101,9 +114,11 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
 ) -> Result<(), Her2kError> {
     // Validate transpose option - only NoTrans and ConjTrans are valid for HER2K
-    if trans == Trans::Trans {
-        return Err(Her2kError::InvalidTrans);
-    }
+    let op = match trans {
+        Trans::NoTrans => Her2kOp::NoTrans,
+        Trans::ConjTrans => Her2kOp::ConjTrans,
+        Trans::Trans => return Err(Her2kError::InvalidTrans),
+    };
 
     // Reference (Z/C)HER2K declare β as a REAL scalar (unlike α, which MAY be
     // complex). The update C = α·A·Bᴴ + conj(α)·B·Aᴴ + β·C is Hermitian only when β
@@ -118,8 +133,8 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 
     // Determine k and validate A, B dimensions
-    let k = match trans {
-        Trans::NoTrans => {
+    let k = match op {
+        Her2kOp::NoTrans => {
             if a.nrows() != n || b.nrows() != n {
                 return Err(Her2kError::DimensionMismatch);
             }
@@ -128,7 +143,7 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             a.ncols()
         }
-        Trans::ConjTrans => {
+        Her2kOp::ConjTrans => {
             if a.ncols() != n || b.ncols() != n {
                 return Err(Her2kError::DimensionMismatch);
             }
@@ -137,7 +152,6 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             a.nrows()
         }
-        Trans::Trans => unreachable!(), // Already checked above
     };
 
     // Handle empty cases
@@ -145,13 +159,21 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
+    // Reference quick return: for (alpha == 0 || k == 0) && beta == 1 nothing changes and C
+    // is left completely untouched (even a non-real diagonal; the real-diagonal projection
+    // only happens on the paths that actually update C).
+    if (alpha == T::zero() || k == 0) && beta == T::one() {
+        return Ok(());
+    }
+
     // Use GEMM-based optimization for larger matrices with real types
-    // For real types, HER2K is equivalent to SYR2K since conjugation has no effect
+    // For real types, HER2K is equivalent to SYR2K since conjugation has no effect.
+    // alpha == 0 never reads A or B (C := beta * C), so it stays on the naive path.
     const GEMM_THRESHOLD: usize = 32;
-    if n >= GEMM_THRESHOLD && k >= 8 {
-        her2k_via_gemm(uplo, trans, alpha, a, b, beta, c, n, k)
+    if n >= GEMM_THRESHOLD && k >= 8 && alpha != T::zero() {
+        her2k_via_gemm(uplo, op, alpha, a, b, beta, c, n, k)
     } else {
-        her2k_naive(uplo, trans, alpha, a, b, beta, c, n, k)
+        her2k_naive(uplo, op, alpha, a, b, beta, c, n, k)
     }
 }
 
@@ -164,8 +186,8 @@ pub fn her2k<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// * **The diagonal is real.** `α·A·Bᴴ + conj(α)·B·Aᴴ` is Hermitian and thus has a
 ///   real diagonal in exact arithmetic, but the two-GEMM accumulation can leave
 ///   rounding noise in the imaginary part, so every `i == j` entry is projected
-///   back onto the reals (matching the module invariant "the diagonal of C is
-///   always real").
+///   back onto the reals (matching the module invariant "whenever C is updated its
+///   diagonal is made real"; the reference quick return never gets here).
 fn write_her2k_triangle<T: Field>(
     uplo: Uplo,
     beta: T,
@@ -202,7 +224,7 @@ fn write_her2k_triangle<T: Field>(
 /// has no effect on real numbers. This uses the same optimization as SYR2K.
 fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     uplo: Uplo,
-    trans: Trans,
+    op: Her2kOp,
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
@@ -215,8 +237,8 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Compute `temp = α·A·Bᴴ + conj(α)·B·Aᴴ` (or the ConjTrans variant) via two GEMMs.
     let mut temp: Mat<T> = Mat::zeros(n, n);
-    match trans {
-        Trans::NoTrans => {
+    match op {
+        Her2kOp::NoTrans => {
             // A is n×k, B is n×k. Build B^H (k×n) and A^H (k×n).
             let mut b_h: Mat<T> = Mat::zeros(k, n);
             for i in 0..n {
@@ -233,7 +255,7 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a, b_h.as_ref(), T::zero(), temp.as_mut()); // temp = α·A·B^H
             gemm(alpha_conj, b, a_h.as_ref(), T::one(), temp.as_mut()); // temp += conj(α)·B·A^H
         }
-        Trans::ConjTrans => {
+        Her2kOp::ConjTrans => {
             // A is k×n, B is k×n. Build A^H (n×k) and B^H (n×k).
             let mut a_h: Mat<T> = Mat::zeros(n, k);
             for i in 0..k {
@@ -250,7 +272,6 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
             gemm(alpha, a_h.as_ref(), b, T::zero(), temp.as_mut()); // temp = α·A^H·B
             gemm(alpha_conj, b_h.as_ref(), a, T::one(), temp.as_mut()); // temp += conj(α)·B^H·A
         }
-        Trans::Trans => unreachable!(),
     }
 
     // Copy triangle with beta scaling, honouring the β==0 / real-diagonal invariants.
@@ -262,7 +283,7 @@ fn her2k_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// Naive HER2K implementation for small matrices.
 fn her2k_naive<T: Field>(
     uplo: Uplo,
-    trans: Trans,
+    op: Her2kOp,
     alpha: T,
     a: MatRef<'_, T>,
     b: MatRef<'_, T>,
@@ -313,8 +334,8 @@ fn her2k_naive<T: Field>(
     if alpha != T::zero() {
         let alpha_conj = alpha.conj();
 
-        match trans {
-            Trans::NoTrans => {
+        match op {
+            Her2kOp::NoTrans => {
                 // C += alpha * A * B^H + conj(alpha) * B * A^H
                 // C[i,j] += alpha * sum_l A[i,l] * conj(B[j,l]) + conj(alpha) * sum_l B[i,l] * conj(A[j,l])
                 match uplo {
@@ -344,7 +365,7 @@ fn her2k_naive<T: Field>(
                     }
                 }
             }
-            Trans::ConjTrans => {
+            Her2kOp::ConjTrans => {
                 // C += alpha * A^H * B + conj(alpha) * B^H * A
                 // C[i,j] += alpha * sum_l conj(A[l,i]) * B[l,j] + conj(alpha) * sum_l conj(B[l,i]) * A[l,j]
                 match uplo {
@@ -378,7 +399,6 @@ fn her2k_naive<T: Field>(
                     }
                 }
             }
-            Trans::Trans => unreachable!(),
         }
     }
 
@@ -767,5 +787,132 @@ mod tests {
         assert!((c[(0, 0)] - 34.0).abs() < 1e-10);
         assert!((c[(1, 0)] - 62.0).abs() < 1e-10);
         assert!((c[(1, 1)] - 106.0).abs() < 1e-10);
+    }
+
+    // Issue #9 class: same contract as ?HERK for the rank-2k update (complex alpha, real beta).
+    #[test]
+    fn test_issue_9_her2k_alpha_beta_zero_semantics() {
+        use num_complex::Complex64;
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        let zero = Complex64::new(0.0, 0.0);
+        let same = |got: Complex64, want: Complex64| {
+            let eq = |a: f64, b: f64| (a.is_nan() && b.is_nan()) || a == b;
+            eq(got.re, want.re) && eq(got.im, want.im)
+        };
+        let a_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.5 * ((2 * i + 3 * j) % 7) as f64 - 1.0,
+                0.25 * ((i + 5 * j) % 6) as f64 - 0.5,
+            )
+        };
+        let b_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.25 * ((i + 2 * j) % 5) as f64 - 0.5,
+                0.25 * ((3 * i + j) % 4) as f64 - 0.25,
+            )
+        };
+        let c_f = |i: usize, j: usize| {
+            Complex64::new(
+                0.5 + 0.125 * (i + j) as f64,
+                if i == j {
+                    0.3
+                } else {
+                    0.0625 * ((i + 3 * j) % 5) as f64
+                },
+            )
+        };
+        // (alpha, beta, A/B poisoned, C poisoned)
+        let scenarios = [
+            (Complex64::new(0.0, 0.0), 0.0, true, true),
+            (Complex64::new(0.0, 0.0), 2.0, true, false),
+            (Complex64::new(0.0, 0.0), 1.0, true, false),
+            (Complex64::new(1.5, -0.5), 0.0, false, true),
+            (Complex64::new(1.5, -0.5), 1.0, false, false),
+            (Complex64::new(1.5, -0.5), 0.5, false, false),
+        ];
+        // (40, 24) crosses the GEMM threshold (n >= 32, k >= 8) and the blocked GEMM path.
+        for (n, k) in [(4usize, 3usize), (40, 24), (5, 0)] {
+            for uplo in [Uplo::Lower, Uplo::Upper] {
+                for trans in [Trans::NoTrans, Trans::ConjTrans] {
+                    for (alpha, beta, poison_ab, poison_c) in scenarios {
+                        let notrans = trans == Trans::NoTrans;
+                        let (ar, ac) = if notrans { (n, k) } else { (k, n) };
+                        let ua = |i: usize, l: usize| {
+                            if notrans { a_f(i, l) } else { a_f(l, i).conj() }
+                        };
+                        let ub = |i: usize, l: usize| {
+                            if notrans { b_f(i, l) } else { b_f(l, i).conj() }
+                        };
+                        let mut a: Mat<Complex64> = Mat::zeros(ar, ac);
+                        let mut b: Mat<Complex64> = Mat::zeros(ar, ac);
+                        for j in 0..ac {
+                            for i in 0..ar {
+                                a[(i, j)] = if poison_ab { nan } else { a_f(i, j) };
+                                b[(i, j)] = if poison_ab { nan } else { b_f(i, j) };
+                            }
+                        }
+                        let mut c: Mat<Complex64> = Mat::zeros(n, n);
+                        for j in 0..n {
+                            for i in 0..n {
+                                c[(i, j)] = if poison_c { nan } else { c_f(i, j) };
+                            }
+                        }
+                        her2k(
+                            uplo,
+                            trans,
+                            alpha,
+                            a.as_ref(),
+                            b.as_ref(),
+                            Complex64::new(beta, 0.0),
+                            c.as_mut(),
+                        )
+                        .unwrap();
+                        let quick = (alpha == zero || k == 0) && beta == 1.0;
+                        for j in 0..n {
+                            for i in 0..n {
+                                let in_tri = match uplo {
+                                    Uplo::Lower => i >= j,
+                                    Uplo::Upper => i <= j,
+                                };
+                                let got = c[(i, j)];
+                                if !in_tri {
+                                    let before = if poison_c { nan } else { c_f(i, j) };
+                                    assert!(same(got, before), "unreferenced C[{i},{j}] = {got:?}");
+                                    continue;
+                                }
+                                let want = if quick {
+                                    c_f(i, j)
+                                } else {
+                                    let acc = if alpha == zero {
+                                        zero
+                                    } else {
+                                        alpha
+                                            * (0..k)
+                                                .map(|l| ua(i, l) * ub(j, l).conj())
+                                                .sum::<Complex64>()
+                                            + alpha.conj()
+                                                * (0..k)
+                                                    .map(|l| ub(i, l) * ua(j, l).conj())
+                                                    .sum::<Complex64>()
+                                    };
+                                    let c_term = if beta == 0.0 { zero } else { c_f(i, j) * beta };
+                                    let val = acc + c_term;
+                                    if i == j {
+                                        Complex64::new(val.re, 0.0)
+                                    } else {
+                                        val
+                                    }
+                                };
+                                assert!(
+                                    (got - want).norm() <= 1e-10 * (1.0 + want.norm()),
+                                    "her2k {uplo:?}/{trans:?} n={n} k={k} alpha={alpha} beta={beta}: \
+                                     C[{i},{j}] = {got:?}, expected {want:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

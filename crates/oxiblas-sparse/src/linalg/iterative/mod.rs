@@ -9,6 +9,27 @@
 //! - Block solvers for multiple right-hand sides
 //! - FGMRES (Flexible GMRES) for variable preconditioning
 //! - IDR(s) (Induced Dimension Reduction) for general systems
+//!
+//! # Scale invariance and extreme scales
+//!
+//! Every convergence and breakdown test is relative (see the helpers'
+//! documentation), and every norm entering such a test is computed with an
+//! overflow-safe scaled 2-norm, so the solvers give the same iteration counts
+//! and bit-identical solutions for `(A, b)` and `(s·A, s·b)` when `s` is a
+//! power of four. Inner products of the iteration itself (`rᵀr`, `pᵀAp`,
+//! Givens and Lanczos coefficients, `A·r`) still grow with powers of the scale
+//! of the data; for a system far from unit scale (largest magnitude of `A` or
+//! `b` outside `2^±63` for `f64`) the solvers therefore iterate on a copy
+//! rescaled by powers of four, `(α·A) x̂ = β·b`, apply `A` as `spmv(α, A, ..)`
+//! (so `A` is not copied), rescale the preconditioner output by a power of
+//! four fixed at its first application, and map the results back exactly.
+//! The rescaled iteration is bit-identical to the plain one wherever the
+//! plain one does not overflow or underflow, so this only changes results
+//! that used to be `∞`, `NaN` or a false convergence. Preconditioners then
+//! receive vectors of the rescaled system and must be linear
+//! (`M⁻¹(c·r) = c·M⁻¹ r`); the preconditioners of this crate apply fixed
+//! linear operators (triangular solves, sparse products, a fixed number of
+//! smoothing sweeps), with no branch on the magnitude of the input.
 
 pub mod bicgstab;
 pub mod block_cg;
@@ -20,6 +41,7 @@ pub(crate) mod helpers;
 pub mod idrs;
 pub mod minres;
 pub mod qmr;
+mod scaling;
 pub mod tfqmr;
 pub mod types;
 

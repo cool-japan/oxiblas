@@ -26,6 +26,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 // Stylistic choices for BLAS library
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::similar_names)]
@@ -71,13 +72,12 @@
 // `transmute::<From, To>()` turbofish annotations instead of relying on
 // let-binding type inference.
 //
-// clippy::missing_safety_doc was also removed during the same pass: all 74
-// `pub unsafe extern "C" fn` CBLAS entry points across cblas/{basic,
-// complex_level1,complex_level2,triangular_symmetric,hermitian,
-// level2_real}.rs that lacked a `# Safety` section now have one describing
-// the raw-pointer preconditions the C ABI cannot enforce itself. This was
-// exactly the gap that let unvalidated CBLAS modules land silently before
-// (see the parameter-validation hygiene item tracked separately).
+// clippy::missing_safety_doc was also removed during the same pass: every
+// `pub unsafe extern "C" fn` CBLAS entry point across the `cblas` modules (152
+// as of 0.2.3, including the issue #14 additions) now has a `# Safety` section
+// describing the raw-pointer preconditions the C ABI cannot enforce itself.
+// This was exactly the gap that let unvalidated CBLAS modules land silently
+// before (see the parameter-validation hygiene item tracked separately).
 // SIMD kernels benefit from inline(always)
 #![allow(clippy::inline_always)]
 // Some refs are cfg-gated

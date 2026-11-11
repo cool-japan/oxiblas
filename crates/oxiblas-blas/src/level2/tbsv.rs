@@ -88,23 +88,21 @@ impl std::error::Error for TbsvError {}
 /// //      [0, 3, 2],
 /// //      [0, 0, 4]]
 /// //
-/// // Solve A·x = b where b = [4, 11, 8]
+/// // Solve A·x = b where b = A·[1, 3, 2] = [2*1 + 1*3, 3*3 + 2*2, 4*2] = [5, 13, 8]
 ///
 /// let ab = Mat::from_rows(&[
 ///     &[0.0f64, 1.0, 2.0],  // superdiagonal
 ///     &[2.0, 3.0, 4.0],     // main diagonal
 /// ]);
-/// let mut x = [4.0f64, 11.0, 8.0];  // b
+/// let mut x = [5.0f64, 13.0, 8.0];  // b
 ///
 /// tbsv(TbsvUplo::Upper, TbsvTrans::NoTrans, TbsvDiag::NonUnit, 3, 1, ab.as_ref(), &mut x).unwrap();
 ///
-/// // Solution: x = [1, 3, 2]
-/// // Verify: A * [1, 3, 2] = [2*1 + 1*3, 3*3 + 2*2, 4*2] = [5, 13, 8]
-/// // Wait, let me recalculate...
-/// // Actually b should be chosen so that x is nice.
-/// // If x = [1, 3, 2], then b = A*x = [2*1+1*3, 3*3+2*2, 4*2] = [5, 13, 8]
-/// // So the example uses b = [4, 11, 8] which gives x close to [1, 3, 2]
-/// assert!((x[2] - 2.0).abs() < 1e-10);  // x[2] = 8/4 = 2
+/// // Back substitution: x[2] = 8/4 = 2, x[1] = (13 - 2*2)/3 = 3,
+/// // x[0] = (5 - 1*3)/2 = 1, so x = [1, 3, 2]
+/// assert!((x[0] - 1.0).abs() < 1e-10);
+/// assert!((x[1] - 3.0).abs() < 1e-10);
+/// assert!((x[2] - 2.0).abs() < 1e-10);
 /// ```
 pub fn tbsv<T: Field>(
     uplo: TbsvUplo,

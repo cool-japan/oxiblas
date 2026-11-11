@@ -31,11 +31,6 @@
 //! dispatch (driven by [`detect_simd_level`](crate::simd::detect_simd_level))
 //! guarantees this and falls back to scalar otherwise.
 
-// AVX-512 intrinsics require a newer Rust than the crate MSRV, but every use is
-// gated behind runtime feature detection, so silence the MSRV lint here (this
-// matches the convention in `simd/x86_64.rs`).
-#![allow(clippy::incompatible_msrv)]
-
 use super::ComplexSimdRegister;
 use core::arch::x86_64::*;
 use num_complex::{Complex32, Complex64};

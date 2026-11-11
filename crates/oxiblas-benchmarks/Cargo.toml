@@ -10,10 +10,10 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["benchmark", "blas", "lapack", "linear-algebra", "performance"]
 categories = ["mathematics", "science", "development-tools::profiling"]
-# Dev/benchmark-only crate: kept off crates.io so the optional `compare-openblas`
-# comparison bench (openblas-src/cblas-sys/lapack-sys/ndarray-linalg/blas-src) stays
-# out of the published Pure-Rust audit surface.
-# Run it with: cargo bench -p oxiblas-benchmarks --features compare-openblas
+# Dev/benchmark-only crate: kept off crates.io. The optional `compare-openblas`
+# bench loads a system OpenBLAS at run time and links no BLAS crate, so it adds
+# nothing but `libc` to the dependency graph.
+# Run it with: cargo bench -p oxiblas-benchmarks --bench comparison --features compare-openblas
 publish = false
 
 [dependencies]
@@ -25,21 +25,21 @@ oxiblas-sparse.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
-# Optional: For comparison benchmarks with other BLAS implementations
-ndarray = { workspace = true, optional = true }
-ndarray-linalg = { workspace = true, optional = true, features = ["openblas-system"] }
-blas-src = { workspace = true, optional = true, features = ["openblas"] }
-cblas-sys = { workspace = true, optional = true }
+# Optional: dlopen/dlsym for the OpenBLAS comparison bench
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 num-complex.workspace = true
 half.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
+
 [features]
 default = []
-# Enable comparison benchmarks with OpenBLAS (BSD-3-Clause license, compatible)
-compare-openblas = ["ndarray", "ndarray-linalg", "blas-src", "cblas-sys"]
+# Enable comparison benchmarks with OpenBLAS, loaded at run time (Unix only)
+compare-openblas = ["dep:libc"]
 
 [[bin]]
 name = "regress"

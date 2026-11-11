@@ -20,6 +20,29 @@
 //! - **Full pivoting**: Permutes both rows and columns to select the largest
 //!   pivot in the remaining submatrix. Most stable but slower.
 //!
+//! # Singularity Tolerance
+//!
+//! Every variant reports `Singular` when the magnitude of the pivot accepted
+//! for a column is at or below `eps · n · s_j`, where `s_j = max_i |a_ij|` is
+//! taken over the finite entries of the column `j` of the input that the
+//! pivot belongs to (only its stored band entries for [`BandLu`]). The
+//! references of all columns are computed once, before factorizing. Rook and
+//! full pivoting interchange columns; they track the interchanges and test
+//! each pivot against the reference of its original column.
+//!
+//! The test is relative to each column, so scaling and conditioning stay
+//! apart: a badly scaled but well-conditioned matrix such as `diag(1e20, 1)`,
+//! or a stiffness matrix with a penalty term `K + 1e20 · e_i e_iᵀ`, factors
+//! (as with LAPACK, which only flags exactly zero pivots), while a column
+//! that elimination reduces to rounding noise, as in a rank-deficient matrix,
+//! is still rejected. Scaling a real matrix by a power of two changes neither
+//! the pivots nor the outcome, as long as no entry or intermediate value
+//! overflows or underflows; for [`Lu`] and [`BandLu`] this extends to scaling
+//! each column by its own power of two, `A · diag(c)`. [`LuFullPiv::rank`]
+//! keeps a global threshold, `n · eps · max |a_ij|`.
+//! [`LuRook::compute_with_tol`] and [`LuFullPiv::compute_with_tol`] use an
+//! explicit tolerance exactly as given, for every column.
+//!
 //! # Band Matrices
 //!
 //! For band matrices with limited bandwidth, specialized algorithms provide
@@ -64,6 +87,7 @@ mod band;
 mod full_piv;
 mod partial_piv;
 mod rook_piv;
+pub(crate) mod tolerance;
 
 pub use band::{BandLu, BandLuError, band_norm_1, band_norm_inf, band_to_dense, dense_to_band};
 pub use full_piv::{LuFullPiv, LuFullPivError};

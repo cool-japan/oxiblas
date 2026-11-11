@@ -593,8 +593,8 @@ fn apply_householder_right<T: Field + Real>(
 
 /// Forms the tridiagonal matrix T = B^T * B from bidiagonal B.
 /// B has diagonal d and superdiagonal e.
-/// T\[i,i\] = d[i]^2 + e\[i-1\]^2 (where e\[-1\] = 0)
-/// T\[i,i+1\] = T\[i+1,i\] = d[i] * e\[i\]
+/// T\[i,i\] = `d[i]`^2 + e\[i-1\]^2 (where e\[-1\] = 0)
+/// T\[i,i+1\] = T\[i+1,i\] = `d[i]` * e\[i\]
 fn form_btb_tridiagonal<T: Field + Real>(d: &[T], e: &[T]) -> (Vec<T>, Vec<T>) {
     let n = d.len();
     let mut t_diag = vec![T::zero(); n];

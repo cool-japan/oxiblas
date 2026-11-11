@@ -481,16 +481,11 @@ impl<T: Scalar> TriangularMat<T> {
             !(self.diag == DiagonalKind::Unit && row == col),
             "Cannot set diagonal of unit triangular matrix"
         );
-        assert!(
-            self.in_triangle(row, col),
-            "Element outside stored triangle"
-        );
-        // Safety of the `expect`: `in_triangle` above is exactly the
-        // condition `PackedMat::set` uses to decide success, so having
-        // just checked it makes the error case unreachable here.
-        self.packed
-            .set(row, col, value)
-            .expect("in_triangle check above guarantees this index is valid");
+        // `PackedMat::set` fails exactly when `(row, col)` is outside the
+        // stored triangle (`!self.in_triangle(row, col)`).
+        if self.packed.set(row, col, value).is_err() {
+            panic!("Element outside stored triangle");
+        }
     }
 
     /// Returns a pointer to the packed data.
@@ -585,11 +580,11 @@ impl<T: Scalar> TriangularMat<T> {
             let n = self.dim();
             for j in 0..n {
                 for i in 0..n {
-                    if self.in_triangle(i, j) && i != j {
-                        // Safety of the `expect`: guarded by `in_triangle` above.
-                        self.packed
-                            .set(i, j, value)
-                            .expect("in_triangle check above guarantees this index is valid");
+                    // `get_mut` is `Some` exactly for the stored triangle.
+                    if i != j
+                        && let Some(slot) = self.packed.get_mut(i, j)
+                    {
+                        *slot = value;
                     }
                 }
             }
@@ -605,10 +600,11 @@ impl<T: Scalar> TriangularMat<T> {
             let n = self.dim();
             for j in 0..n {
                 for i in 0..n {
-                    if self.in_triangle(i, j) && i != j {
-                        if let Some(val) = self.packed.get_mut(i, j) {
-                            *val *= alpha;
-                        }
+                    if self.in_triangle(i, j)
+                        && i != j
+                        && let Some(val) = self.packed.get_mut(i, j)
+                    {
+                        *val *= alpha;
                     }
                 }
             }
@@ -807,15 +803,11 @@ impl<'a, T: Scalar> TriangularMut<'a, T> {
             !(self.diag == DiagonalKind::Unit && row == col),
             "Cannot set diagonal of unit triangular matrix"
         );
-        assert!(
-            self.packed.packed_index(row, col).is_some(),
-            "Element outside stored triangle"
-        );
-        // Safety of the `expect`: the `packed_index` check above is exactly
-        // the condition `PackedMut::set` uses to decide success.
-        self.packed
-            .set(row, col, value)
-            .expect("packed_index check above guarantees this index is valid");
+        // `PackedMut::set` fails exactly when `(row, col)` is outside the
+        // stored triangle (`packed_index(row, col)` is `None`).
+        if self.packed.set(row, col, value).is_err() {
+            panic!("Element outside stored triangle");
+        }
     }
 
     /// Creates an immutable reborrow.
@@ -1069,5 +1061,69 @@ mod tests {
         tmut.set(0, 0, 10.0);
         assert_eq!(tmut.get(0, 0), Some(&10.0));
         assert_eq!(data[0], 10.0);
+    }
+
+    // --- Regression: `set` / `fill` without `expect` --------------------------
+
+    #[test]
+    fn test_triangular_unit_fill_writes_off_diagonal_only() {
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            let n = 4;
+            let mut tri: TriangularMat<f64> = TriangularMat::unit_zeros(n, uplo);
+            tri.fill(2.5);
+            for j in 0..n {
+                for i in 0..n {
+                    let stored = match uplo {
+                        TriangularKind::Upper => i <= j,
+                        TriangularKind::Lower => i >= j,
+                    };
+                    let expected = if i == j {
+                        None // unit diagonal is implicit
+                    } else if stored {
+                        Some(&2.5)
+                    } else {
+                        None
+                    };
+                    assert_eq!(tri.get(i, j), expected, "{uplo:?} ({i}, {j})");
+                }
+            }
+            // The (implicit) diagonal slots of the packed storage stay zero.
+            assert!(tri.as_packed().diagonal().iter().all(|&d| d == 0.0));
+            assert_eq!(tri.diagonal(), vec![1.0; n]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside stored triangle")]
+    fn test_triangular_set_outside_triangle_panics() {
+        let mut tri: TriangularMat<f64> =
+            TriangularMat::zeros(3, TriangularKind::Upper, DiagonalKind::NonUnit);
+        tri.set(2, 0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside stored triangle")]
+    fn test_triangular_set_out_of_bounds_panics() {
+        let mut tri: TriangularMat<f64> =
+            TriangularMat::zeros(3, TriangularKind::Lower, DiagonalKind::NonUnit);
+        tri.set(3, 3, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside stored triangle")]
+    fn test_triangular_mut_set_outside_triangle_panics() {
+        let mut data = [0.0f64; 6];
+        let mut tmut =
+            TriangularMut::from_slice(&mut data, 3, TriangularKind::Lower, DiagonalKind::NonUnit);
+        tmut.set(0, 2, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot set diagonal of unit triangular matrix")]
+    fn test_triangular_mut_set_unit_diagonal_panics() {
+        let mut data = [0.0f64; 6];
+        let mut tmut =
+            TriangularMut::from_slice(&mut data, 3, TriangularKind::Upper, DiagonalKind::Unit);
+        tmut.set(1, 1, 1.0);
     }
 }

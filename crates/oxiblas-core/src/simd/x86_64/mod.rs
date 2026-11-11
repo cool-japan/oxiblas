@@ -14,11 +14,9 @@
 // Allow these clippy lints for SIMD code (inherited by every submodule):
 // - should_implement_trait: We use add/sub/mul/neg methods on trait implementations
 // - missing_transmute_annotations: Transmutes in SIMD are clear from context
-// - incompatible_msrv: AVX-512 intrinsics require newer Rust but we gate with runtime detection
 // - needless_range_loop: Index-based loops are clearer for SIMD element access patterns
 #![allow(clippy::should_implement_trait)]
 #![allow(clippy::missing_transmute_annotations)]
-#![allow(clippy::incompatible_msrv)]
 #![allow(clippy::needless_range_loop)]
 
 mod f32x16_traits;

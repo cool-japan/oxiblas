@@ -5,7 +5,10 @@
 //! Provides:
 //! - **SymmetricGeneralizedEvd**: For symmetric A and symmetric positive definite B.
 //!   Reduces to standard EVD via Cholesky factorization.
-//! - **GeneralizedEvd**: For general matrices A and B (requires QZ algorithm).
+//! - **GeneralizedEvd**: For general matrices A and B. It does not use the QZ
+//!   algorithm: B is LU-factorized and the eigenproblem of `B⁻¹·A` is solved, so
+//!   B must be nonsingular. For a singular B or for generalized Schur forms use
+//!   [`Qz`](crate::evd::Qz).
 
 use crate::cholesky::Cholesky;
 use oxiblas_core::scalar::{Field, Real, Scalar};
@@ -275,8 +278,14 @@ impl<T: Field + Real + bytemuck::Zeroable> SymmetricGeneralizedEvd<T> {
 ///
 /// Solves A * x = λ * B * x where A and B are general (possibly non-symmetric) matrices.
 ///
-/// Uses the QZ algorithm (generalized Schur decomposition) when available,
-/// otherwise falls back to explicit matrix inverse (less stable).
+/// This is not a QZ decomposition: B is LU-factorized (`Lu::compute(b)`) and the
+/// eigenvalues (with [`compute_with_eigenvectors`](Self::compute_with_eigenvectors),
+/// also the eigenvectors) of `B⁻¹·A` are computed. B must therefore be
+/// nonsingular ([`GeneralizedEvdError::Singular`] otherwise; only
+/// [`compute`](Self::compute) on a 1×1 pencil with `|b| <= epsilon` reports an
+/// infinite eigenvalue instead), and the result can be inaccurate when B is
+/// ill-conditioned. For a singular B, infinite eigenvalues or generalized Schur
+/// forms use [`Qz`](crate::evd::Qz).
 #[derive(Debug, Clone)]
 pub struct GeneralizedEvd<T: Scalar> {
     /// Real parts of eigenvalues.
@@ -297,8 +306,11 @@ pub struct GeneralizedEvd<T: Scalar> {
 impl<T: Field + Real + bytemuck::Zeroable> GeneralizedEvd<T> {
     /// Computes the generalized eigenvalues of A * x = λ * B * x.
     ///
-    /// This is a fallback implementation that inverts B and solves B^(-1) * A.
-    /// For robust computation, use the QZ algorithm.
+    /// Forms B^(-1) * A from an LU factorization of B and computes its
+    /// eigenvalues, so B must be nonsingular ([`GeneralizedEvdError::Singular`]
+    /// otherwise; a 1×1 pencil with `|b| <= epsilon` is reported as an infinite
+    /// eigenvalue instead). For a singular B, or for robust computation, use
+    /// [`Qz`](crate::evd::Qz).
     ///
     /// # Warning
     ///
@@ -389,6 +401,9 @@ impl<T: Field + Real + bytemuck::Zeroable> GeneralizedEvd<T> {
     }
 
     /// Computes generalized eigenvalues and eigenvectors.
+    ///
+    /// Uses the same `B⁻¹·A` reduction as [`compute`](Self::compute), so B must
+    /// be nonsingular here as well; use [`Qz`](crate::evd::Qz) for a singular B.
     pub fn compute_with_eigenvectors(
         a: MatRef<'_, T>,
         b: MatRef<'_, T>,

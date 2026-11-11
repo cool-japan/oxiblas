@@ -15,7 +15,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> GaussSeidel<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or has zero diagonal elements.
+    /// Returns error if matrix is not square or has zero diagonal elements
+    /// ([`PreconditionerError::ZeroDiagonal`] for a missing or exactly zero
+    /// diagonal entry). Only an exact zero is rejected, so `s·A` builds
+    /// whenever `A` does, whatever the scale `s`.
     pub fn new(a: &CsrMatrix<T>) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -33,7 +36,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> GaussSeidel<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let diag_val = a.values()[k].clone();
-                    if Scalar::abs(diag_val) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if diag_val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     found = true;
@@ -141,7 +144,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SOR<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or has zero diagonal elements.
+    /// Returns error if matrix is not square or has zero diagonal elements
+    /// ([`PreconditionerError::ZeroDiagonal`] for a missing or exactly zero
+    /// diagonal entry). Only an exact zero is rejected, so `s·A` builds
+    /// whenever `A` does, whatever the scale `s`.
     pub fn new(a: &CsrMatrix<T>, omega: T) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -159,7 +165,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SOR<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let diag_val = a.values()[k].clone();
-                    if Scalar::abs(diag_val) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if diag_val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     found = true;
@@ -274,7 +280,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SSOR<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or has zero diagonal elements.
+    /// Returns error if matrix is not square or has zero diagonal elements
+    /// ([`PreconditionerError::ZeroDiagonal`] for a missing or exactly zero
+    /// diagonal entry). Only an exact zero is rejected, so `s·A` builds
+    /// whenever `A` does, whatever the scale `s`.
     pub fn new(a: &CsrMatrix<T>, omega: T) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -292,7 +301,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> SSOR<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let diag_val = a.values()[k].clone();
-                    if Scalar::abs(diag_val) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if diag_val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     found = true;

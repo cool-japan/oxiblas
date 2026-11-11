@@ -291,10 +291,14 @@ impl<T: Field + Real + bytemuck::Zeroable> Hessenberg<T> {
     }
 
     /// Reduces a matrix to upper Hessenberg form with specified block size.
+    ///
+    /// A block size of 0 is treated as 1.
     pub fn compute_blocked_with_block_size(
         a: MatRef<'_, T>,
         block_size: usize,
     ) -> Result<Self, HessenbergError> {
+        // A zero-width block would never advance the blocked loop.
+        let block_size = block_size.max(1);
         let m = a.nrows();
         let n = a.ncols();
 
@@ -495,7 +499,7 @@ pub struct HessenbergFactors<T: Scalar> {
     /// - Below subdiagonal: Householder vectors v (with implicit leading 1)
     factors: Mat<T>,
     /// Scalar factors (tau) for Householder reflectors.
-    /// tau[k] corresponds to reflector P_k = I - tau[k] * v_k * v_k^T
+    /// `tau[k]` corresponds to reflector P_k = I - `tau[k]` * v_k * v_k^T
     tau: Vec<T>,
     /// Matrix dimension.
     n: usize,
@@ -1000,8 +1004,8 @@ fn norm<T: Field + Real>(x: &[T]) -> T {
 }
 
 /// Computes LAPACK-style Householder vector.
-/// Returns (v, tau) where v[0] = 1 (implicit), and P = I - tau * v * v^H
-/// transforms x to [beta, 0, ..., 0] with beta = -sign(x[0]) * ||x||.
+/// Returns (v, tau) where `v[0]` = 1 (implicit), and P = I - tau * v * v^H
+/// transforms x to \[beta, 0, ..., 0\] with beta = -sign(`x[0]`) * ||x||.
 fn householder_vector_lapack<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
     let n = x.len();
     if n == 0 {
@@ -1040,7 +1044,7 @@ fn householder_vector_lapack<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
 
 /// Computes a Householder vector for zeroing elements below the first.
 /// Returns (v, tau) such that (I - tau * v * v^T) * x = [-sign(x\[0\]) * ||x||, 0, ..., 0]^T
-/// Uses LAPACK-style formulation with v[0] = 1.
+/// Uses LAPACK-style formulation with `v[0]` = 1.
 fn householder_vector_with_tau<T: Field + Real>(x: &[T]) -> (Vec<T>, T) {
     let n = x.len();
     if n == 0 {

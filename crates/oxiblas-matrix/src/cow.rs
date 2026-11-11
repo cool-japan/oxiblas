@@ -46,6 +46,10 @@ use oxiblas_core::scalar::Scalar;
 use std::sync::Arc;
 
 /// Shared matrix data with reference counting.
+///
+/// `Clone` is what lets [`Arc::make_mut`] perform the copy-on-write step: it
+/// deep-copies the (padded) buffer and the shape metadata.
+#[derive(Clone)]
 struct SharedMatData<T: Scalar> {
     /// Underlying data storage.
     data: AlignedVec<T, DEFAULT_ALIGN>,
@@ -287,26 +291,17 @@ impl<T: Scalar> CowMat<T> {
     /// This is the key COW operation. If the data is shared, it will be cloned
     /// before returning a mutable reference.
     pub fn make_mut(&mut self) -> MatMut<'_, T> {
-        // If we're not unique, we need to clone the data
-        if !self.is_unique() {
-            let cloned = SharedMatData {
-                data: self.inner.data.clone(),
-                nrows: self.inner.nrows,
-                ncols: self.inner.ncols,
-                row_stride: self.inner.row_stride,
-            };
-            self.inner = Arc::new(cloned);
-        }
-
-        // Now we're guaranteed to be unique, get mutable access
-        // Safety: We just ensured we're the only owner
-        let inner = Arc::get_mut(&mut self.inner).expect("Should be unique after clone");
+        // Copy-on-write: `Arc::make_mut` clones the data into a fresh
+        // allocation first if any other `CowMat` still shares it, and
+        // returns a borrow of the now-unique data.
+        let inner = Arc::make_mut(&mut self.inner);
 
         // SAFETY: `inner.data` holds `row_stride * ncols` initialized, aligned
         // elements and `row_stride >= nrows`, so every in-bounds `(i, j)`
         // offset is within the allocation and no two indices alias; the
-        // `Arc::get_mut` above proves this handle is unique, and `&mut self`
-        // keeps it alive and exclusive for the view's lifetime.
+        // `&mut` returned by `Arc::make_mut` above proves this handle is
+        // unique, and `&mut self` keeps it alive and exclusive for the view's
+        // lifetime.
         unsafe {
             MatMut::new(
                 inner.data.as_mut_ptr(),
@@ -364,18 +359,9 @@ impl<T: Scalar> IndexMut<(usize, usize)> for CowMat<T> {
             "Index out of bounds"
         );
 
-        // Ensure we have unique ownership
-        if !self.is_unique() {
-            let cloned = SharedMatData {
-                data: self.inner.data.clone(),
-                nrows: self.inner.nrows,
-                ncols: self.inner.ncols,
-                row_stride: self.inner.row_stride,
-            };
-            self.inner = Arc::new(cloned);
-        }
-
-        let inner = Arc::get_mut(&mut self.inner).expect("Should be unique");
+        // Copy-on-write: clone the data first if it is shared, then borrow
+        // the now-unique data mutably.
+        let inner = Arc::make_mut(&mut self.inner);
         let idx = row + col * inner.row_stride;
         &mut inner.data[idx]
     }
@@ -535,6 +521,13 @@ mod tests {
         // get copied. Reading the sentinel back proves the exact same
         // memory (padding included) survived the move untouched.
         if row_stride > nrows {
+            // SAFETY: `from_rows` allocated a zero-initialized buffer of
+            // `row_stride * ncols` (here `row_stride * 3`) elements, the loop
+            // above wrote `-1.0` into `raw_data_mut()[nrows..row_stride]`, and
+            // `from_mat` moved that same buffer into `cow` (pointer equality
+            // is asserted above). This branch runs only when
+            // `nrows < row_stride`, so offset `nrows` is an initialized
+            // padding element inside the buffer, which `cow` keeps alive.
             let padding_val = unsafe { *cow.as_ptr().add(nrows) };
             assert_eq!(padding_val, -1.0);
         }
@@ -620,5 +613,50 @@ mod tests {
 
         assert_eq!(a[(0, 0)], 0.0);
         assert_eq!(b[(0, 0)], 10.0);
+    }
+
+    // --- Regression: copy-on-write via `Arc::make_mut` (no `expect`) --------
+
+    #[test]
+    fn test_cow_make_mut_unique_keeps_buffer() {
+        let mut a: CowMat<f64> = CowMat::filled(5, 3, 1.0);
+        let ptr_before = a.as_ptr();
+        {
+            let mut view = a.make_mut();
+            view[(4, 2)] = 7.0;
+        }
+        assert_eq!(a.as_ptr(), ptr_before, "unique make_mut must not copy");
+        assert_eq!(a.ref_count(), 1);
+        assert_eq!(a[(4, 2)], 7.0);
+    }
+
+    #[test]
+    fn test_cow_make_mut_shared_copies_padded_layout() {
+        // 5 rows of f64 are padded to a larger row stride, so the copy must
+        // carry the stride along with the data.
+        let rows: [&[f64]; 5] = [
+            &[1.0, 2.0, 3.0],
+            &[4.0, 5.0, 6.0],
+            &[7.0, 8.0, 9.0],
+            &[10.0, 11.0, 12.0],
+            &[13.0, 14.0, 15.0],
+        ];
+        let a: CowMat<f64> = CowMat::from_rows(&rows);
+        let mut b = a.clone();
+        assert_eq!(a.ref_count(), 2);
+        {
+            let mut view = b.make_mut();
+            view[(4, 0)] = -1.0;
+        }
+        assert_ne!(a.as_ptr(), b.as_ptr());
+        assert_eq!((a.ref_count(), b.ref_count()), (1, 1));
+        assert_eq!(b.row_stride(), a.row_stride());
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                assert_eq!(a[(i, j)], value);
+                let expected = if (i, j) == (4, 0) { -1.0 } else { value };
+                assert_eq!(b[(i, j)], expected);
+            }
+        }
     }
 }

@@ -43,24 +43,15 @@ deny = [
     { crate = "z3-sys", reason = "use oxiz instead (COOLJAPAN policy)" },
 
     # --- OpenBLAS family: OxiBLAS *is* the sanctioned pure-Rust replacement ---
-    # These crates are unreachable under `[graph] all-features = false`
-    # (this file's setting, matching plain `cargo build`/`cargo test`): they
-    # only enter Cargo.lock through oxiblas-benchmarks' opt-in, non-default
-    # `compare-openblas` feature (that crate is `publish = false` and exists
-    # solely to benchmark OxiBLAS against a system OpenBLAS install; see its
-    # Cargo.toml). No publishable crate's default or non-default feature set
-    # reaches them, so a plain (unwrapped) ban is correct here: it costs
-    # nothing today and still catches any *future* change that makes one of
-    # these reachable outside that one documented, opt-in path. If this file
-    # is ever switched to `all-features = true` for a deeper audit, add
-    # `wrappers = ["oxiblas-benchmarks"]` (or `["openblas-src"]` for
-    # `openblas-build`, `["ndarray-linalg"]` for `lapack-sys`) back to scope
-    # the exception, matching how `oxiblas-benchmarks/Cargo.toml` documents
-    # the same boundary.
-    { crate = "openblas-src", reason = "opt-in benchmark comparison only; use oxiblas as the production BLAS" },
-    { crate = "openblas-build", reason = "transitive build helper for openblas-src's opt-in comparison path only" },
-    { crate = "blas-src", reason = "opt-in benchmark comparison only; use oxiblas as the production BLAS" },
-    { crate = "cblas-sys", reason = "opt-in benchmark comparison only; use oxiblas-blas's cblas module in production" },
-    { crate = "lapack-sys", reason = "transitive dep of ndarray-linalg's opt-in benchmark comparison path only" },
-    { crate = "ndarray-linalg", reason = "opt-in benchmark comparison only; use oxiblas-lapack in production" },
+    # Nothing in this workspace depends on these crates. The opt-in
+    # `compare-openblas` feature of oxiblas-benchmarks (`publish = false`) loads
+    # a system OpenBLAS at run time with dlopen and links no BLAS crate: a
+    # linked BLAS would lose its `cblas_*` symbols to the ones oxiblas-blas
+    # exports. The bans catch any change that brings one of them back.
+    { crate = "openblas-src", reason = "use oxiblas as the BLAS" },
+    { crate = "openblas-build", reason = "build helper of openblas-src; use oxiblas as the BLAS" },
+    { crate = "blas-src", reason = "use oxiblas as the BLAS" },
+    { crate = "cblas-sys", reason = "use oxiblas-blas's cblas module" },
+    { crate = "lapack-sys", reason = "transitive dep of ndarray-linalg; use oxiblas-lapack" },
+    { crate = "ndarray-linalg", reason = "use oxiblas-lapack" },
 ]

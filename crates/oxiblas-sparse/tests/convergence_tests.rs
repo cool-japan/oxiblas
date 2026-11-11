@@ -300,6 +300,29 @@ fn test_pcg_jacobi_speedup() {
     );
 }
 
+#[test]
+fn test_reexport_pcg_from_linalg_and_prelude() {
+    // `pcg` must be reachable like every other solver: from `linalg` and from
+    // `linalg::prelude`, not only from `linalg::iterative`.
+    use oxiblas_sparse::linalg::pcg as linalg_pcg;
+    use oxiblas_sparse::linalg::prelude::pcg as prelude_pcg;
+
+    let a = make_poisson_1d(20);
+    let b = vec![1.0; 20];
+    let x0 = vec![0.0; 20];
+    let identity = |r: &[f64]| -> Vec<f64> { r.to_vec() };
+
+    let direct = pcg(&a, &b, &x0, identity, 1e-10, 100).unwrap();
+    let via_linalg = linalg_pcg(&a, &b, &x0, identity, 1e-10, 100).unwrap();
+    let via_prelude = prelude_pcg(&a, &b, &x0, identity, 1e-10, 100).unwrap();
+
+    assert!(direct.converged);
+    assert_eq!(direct.iterations, via_linalg.iterations);
+    assert_eq!(direct.iterations, via_prelude.iterations);
+    assert_eq!(direct.x, via_linalg.x);
+    assert_eq!(direct.x, via_prelude.x);
+}
+
 // =============================================================================
 // BiCGStab Convergence Tests
 // =============================================================================

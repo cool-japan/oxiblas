@@ -80,7 +80,7 @@ pub struct Balance<T: Scalar> {
     /// The balanced matrix.
     balanced: Mat<T>,
     /// Permutation information: row/column i of the balanced matrix
-    /// corresponds to row/column perm[i] of the original matrix.
+    /// corresponds to row/column `perm[i]` of the original matrix.
     perm: Vec<usize>,
     /// Scaling factors: D = diag(scale).
     scale: Vec<T>,

@@ -129,7 +129,8 @@ impl<T: Field> Tensor3<T> {
 ///
 /// # Errors
 ///
-/// Returns `TensorError::DimensionMismatch` if inner dimensions don't match.
+/// Returns `TensorError::DimensionMismatch` if inner dimensions don't match,
+/// or if `a` holds fewer than `m * n` or `b` fewer than `n * k` elements.
 pub fn contract_2d<T: Field + GemmKernel + bytemuck::Zeroable>(
     a: &[T],
     a_dims: (usize, usize),
@@ -140,6 +141,13 @@ pub fn contract_2d<T: Field + GemmKernel + bytemuck::Zeroable>(
     let (n2, k) = b_dims;
 
     if n != n2 {
+        return Err(TensorError::DimensionMismatch);
+    }
+    // Both paths below read `m * n` elements of `a` and `n * k` of `b`.
+    let holds = |len: usize, rows: usize, cols: usize| {
+        rows.checked_mul(cols).is_some_and(|need| len >= need)
+    };
+    if !holds(a.len(), m, n) || !holds(b.len(), n, k) {
         return Err(TensorError::DimensionMismatch);
     }
 
@@ -157,10 +165,13 @@ pub fn contract_2d<T: Field + GemmKernel + bytemuck::Zeroable>(
         // So gemm(B^T, A^T) -> C^T gives us C in row-major!
 
         // Create views: B^T (k×n) and A^T (n×m)
-        // SAFETY: `b`/`a` are slices of exactly the required length for these
-        // dimensions (checked by the caller's shape validation above), and the
-        // views do not outlive them.
+        // SAFETY: `b.len() >= n * k` was checked at the top, so every offset
+        // `i + j * k` with `i < k`, `j < n` is inside `b`; the view does not
+        // outlive it.
         let b_t = unsafe { MatRef::new(b.as_ptr(), k, n, k) };
+        // SAFETY: `a.len() >= m * n` was checked at the top, so every offset
+        // `i + j * n` with `i < n`, `j < m` is inside `a`; the view does not
+        // outlive it.
         let a_t = unsafe { MatRef::new(a.as_ptr(), n, m, n) };
 
         // Result: C^T (k×m)
@@ -300,6 +311,12 @@ pub fn batched_matmul<T: Field + GemmKernel + bytemuck::Zeroable>(
             // within `b`/`a`'s allocation (each batch slot is exactly n*k / k*m
             // elements), and the resulting views do not outlive the tensors.
             let b_t = unsafe { MatRef::new(b.data().as_ptr().add(b_offset), n, k, n) };
+            // SAFETY: a `Tensor3` always holds `dim0 * dim1 * dim2` elements
+            // (`zeros` allocates them and `from_data` asserts the length), so
+            // `a` holds `batch_a * m * k` and the batch slot starting at
+            // `a_offset = b_idx * m * k` holds the `k * m` elements a `k x m`
+            // view with leading dimension `k` addresses; the view does not
+            // outlive `a`.
             let a_t = unsafe { MatRef::new(a.data().as_ptr().add(a_offset), k, m, k) };
 
             // Result: C^T (n×m)
@@ -1103,6 +1120,37 @@ mod tests {
         assert_eq!(c[1], 8.0); // 2+6
         assert_eq!(c[2], 10.0); // 3+7
         assert_eq!(c[3], 12.0); // 4+8
+    }
+
+    #[test]
+    fn test_contract_2d_rejects_short_slices() {
+        // The GEMM path (a dimension >= 32) used to build views over `m * n`
+        // and `n * k` elements without checking the slices, reading past them;
+        // the small path panicked on an out-of-bounds index. Both now report
+        // a dimension mismatch.
+        let (m, n, k) = (40usize, 33usize, 35usize);
+        let a = vec![1.0f64; m * n];
+        let b = vec![1.0f64; n * k];
+        assert_eq!(
+            contract_2d(&a[..m * n - 1], (m, n), &b, (n, k)),
+            Err(TensorError::DimensionMismatch)
+        );
+        assert_eq!(
+            contract_2d(&a, (m, n), &b[..n * k - 1], (n, k)),
+            Err(TensorError::DimensionMismatch)
+        );
+        assert_eq!(
+            contract_2d(&[1.0f64; 3], (2, 2), &[1.0f64; 4], (2, 2)),
+            Err(TensorError::DimensionMismatch)
+        );
+        assert_eq!(
+            contract_2d(&a, (usize::MAX, 2), &b, (2, 1)),
+            Err(TensorError::DimensionMismatch)
+        );
+        // Exact (and longer) slices still work.
+        let c = contract_2d(&a, (m, n), &b, (n, k)).unwrap();
+        assert_eq!(c.len(), m * k);
+        assert!(c.iter().all(|&x| x == n as f64));
     }
 
     #[test]

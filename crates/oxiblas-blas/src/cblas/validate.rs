@@ -15,10 +15,11 @@
 //!   column runs past the end of the allocation.
 //!
 //! Reference BLAS handles both by calling `xerbla` and returning without
-//! touching the operands. These helpers reproduce that contract: they return
-//! `false` and the caller **no-ops** (value-returning routines return zero).
-//! Panicking is not an option — unwinding across an `extern "C"` boundary is
-//! undefined behavior.
+//! touching the operands. These helpers reproduce the returning half of that
+//! contract (validate-then-return): they return `false` and the caller
+//! **no-ops**, without calling `cblas_xerbla` (value-returning routines return
+//! zero). Panicking is not an option — a panic that reaches an `extern "C"`
+//! boundary aborts the process (since Rust 1.81).
 //!
 //! Null-pointer checks live at the call sites (`is_null()`), because which
 //! pointers a routine dereferences varies per routine.
@@ -187,16 +188,37 @@ pub(super) fn square_lda_valid(n: i32, lda: i32) -> bool {
     lda >= n.max(1)
 }
 
-/// Validates a BLAS-1 vector increment.
+/// Validates a vector increment of a **Level-2** routine (GEMV, HEMV, SYR,
+/// TRMV, …).
 ///
-/// The reference contract allows a negative increment (the vector is traversed
-/// back-to-front) but **not** zero: `inc == 0` makes every logical element
-/// alias element 0, which is meaningless for the mutating routines and is
-/// rejected by reference BLAS. `n <= 0` is handled separately by the callers,
-/// which return the identity result.
+/// The reference Level-2 routines allow a negative increment (the vector is
+/// traversed back-to-front) but **not** zero: they call `xerbla` for
+/// `incx == 0` / `incy == 0`, and the callers no-op to match.
+///
+/// Do **not** use this for Level-1 routines: Netlib 3.12 Level-1 BLAS accepts
+/// `inc == 0` (DOT/AXPY/COPY/SWAP/ROT/ROTM and NRM2 simply re-use element 0
+/// on every iteration, e.g. LAPACK's `dcopy(n, zero, 0, x, 1)` broadcast),
+/// while SCAL/ASUM/IAMAX treat every `inc <= 0` as a quick return.
+/// `n <= 0` is handled separately by the callers, which return the identity
+/// result.
 #[inline]
 pub(super) fn inc_valid(inc: i32) -> bool {
     inc != 0
+}
+
+/// Validates the band shape of a banded Level-2 routine: GBMV passes its `kl`
+/// sub- and `ku` super-diagonal counts, SBMV / HBMV / TBMV / TBSV pass `k`
+/// and `0`.
+///
+/// Reference BLAS rejects a negative band count and `lda < kl + ku + 1` (band
+/// storage needs one row per stored diagonal) with `xerbla`. Reference CBLAS
+/// forwards `lda` unchanged for both layouts — row-major band storage is the
+/// column-major band storage of `A^T`, which has the same number of
+/// diagonals — so the same bound applies to `RowMajor`. The sum is formed in
+/// `i64` so band counts near `i32::MAX` cannot overflow.
+#[inline]
+pub(super) fn band_lda_valid(kl: i32, ku: i32, lda: i32) -> bool {
+    kl >= 0 && ku >= 0 && i64::from(lda) > i64::from(kl) + i64::from(ku)
 }
 
 #[cfg(test)]
@@ -352,5 +374,23 @@ mod tests {
         assert!(square_lda_valid(0, 1));
         assert!(inc_valid(-1));
         assert!(!inc_valid(0));
+    }
+
+    #[test]
+    fn test_issue_14_band_lda_valid() {
+        // lda must hold one row per stored diagonal: kl + ku + 1.
+        assert!(band_lda_valid(1, 2, 4));
+        assert!(band_lda_valid(0, 0, 1));
+        assert!(band_lda_valid(3, 0, 10));
+        assert!(!band_lda_valid(1, 2, 3));
+        assert!(!band_lda_valid(0, 0, 0));
+        // Negative band counts or leading dimensions are rejected.
+        assert!(!band_lda_valid(-1, 2, 10));
+        assert!(!band_lda_valid(1, -1, 10));
+        assert!(!band_lda_valid(1, 1, -3));
+        // kl + ku + 1 near i32::MAX must not overflow into acceptance.
+        assert!(!band_lda_valid(i32::MAX, i32::MAX, i32::MAX));
+        assert!(!band_lda_valid(i32::MAX, 0, i32::MAX));
+        assert!(band_lda_valid(i32::MAX - 1, 0, i32::MAX));
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Performs the Hermitian rank-1 update: A = alpha * x * x^H + A
 //! where A is a Hermitian matrix stored in packed format.
-//! Note: alpha must be real for the result to remain Hermitian.
+//! `alpha` is typed `T::Real`, so the update keeps A Hermitian.
 //!
 //! # Packed Storage Format
 //!
@@ -21,6 +21,7 @@
 //! Index: ap[i + (2*n - j - 1)*j/2] = a(i,j) for i >= j
 //! ```
 
+use super::her::real_alpha_conj;
 use num_traits::Zero;
 use oxiblas_core::scalar::Field;
 
@@ -74,14 +75,24 @@ fn lower_packed_index(i: usize, j: usize, n: usize) -> usize {
 /// Only the specified triangle (upper or lower) is stored and updated.
 /// For a Hermitian matrix, A\[i,j\] = conj(A\[j,i\]) and diagonal is real.
 ///
-/// Note: alpha should be real for the result to remain Hermitian.
-/// The function uses the real part of alpha for the diagonal update.
+/// This is the packed twin of [`her`](crate::level2::her()) and gives the same
+/// results as `her` on the same data (bitwise for NaN-free input; with NaN input
+/// the NaN sign/payload may differ). As in reference BLAS `?hpr`, the imaginary
+/// part of every diagonal element is *set to zero* by the update
+/// (`A[j,j] = real(A[j,j]) + real(temp * x[j])` with `temp = alpha * conj(x[j])`,
+/// formed exactly as in `her`), and a column with `x[j] == 0` is skipped entirely
+/// (only `A[j,j] = real(A[j,j])` is applied), so an infinite or NaN `x[i]` cannot
+/// reach it. If `n == 0` or `alpha == 0` the packed array is left completely
+/// untouched (including an imaginary diagonal).
+///
+/// `alpha` is typed `T::Real`, so the update keeps A Hermitian; the Hermitian
+/// update with a complex scalar is the rank-2 update [`hpr2`](crate::level2::hpr2()).
 ///
 /// # Arguments
 ///
 /// * `uplo` - Specifies whether the upper or lower triangle is stored
 /// * `n` - Order of the Hermitian matrix A
-/// * `alpha` - The real scalar alpha (real part of T used for diagonal)
+/// * `alpha` - The real scalar alpha
 /// * `x` - The vector x of length n
 /// * `ap` - The packed Hermitian matrix (n*(n+1)/2 elements)
 ///
@@ -134,35 +145,50 @@ pub fn hpr<T: Field>(
         return Ok(());
     }
 
+    // The loops mirror `her` operation for operation, so packed and dense storage
+    // give the same results (bitwise for NaN-free input; with NaN input the NaN
+    // sign/payload may differ).
     match uplo {
         HprUplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * x[i] * conj(x[j]) for i <= j
             for j in 0..n {
-                let x_j_conj = x[j].conj();
-                let alpha_xj_conj = T::from_real(alpha) * x_j_conj;
+                let kjj = upper_packed_index(j, j);
+                // Reference ?HPR skips the column update when x(j) == 0 (so an
+                // infinite or NaN x(i) cannot reach it as `x(i) * conj(0)`) and only
+                // drops the imaginary part of the diagonal.
+                if x[j] == T::zero() {
+                    ap[kjj] = T::from_real(ap[kjj].real());
+                    continue;
+                }
+                let alpha_xj_conj = real_alpha_conj(alpha, x[j]);
 
                 for i in 0..j {
                     let kij = upper_packed_index(i, j);
                     ap[kij] += alpha_xj_conj * x[i];
                 }
 
-                // Diagonal: A[j,j] += alpha * x[j] * conj(x[j]) = alpha * |x[j]|^2
-                // Result must be real
-                let kjj = upper_packed_index(j, j);
-                let norm_sq = x[j].abs_sq();
-                ap[kjj] = T::from_real(ap[kjj].real() + alpha * norm_sq);
+                // Diagonal: A[j,j] = real(A[j,j]) + real(alpha * conj(x[j]) * x[j]).
+                // Like reference ?HPR the stored imaginary part is dropped, so the
+                // diagonal is exactly real afterwards.
+                let val = alpha_xj_conj * x[j];
+                ap[kjj] = T::from_real(ap[kjj].real() + val.real());
             }
         }
         HprUplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * x[i] * conj(x[j]) for i >= j
             for j in 0..n {
-                let x_j_conj = x[j].conj();
-                let alpha_xj_conj = T::from_real(alpha) * x_j_conj;
-
-                // Diagonal: A[j,j] += alpha * |x[j]|^2 (must be real)
                 let kjj = lower_packed_index(j, j, n);
-                let norm_sq = x[j].abs_sq();
-                ap[kjj] = T::from_real(ap[kjj].real() + alpha * norm_sq);
+                // Column skip for x(j) == 0, as in the upper branch.
+                if x[j] == T::zero() {
+                    ap[kjj] = T::from_real(ap[kjj].real());
+                    continue;
+                }
+                let alpha_xj_conj = real_alpha_conj(alpha, x[j]);
+
+                // Diagonal: real(A[j,j]) + real(update); stored imaginary part
+                // dropped, as in reference ?HPR.
+                let val = alpha_xj_conj * x[j];
+                ap[kjj] = T::from_real(ap[kjj].real() + val.real());
 
                 for i in (j + 1)..n {
                     let kij = lower_packed_index(i, j, n);
@@ -203,6 +229,7 @@ pub fn hpr_new<T: Field>(uplo: HprUplo, alpha: T::Real, x: &[T]) -> Vec<T> {
 mod tests {
     use super::*;
     use num_complex::Complex64;
+    use oxiblas_matrix::Mat;
 
     fn c(re: f64, im: f64) -> Complex64 {
         Complex64::new(re, im)
@@ -418,5 +445,190 @@ mod tests {
         assert!(approx_eq_c(ap[4], c(1.0, 1.0)));
         assert!(approx_eq(ap[5].re, 2.0));
         assert!(approx_eq(ap[5].im, 0.0));
+    }
+
+    fn bits(z: Complex64) -> (u64, u64) {
+        (z.re.to_bits(), z.im.to_bits())
+    }
+
+    fn finite(z: Complex64) -> bool {
+        z.re.is_finite() && z.im.is_finite()
+    }
+
+    /// Issue #14: reference ?HPR skips column `j` when `x(j) == 0` and only sets
+    /// `AP(jj) = real(AP(jj))`, so an infinite `x(i)` cannot reach the column as
+    /// `x(i) * conj(0) = NaN`.
+    #[test]
+    fn test_issue_14_hpr_zero_column_skip() {
+        let inf = f64::INFINITY;
+
+        // Lower packed [A00, A10, A20, A11, A21, A22] with an imaginary diagonal:
+        // column 0 (x0 == 0) holds row 1, where x1 is infinite.
+        let ap0 = [
+            c(1.0, 0.5),
+            c(0.2, 0.1),
+            c(0.3, -0.2),
+            c(2.0, 0.7),
+            c(0.4, 0.6),
+            c(3.0, -0.8),
+        ];
+        let mut ap = ap0;
+        let x = [c(0.0, -0.0), c(inf, 0.0), c(1.0, 0.5)];
+        hpr(HprUplo::Lower, 3, 1.5, &x, &mut ap).unwrap();
+        assert_eq!(bits(ap[1]), bits(ap0[1]));
+        assert_eq!(bits(ap[2]), bits(ap0[2]));
+        assert_eq!(bits(ap[0]), bits(c(1.0, 0.0)));
+        // Column 1 is updated with temp = 1.5 * conj(Inf).
+        assert!(!finite(ap[3]) && !finite(ap[4]));
+
+        // Upper packed [A00, A01, A11, A02, A12, A22] with an imaginary diagonal:
+        // column 2 (x2 == 0) holds row 1, where x1 is infinite.
+        let ap0 = [
+            c(1.0, 0.5),
+            c(0.2, 0.1),
+            c(2.0, 0.7),
+            c(0.3, -0.2),
+            c(0.4, 0.6),
+            c(3.0, -0.8),
+        ];
+        let mut ap = ap0;
+        let x = [c(1.0, 0.5), c(inf, 0.0), c(-0.0, 0.0)];
+        hpr(HprUplo::Upper, 3, 1.5, &x, &mut ap).unwrap();
+        assert_eq!(bits(ap[3]), bits(ap0[3]));
+        assert_eq!(bits(ap[4]), bits(ap0[4]));
+        assert_eq!(bits(ap[5]), bits(c(3.0, 0.0)));
+        assert!(!finite(ap[1]) && !finite(ap[2]));
+    }
+
+    /// Dense `n x n` Hermitian test matrix whose diagonal carries an imaginary part
+    /// the update must drop, and its packed `uplo` triangle.
+    fn hermitian_pair(uplo: HprUplo, n: usize) -> (Mat<Complex64>, Vec<Complex64>) {
+        let mut a: Mat<Complex64> = Mat::filled(n, n, c(f64::NAN, f64::NAN));
+        let mut ap = vec![c(0.0, 0.0); n * (n + 1) / 2];
+        for j in 0..n {
+            for i in 0..n {
+                let stored = match uplo {
+                    HprUplo::Upper => i <= j,
+                    HprUplo::Lower => i >= j,
+                };
+                if !stored {
+                    continue;
+                }
+                let v = c(
+                    0.25 * (i + 1) as f64 - 0.5 * j as f64,
+                    0.125 * (i + 2 * j) as f64 + 0.0625,
+                );
+                a[(i, j)] = v;
+                let k = match uplo {
+                    HprUplo::Upper => upper_packed_index(i, j),
+                    HprUplo::Lower => lower_packed_index(i, j, n),
+                };
+                ap[k] = v;
+            }
+        }
+        (a, ap)
+    }
+
+    /// Issue #13: reference ?HPR forms `TEMP = ALPHA*DCONJG(X(J))` as the complex
+    /// product `(alpha, 0) * conj(x(j))`, exactly like ?HER, so an infinite `x(j)`
+    /// gives the diagonal `(NaN, +0)` in `hpr` as in `her`, and the two agree
+    /// bitwise on every stored element (the input holds no NaN). The expected
+    /// values follow zhpr.f; NaN bit patterns are only compared between the twins,
+    /// never against a literal.
+    #[test]
+    fn test_issue_13_her_hpr_infinite_x_diagonal_matches_reference() {
+        use crate::level2::{HerUplo, her};
+        let inf = f64::INFINITY;
+        for alpha in [0.5, -2.0] {
+            for xj in [c(inf, 0.0), c(0.0, inf), c(-inf, 1.0)] {
+                for (uplo, her_uplo) in [
+                    (HprUplo::Lower, HerUplo::Lower),
+                    (HprUplo::Upper, HerUplo::Upper),
+                ] {
+                    let x = [c(0.0, 0.0), xj];
+                    let (mut a, mut ap) = hermitian_pair(uplo, 2);
+                    // Packed indices of A00, A11 and the stored off-diagonal element.
+                    let (k00, k11, koff, off) = match uplo {
+                        HprUplo::Upper => (
+                            upper_packed_index(0, 0),
+                            upper_packed_index(1, 1),
+                            upper_packed_index(0, 1),
+                            (0, 1),
+                        ),
+                        HprUplo::Lower => (
+                            lower_packed_index(0, 0, 2),
+                            lower_packed_index(1, 1, 2),
+                            lower_packed_index(1, 0, 2),
+                            (1, 0),
+                        ),
+                    };
+                    let (a00, aoff) = (ap[k00], ap[koff]);
+                    hpr(uplo, 2, alpha, &x, &mut ap).unwrap();
+                    her(her_uplo, alpha, &x, a.as_mut()).unwrap();
+                    let what = format!("{uplo:?} alpha={alpha} x1={xj}");
+                    // A11 = real(A11) + real(x1 * temp), where temp holds a NaN part.
+                    assert!(ap[k11].re.is_nan(), "{what}");
+                    assert_eq!(ap[k11].im.to_bits(), 0.0f64.to_bits(), "{what}");
+                    // Column 0 (x0 == 0) is skipped: A00 = real(A00).
+                    assert_eq!(bits(ap[k00]), bits(c(a00.re, 0.0)), "{what}");
+                    match uplo {
+                        // A01 += x0 * temp: 0 times a NaN and an infinite part.
+                        HprUplo::Upper => {
+                            assert!(ap[koff].re.is_nan() && ap[koff].im.is_nan(), "{what}");
+                        }
+                        // Column 0 is skipped and column 1 has no subdiagonal.
+                        HprUplo::Lower => assert_eq!(bits(ap[koff]), bits(aoff), "{what}"),
+                    }
+                    // `her` gives the same bits on every stored element.
+                    for (k, (i, j)) in [(k00, (0, 0)), (k11, (1, 1)), (koff, off)] {
+                        assert_eq!(bits(ap[k]), bits(a[(i, j)]), "her {what} ({i},{j})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #13 / #14: `hpr` is the packed twin of `her` (same column skip, same
+    /// temp, same diagonal expression), so both give bitwise identical results on
+    /// this NaN-free data, NaN generated from Inf included.
+    #[test]
+    fn test_issue_14_hpr_matches_her_bitwise() {
+        use crate::level2::{HerUplo, her};
+        let inf = f64::INFINITY;
+        let xs = [
+            [c(0.0, 0.0), c(inf, 0.0), c(1.0, -2.0), c(-0.0, 0.0)],
+            [c(0.3, 0.7), c(-1.1, 0.2), c(0.0, inf), c(2.5, -0.5)],
+            [c(0.1, -0.2), c(0.3, 0.4), c(-0.5, 0.6), c(0.7, 0.8)],
+        ];
+        let n = 4;
+        for (uplo, her_uplo) in [
+            (HprUplo::Lower, HerUplo::Lower),
+            (HprUplo::Upper, HerUplo::Upper),
+        ] {
+            for x in &xs {
+                for alpha in [0.75, -1.25] {
+                    let (mut a, mut ap) = hermitian_pair(uplo, n);
+                    hpr(uplo, n, alpha, x, &mut ap).unwrap();
+                    her(her_uplo, alpha, x, a.as_mut()).unwrap();
+                    for j in 0..n {
+                        let rows = match uplo {
+                            HprUplo::Upper => 0..j + 1,
+                            HprUplo::Lower => j..n,
+                        };
+                        for i in rows {
+                            let k = match uplo {
+                                HprUplo::Upper => upper_packed_index(i, j),
+                                HprUplo::Lower => lower_packed_index(i, j, n),
+                            };
+                            assert_eq!(
+                                bits(ap[k]),
+                                bits(a[(i, j)]),
+                                "{uplo:?} alpha={alpha} x={x:?} ({i},{j})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

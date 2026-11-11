@@ -38,7 +38,10 @@ impl std::error::Error for SyrError {}
 /// Performs the symmetric rank-1 update: A = alpha * x * x^T + A
 ///
 /// Only the specified triangle (upper or lower) of A is accessed and modified.
-/// The other triangle is not referenced.
+/// The other triangle is not referenced. As in reference BLAS `?syr`, column `j`
+/// is updated as `A[i,j] += x[i] * (alpha * x[j])`, and a column with
+/// `x[j] == 0` is skipped entirely, so an infinite or NaN `x[i]` cannot reach it
+/// as `x[i] * 0`. If `n == 0` or `alpha == 0` the matrix is left untouched.
 ///
 /// # Arguments
 ///
@@ -92,8 +95,15 @@ pub fn syr<T: Real>(uplo: SyrUplo, alpha: T, x: &[T], a: MatMut<'_, T>) -> Resul
         SyrUplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * x[i] * x[j] for i >= j
             for j in 0..n {
+                // Reference ?SYR skips the column when x(j) == 0, so an infinite
+                // or NaN x(i) cannot reach it as `x(i) * (alpha * 0)`.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in j..n {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i, j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         *ptr += alpha_xj * x[i];
@@ -104,8 +114,14 @@ pub fn syr<T: Real>(uplo: SyrUplo, alpha: T, x: &[T], a: MatMut<'_, T>) -> Resul
         SyrUplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * x[i] * x[j] for i <= j
             for j in 0..n {
+                // Column skip for x(j) == 0, as in the lower branch.
+                if x[j] == T::zero() {
+                    continue;
+                }
                 let alpha_xj = alpha * x[j];
                 for i in 0..=j {
+                    // SAFETY: `a` is an exclusive `MatMut` view and `i <= j < n`, so
+                    // `a_ptr.add(i + j * rs)` is an in-bounds element of that view.
                     unsafe {
                         let ptr = a_ptr.add(i + j * rs).cast_mut();
                         *ptr += alpha_xj * x[i];
@@ -120,7 +136,18 @@ pub fn syr<T: Real>(uplo: SyrUplo, alpha: T, x: &[T], a: MatMut<'_, T>) -> Resul
 
 /// Performs the symmetric rank-1 update on a freshly allocated matrix.
 ///
-/// Returns A + alpha * x * x^T where the result is fully symmetric.
+/// Returns alpha * x * x^T as a fully symmetric matrix.
+///
+/// The lower triangle is computed by [`syr`] with [`SyrUplo::Lower`] on a zero
+/// matrix, so it has the reference `?syr` semantics (`A[i,j] = 0 + x[i] *
+/// (alpha * x[j])`), and the strictly upper triangle mirrors it,
+/// `A[j,i] = A[i,j]`. In particular:
+///
+/// * A column with `x[j] == 0` is skipped and stays zero, so an infinite or NaN
+///   `x[i]` cannot reach it. Like the reference this is order dependent:
+///   `x = [0, Inf]` gives `A[1,0] = A[0,1] = 0`, but `x = [Inf, 0]` gives
+///   `A[1,0] = 0 * (alpha * Inf) = NaN`, mirrored into `A[0,1]`.
+/// * Every entry is accumulated onto `+0`, so a `-0` product is stored as `+0`.
 ///
 /// # Arguments
 ///
@@ -138,12 +165,21 @@ pub fn syr_new<T: Real + bytemuck::Zeroable>(alpha: T, x: &[T]) -> oxiblas_matri
         return a;
     }
 
-    // Create full symmetric matrix
-    for i in 0..n {
-        for j in 0..=i {
-            let val = alpha * x[i] * x[j];
-            a[(i, j)] = val;
-            a[(j, i)] = val;
+    // `a` is `n x n` and `x.len() == n`, so `syr` cannot fail. Should a future
+    // dimension bug make it fail anyway, debug builds stop at the assertion;
+    // release builds return the zero matrix (`syr` reports its errors before
+    // writing) instead of panicking.
+    let updated = syr(SyrUplo::Lower, alpha, x, a.as_mut());
+    debug_assert!(
+        updated.is_ok(),
+        "syr_new: syr rejected an {n} x {n} matrix with x.len() == {n}: {updated:?}"
+    );
+    if updated.is_ok() {
+        // Mirror the strictly lower triangle into the upper one.
+        for j in 0..n {
+            for i in (j + 1)..n {
+                a[(j, i)] = a[(i, j)];
+            }
         }
     }
 
@@ -316,5 +352,96 @@ mod tests {
         assert!((a[(0, 0)] + 1.0).abs() < 1e-10); // -1*1
         assert!((a[(1, 0)] + 2.0).abs() < 1e-10); // -2*1
         assert!((a[(1, 1)] + 4.0).abs() < 1e-10); // -2*2
+    }
+
+    /// Issue #14: reference ?SYR skips column `j` when `x(j) == 0`, so an infinite
+    /// `x(i)` cannot reach it as `x(i) * (alpha * 0) = NaN`.
+    #[test]
+    fn test_issue_14_syr_zero_column_skip() {
+        let inf = f64::INFINITY;
+
+        // Lower: column 0 (x0 == 0) holds row 1, where x1 is infinite.
+        let x = [0.0, inf, 2.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 9.0, 9.0], &[0.5, 2.0, 9.0], &[0.25, 0.75, 3.0]]);
+        let before = a.clone();
+        syr(SyrUplo::Lower, 1.5, &x, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 0)].to_bits(),
+                before[(i, 0)].to_bits(),
+                "Lower ({i},0)"
+            );
+        }
+        // Column 1: temp = 1.5 * Inf, so A11 and A21 become Inf.
+        assert_eq!(a[(1, 1)], inf);
+        assert_eq!(a[(2, 1)], inf);
+        assert_eq!(a[(2, 2)], 3.0 + (1.5 * 2.0) * 2.0);
+        assert_eq!((a[(0, 1)], a[(0, 2)], a[(1, 2)]), (9.0, 9.0, 9.0));
+
+        // Upper: column 2 (x2 == -0) holds row 1, where x1 is infinite.
+        let x = [2.0, inf, -0.0];
+        let mut a = Mat::from_rows(&[&[1.0f64, 0.5, 0.25], &[9.0, 2.0, 0.75], &[9.0, 9.0, 3.0]]);
+        let before = a.clone();
+        syr(SyrUplo::Upper, 1.5, &x, a.as_mut()).unwrap();
+        for i in 0..3 {
+            assert_eq!(
+                a[(i, 2)].to_bits(),
+                before[(i, 2)].to_bits(),
+                "Upper ({i},2)"
+            );
+        }
+        assert_eq!(a[(0, 1)], inf);
+        assert_eq!(a[(1, 1)], inf);
+        assert_eq!(a[(0, 0)], 1.0 + (1.5 * 2.0) * 2.0);
+        assert_eq!((a[(1, 0)], a[(2, 0)], a[(2, 1)]), (9.0, 9.0, 9.0));
+    }
+
+    /// `syr_new` builds its lower triangle with `syr(Lower, ..)` on a zero matrix, so
+    /// the reference zero-column skip applies: for `x = [0, Inf]` column 0 is
+    /// skipped, `A[1,0]` stays `0` and is mirrored into `A[0,1]`. (The old direct
+    /// product `alpha * x[1] * x[0] = Inf * 0` made both NaN.)
+    #[test]
+    fn test_syr_new_skips_zero_column() {
+        let inf = f64::INFINITY;
+
+        let a = syr_new(1.0, &[0.0, inf]);
+        assert_eq!((a[(0, 0)], a[(1, 0)], a[(0, 1)]), (0.0, 0.0, 0.0));
+        assert_eq!(a[(1, 1)], inf);
+
+        // The lower-triangle semantics are order dependent, as in the reference:
+        // with x = [Inf, 0] column 0 is not skipped and A[1,0] = x[1] * (alpha *
+        // x[0]) = 0 * Inf is NaN (mirrored), while the skipped column 1 stays zero.
+        let a = syr_new(1.0, &[inf, 0.0]);
+        assert_eq!(a[(0, 0)], inf);
+        assert!(a[(1, 0)].is_nan() && a[(0, 1)].is_nan());
+        assert_eq!(a[(1, 1)], 0.0);
+    }
+
+    /// Every lower entry of `syr_new` is `0 + product` (a skipped column stays `+0`),
+    /// so a `-0` product is stored as `+0`. The old direct products kept the `-0`.
+    #[test]
+    fn test_syr_new_negative_zero_product_is_positive_zero() {
+        let a = syr_new(-1.0, &[1.0f64, 0.0]);
+        assert_eq!(a[(0, 0)], -1.0);
+        for (i, j) in [(1, 0), (0, 1), (1, 1)] {
+            assert_eq!(a[(i, j)].to_bits(), 0.0f64.to_bits(), "({i},{j})");
+        }
+    }
+
+    /// `syr_new` equals `syr(Lower, ..)` on a zero matrix bit for bit (reference
+    /// temp `alpha * x[j]` and evaluation order), mirrored into the upper triangle.
+    #[test]
+    fn test_syr_new_matches_lower_syr_on_zero_matrix() {
+        let x = [1.25f64, -0.3, 0.0, 2.0e-3, 7.5];
+        let alpha = -0.37;
+        let a = syr_new(alpha, &x);
+        let mut lower: Mat<f64> = Mat::zeros(5, 5);
+        syr(SyrUplo::Lower, alpha, &x, lower.as_mut()).unwrap();
+        for j in 0..5 {
+            for i in j..5 {
+                assert_eq!(a[(i, j)].to_bits(), lower[(i, j)].to_bits(), "({i},{j})");
+                assert_eq!(a[(j, i)].to_bits(), lower[(i, j)].to_bits(), "({j},{i})");
+            }
+        }
     }
 }

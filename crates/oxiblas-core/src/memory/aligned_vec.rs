@@ -46,7 +46,8 @@ const fn assert_align_is_power_of_two<const ALIGN: usize>() {
 /// # Type Parameters
 ///
 /// - `T`: The element type
-/// - `ALIGN`: The minimum alignment in bytes (default: 64 for cache line alignment)
+/// - `ALIGN`: The minimum alignment in bytes (default: [`DEFAULT_ALIGN`], the cache
+///   line size: 128 on aarch64, 64 elsewhere)
 /// - `A`: The allocator type (default: `Global`)
 ///
 /// # Custom Allocators

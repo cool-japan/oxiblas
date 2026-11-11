@@ -71,7 +71,13 @@ pub fn csr_to_csc<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CscMatrix<T> {
         }
     }
 
-    // SAFETY: We've constructed valid CSC data
+    // SAFETY: `col_ptrs` has `ncols + 1` entries: 0, then prefix sums of the
+    // per-column counts, so it never decreases and ends at nnz. `csr` satisfies
+    // the CSR contract (`row_ptrs[0] == 0`, `row_ptrs[nrows] == nnz`), so the
+    // row loop visits each of the nnz entries exactly once, and each lands in
+    // its own slot of its column's range: every slot is written, with a row
+    // index `< nrows`. No `(row, col)` position repeats, because none repeats
+    // in `csr`; rows are visited in order, so each column is even sorted.
     unsafe { CscMatrix::new_unchecked(nrows, ncols, col_ptrs, row_indices, values) }
 }
 
@@ -120,7 +126,12 @@ pub fn csc_to_csr<T: Scalar + Clone>(csc: &CscMatrix<T>) -> CsrMatrix<T> {
         }
     }
 
-    // SAFETY: We've constructed valid CSR data
+    // SAFETY: mirror image of `csr_to_csc`: `row_ptrs` has `nrows + 1` entries
+    // (0, then prefix sums of the per-row counts) ending at nnz; since `csc`
+    // satisfies the CSC contract, the column loop visits each of the nnz
+    // entries exactly once and fills every slot with a column index `< ncols`.
+    // No `(row, col)` position repeats, because none repeats in `csc`; columns
+    // are visited in order, so each row is even sorted.
     unsafe { CsrMatrix::new_unchecked(nrows, ncols, row_ptrs, col_indices, values) }
 }
 
@@ -235,7 +246,13 @@ pub fn coo_to_csr<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
         current_row += 1;
     }
 
-    // SAFETY: We've constructed valid CSR data
+    // SAFETY: `coo` is non-empty and its row indices are `< nrows` (COO
+    // contract), so `row_ptrs` gets its initial 0 plus one running
+    // `values.len()` per row `0..nrows`: `nrows + 1` non-decreasing entries
+    // ending at nnz. Columns and values are pushed together, every column comes
+    // from `coo` (`< ncols`), and duplicates were summed into one entry per
+    // column while scanning the sorted entries, so rows are sorted and
+    // duplicate-free.
     unsafe { CsrMatrix::new_unchecked(nrows, ncols, row_ptrs, col_indices, values) }
 }
 
@@ -320,7 +337,11 @@ pub fn coo_to_csc<T: Scalar<Real = T> + Clone + Field + Real>(coo: &CooMatrix<T>
         current_col += 1;
     }
 
-    // SAFETY: We've constructed valid CSC data
+    // SAFETY: mirror image of `coo_to_csr`: `col_ptrs` gets its initial 0 plus
+    // one running `values.len()` per column `0..ncols` (`ncols + 1`
+    // non-decreasing entries ending at nnz); rows and values are pushed
+    // together, every row comes from `coo` (`< nrows`), and duplicates were
+    // summed, so columns are sorted and duplicate-free.
     unsafe { CscMatrix::new_unchecked(nrows, ncols, col_ptrs, row_indices, values) }
 }
 
@@ -345,7 +366,9 @@ pub fn csr_to_coo<T: Scalar + Clone>(csr: &CsrMatrix<T>) -> CooMatrix<T> {
         }
     }
 
-    // SAFETY: Valid COO data derived from valid CSR
+    // SAFETY: the three arrays are pushed together (equal lengths); every row
+    // is a loop index `< nrows` and every column comes from `csr`, whose CSR
+    // contract keeps it `< ncols`.
     unsafe { CooMatrix::new_unchecked(nrows, ncols, row_indices, col_indices, values) }
 }
 
@@ -370,7 +393,9 @@ pub fn csc_to_coo<T: Scalar + Clone>(csc: &CscMatrix<T>) -> CooMatrix<T> {
         }
     }
 
-    // SAFETY: Valid COO data derived from valid CSC
+    // SAFETY: the three arrays are pushed together (equal lengths); every
+    // column is a loop index `< ncols` and every row comes from `csc`, whose
+    // CSC contract keeps it `< nrows`.
     unsafe { CooMatrix::new_unchecked(nrows, ncols, row_indices, col_indices, values) }
 }
 
@@ -384,8 +409,11 @@ pub fn csc_to_coo<T: Scalar + Clone>(csc: &CscMatrix<T>) -> CooMatrix<T> {
 ///
 /// * `csr` - Source CSR matrix
 /// * `offsets` - Optional list of diagonal offsets to extract. If None, all non-empty diagonals are extracted.
+///   The list is sorted and deduplicated, and offsets that address no
+///   position of an `nrows x ncols` matrix are ignored.
 ///
-/// Time complexity: O(nnz)
+/// Time complexity: O(nnz · ndiag) (each extracted diagonal scans every
+/// stored entry)
 pub fn csr_to_dia<T: Scalar + Clone + Field>(
     csr: &CsrMatrix<T>,
     offsets: Option<Vec<isize>>,
@@ -394,23 +422,26 @@ pub fn csr_to_dia<T: Scalar + Clone + Field>(
     let eps = <T as Scalar>::epsilon();
 
     // Find all non-empty diagonals if not specified
-    let offsets = offsets.unwrap_or_else(|| {
+    let mut offsets = offsets.unwrap_or_else(|| {
         let mut found = std::collections::HashSet::new();
         for (row, col, val) in csr.iter() {
             if Scalar::abs(val.clone()) > eps {
                 found.insert(col as isize - row as isize);
             }
         }
-        let mut offsets: Vec<_> = found.into_iter().collect();
-        offsets.sort();
-        offsets
+        found.into_iter().collect()
     });
+    // `DiaMatrix` requires sorted, distinct, in-bounds offsets; caller-supplied
+    // lists are normalized to that.
+    DiaMatrix::<T>::normalize_offsets(&mut offsets, nrows, ncols);
 
     if offsets.is_empty() {
         return DiaMatrix::zeros(nrows, ncols);
     }
 
-    let diag_len = nrows.min(ncols);
+    // `DiaMatrix` pads every diagonal to `max(nrows, ncols)` and indexes it by
+    // column (see `DiaMatrix::new`).
+    let diag_len = nrows.max(ncols);
     let mut data = Vec::with_capacity(offsets.len());
 
     for &offset in &offsets {
@@ -433,7 +464,9 @@ pub fn csr_to_dia<T: Scalar + Clone + Field>(
         data.push(diag);
     }
 
-    // Safety: we constructed valid DIA data
+    // SAFETY: `normalize_offsets` left `offsets` sorted, distinct and in
+    // bounds, `data` holds one diagonal per offset, and every diagonal has the
+    // `max(nrows, ncols)` length `DiaMatrix` requires.
     unsafe { DiaMatrix::new_unchecked(nrows, ncols, offsets, data) }
 }
 
@@ -1189,6 +1222,54 @@ mod tests {
                 assert!((v1 - v2).abs() < 1e-10);
             }
         }
+    }
+
+    /// Regression: `csr_to_dia` sized every diagonal `min(nrows, ncols)`, but
+    /// `DiaMatrix` stores diagonals padded to `max(nrows, ncols)` and indexes
+    /// them by column, so a wide matrix lost every entry right of column
+    /// `nrows - 1` and the result violated the `DiaMatrix::new_unchecked`
+    /// contract. Caller-supplied offsets also reached that contract unsorted,
+    /// duplicated or out of range.
+    #[test]
+    fn test_csr_to_dia_non_square_and_caller_offsets() {
+        let revalidated = |dia: &DiaMatrix<f64>| {
+            DiaMatrix::new(
+                dia.nrows(),
+                dia.ncols(),
+                dia.offsets().to_vec(),
+                dia.data().to_vec(),
+            )
+            .is_ok()
+        };
+
+        // [1 0 0 0 2]
+        // [0 0 0 3 0]
+        let wide = CsrMatrix::new(2, 5, vec![0, 2, 3], vec![0, 4, 3], vec![1.0f64, 2.0, 3.0])
+            .expect("valid CSR");
+        let dia = csr_to_dia(&wide, None);
+        assert!(revalidated(&dia));
+        let back = dia_to_csr(&dia);
+        assert_eq!(back.get(0, 0), Some(&1.0));
+        assert_eq!(back.get(0, 4), Some(&2.0));
+        assert_eq!(back.get(1, 3), Some(&3.0));
+        assert_eq!(back.nnz(), 3);
+
+        // Transposed shape: 5 x 2.
+        let tall = wide.transpose();
+        let dia = csr_to_dia(&tall, None);
+        assert!(revalidated(&dia));
+        let back = dia_to_csr(&dia);
+        assert_eq!(back.get(4, 0), Some(&2.0));
+        assert_eq!(back.get(3, 1), Some(&3.0));
+        assert_eq!(back.nnz(), 3);
+
+        // Unsorted, duplicated and out-of-range offsets are normalized.
+        let dia = csr_to_dia(&wide, Some(vec![4, 0, 0, 9, -7]));
+        assert!(revalidated(&dia));
+        assert_eq!(dia.offsets(), &[0, 4]);
+        let back = dia_to_csr(&dia);
+        assert_eq!(back.get(0, 4), Some(&2.0));
+        assert_eq!(back.get(1, 3), None);
     }
 
     // ========================================================================

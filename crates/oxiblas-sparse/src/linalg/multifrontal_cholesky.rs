@@ -135,7 +135,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> FrontalMatrix<T> {
     ///
     /// For Cholesky (symmetric), loads entries from column `node` of A.
     /// Only entries where both row and column are in the frontal index set
-    /// are assembled. Since A is symmetric, we symmetrize: an entry A[i,j]
+    /// are assembled. Since A is symmetric, we symmetrize: an entry `A[i,j]`
     /// from column j (with i in frontal) fills both (local_i, local_j) and
     /// (local_j, local_i).
     fn assemble_original(&mut self, a: &CscMatrix<T>, global_cols: &[usize]) {
@@ -358,7 +358,7 @@ pub struct MultifrontalCholesky<T: Scalar> {
     postorder: Vec<usize>,
     /// For each column j, the row indices of L below the diagonal (sorted).
     l_row_indices: Vec<Vec<usize>>,
-    /// Dense L factor storage: for column j, stores [L[j,j], L[sub_rows[0],j], ...]
+    /// Dense L factor storage: for column j, stores \[`L[j,j]`, `L[sub_rows[0],j]`, ...\]
     l_values: Vec<Vec<T>>,
     /// Fill-reducing permutation.
     perm: Vec<usize>,

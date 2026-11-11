@@ -75,19 +75,27 @@
 //! ```
 
 mod bidiag_dc;
+mod bidiag_merge;
+mod bidiag_qr;
 mod bidiag_reduce;
 mod bidiagonal;
+mod blocked_bidiag;
 mod complex;
 mod complex_bidiag;
 mod complex_dc;
+mod dc_kernels;
 mod divide_conquer;
 mod qr_based;
 mod randomized;
+mod secular;
 mod selective;
 mod truncated;
 
 #[cfg(feature = "parallel")]
 mod parallel_svd;
+
+#[cfg(test)]
+mod dc_accuracy_tests;
 
 pub use bidiag_reduce::{
     BidiagError, BidiagFactors, BidiagVect, Side, Trans, gebrd, orgbr, ormbr, ungbr, unmbr,

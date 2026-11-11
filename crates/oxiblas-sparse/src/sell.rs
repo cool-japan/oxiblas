@@ -205,6 +205,38 @@ impl<T: Scalar + Clone> SellMatrix<T> {
             });
         }
 
+        // Slice `s` stores `slice_widths[s] * slice_size` entries starting at
+        // `slice_ptrs[s]` (column-major within the slice). Every slice must fit
+        // in the data arrays, and every entry that `matvec` / `to_csr` can read
+        // (a nonzero value in a row `< nrows`) must name a column `< ncols`.
+        // Zero entries and padding rows are never read, so their column index
+        // is unconstrained.
+        for s in 0..num_slices {
+            let start = slice_ptrs[s];
+            let width = slice_widths[s];
+            let end = width
+                .checked_mul(slice_size)
+                .and_then(|len| len.checked_add(start));
+            if !matches!(end, Some(end) if end <= values.len()) {
+                return Err(SellError::DataLengthMismatch {
+                    expected: end.unwrap_or(usize::MAX),
+                    actual: values.len(),
+                });
+            }
+            // `s < num_slices` gives `s * slice_size < nrows`.
+            let slice_start_row = s * slice_size;
+            let rows_in_slice =
+                nrows.min(slice_start_row.saturating_add(slice_size)) - slice_start_row;
+            for k in 0..width {
+                let col_offset = start + k * slice_size;
+                for idx in col_offset..col_offset + rows_in_slice {
+                    if !values[idx].is_zero() && col_indices[idx] >= ncols {
+                        return Err(SellError::InvalidDimensions { nrows, ncols });
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             nrows,
             ncols,
@@ -626,16 +658,10 @@ impl<T: Scalar + Clone> SellMatrix<T> {
                 }
             }
 
-            // Output rows in sorted order
-            for (row_in_slice, entries) in row_entries.into_iter().enumerate() {
+            // Output rows in sorted order, summing repeated columns.
+            for (row_in_slice, mut entries) in row_entries.into_iter().enumerate() {
                 let global_row = slice_start_row + row_in_slice;
-                let mut sorted_entries = entries;
-                sorted_entries.sort_by_key(|(col, _)| *col);
-
-                for (col, val) in sorted_entries {
-                    csr_col_indices.push(col);
-                    csr_values.push(val);
-                }
+                crate::csr::push_summed_run(&mut entries, &mut csr_col_indices, &mut csr_values);
                 row_ptrs[global_row + 1] = csr_col_indices.len();
             }
         }
@@ -647,7 +673,16 @@ impl<T: Scalar + Clone> SellMatrix<T> {
             }
         }
 
-        // Safety: we constructed valid CSR data
+        // SAFETY: the slices partition the rows `0..nrows` in order, and
+        // `row_ptrs[row + 1]` is set to the running `csr_col_indices.len()`
+        // after each row, so `row_ptrs` (initially `nrows + 1` zeros) starts at
+        // 0, never decreases and ends at nnz. Columns and values are pushed
+        // together. Only nonzero entries of real rows are read, and every
+        // constructor keeps their columns `< ncols` (`new` validates them;
+        // `zeros`, `eye` and `from_csr` store only in-range columns); `scale`
+        // maps zero entries to zero or NaN, which the `abs() > eps` filter
+        // skips. `push_summed_run` makes each row strictly ascending, so no row
+        // repeats a column.
         unsafe {
             CsrMatrix::new_unchecked(
                 self.nrows,
@@ -977,5 +1012,60 @@ mod tests {
             assert!((y[2] - 43.0).abs() < 1e-10);
             assert!((y[3] - 28.0).abs() < 1e-10);
         }
+    }
+
+    // --- Regression: `new` must reject what `to_csr` cannot convert ---------
+    //
+    // `SellMatrix::new` checked only array lengths, so a stored entry could
+    // name a column `>= ncols` (which `to_csr` copied into the CSR via
+    // `new_unchecked`), and a slice could extend past the data arrays.
+
+    #[test]
+    fn test_sell_new_rejects_out_of_range_column() {
+        // One slice of 2 rows, width 1: row 0 stores column 5 of a 2x2 matrix.
+        let result = SellMatrix::new(2, 2, 2, vec![0, 2], vec![1], vec![5, 0], vec![1.0f64, 2.0]);
+        assert_eq!(
+            result.err(),
+            Some(SellError::InvalidDimensions { nrows: 2, ncols: 2 })
+        );
+    }
+
+    #[test]
+    fn test_sell_new_rejects_slice_past_data() {
+        // Width 2 needs 2 * 2 = 4 entries, but only 2 are stored.
+        let result = SellMatrix::new(2, 2, 2, vec![0, 4], vec![2], vec![0, 1], vec![1.0f64, 2.0]);
+        assert!(matches!(
+            result,
+            Err(SellError::DataLengthMismatch { actual: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn test_sell_new_accepts_zero_padding_with_any_index() {
+        // Slots that are zero (or belong to padding rows past `nrows`) are never
+        // read, so their column index is unconstrained.
+        let sell = SellMatrix::new(
+            1,
+            2,
+            2,
+            vec![0, 4],
+            vec![2],
+            vec![1, usize::MAX, usize::MAX, 7],
+            vec![4.0f64, 9.0, 0.0, 9.0],
+        )
+        .expect("only in-range, nonzero entries of real rows are read");
+        assert_eq!(sell.to_csr().get(0, 1), Some(&4.0));
+    }
+
+    #[test]
+    fn test_sell_to_csr_sums_duplicate_columns() {
+        // One row, width 2, both entries in column 1.
+        let sell = SellMatrix::new(1, 3, 1, vec![0, 2], vec![2], vec![1, 1], vec![1.0f64, 2.0])
+            .expect("valid SELL");
+        let csr = sell.to_csr();
+        crate::csr::assert_valid_csr(&csr);
+        assert_eq!(csr.get(0, 1), Some(&3.0));
+        assert_eq!(csr.nnz(), 1);
+        assert_eq!(sell.mul_vec(&[1.0, 10.0, 100.0]), vec![30.0]);
     }
 }

@@ -1,15 +1,66 @@
 //! FGMRES (Flexible GMRES) and FGMRES-IR solvers.
 
 use super::gmres::gmres;
-use super::helpers::{dot, givens_rotation_gmres, norm, solve_upper_triangular};
+use super::helpers::{
+    converged_true_residual, dot, givens_rotation_gmres, negligible_norm, norm,
+    solve_upper_triangular,
+};
+use super::scaling::{Operator, PrecondScaling, SystemScaling};
 use super::types::{FgmresResult, IterativeError};
 use crate::csr::CsrMatrix;
-use crate::ops::spmv;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 
-/// Solver function. See module documentation for details.
+/// Flexible GMRES: the (possibly variable or stateful) preconditioner may
+/// change from one Arnoldi step to the next; the preconditioned vectors are
+/// stored explicitly for the solution update.
+///
+/// Converges when the least-squares residual estimate satisfies
+/// `<= tol·‖b‖` and the true residual `‖b − A x‖` confirms it (the reported
+/// `residual_norm` is then the true residual); otherwise the method restarts
+/// from the true residual, as [`super::gmres::gmres`] does. Norms are
+/// overflow-safe; for a system far from unit scale `precond` receives
+/// vectors of the rescaled system and must be homogeneous
+/// (`M_j⁻¹(c·v) = c·M_j⁻¹ v`; see the [module documentation](super)).
+///
+/// # Breakdown
+///
+/// Same lucky-breakdown rule as [`super::gmres::gmres`]: the sub-diagonal entry
+/// `h_{j+1,j}` negligible relative to `‖A z_j‖` triggers a true-residual check
+/// (converged, or restart from the true residual).
 pub fn fgmres<T, F>(
     a: &CsrMatrix<T>,
+    b: &[T],
+    x0: &[T],
+    precond: &mut F,
+    restart: usize,
+    tol: T,
+    max_iter: usize,
+) -> Result<FgmresResult<T>, IterativeError>
+where
+    T: Scalar<Real = T> + Clone + Field + Real,
+    F: FnMut(&[T]) -> Vec<T>,
+{
+    let scaling = SystemScaling::for_rhs(a, b);
+    let precond_scaling = PrecondScaling::new();
+    let mut scaled_precond = |v: &[T]| precond_scaling.finish(v, precond(v));
+    let mut result = fgmres_scaled(
+        &scaling.operator(a),
+        &scaling.rhs(b),
+        &scaling.initial_guess(x0),
+        &mut scaled_precond,
+        restart,
+        tol,
+        max_iter,
+    )?;
+    scaling.solution(&mut result.x);
+    result.residual_norm = scaling.residual(result.residual_norm);
+    scaling.residuals(&mut result.residual_history);
+    Ok(result)
+}
+
+/// [`fgmres`] on the (rescaled) system `a x = b`.
+fn fgmres_scaled<T, F>(
+    a: &Operator<'_, T>,
     b: &[T],
     x0: &[T],
     precond: &mut F,
@@ -43,7 +94,7 @@ where
     while total_iter < max_iter {
         // Compute initial residual r = b - A*x
         let mut r = vec![T::zero(); n];
-        spmv(T::one(), a, &x, T::zero(), &mut r);
+        a.apply(&x, &mut r);
         for i in 0..n {
             r[i] = b[i].clone() - r[i].clone();
         }
@@ -87,7 +138,8 @@ where
         let mut g = vec![T::zero(); restart + 1];
         g[0] = beta.clone();
 
-        let mut inner_converged = false;
+        // Set when a lucky breakdown has already folded the cycle into x.
+        let mut solution_updated = false;
 
         // Inner loop (Arnoldi iteration with variable preconditioning)
         for j in 0..restart {
@@ -101,7 +153,9 @@ where
 
             // w = A * z[j]
             let mut w = vec![T::zero(); n];
-            spmv(T::one(), a, &z_j, T::zero(), &mut w);
+            a.apply(&z_j, &mut w);
+            // ||A z_j||: the norm the sub-diagonal entry is derived from
+            let w_norm = norm(&w);
 
             // Modified Gram-Schmidt orthogonalization
             let mut h_col = vec![T::zero(); j + 2];
@@ -111,7 +165,9 @@ where
                     w[k] = w[k].clone() - h_col[i].clone() * v[i][k].clone();
                 }
             }
-            h_col[j + 1] = norm(&w);
+            // h_{j+1,j}, kept before the Givens rotation overwrites h_col[j + 1]
+            let h_sub = norm(&w);
+            h_col[j + 1] = h_sub.clone();
 
             // Apply previous Givens rotations to new column
             for i in 0..j {
@@ -142,7 +198,7 @@ where
             total_iter += 1;
 
             if res_norm <= tol_abs {
-                // Converged - solve upper triangular system H*y = g
+                // Converged estimate - solve upper triangular system H*y = g
                 let y = solve_upper_triangular(&h, &g, j + 1);
 
                 // Update solution: x = x + Z*y (using preconditioned vectors)
@@ -152,39 +208,58 @@ where
                     }
                 }
 
-                return Ok(FgmresResult {
-                    x,
-                    iterations: total_iter,
-                    restarts,
-                    residual_norm: res_norm,
-                    converged: true,
-                    residual_history,
-                });
+                // Confirm with the true residual before reporting: the estimate
+                // |g_{j+1}| is exactly 0 when A v_j = 0 or h_{j+1,j} = 0 (the
+                // rotation then has s = 0) even if the triangular solve had to
+                // drop a singular direction, and in finite precision it drifts
+                // away from ||b - A x||.
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(FgmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
+                break;
             }
 
-            // Check for breakdown
-            if Scalar::abs(h[j][j + 1].clone()) <= <T as Scalar>::epsilon() {
-                // Lucky breakdown - exact solution found in Krylov subspace
+            // Lucky breakdown: the Krylov subspace is (numerically) invariant
+            if negligible_norm(h_sub.clone(), w_norm) {
                 let y = solve_upper_triangular(&h, &g, j + 1);
                 for i in 0..=j {
                     for k in 0..n {
                         x[k] = x[k].clone() + y[i].clone() * z[i][k].clone();
                     }
                 }
-                inner_converged = true;
+                if let Some(residual_norm) = converged_true_residual(a, b, &x, tol_abs.clone()) {
+                    return Ok(FgmresResult {
+                        x,
+                        iterations: total_iter,
+                        restarts,
+                        residual_norm,
+                        converged: true,
+                        residual_history,
+                    });
+                }
+                // Not converged: restart from the true residual.
+                solution_updated = true;
                 break;
             }
 
             // Normalize w to get v[j+1]
             let mut v_new = vec![T::zero(); n];
-            let h_norm = h[j][j + 1].clone();
             for k in 0..n {
-                v_new[k] = w[k].clone() / h_norm.clone();
+                v_new[k] = w[k].clone() / h_sub.clone();
             }
             v.push(v_new);
         }
 
-        if !inner_converged && !h.is_empty() {
+        if !solution_updated && !h.is_empty() {
             // Solve upper triangular system before restart
             let m = h.len();
             let y = solve_upper_triangular(&h, &g, m);
@@ -204,7 +279,7 @@ where
 
     // Final residual computation
     let mut r = vec![T::zero(); n];
-    spmv(T::one(), a, &x, T::zero(), &mut r);
+    a.apply(&x, &mut r);
     for i in 0..n {
         r[i] = b[i].clone() - r[i].clone();
     }
@@ -220,7 +295,9 @@ where
     })
 }
 
-/// Solver function. See module documentation for details.
+/// FGMRES with an inner GMRES solve as the (variable) preconditioner.
+///
+/// If an inner solve fails, the preconditioner falls back to the identity.
 pub fn fgmres_ir<T: Scalar<Real = T> + Clone + Field + Real>(
     a: &CsrMatrix<T>,
     b: &[T],

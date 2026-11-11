@@ -69,6 +69,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::module_name_repetitions)]
 // Sparse library uses Clone::clone() for generic T where Copy isn't always available
 #![allow(clippy::clone_on_copy)]

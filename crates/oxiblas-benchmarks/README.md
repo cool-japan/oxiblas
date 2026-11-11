@@ -1,6 +1,6 @@
 # OxiBLAS Benchmarks
 
-Comprehensive performance benchmarks for the OxiBLAS library using Criterion.rs, including direct comparisons with OpenBLAS and other BLAS implementations.
+Comprehensive performance benchmarks for the OxiBLAS library using Criterion.rs, including direct comparisons with OpenBLAS.
 
 ## Quick Start
 
@@ -25,7 +25,15 @@ Benchmarks are organized into separate files by category:
 - **`blas_level3.rs`** - Matrix-matrix operations (gemm, trmm, gemm3m)
 - **`lapack_qr.rs`** - QR factorizations (standard, pivot, LQ, RQ, COD)
 - **`lapack_svd.rs`** - Singular Value Decomposition
+- **`lapack_factorization.rs`** - LU and Cholesky factorizations
+- **`lapack_evd.rs`** - Eigenvalue decompositions
+- **`lapack_solve.rs`** - Linear system solvers
+- **`sparse_ops.rs`** - Sparse matrix operations and iterative solvers
+- **`sparse_eigen_svd.rs`** - Sparse eigenvalue and SVD solvers
+- **`size_variations.rs`** - GEMM at tiny, non-power-of-2, rectangular and large sizes
+- **`precision_bench.rs`** - f32 vs f64 GEMM, f16 storage, mixed-precision LU
 - **`new_features.rs`** - Recently added features (einsum, extended precision, tensor ops)
+- **`advanced_features.rs`** - Parallel Level 1, Strassen, asymmetric GEMM, TRSM
 - **`comparison.rs`** - Direct speed comparisons with OpenBLAS (requires `compare-openblas` feature)
 
 ## Running Benchmarks
@@ -73,7 +81,7 @@ cargo bench --package oxiblas-benchmarks --bench blas_level3 -- gemm_f64/256
 
 ### Prerequisites
 
-To run comparison benchmarks, you need OpenBLAS installed on your system:
+The comparison loads an OpenBLAS shared library at run time with `dlopen`, so nothing is linked at build time. It runs on Unix only. Install OpenBLAS on your system:
 
 **macOS:**
 ```bash
@@ -95,6 +103,16 @@ sudo dnf install openblas-devel
 sudo pacman -S openblas
 ```
 
+The library is taken from the `OPENBLAS_LIB` environment variable if that is set. Otherwise the default loader search for `libopenblas` is tried, then `brew --prefix openblas`.
+
+OpenBLAS must not be linked into this benchmark. `oxiblas-blas` exports `#[no_mangle]` `cblas_*` symbols, so any `cblas_*` reference in the binary binds to OxiBLAS at link time and OpenBLAS never runs. That is what happened before 0.2.3. The benchmark now panics at startup if a routine resolves into its own binary, and it prints the library path, build configuration and kernel in use:
+
+```text
+OpenBLAS under test: /path/to/libopenblasp-r0.3.30.dylib
+  config: OpenBLAS 0.3.30 DYNAMIC_ARCH NO_AFFINITY USE_OPENMP neoversen1 MAX_THREADS=56
+  kernel: neoversen1, sequential groups measured at 1.00 cores
+```
+
 ### Running Comparisons
 
 ```bash
@@ -105,8 +123,19 @@ cargo bench --package oxiblas-benchmarks --bench comparison --features compare-o
 cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas -- gemm_comparison
 
 # Run comparison for specific size
-cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas -- gemm_comparison/512
+cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas -- 'gemm_comparison/.*/512'
+
+# Use a specific OpenBLAS build
+OPENBLAS_LIB=/path/to/libopenblas.so cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas
 ```
+
+Both libraries work on the same `Mat` buffers, so layout, alignment and leading dimensions match. The sequential groups run OpenBLAS on one thread, whatever `OPENBLAS_NUM_THREADS` says, because the OxiBLAS calls there are sequential and allocate only packing buffers: startup sets the count through `openblas_set_num_threads` and, in OpenMP builds, `omp_set_num_threads`, and panics if a threaded GEMM still uses more than one core of CPU time. The `*_parallel_comparison` groups give both libraries the same thread count, as described below.
+
+This crate enables `oxiblas-blas/parallel`. Before the 0.2.3 TRSM rewrite, `trsm_in_place` then ran its GEMM updates on the Rayon pool from order 256 without being asked, so the published one-thread DTRSM figures at n = 256 and 512 were not single-threaded. TRSM is sequential now; `trsm_with_par` takes an explicit `Par`.
+
+The GEMM groups count `n³` elements per call, so GFLOPS = 2 × Gelem/s.
+
+The parallel groups use every available core. Set `RAYON_NUM_THREADS` to change that: OpenBLAS follows the same variable, so both libraries get the same thread count. On CPUs that mix performance and efficiency cores, compare more than one count, because a thread count that suits one library may not suit the other.
 
 ### Comparison Benchmark Coverage
 
@@ -116,6 +145,10 @@ The comparison suite benchmarks the following operations against OpenBLAS:
 |-----------|-------|-------------|
 | **DGEMM** | 64, 128, 256, 512, 1024 | Square matrix multiplication |
 | **DGEMM (rect)** | 128×256×128, 256×512×256, 512×256×512 | Rectangular matrices |
+| **SGEMM** | 64, 128, 256, 512, 1024 | Single precision matrix multiplication |
+| **DGEMM, SGEMM (parallel)** | 512, 1024, 2048 | Matrix multiplication on every available core, or `RAYON_NUM_THREADS` threads |
+| **DTRSM** | 64, 128, 256, 512 | Triangular solve with multiple right-hand sides |
+| **DSYRK** | 64, 128, 256, 512 | Symmetric rank-k update |
 | **DGEMV** | 100, 500, 1K, 5K, 10K | Matrix-vector multiplication |
 | **DDOT** | 1K, 10K, 100K, 1M | Vector dot product |
 | **DAXPY** | 1K, 10K, 100K, 1M | Vector addition |
@@ -125,43 +158,36 @@ The comparison suite benchmarks the following operations against OpenBLAS:
 
 Criterion will display results for both implementations:
 
-```
+```text
 gemm_comparison/oxiblas/256
-                        time:   [1.234 ms 1.245 ms 1.256 ms]
+                        time:   [667.65 µs 668.82 µs 670.34 µs]
 gemm_comparison/openblas/256
-                        time:   [1.100 ms 1.110 ms 1.120 ms]
+                        time:   [618.16 µs 619.23 µs 620.44 µs]
 ```
 
 **Performance Analysis:**
-- **OxiBLAS: 1.245 ms, OpenBLAS: 1.110 ms** → OpenBLAS is ~12% faster
-- **Ratio = 1.245 / 1.110 = 1.12** → OxiBLAS is at ~89% of OpenBLAS performance
+- **OxiBLAS: 668.82 µs, OpenBLAS: 619.23 µs** → OpenBLAS is ~8% faster
+- **Ratio = 619.23 / 668.82 = 93%** → OxiBLAS runs at 93% of OpenBLAS's speed
 
 **Performance Ratio Interpretation:**
-- **Ratio < 1.0**: OxiBLAS is faster than OpenBLAS ✅
-- **Ratio ≈ 1.0**: Similar performance (~5% difference)
-- **Ratio > 1.0**: OpenBLAS is faster
-- **Ratio < 1.1**: Competitive (within 10%)
-- **Ratio < 1.5**: Acceptable for pure Rust (within 50%)
-- **Ratio > 2.0**: Significant gap, optimization needed
 
-### Expected Performance
+The published tables use this ratio, OxiBLAS's speed as a percentage of OpenBLAS's:
 
-Based on similar pure-Rust BLAS implementations:
+- **Above 100%**: OxiBLAS is faster than OpenBLAS
+- **About 100%**: Similar performance (~5% difference)
+- **Below 100%**: OpenBLAS is faster
+- **Above 90%**: Competitive (within about 10%)
+- **Above 67%**: Acceptable for pure Rust (OxiBLAS takes up to 1.5 times as long)
+- **Below 50%**: Significant gap, optimization needed
 
-| Operation Type | Expected Performance vs OpenBLAS |
-|----------------|----------------------------------|
-| Level 1 (vectors) | 80-95% | Memory bandwidth limited |
-| Level 2 (matvec) | 70-85% | Cache effects dominant |
-| Level 3 (matmul) | 60-90% | Compute kernel quality |
-| Large GEMM (>512) | 70-85% | Block algorithm efficiency |
-| Small GEMM (<128) | 85-95% | Less overhead impact |
+### Current Results
 
-**Note:** OpenBLAS is highly optimized assembly code. OxiBLAS achieving 80%+ performance in pure Rust is excellent.
+Measured figures are in [Performance](../../README.md#performance) in the root README. Run the suite on your own hardware for numbers that apply to it.
 
 ## Viewing Results
 
 After running benchmarks, Criterion generates HTML reports in:
-```
+```text
 target/criterion/
 ```
 
@@ -188,8 +214,11 @@ Open `target/criterion/report/index.html` in your browser to view detailed resul
 
 ### LAPACK
 - QR factorizations: 50×50, 100×100, 200×200, 500×500
-- SVD: 50×50, 100×100, 200×200
 - Variants: Standard QR, QR with pivot, LQ, RQ, COD
+- SVD (`lapack_svd`, full-rank fixed-seed random matrices): `svd_jacobi` (one-sided Jacobi `Svd`) at 50, 100 and 200, `svd_divide_conquer` (`SvdDc`) at 50, 100, 200 and 500, and the `svd_algorithm_comparison` group
+- Symmetric EVD (`lapack_evd`): `symmetric_evd` and `symmetric_evd_dc` at 50-200, `symmetric_evd_large` and `symmetric_evd_dc_large` at 300, 500 and 1000, `symmetric_evd_random` and `symmetric_evd_dc_random` at 100, 200, 500 and 1000 (10 samples each for the large and random groups); general EVD, Hessenberg and Schur groups as well
+
+The `evd_svd_bench` example of the `oxiblas` crate times the same four solvers at 200-2000 and also prints residual and orthogonality errors: `cargo run --release -p oxiblas --example evd_svd_bench -- [--reps N] [SIZE ...]`.
 
 ### New Features
 - Extended precision dot products (Kahan, pairwise, mixed precision)
@@ -209,7 +238,7 @@ To add new benchmarks:
    harness = false
    ```
 3. Import criterion and implement benchmarks:
-   ```rust
+   ```rust,ignore
    use criterion::{criterion_group, criterion_main, Criterion};
 
    fn your_bench(c: &mut Criterion) {
@@ -230,7 +259,7 @@ For accurate benchmarks:
 
 1. **Close background applications** that might affect CPU performance
 2. **Disable CPU frequency scaling** if possible
-3. **Run on battery power** with performance mode enabled (laptops)
+3. **Stay on mains power** (laptops)
 4. **Use release mode** (always, criterion handles this automatically)
 5. **Multiple runs**: Criterion runs each benchmark multiple times for statistical accuracy
 
@@ -308,32 +337,18 @@ cargo flamegraph --bench blas_level3 --package oxiblas-benchmarks
 
 ### OpenBLAS Not Found
 
-**Error:** `cannot find -lopenblas`
+**Error:** `could not load OpenBLAS (tried [...]); set OPENBLAS_LIB to its path`
 
 **Solution:**
 ```bash
 # macOS: Check installation
 brew list openblas
 
-# Set library path if needed
-export LIBRARY_PATH=/opt/homebrew/opt/openblas/lib:$LIBRARY_PATH
+# Linux: Install the library
+sudo apt-get install libopenblas-dev
 
-# Linux: Install development packages
-sudo apt-get install libopenblas-dev pkg-config
-```
-
-### Comparison Benchmarks Won't Compile
-
-**Error:** Feature-related compilation errors
-
-**Solution:**
-```bash
-# Ensure feature is enabled
-cargo bench --package oxiblas-benchmarks --bench comparison --features compare-openblas
-
-# Clean and rebuild
-cargo clean
-cargo bench --package oxiblas-benchmarks --features compare-openblas
+# Point the benchmark at the library
+export OPENBLAS_LIB=/path/to/libopenblas.so
 ```
 
 ### Inconsistent Results
@@ -414,8 +429,9 @@ When adding new benchmarks, follow these guidelines:
 
 ### 1. Structure
 
-```rust
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+```rust,ignore
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 fn bench_operation(c: &mut Criterion) {
     let mut group = c.benchmark_group("operation_name");
@@ -502,54 +518,12 @@ jobs:
 
 ## Performance Goals
 
-### macOS (Apple M3) - Updated 2026-03-16
+The results come from `comparison.rs` and are published in [Performance](../../README.md#performance) in the root README. The gaps listed here before 0.2.3 (a full-GEMM SYRK, a slow TRSM and GEMV, DOT at about half of OpenBLAS and NRM2 at about two thirds, small GEMM at 73-85%) were the targets of the 0.2.3 kernel work: SYRK is triangle-only, TRSM is blocked with packed diagonal blocks, small GEMM lost most of its per-call overhead, and aarch64 has NEON DOT, NRM2 and GEMV kernels. What remains, measured on an Apple M3 on 2026-11-09:
 
-| Category | Current vs OpenBLAS | Status | Notes |
-|----------|---------------------|--------|-------|
-| **DGEMM (f64) 64×64** | **101%** | 🟢 Excellent | **Faster than OpenBLAS!** |
-| **DGEMM (f64) 128×128** | 97% | 🟢 Very Good | - |
-| **DGEMM (f64) 256×256** | 98% | 🟢 Very Good | - |
-| **DGEMM (f64) 512×512** | **101%** | 🟢 **Excellent** | **Faster than OpenBLAS!** |
-| **DGEMM (f64) 1024×1024** | **101%** | 🟢 **Excellent** | **Faster than OpenBLAS!** |
-| **SGEMM (f32) 64×64** | **101%** | 🟢 Excellent | - |
-| **SGEMM (f32) 128×128** | **121%** | 🟢 **Outstanding** | **21% faster!** |
-| **SGEMM (f32) 256×256** | **101%** | 🟢 Excellent | - |
-| **SGEMM (f32) 512×512** | **104%** | 🟢 Excellent | - |
-| **SGEMM (f32) 1024×1024** | **172%** | 🟢 **Outstanding** | **72% faster!** |
-| **DOT (f64) 100K** | **165%** | 🟢 **Outstanding** | **65% faster!** |
-| **DOT (f64) 1M** | **167%** | 🟢 **Outstanding** | **67% faster!** |
-| AXPY (f64) | 64% | 🟡 Good | Optimization opportunity |
-
-**Breakthrough Achievement:** OxiBLAS **matches or exceeds OpenBLAS** on Apple M3!
-- f64 GEMM: **97-101% of OpenBLAS** (competitive across all sizes)
-- f32 GEMM: **101-172% of OpenBLAS** (dominates f32 operations)
-- DOT product: **165-167% of OpenBLAS** (significantly faster)
-
-### Linux x86_64 (Intel Xeon E5-2623 v4) - Updated 2026-03-16
-
-| Category | Current vs OpenBLAS | Status | Notes |
-|----------|---------------------|--------|-------|
-| **DGEMM (f64) 64×64** | **100%** | 🟢 Excellent | Identical performance |
-| **DGEMM (f64) 128×128** | 90% | 🟢 Very Good | - |
-| **DGEMM (f64) 256×256** | 95% | 🟢 Very Good | Peak: 220 GFLOPS |
-| **DGEMM (f64) 512×512** | 80% | 🟡 Good | Optimization target |
-| **DGEMM (f64) 1024×1024** | **102%** | 🟢 **Excellent** | **Faster than OpenBLAS!** |
-| **SGEMM (f32) 64×64** | **112%** | 🟢 **Excellent** | **Faster than OpenBLAS!** |
-| **SGEMM (f32) 128×128** | 100% | 🟢 Excellent | Identical performance |
-| **SGEMM (f32) 256×256** | 95% | 🟢 Very Good | - |
-| **SGEMM (f32) 512×512** | 94% | 🟢 Very Good | - |
-
-**Key Achievements:**
-- **13-20% performance improvement** after Linux-specific cache tuning
-- **Fine-tuned blocking parameters:** KC=192, MC=128 (optimized for 256KB L2 cache)
-- **Platform-aware cache detection:** Linux sysfs, macOS sysctl, x86_64 CPUID fallback
-- **All tests passing** with zero warnings
-- **OxiBLAS outperforms OpenBLAS** on very large f64 matrices (1024×1024) and small f32 matrices (64×64)
-
-**Legend:**
-- 🟢 Achieved (≥90% or better)
-- 🟡 In Progress (80-89%)
-- 🔴 Needs Work (<80%)
+- GEMV at 5000×5000 runs at 97% of OpenBLAS (3.64 ms against 3.53 ms), the one GEMV size where OpenBLAS is ahead.
+- f64 GEMM on one thread is at 92-99% of OpenBLAS's faster per-process level, and rectangular GEMM at 96-98%.
+- Complex GEMM and the complex blocked SYRK path run on a scalar 2×2 complex micro-kernel.
+- x86_64 has not been compared with OpenBLAS since the comparison was fixed in 0.2.3, and the new Level-1/2 kernels are aarch64 only.
 
 ## See Also
 

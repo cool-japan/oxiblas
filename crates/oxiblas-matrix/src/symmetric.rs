@@ -203,33 +203,13 @@ impl<T: Scalar> SymmetricMat<T> {
     /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let n = self.dim();
-        assert!(row < n && col < n, "Index out of bounds");
-
-        match self.uplo() {
-            TriangularKind::Upper => {
-                if row <= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row <= col is within the stored upper triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row > col swapped to (col, row) is within the upper triangle");
-                }
-            }
-            TriangularKind::Lower => {
-                if row >= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row >= col is within the stored lower triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row < col swapped to (col, row) is within the lower triangle");
-                }
-            }
-        }
+        // `get_mut` folds `(row, col)` onto the stored triangle (swapping to
+        // `(col, row)` for the other half), so it is `None` exactly when an
+        // index is out of bounds.
+        let Some(slot) = self.get_mut(row, col) else {
+            panic!("Index out of bounds");
+        };
+        *slot = value;
     }
 
     /// Returns a pointer to the packed data.
@@ -545,6 +525,12 @@ impl<'a, T: Scalar> SymmetricViewMut<'a, T> {
 /// For a Hermitian matrix A, `A[i,j] = conj(A[j,i])`. The diagonal elements
 /// are real. This is the complex analogue of a symmetric matrix.
 ///
+/// Only one triangle (`uplo`) is stored. [`set`](Self::set) and
+/// [`element`](Self::element) work with the *logical* matrix in either
+/// triangle; [`get`](Self::get) and [`get_mut`](Self::get_mut) give raw
+/// access to the single stored slot of a pair, which holds `A[i,j]` for the
+/// stored orientation and `conj(A[i,j])` for the other one.
+///
 /// # Example
 ///
 /// ```
@@ -554,17 +540,23 @@ impl<'a, T: Scalar> SymmetricViewMut<'a, T> {
 ///
 /// let mut h: HermitianMat<Complex64> = HermitianMat::zeros(2, TriangularKind::Upper);
 ///
-/// // Diagonal must be real
+/// // Diagonal is real (only the real part of a diagonal write is kept)
 /// h.set(0, 0, Complex64::new(1.0, 0.0));
 /// h.set(1, 1, Complex64::new(2.0, 0.0));
 ///
 /// // Off-diagonal: (0,1) and (1,0) are conjugates
 /// h.set(0, 1, Complex64::new(3.0, 4.0));
 ///
-/// assert_eq!(h.get(0, 1), Some(&Complex64::new(3.0, 4.0)));
-/// // (1, 0) returns the conjugate
-/// // Note: Our implementation stores only one triangle, so get(1,0) returns
-/// // the stored value which is conceptually the conjugate when used in operations
+/// assert_eq!(h.element(0, 1), Some(Complex64::new(3.0, 4.0)));
+/// assert_eq!(h.element(1, 0), Some(Complex64::new(3.0, -4.0)));
+///
+/// // Writing through the non-stored triangle is equivalent.
+/// h.set(1, 0, Complex64::new(5.0, -6.0));
+/// assert_eq!(h.element(0, 1), Some(Complex64::new(5.0, 6.0)));
+///
+/// // `get` returns the raw stored slot (here the upper triangle) for both
+/// // orientations of a pair.
+/// assert_eq!(h.get(1, 0), Some(&Complex64::new(5.0, 6.0)));
 /// ```
 #[derive(Clone)]
 pub struct HermitianMat<T: Scalar> {
@@ -620,11 +612,22 @@ impl<T: Scalar> HermitianMat<T> {
         self.packed.is_empty()
     }
 
+    /// Returns `true` when `(row, col)` lies in the stored triangle.
+    #[inline]
+    fn is_stored(&self, row: usize, col: usize) -> bool {
+        match self.uplo() {
+            TriangularKind::Upper => row <= col,
+            TriangularKind::Lower => row >= col,
+        }
+    }
+
     /// Returns element at (row, col) from the stored triangle.
     ///
     /// Note: For Hermitian matrices, `A[j,i] = conj(A[i,j])`. This method
     /// returns the stored value; the conjugate relationship must be
     /// handled by the caller for off-diagonal access to the non-stored triangle.
+    /// Use [`element`](Self::element) to read the logical `A[row, col]` in
+    /// either triangle.
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         match self.uplo() {
@@ -645,7 +648,14 @@ impl<T: Scalar> HermitianMat<T> {
         }
     }
 
-    /// Returns mutable element at (row, col).
+    /// Returns a mutable reference to the stored slot of (row, col).
+    ///
+    /// Like [`get`](Self::get) this is raw storage access: for (row, col) in
+    /// the non-stored triangle the slot is that of (col, row) and holds
+    /// `conj(A[row, col])`, so writing `z` through it makes
+    /// `A[row, col] = conj(z)`. Writing a non-real value to a diagonal slot
+    /// breaks the Hermitian invariant. Use [`set`](Self::set) to assign a
+    /// logical element.
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut T> {
         match self.uplo() {
@@ -666,39 +676,48 @@ impl<T: Scalar> HermitianMat<T> {
         }
     }
 
+    /// Returns the logical element `A[row, col]` by value, in either triangle:
+    /// the stored value for the stored triangle and its conjugate for the
+    /// other one. Returns `None` if an index is out of bounds.
+    #[inline]
+    pub fn element(&self, row: usize, col: usize) -> Option<T> {
+        let stored = *self.get(row, col)?;
+        Some(if self.is_stored(row, col) {
+            stored
+        } else {
+            stored.conj()
+        })
+    }
+
     /// Sets element at (row, col).
+    ///
+    /// After the call the logical matrix satisfies `A[row, col] = value` and,
+    /// by the Hermitian symmetry, `A[col, row] = conj(value)`, whichever
+    /// triangle is stored (a write to the non-stored triangle stores
+    /// `conj(value)` in the mirrored slot).
+    ///
+    /// The diagonal of a Hermitian matrix is real (`A[i, i] = conj(A[i, i])`),
+    /// so for `row == col` only the real part of `value` is stored and its
+    /// imaginary part is discarded.
     ///
     /// # Panics
     /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let n = self.dim();
-        assert!(row < n && col < n, "Index out of bounds");
-
-        match self.uplo() {
-            TriangularKind::Upper => {
-                if row <= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row <= col is within the stored upper triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row > col swapped to (col, row) is within the upper triangle");
-                }
-            }
-            TriangularKind::Lower => {
-                if row >= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row >= col is within the stored lower triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row < col swapped to (col, row) is within the lower triangle");
-                }
-            }
-        }
+        let stored = if row == col {
+            T::from_real(value.real())
+        } else if self.is_stored(row, col) {
+            value
+        } else {
+            value.conj()
+        };
+        // `get_mut` folds `(row, col)` onto the stored triangle (swapping to
+        // `(col, row)` for the other half), so it is `None` exactly when an
+        // index is out of bounds.
+        let Some(slot) = self.get_mut(row, col) else {
+            panic!("Index out of bounds");
+        };
+        *slot = stored;
     }
 
     /// Returns a pointer to the packed data.
@@ -745,13 +764,18 @@ impl<T: Scalar> HermitianMat<T> {
 
     /// Sets the diagonal elements.
     ///
-    /// For Hermitian matrices, diagonal elements should be real.
+    /// The diagonal of a Hermitian matrix is real, so only the real part of
+    /// each value is stored (the same rule as [`set`](Self::set)).
     #[inline]
     pub fn set_diagonal(&mut self, diag: &[T]) {
-        self.packed.set_diagonal(diag);
+        let real_diag: Vec<T> = diag.iter().map(|d| T::from_real(d.real())).collect();
+        self.packed.set_diagonal(&real_diag);
     }
 
     /// Fills all stored elements with a value.
+    ///
+    /// This writes `value` verbatim to every stored slot, the diagonal
+    /// included; with a non-real `value` the diagonal is therefore not real.
     #[inline]
     pub fn fill(&mut self, value: T) {
         self.packed.fill(value);
@@ -930,7 +954,8 @@ impl<T: Scalar + core::fmt::Debug> core::fmt::Debug for HermitianMat<T> {
                 if j > 0 {
                     write!(f, ", ")?;
                 }
-                if let Some(v) = self.get(i, j) {
+                // The logical element (conjugated in the non-stored triangle).
+                if let Some(v) = self.element(i, j) {
                     write!(f, "{:?}", v)?;
                 } else {
                     write!(f, "*")?;
@@ -1091,33 +1116,13 @@ impl<'a, T: Scalar> SymmetricMut<'a, T> {
     /// Panics if `row` or `col` is out of bounds.
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let n = self.dim();
-        assert!(row < n && col < n, "Index out of bounds");
-
-        match self.uplo() {
-            TriangularKind::Upper => {
-                if row <= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row <= col is within the stored upper triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row > col swapped to (col, row) is within the upper triangle");
-                }
-            }
-            TriangularKind::Lower => {
-                if row >= col {
-                    self.packed
-                        .set(row, col, value)
-                        .expect("row >= col is within the stored lower triangle");
-                } else {
-                    self.packed
-                        .set(col, row, value)
-                        .expect("row < col swapped to (col, row) is within the lower triangle");
-                }
-            }
-        }
+        // `get_mut` folds `(row, col)` onto the stored triangle (swapping to
+        // `(col, row)` for the other half), so it is `None` exactly when an
+        // index is out of bounds.
+        let Some(slot) = self.get_mut(row, col) else {
+            panic!("Index out of bounds");
+        };
+        *slot = value;
     }
 
     /// Creates an immutable reborrow.
@@ -1508,5 +1513,297 @@ mod tests {
         // Hermitian invariant: A[1,0] == conj(A[0,1]).
         assert_eq!(dense[(1, 0)], dense[(0, 1)].conj());
         assert_eq!(dense[(1, 0)], Complex64::new(6.0, -8.0));
+    }
+
+    // --- Regression: `set` without `expect` -------------------------------
+    //
+    // `set` used to fold `(row, col)` onto the stored triangle by hand and
+    // `.expect` the packed write. It now writes through `get_mut`, which does
+    // the same folding; these tests pin that every in-bounds index (stored or
+    // mirrored half, both storage kinds) still lands in the single packed slot
+    // it always did, and that out-of-bounds indices still panic.
+
+    /// Packed slot of `(row, col)` after folding onto the stored triangle.
+    fn folded_slot(n: usize, uplo: TriangularKind, row: usize, col: usize) -> usize {
+        let (i, j) = match uplo {
+            TriangularKind::Upper => (row.min(col), row.max(col)),
+            TriangularKind::Lower => (row.max(col), row.min(col)),
+        };
+        let probe: PackedMat<f64> = PackedMat::zeros(n, uplo);
+        probe
+            .packed_index(i, j)
+            .unwrap_or_else(|| panic!("({i}, {j}) must be stored"))
+    }
+
+    #[test]
+    fn test_symmetric_set_folds_every_index_onto_stored_slot() {
+        let n = 4;
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            for row in 0..n {
+                for col in 0..n {
+                    let value = (10 * row + col) as f64 + 1.0;
+                    let expected = folded_slot(n, uplo, row, col);
+
+                    let mut s: SymmetricMat<f64> = SymmetricMat::zeros(n, uplo);
+                    s.set(row, col, value);
+                    assert_eq!(s.as_slice()[expected], value, "{uplo:?} ({row}, {col})");
+                    assert_eq!(s.get(row, col), Some(&value));
+                    assert_eq!(s.get(col, row), Some(&value));
+
+                    let mut data = vec![0.0f64; PackedMat::<f64>::packed_len(n)];
+                    let mut sm = SymmetricMut::from_slice(&mut data, n, uplo);
+                    sm.set(row, col, value);
+                    assert_eq!(sm.get(col, row), Some(&value));
+                    assert_eq!(
+                        data[expected], value,
+                        "SymmetricMut {uplo:?} ({row}, {col})"
+                    );
+
+                    let mut h: HermitianMat<Complex64> = HermitianMat::zeros(n, uplo);
+                    let z = Complex64::new(value, -value);
+                    h.set(row, col, z);
+                    // One stored slot serves both (row, col) and (col, row). It
+                    // holds A[row, col] = z when (row, col) is the stored
+                    // orientation, conj(z) = A[col, row] when it is the mirrored
+                    // one, and only the real part on the diagonal.
+                    let stored_orientation = match uplo {
+                        TriangularKind::Upper => row <= col,
+                        TriangularKind::Lower => row >= col,
+                    };
+                    let slot_value = if row == col {
+                        Complex64::new(value, 0.0)
+                    } else if stored_orientation {
+                        z
+                    } else {
+                        z.conj()
+                    };
+                    assert_eq!(
+                        h.as_slice()[expected],
+                        slot_value,
+                        "Hermitian {uplo:?} ({row}, {col})"
+                    );
+                    assert_eq!(h.get(col, row), Some(&slot_value));
+                    assert_eq!(h.get(row, col), Some(&slot_value));
+                }
+            }
+        }
+    }
+
+    /// `set(row, col, z)` must make the *logical* matrix satisfy
+    /// `A[row, col] = z` and `A[col, row] = conj(z)` for every index, whichever
+    /// triangle is stored, and a diagonal write keeps only the real part.
+    /// Previously a write to the non-stored triangle stored `z` unconjugated in
+    /// the mirrored slot, so the matrix read back `conj(z)` at `(row, col)`.
+    #[test]
+    fn test_hermitian_set_writes_logical_element_in_both_triangles() {
+        let n = 4;
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            for row in 0..n {
+                for col in 0..n {
+                    let z = Complex64::new(1.0 + row as f64, 0.5 + 2.0 * col as f64);
+                    let expected = if row == col {
+                        Complex64::new(z.re, 0.0)
+                    } else {
+                        z
+                    };
+                    let mut h: HermitianMat<Complex64> = HermitianMat::zeros(n, uplo);
+                    h.set(row, col, z);
+
+                    // Logical access in both triangles.
+                    assert_eq!(
+                        h.element(row, col),
+                        Some(expected),
+                        "{uplo:?} element({row},{col})"
+                    );
+                    assert_eq!(
+                        h.element(col, row),
+                        Some(expected.conj()),
+                        "{uplo:?} element({col},{row}) after set({row},{col})"
+                    );
+
+                    let dense = h.to_dense();
+                    assert_eq!(dense[(row, col)], expected, "{uplo:?} A[{row},{col}]");
+                    assert_eq!(
+                        dense[(col, row)],
+                        expected.conj(),
+                        "{uplo:?} A[{col},{row}] after set({row},{col})"
+                    );
+                    // Every other entry stays zero.
+                    for i in 0..n {
+                        for j in 0..n {
+                            if (i, j) != (row, col) && (i, j) != (col, row) {
+                                assert_eq!(dense[(i, j)], Complex64::new(0.0, 0.0));
+                            }
+                        }
+                    }
+                    // `get` reads the raw stored slot: the logical value for the
+                    // stored orientation of the pair.
+                    let stored_is_row_col = match uplo {
+                        TriangularKind::Upper => row <= col,
+                        TriangularKind::Lower => row >= col,
+                    };
+                    let (si, sj, logical) = if stored_is_row_col {
+                        (row, col, expected)
+                    } else {
+                        (col, row, expected.conj())
+                    };
+                    assert_eq!(
+                        h.get(si, sj),
+                        Some(&logical),
+                        "{uplo:?} raw slot ({si},{sj})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Filling a whole Hermitian matrix through `set` — in an order that writes
+    /// both triangles — reproduces the dense matrix for both storage kinds and
+    /// both precisions.
+    #[test]
+    fn test_hermitian_set_roundtrip_through_both_triangles() {
+        let original = Mat::from_rows(&[
+            &[
+                Complex64::new(1.0, 0.0),
+                Complex64::new(3.0, 4.0),
+                Complex64::new(5.0, -2.0),
+            ],
+            &[
+                Complex64::new(3.0, -4.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(6.0, 1.0),
+            ],
+            &[
+                Complex64::new(5.0, 2.0),
+                Complex64::new(6.0, -1.0),
+                Complex64::new(7.0, 0.0),
+            ],
+        ]);
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            // Upper-triangle entries via (i, j), lower ones via (j, i): half of
+            // the writes land in the non-stored triangle for either `uplo`.
+            let mut h: HermitianMat<Complex64> = HermitianMat::zeros(3, uplo);
+            for (i, j) in [(0, 0), (1, 0), (0, 2), (1, 1), (2, 1), (2, 2)] {
+                h.set(i, j, original[(i, j)]);
+            }
+            let dense = h.to_dense();
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_eq!(dense[(i, j)], original[(i, j)], "{uplo:?} ({i}, {j})");
+                    assert_eq!(h.element(i, j), Some(original[(i, j)]), "{uplo:?} element");
+                }
+            }
+            // The Debug rendering shows the logical matrix, so the mirrored
+            // triangle prints the conjugates.
+            let shown = format!("{h:?}");
+            assert!(
+                shown.contains(&format!("{:?}", original[(1, 0)]))
+                    && shown.contains(&format!("{:?}", original[(0, 1)])),
+                "{uplo:?} Debug must show both triangles: {shown}"
+            );
+
+            let mut h32: HermitianMat<Complex<f32>> = HermitianMat::zeros(3, uplo);
+            for (i, j) in [(0, 0), (1, 0), (0, 2), (1, 1), (2, 1), (2, 2)] {
+                let z = original[(i, j)];
+                h32.set(i, j, Complex::new(z.re as f32, z.im as f32));
+            }
+            let dense32 = h32.to_dense_f32();
+            for i in 0..3 {
+                for j in 0..3 {
+                    let z = original[(i, j)];
+                    assert_eq!(
+                        dense32[(i, j)],
+                        Complex::new(z.re as f32, z.im as f32),
+                        "f32 {uplo:?} ({i}, {j})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Diagonal rule: a Hermitian diagonal is real, so `set(i, i, z)` and
+    /// `set_diagonal` keep only the real part of each value.
+    #[test]
+    fn test_hermitian_diagonal_writes_keep_real_part() {
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            let mut h: HermitianMat<Complex64> = HermitianMat::zeros(3, uplo);
+            h.set(1, 1, Complex64::new(2.5, -7.0));
+            assert_eq!(h.element(1, 1), Some(Complex64::new(2.5, 0.0)));
+            assert_eq!(h.get(1, 1), Some(&Complex64::new(2.5, 0.0)));
+            assert_eq!(h.to_dense()[(1, 1)], Complex64::new(2.5, 0.0));
+
+            h.set_diagonal(&[
+                Complex64::new(1.0, 1.0),
+                Complex64::new(-2.0, 0.5),
+                Complex64::new(3.0, 0.0),
+            ]);
+            assert_eq!(
+                h.diagonal(),
+                vec![
+                    Complex64::new(1.0, 0.0),
+                    Complex64::new(-2.0, 0.0),
+                    Complex64::new(3.0, 0.0),
+                ]
+            );
+        }
+    }
+
+    /// `get_mut` stays a raw stored-slot accessor: writing `z` through the
+    /// mirrored orientation stores `z` in the shared slot, i.e. sets
+    /// `A[row, col] = conj(z)`, as documented.
+    #[test]
+    fn test_hermitian_get_mut_is_raw_slot_access() {
+        let mut h: HermitianMat<Complex64> = HermitianMat::zeros(2, TriangularKind::Upper);
+        let z = Complex64::new(1.0, 2.0);
+        if let Some(slot) = h.get_mut(1, 0) {
+            *slot = z;
+        }
+        assert_eq!(h.get(0, 1), Some(&z));
+        assert_eq!(h.element(0, 1), Some(z));
+        assert_eq!(h.element(1, 0), Some(z.conj()));
+    }
+
+    /// For a real element type conjugation is the identity: `set` on either
+    /// triangle behaves symmetrically, and `element` agrees with `get`.
+    #[test]
+    fn test_hermitian_real_element_type() {
+        for uplo in [TriangularKind::Upper, TriangularKind::Lower] {
+            let mut h: HermitianMat<f64> = HermitianMat::zeros(3, uplo);
+            h.set(2, 0, 4.0);
+            h.set(1, 1, -1.5);
+            assert_eq!(h.element(2, 0), Some(4.0));
+            assert_eq!(h.element(0, 2), Some(4.0));
+            assert_eq!(h.element(1, 1), Some(-1.5));
+            assert_eq!(h.get(0, 2), Some(&4.0));
+        }
+    }
+
+    #[test]
+    fn test_hermitian_element_out_of_bounds_is_none() {
+        let h: HermitianMat<Complex64> = HermitianMat::zeros(3, TriangularKind::Lower);
+        assert_eq!(h.element(3, 0), None);
+        assert_eq!(h.element(0, 3), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds")]
+    fn test_symmetric_set_out_of_bounds_panics() {
+        let mut s: SymmetricMat<f64> = SymmetricMat::zeros(3, TriangularKind::Lower);
+        s.set(1, 3, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds")]
+    fn test_hermitian_set_out_of_bounds_panics() {
+        let mut h: HermitianMat<Complex64> = HermitianMat::zeros(3, TriangularKind::Upper);
+        h.set(3, 0, Complex64::new(1.0, 0.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds")]
+    fn test_symmetric_mut_set_out_of_bounds_panics() {
+        let mut data = vec![0.0f64; PackedMat::<f64>::packed_len(3)];
+        let mut sm = SymmetricMut::from_slice(&mut data, 3, TriangularKind::Upper);
+        sm.set(0, 7, 1.0);
     }
 }

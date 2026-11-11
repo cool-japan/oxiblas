@@ -138,9 +138,38 @@ pub fn dot_par<T: Field + Send + Sync>(x: &[T], y: &[T], par: Par) -> T {
 }
 
 /// Internal parallel dot implementation using Rayon reduction.
+///
+/// On aarch64 (without `force-scalar`), `f64` / `f32` chunks run on the NEON
+/// dot kernel; other types and targets use the portable loop below.
 #[cfg(feature = "parallel")]
 fn dot_parallel<T: Field + Send + Sync>(x: &[T], y: &[T]) -> T {
     const CHUNK_SIZE: usize = 4096;
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use super::dot_neon;
+        use super::typed::{same_slice, same_value};
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f64>(x), same_slice::<T, f64>(y))
+            && let Some(r) = same_value::<f64, T>(
+                xs.par_chunks(CHUNK_SIZE)
+                    .zip(ys.par_chunks(CHUNK_SIZE))
+                    .map(|(xc, yc)| dot_neon::dot_f64(xc, yc))
+                    .sum::<f64>(),
+            )
+        {
+            return r;
+        }
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f32>(x), same_slice::<T, f32>(y))
+            && let Some(r) = same_value::<f32, T>(
+                xs.par_chunks(CHUNK_SIZE)
+                    .zip(ys.par_chunks(CHUNK_SIZE))
+                    .map(|(xc, yc)| dot_neon::dot_f32(xc, yc))
+                    .sum::<f32>(),
+            )
+        {
+            return r;
+        }
+    }
 
     x.par_chunks(CHUNK_SIZE)
         .zip(y.par_chunks(CHUNK_SIZE))
@@ -194,7 +223,7 @@ pub fn nrm2_par<T: Real + Send + Sync>(x: &[T], par: Par) -> T {
     super::nrm2(x)
 }
 
-/// Combines two Blue's-scaling `(scale, ssq)` accumulators, each satisfying
+/// Combines two dlassq-style `(scale, ssq)` accumulators, each satisfying
 /// `Σ|x|² == scale² · ssq`, into one covering both partial sums.
 ///
 /// This is the cross-chunk reduction step the parallel nrm2 needs: without it
@@ -237,16 +266,45 @@ fn nrm2_combine<T: Real>(a: (T, T), b: (T, T)) -> (T, T) {
 
 /// Internal parallel nrm2 implementation.
 ///
-/// Each chunk folds its elements into a Blue's-scaling `(scale, ssq)` pair; the
+/// Each chunk folds its elements into a dlassq-style `(scale, ssq)` pair; the
 /// pairs are then reduced with [`nrm2_combine`], which rescales across chunk
 /// boundaries. This keeps the whole computation overflow/underflow-safe and
 /// consistent with the scalar and SIMD paths — a naive per-chunk sum of squares
 /// would overflow or lose precision.
+///
+/// On aarch64 (without `force-scalar`), `f64` / `f32` vectors instead run the
+/// one-pass Blue's-algorithm kernel of `nrm2` on every chunk: its three
+/// accumulators `(asml, amed, abig)` simply add up across chunks, and the
+/// reference combine step of their sums yields the norm of the whole vector.
 #[cfg(feature = "parallel")]
 fn nrm2_parallel<T: Real + Send + Sync>(x: &[T]) -> T {
     use super::nrm2::{nrm2_finalize, nrm2_fold};
 
     const CHUNK_SIZE: usize = 4096;
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use super::nrm2_blue;
+        use super::typed::{same_slice, same_value};
+        if let Some(xs) = same_slice::<T, f64>(x) {
+            let (asml, amed, abig) = xs
+                .par_chunks(CHUNK_SIZE)
+                .map(nrm2_blue::accumulators_f64)
+                .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+            if let Some(r) = same_value::<f64, T>(nrm2_blue::blue_combine_f64(asml, amed, abig)) {
+                return r;
+            }
+        }
+        if let Some(xs) = same_slice::<T, f32>(x) {
+            let (asml, amed, abig) = xs
+                .par_chunks(CHUNK_SIZE)
+                .map(nrm2_blue::accumulators_f32)
+                .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+            if let Some(r) = same_value::<f32, T>(nrm2_blue::blue_combine_f32(asml, amed, abig)) {
+                return r;
+            }
+        }
+    }
 
     let state = x
         .par_chunks(CHUNK_SIZE)
@@ -302,20 +360,21 @@ fn asum_parallel<T: Real + Send + Sync>(x: &[T]) -> T {
 }
 
 /// Parallel scal: x = α·x with parallelization control.
+///
+/// Same semantics as the serial [`scal`](super::scal()) (and reference
+/// `DSCAL`): every element is literally multiplied by `alpha`, including when
+/// `alpha == 0`, so `NaN`/`Inf` entries become `NaN` and the sign of a zero
+/// follows IEEE-754 (`0 * -0.0 == -0.0`) instead of being scrubbed to `+0.0`.
 pub fn scal_par<T: Field + Send + Sync>(alpha: T, x: &mut [T], par: Par) {
     let n = x.len();
     if n == 0 {
         return;
     }
 
-    if alpha == T::zero() {
-        // Fast path: zero out the vector
-        for xi in x.iter_mut() {
-            *xi = T::zero();
-        }
-        return;
-    }
-
+    // Multiplying by 1 is an exact no-op for every value, so skipping the
+    // loop is numerically identical (this mirrors `scal` and DSCAL's
+    // `DA.EQ.ONE` quick return). There is deliberately NO `alpha == 0`
+    // zero-fill: it would disagree with `scal` on NaN/Inf and signed zeros.
     if alpha == T::one() {
         return;
     }
@@ -400,6 +459,65 @@ mod tests {
         assert!((x[1] - 4.0).abs() < 1e-10);
         assert!((x[2] - 6.0).abs() < 1e-10);
         assert!((x[3] - 8.0).abs() < 1e-10);
+    }
+
+    /// Asserts `got` equals `expected` element-wise, bit-for-bit for non-NaN
+    /// values (so `-0.0` vs `+0.0` is distinguished) and NaN-for-NaN.
+    fn assert_same_bits(got: &[f64], expected: &[f64]) {
+        assert_eq!(got.len(), expected.len());
+        for (i, (g, e)) in got.iter().zip(expected).enumerate() {
+            if e.is_nan() {
+                assert!(g.is_nan(), "index {i}: expected NaN, got {g}");
+            } else {
+                assert_eq!(g.to_bits(), e.to_bits(), "index {i}: got {g}, expected {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_9_scal_par_alpha_zero_multiplies_like_scal() {
+        // Netlib DSCAL (and the serial `scal`) multiply even when alpha == 0:
+        // NaN stays NaN and 0 * -0.0 == -0.0. `scal_par` used to zero-fill.
+        let mut x = vec![f64::NAN, -0.0, 0.0];
+        scal_par(0.0, &mut x, Par::Seq);
+        assert!(x[0].is_nan(), "0 * NaN must stay NaN, got {}", x[0]);
+        assert!(
+            x[1] == 0.0 && x[1].is_sign_negative(),
+            "0 * -0.0 must be -0.0, got {}",
+            x[1]
+        );
+        assert!(
+            x[2] == 0.0 && x[2].is_sign_positive(),
+            "0 * 0.0 must be +0.0, got {}",
+            x[2]
+        );
+
+        let base = [f64::NAN, -0.0, 0.0, f64::INFINITY, -3.0, 2.5];
+        let mut serial = base.to_vec();
+        let mut par = base.to_vec();
+        super::super::scal(0.0, &mut serial);
+        scal_par(0.0, &mut par, Par::Seq);
+        assert_same_bits(&par, &serial);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_issue_9_scal_par_alpha_zero_rayon_multiplies_like_scal() {
+        // Large enough to take the Rayon path (threshold 65536).
+        let n = 100_000;
+        let base: Vec<f64> = (0..n)
+            .map(|i| match i % 4 {
+                0 => f64::NAN,
+                1 => -0.0,
+                2 => 0.0,
+                _ => -(i as f64),
+            })
+            .collect();
+        let mut serial = base.clone();
+        let mut par = base;
+        super::super::scal(0.0, &mut serial);
+        scal_par(0.0, &mut par, Par::Rayon);
+        assert_same_bits(&par, &serial);
     }
 
     #[test]
@@ -635,6 +753,38 @@ mod tests {
         assert!(
             nrm2_par(&x3, Par::Rayon).is_nan(),
             "parallel nrm2 of Inf+NaN must be NaN"
+        );
+    }
+
+    /// Per-chunk accumulators combine like a single pass in every regime of
+    /// the algorithm: only tiny values (`asml`), tiny values plus one chunk of
+    /// mid-range values (`asml` + `amed`), tiny values plus one huge value
+    /// (`abig`, `asml` discarded), and f32.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_nrm2_par_chunked_accumulators_match_sequential() {
+        let n = 50_000;
+        let tiny: Vec<f64> = (0..n).map(|i| 1e-300 * (1.0 + (i % 17) as f64)).collect();
+        let mut mixed = tiny.clone();
+        for v in &mut mixed[20_000..20_100] {
+            *v = 3.0;
+        }
+        let mut big = tiny.clone();
+        big[45_000] = 1e300;
+        for (what, x) in [("tiny", &tiny), ("mixed", &mixed), ("big", &big)] {
+            let par = nrm2_par(x, Par::Rayon);
+            let seq = super::super::nrm2(x);
+            assert!(
+                (par - seq).abs() <= 1e-12 * seq,
+                "{what}: parallel {par:e} vs sequential {seq:e}"
+            );
+        }
+        let xf: Vec<f32> = (0..n).map(|i| ((i % 101) as f32 - 50.0) * 1e-3).collect();
+        let par = nrm2_par(&xf, Par::Rayon);
+        let seq = super::super::nrm2(&xf);
+        assert!(
+            (par - seq).abs() <= 1e-5 * seq,
+            "f32: parallel {par} vs sequential {seq}"
         );
     }
 }

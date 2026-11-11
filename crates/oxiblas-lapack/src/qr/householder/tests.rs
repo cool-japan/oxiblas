@@ -271,7 +271,7 @@ fn test_qr_extreme_magnitude_column_stays_orthogonal() {
     // naive sum-of-squares norm: (1e200)^2 = 1e400 vastly exceeds
     // f64::MAX (~1.8e308), producing an infinite norm that corrupts
     // beta/tau with NaN and destroys orthogonality of Q. The scaled
-    // (Blue's-algorithm-style) norm computation must keep the norm --
+    // (dlassq-style) norm computation must keep the norm --
     // and therefore Q -- finite and orthogonal.
     let huge = 1.0e200_f64;
     let a = Mat::from_rows(&[&[huge, 2.0, 3.0], &[huge, 5.0, 6.0], &[huge, 8.0, 10.0]]);

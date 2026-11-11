@@ -2,12 +2,47 @@
 //!
 //! This algorithm is more efficient for large matrices than the Jacobi method.
 //! It first reduces the matrix to bidiagonal form, then applies divide-and-conquer
-//! to compute the SVD of the bidiagonal matrix.
+//! to compute the SVD of the bidiagonal matrix (the LAPACK `dgesdd` scheme).
 //!
-//! Complexity: O(n²) for the bidiagonal SVD, O(mn²) or O(m²n) for bidiagonalization.
+//! Pipeline (`m ≥ n`; a wide matrix is handled through its transpose):
+//!
+//! 0. Non-finite input is rejected; a matrix whose largest entry lies outside
+//!    `[√safmin/ε, ε/√safmin]` is scaled into that range by a power of two
+//!    (exactly, as `dgesdd` does with `dlascl`) and the singular values are
+//!    unscaled at the end.
+//! 1. Blocked Householder bidiagonalisation `A = Q·B·Pᵀ` (`dgebrd`/`dlabrd`
+//!    panels, GEMM trailing updates).
+//! 2. Divide-and-conquer SVD of the bidiagonal `B` itself (`dbdsdc`; see
+//!    [`crate::svd::bidiag_dc`]): Gu–Eisenstat merges whose singular vectors
+//!    are orthogonal without re-orthogonalisation, the `dbdsqr` QR iteration
+//!    for blocks of at most 25 rows.
+//! 3. `U = Q·diag(U_B, I)` and `V = P·V_B`, with the reflectors applied as
+//!    compact-WY blocks (three GEMMs per block) instead of forming `Q`, `P`.
+//!
+//! The result is backward stable: the residual `‖A − UΣVᵀ‖` and the loss of
+//! orthogonality of `U` and `V` are of order `n·ε` (relative to `‖A‖`), and
+//! every singular value has an absolute error of order `n·ε·‖A‖`.
+//!
+//! For `f32`/`f64` every Level-3 step runs on the optimised `oxiblas_blas`
+//! GEMM, sequentially for [`SvdDc::compute`] and with the requested [`Par`]
+//! mode for `SvdDc::compute_with_par` (feature `parallel`; the parallel
+//! GEMM is bitwise identical to the sequential one); other real scalar types
+//! (e.g. `f16`) run the same algorithm on a portable column-oriented backend.
+//!
+//! Complexity: O(mn²) for the bidiagonalization and back-transformation, and
+//! O(n³) (GEMM merges) for the bidiagonal SVD, typically much less once
+//! deflation sets in.
 
+use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
+
+use super::bidiag_dc::{BidiagDcError, bidiag_svd_into};
+use super::blocked_bidiag::{ReflectorLayout, apply_reflectors_left, gebrd_tall};
+use super::dc_kernels::{
+    BlasOps, DenseOps, PortableOps, fabs, mul_pow2, pow2_exponent, same_mut, scale_pow2,
+    transpose_into,
+};
 
 /// Error type for divide-and-conquer SVD computation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +70,11 @@ impl std::error::Error for SvdDcError {}
 /// Singular Value Decomposition using divide-and-conquer algorithm.
 ///
 /// A = U·Σ·V^T where Σ contains singular values on the diagonal.
+///
+/// [`compute`](Self::compute) runs on the calling thread. With the `parallel`
+/// feature, `compute_with_par` runs the GEMMs of the bidiagonal reduction,
+/// the divide-and-conquer merges and the back-transformation with a given
+/// [`Par`] and returns bitwise the same result.
 #[derive(Debug, Clone)]
 pub struct SvdDc<T: Scalar> {
     /// Left singular vectors (m×m orthogonal matrix).
@@ -69,12 +109,55 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
     /// assert!((sigma[0] - 4.0).abs() < 1e-10);
     /// assert!((sigma[1] - 3.0).abs() < 1e-10);
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`SvdDcError::EmptyMatrix`] if `a` has no rows or no columns.
+    /// - [`SvdDcError::NotConverged`] if `a` has a NaN or infinite entry (no
+    ///   finite SVD exists; nothing is computed), or if the bidiagonal QR
+    ///   iteration exhausts its iteration budget.
+    /// - [`SvdDcError::SecularEquationFailed`] if a merge of the divide and
+    ///   conquer produces a non-finite singular value or vector.
     pub fn compute(a: MatRef<'_, T>) -> Result<Self, SvdDcError> {
+        Self::compute_impl(a, Par::Seq)
+    }
+
+    /// Same as [`Self::compute`], with the GEMMs of the bidiagonal reduction,
+    /// of the divide-and-conquer merges and of the back-transformation run
+    /// with `par`.
+    ///
+    /// The result is bitwise identical to [`Self::compute`] for every `Par`:
+    /// the parallel GEMM only partitions its output, and every other stage
+    /// runs on the calling thread. Scalar types without an optimised GEMM
+    /// (e.g. `f16`) ignore `par`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::compute`].
+    #[cfg(feature = "parallel")]
+    pub fn compute_with_par(a: MatRef<'_, T>, par: Par) -> Result<Self, SvdDcError> {
+        Self::compute_impl(a, par)
+    }
+
+    /// [`Self::compute`] with the GEMMs run with `par`.
+    fn compute_impl(a: MatRef<'_, T>, par: Par) -> Result<Self, SvdDcError> {
         let m = a.nrows();
         let n = a.ncols();
 
         if m == 0 || n == 0 {
             return Err(SvdDcError::EmptyMatrix);
+        }
+
+        // Largest entry; a NaN or an infinity has no finite SVD.
+        let mut anrm = T::zero();
+        for j in 0..n {
+            for i in 0..m {
+                let x = a[(i, j)];
+                if !x.is_finite() {
+                    return Err(SvdDcError::NotConverged);
+                }
+                anrm = anrm.max(fabs(x));
+            }
         }
 
         // Handle 1x1 case
@@ -92,120 +175,48 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
             return Ok(Self { u, sigma, vt, m, n });
         }
 
-        // For wide matrices (m < n), compute SVD of transpose then swap U and Vt
-        // A^T = U' * Σ * V'^T => A = V' * Σ * U'^T
+        // Scale into the safe range (exact power of two, `dgesdd`).
+        let ks = safe_range_exponent(anrm);
+
+        // For wide matrices (m < n), compute the SVD of the (tall) transpose:
+        // Aᵀ = U'·Σ·V'ᵀ  ⇒  A = V'·Σ·U'ᵀ, so U = V' and Vᵀ = U'ᵀ.
         if m < n {
             let mut at = Mat::zeros(n, m);
-            for i in 0..m {
-                for j in 0..n {
-                    at[(j, i)] = a[(i, j)];
-                }
-            }
-
-            let svd_t = Self::compute_tall(at.as_ref())?;
-
-            // Swap: U = V', Vt = U'^T
-            let mut u = Mat::zeros(m, m);
+            transpose_into(a, at.as_mut());
+            scale_pow2(at.raw_data_mut(), ks);
+            let (u_t, mut sigma, v_t) = svd_tall(at, par)?;
+            scale_pow2(&mut sigma, -ks);
             let mut vt = Mat::zeros(n, n);
-
-            // U = (Vt')^T = V'
-            for i in 0..m {
-                for j in 0..m {
-                    u[(i, j)] = svd_t.vt[(j, i)];
-                }
-            }
-
-            // Vt = U'^T
-            for i in 0..n {
-                for j in 0..n {
-                    vt[(i, j)] = svd_t.u[(j, i)];
-                }
-            }
-
+            transpose_into(u_t.as_ref(), vt.as_mut());
             return Ok(Self {
-                u,
-                sigma: svd_t.sigma,
+                u: v_t,
+                sigma,
                 vt,
                 m,
                 n,
             });
         }
 
-        Self::compute_tall(a)
-    }
-
-    /// Computes SVD for tall or square matrices (m >= n).
-    fn compute_tall(a: MatRef<'_, T>) -> Result<Self, SvdDcError> {
-        let m = a.nrows();
-        let n = a.ncols();
-
-        // Step 1: Reduce to bidiagonal form
-        // A = U_b · B · V_b^T where B is bidiagonal
-        let (u_b, d, e, v_b) = bidiagonalize_tall(a)?;
-
-        let k = m.min(n);
-
-        // Step 2: Compute SVD of bidiagonal matrix using divide-and-conquer
-        let (u_bd, sigma, vt_bd) = Self::bidiagonal_svd_dc(&d, &e)?;
-
-        // Step 3: Combine: U = U_b · U_bd_ext, V^T = Vt_bd_ext · V_b
-        // where U_bd_ext embeds the k×k U_bd into m×m (with identity in remaining diagonal)
-        // and Vt_bd_ext embeds the k×k Vt_bd into n×n (with identity in remaining diagonal)
-
-        // U = U_b * [U_bd | 0  ]
-        //           [0    | I_{m-k}]
-        let mut u = Mat::zeros(m, m);
-        for i in 0..m {
-            for j in 0..m {
-                if j < k {
-                    // Columns 0..k: multiply U_b[:, 0..k] * U_bd[0..k, j]
-                    let mut sum = T::zero();
-                    for l in 0..k {
-                        sum = sum + u_b[(i, l)] * u_bd[(l, j)];
-                    }
-                    u[(i, j)] = sum;
-                } else {
-                    // Columns k..m: just copy from U_b (identity part)
-                    u[(i, j)] = u_b[(i, j)];
-                }
+        let mut work = Mat::zeros(m, n);
+        for j in 0..n {
+            for i in 0..m {
+                work[(i, j)] = a[(i, j)];
             }
         }
-
-        // V^T = [Vt_bd | 0      ] * V_b
-        //       [0     | I_{n-k}]
-        // Since Vt_bd is k×k and V_b is n×n, for rows i < k we multiply by Vt_bd,
-        // for rows i >= k we just take V_b[i, :]
+        scale_pow2(work.raw_data_mut(), ks);
+        let (u, mut sigma, v) = svd_tall(work, par)?;
+        scale_pow2(&mut sigma, -ks);
         let mut vt = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in 0..n {
-                if i < k {
-                    // Rows 0..k: multiply Vt_bd[i, 0..k] * V_b[0..k, j]
-                    let mut sum = T::zero();
-                    for l in 0..k {
-                        sum = sum + vt_bd[(i, l)] * v_b[(l, j)];
-                    }
-                    vt[(i, j)] = sum;
-                } else {
-                    // Rows k..n: just copy from V_b (identity part)
-                    vt[(i, j)] = v_b[(i, j)];
-                }
-            }
-        }
-
+        transpose_into(v.as_ref(), vt.as_mut());
         Ok(Self { u, sigma, vt, m, n })
     }
 
-    /// Computes the SVD of the bidiagonal matrix with diagonal `d` and
-    /// super-diagonal `e` using the shared real divide-and-conquer kernel
-    /// (secular-equation merge with deflation; see [`crate::svd::bidiag_dc`]).
-    fn bidiagonal_svd_dc(d: &[T], e: &[T]) -> Result<(Mat<T>, Vec<T>, Mat<T>), SvdDcError> {
-        crate::svd::bidiag_dc::bidiagonal_svd_dc(d, e).map_err(|err| match err {
-            crate::svd::bidiag_dc::BidiagDcError::NotConverged => SvdDcError::NotConverged,
-            crate::svd::bidiag_dc::BidiagDcError::SecularEquationFailed => {
-                SvdDcError::SecularEquationFailed
-            }
-        })
+    /// Splits the decomposition into `(U, σ, Vᵀ)`.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn into_parts(self) -> (Mat<T>, Vec<T>, Mat<T>) {
+        (self.u, self.sigma, self.vt)
     }
+
     /// Returns the singular values (sorted in descending order).
     pub fn singular_values(&self) -> &[T] {
         &self.sigma
@@ -313,212 +324,131 @@ impl<T: Field + Real + bytemuck::Zeroable> SvdDc<T> {
     }
 }
 
-/// Bidiagonalize a tall or square matrix (m >= n).
-fn bidiagonalize_tall<T: Field + Real + bytemuck::Zeroable>(
-    a: MatRef<'_, T>,
-) -> Result<(Mat<T>, Vec<T>, Vec<T>, Mat<T>), SvdDcError> {
-    let m = a.nrows();
-    let n = a.ncols();
-    let k = m.min(n);
-
-    // Copy A to working matrix
-    let mut work = Mat::zeros(m, n);
-    for i in 0..m {
-        for j in 0..n {
-            work[(i, j)] = a[(i, j)];
-        }
+/// Error mapping from the shared bidiagonal kernel.
+fn map_bidiag_error(err: BidiagDcError) -> SvdDcError {
+    match err {
+        BidiagDcError::NotConverged => SvdDcError::NotConverged,
+        BidiagDcError::SecularEquationFailed => SvdDcError::SecularEquationFailed,
     }
+}
 
-    // Store Householder vectors and tau values for later U and V computation
-    let mut tau_left = vec![T::zero(); k];
-    let num_right = k.saturating_sub(1);
-    let mut tau_right = vec![T::zero(); num_right];
-
-    let mut d = vec![T::zero(); k];
-    let mut e = vec![T::zero(); num_right];
-
-    for j in 0..k {
-        // Apply Householder from the left to zero column j below diagonal
-        let (tau, beta) = householder_left(&mut work, j, m, n);
-        d[j] = beta;
-        tau_left[j] = tau;
-
-        // Apply to remaining columns
-        apply_householder_left_bidiag(&mut work, j, m, n, tau);
-
-        // Apply Householder from the right to zero row j to the right of superdiagonal
-        if j < n - 1 {
-            let (tau, beta) = householder_right(&mut work, j, m, n);
-            if j < e.len() {
-                e[j] = beta;
-                tau_right[j] = tau;
-            }
-
-            // Apply to remaining rows
-            apply_householder_right_bidiag(&mut work, j, m, n, tau);
-        }
+/// The power-of-two exponent `k` that brings `anrm·2^k` into
+/// `[smlnum, bignum]` (`smlnum = √safmin/ε`, `bignum = 1/smlnum`, as in
+/// `dgesdd`), or `0` when `anrm` already lies there (or is zero).
+///
+/// For formats too narrow for that range to exist (`smlnum ≥ bignum`, e.g.
+/// `f16`) the matrix is scaled to unit max-norm instead.
+fn safe_range_exponent<T: Real>(anrm: T) -> i32 {
+    if !(anrm > T::zero() && anrm.is_finite()) {
+        return 0;
     }
+    let smlnum = <T as Real>::sqrt(<T as Scalar>::min_positive()) / <T as Scalar>::epsilon();
+    let bignum = T::one() / smlnum;
+    if smlnum >= bignum {
+        return pow2_exponent(anrm);
+    }
+    let to_i32 = |x: T| num_traits::ToPrimitive::to_i32(&x).unwrap_or(0);
+    if anrm < smlnum {
+        let mut k = to_i32(<T as Real>::ceil(num_traits::Float::log2(smlnum / anrm)));
+        while mul_pow2(anrm, k) < smlnum {
+            k += 1;
+        }
+        k
+    } else if anrm > bignum {
+        let mut k = -to_i32(<T as Real>::ceil(num_traits::Float::log2(anrm / bignum)));
+        while mul_pow2(anrm, k) > bignum {
+            k -= 1;
+        }
+        k
+    } else {
+        0
+    }
+}
 
-    // Build U: start with identity and apply reflections from right
+/// Full SVD of the tall-or-square `work` (`m ≥ n`), consumed as workspace.
+///
+/// Returns `(U, σ, V)` with `U` `m×m` and `V` `n×n` (by columns). `f64` and
+/// `f32` run the GEMM-backed pipeline with every GEMM in mode `par`; every
+/// other real type runs the same algorithm on the portable column-oriented
+/// backend.
+fn svd_tall<T: Field + Real + bytemuck::Zeroable>(
+    mut work: Mat<T>,
+    par: Par,
+) -> Result<(Mat<T>, Vec<T>, Mat<T>), SvdDcError> {
+    let m = work.nrows();
+    let n = work.ncols();
     let mut u = Mat::zeros(m, m);
-    for i in 0..m {
+    let mut sigma = vec![T::zero(); n];
+    let mut v = Mat::zeros(n, n);
+    if let Some(res) = typed_svd_tall::<T, f64>(par, &mut work, &mut u, &mut sigma, &mut v) {
+        res?;
+    } else if let Some(res) = typed_svd_tall::<T, f32>(par, &mut work, &mut u, &mut sigma, &mut v) {
+        res?;
+    } else {
+        svd_tall_into::<T, PortableOps>(PortableOps, &mut work, &mut u, &mut sigma, &mut v)?;
+    }
+    Ok((u, sigma, v))
+}
+
+/// Runs the GEMM-backed pipeline when `T` is the BLAS scalar `G`.
+fn typed_svd_tall<T, G>(
+    par: Par,
+    work: &mut Mat<T>,
+    u: &mut Mat<T>,
+    sigma: &mut Vec<T>,
+    v: &mut Mat<T>,
+) -> Option<Result<(), SvdDcError>>
+where
+    T: Field + Real + bytemuck::Zeroable,
+    G: Field + Real + bytemuck::Zeroable + oxiblas_blas::level3::gemm_kernel::GemmKernel,
+{
+    let work = same_mut::<Mat<T>, Mat<G>>(work)?;
+    let u = same_mut::<Mat<T>, Mat<G>>(u)?;
+    let sigma = same_mut::<Vec<T>, Vec<G>>(sigma)?;
+    let v = same_mut::<Mat<T>, Mat<G>>(v)?;
+    Some(svd_tall_into::<G, BlasOps>(
+        BlasOps { par },
+        work,
+        u,
+        sigma,
+        v,
+    ))
+}
+
+/// The divide-and-conquer SVD pipeline for `m ≥ n` (see the module docs),
+/// writing `U` (`m×m`), `σ` and `V` (`n×n`, by columns) into the buffers.
+fn svd_tall_into<T, B>(
+    ops: B,
+    work: &mut Mat<T>,
+    u: &mut Mat<T>,
+    sigma: &mut [T],
+    v: &mut Mat<T>,
+) -> Result<(), SvdDcError>
+where
+    T: Field + Real + bytemuck::Zeroable,
+    B: DenseOps<T>,
+{
+    let m = work.nrows();
+    let n = work.ncols();
+    let factors = gebrd_tall::<T, B>(ops, work);
+
+    let mut u_b = Mat::zeros(n, n);
+    bidiag_svd_into::<T, B>(ops, &factors.d, &factors.e, &mut u_b, sigma, v)
+        .map_err(map_bidiag_error)?;
+
+    // U = Q · [U_B 0; 0 I].
+    for j in 0..n {
+        for i in 0..n {
+            u[(i, j)] = u_b[(i, j)];
+        }
+    }
+    for i in n..m {
         u[(i, i)] = T::one();
     }
-
-    for j in 0..k {
-        let tau = tau_left[j];
-        if tau != T::zero() {
-            for r in 0..m {
-                let mut w = u[(r, j)];
-                for i in (j + 1)..m {
-                    w = w + u[(r, i)] * work[(i, j)];
-                }
-
-                let tw = tau * w;
-                u[(r, j)] = u[(r, j)] - tw;
-                for i in (j + 1)..m {
-                    u[(r, i)] = u[(r, i)] - tw * work[(i, j)];
-                }
-            }
-        }
-    }
-
-    // Build V: start with identity and apply reflections from right
-    let mut v = Mat::zeros(n, n);
-    for i in 0..n {
-        v[(i, i)] = T::one();
-    }
-
-    for j in 0..tau_right.len() {
-        let tau = tau_right[j];
-        if tau != T::zero() {
-            let start = j + 1;
-            for r in 0..n {
-                let mut w = v[(r, start)];
-                for i in (start + 1)..n {
-                    w = w + v[(r, i)] * work[(j, i)];
-                }
-
-                let tw = tau * w;
-                v[(r, start)] = v[(r, start)] - tw;
-                for i in (start + 1)..n {
-                    v[(r, i)] = v[(r, i)] - tw * work[(j, i)];
-                }
-            }
-        }
-    }
-
-    // V^T
-    let mut vt = Mat::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            vt[(i, j)] = v[(j, i)];
-        }
-    }
-
-    Ok((u, d, e, vt))
-}
-
-/// Computes Householder vector for zeroing column j below diagonal.
-fn householder_left<T: Field + Real>(work: &mut Mat<T>, j: usize, m: usize, _n: usize) -> (T, T) {
-    let mut norm_sq = T::zero();
-    for i in j..m {
-        norm_sq = norm_sq + work[(i, j)] * work[(i, j)];
-    }
-    let norm = Real::sqrt(norm_sq);
-
-    if norm == T::zero() {
-        return (T::zero(), T::zero());
-    }
-
-    let x_j = work[(j, j)];
-    let beta = if x_j >= T::zero() { -norm } else { norm };
-    let tau = (beta - x_j) / beta;
-
-    let scale = T::one() / (x_j - beta);
-    for i in (j + 1)..m {
-        work[(i, j)] = work[(i, j)] * scale;
-    }
-
-    (tau, beta)
-}
-
-/// Computes Householder vector for zeroing row j to the right of superdiagonal.
-fn householder_right<T: Field + Real>(work: &mut Mat<T>, j: usize, _m: usize, n: usize) -> (T, T) {
-    let start_col = j + 1;
-    let mut norm_sq = T::zero();
-    for i in start_col..n {
-        norm_sq = norm_sq + work[(j, i)] * work[(j, i)];
-    }
-    let norm = Real::sqrt(norm_sq);
-
-    if norm == T::zero() {
-        return (T::zero(), T::zero());
-    }
-
-    let x_j = work[(j, start_col)];
-    let beta = if x_j >= T::zero() { -norm } else { norm };
-    let tau = (beta - x_j) / beta;
-
-    let scale = T::one() / (x_j - beta);
-    for i in (start_col + 1)..n {
-        work[(j, i)] = work[(j, i)] * scale;
-    }
-
-    (tau, beta)
-}
-
-/// Applies Householder reflection from the left to trailing submatrix.
-fn apply_householder_left_bidiag<T: Field + Real>(
-    work: &mut Mat<T>,
-    j: usize,
-    m: usize,
-    n: usize,
-    tau: T,
-) {
-    if tau == T::zero() {
-        return;
-    }
-
-    for col in (j + 1)..n {
-        let mut w = work[(j, col)];
-        for i in (j + 1)..m {
-            w = w + work[(i, j)] * work[(i, col)];
-        }
-
-        let tw = tau * w;
-        work[(j, col)] = work[(j, col)] - tw;
-        for i in (j + 1)..m {
-            work[(i, col)] = work[(i, col)] - tw * work[(i, j)];
-        }
-    }
-}
-
-/// Applies Householder reflection from the right to trailing submatrix.
-fn apply_householder_right_bidiag<T: Field + Real>(
-    work: &mut Mat<T>,
-    j: usize,
-    m: usize,
-    n: usize,
-    tau: T,
-) {
-    if tau == T::zero() {
-        return;
-    }
-
-    let start_col = j + 1;
-    for row in (j + 1)..m {
-        let mut w = work[(row, start_col)];
-        for i in (start_col + 1)..n {
-            w = w + work[(j, i)] * work[(row, i)];
-        }
-
-        let tw = tau * w;
-        work[(row, start_col)] = work[(row, start_col)] - tw;
-        for i in (start_col + 1)..n {
-            work[(row, i)] = work[(row, i)] - tw * work[(j, i)];
-        }
-    }
+    apply_reflectors_left::<T, B>(ops, work, &factors.tauq, ReflectorLayout::Columns, u);
+    // V = P · V_B.
+    apply_reflectors_left::<T, B>(ops, work, &factors.taup, ReflectorLayout::Rows, v);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -644,11 +574,10 @@ mod tests {
         let svd = SvdDc::compute(a.as_ref()).unwrap();
         let reconstructed = svd.reconstruct();
 
-        // Divide-and-conquer has slightly lower precision due to secular equation solving
         for i in 0..3 {
             for j in 0..3 {
                 assert!(
-                    approx_eq(reconstructed[(i, j)], a[(i, j)], 1e-5),
+                    approx_eq(reconstructed[(i, j)], a[(i, j)], 1e-12),
                     "reconstructed[{},{}] = {}, a = {}",
                     i,
                     j,
@@ -659,99 +588,60 @@ mod tests {
         }
     }
 
+    /// `Q·B·Pᵀ = A` for the reduction used by the pipeline (square and tall).
     #[test]
     fn test_bidiagonalize() {
-        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]);
+        for a in [
+            Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0]]),
+            Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0]]),
+        ] {
+            let (m, n) = (a.nrows(), a.ncols());
+            let mut work = a.clone();
+            let f = gebrd_tall::<f64, BlasOps>(BlasOps::SEQ, &mut work);
+            let mut q = Mat::<f64>::zeros(m, m);
+            for i in 0..m {
+                q[(i, i)] = 1.0;
+            }
+            apply_reflectors_left::<f64, BlasOps>(
+                BlasOps::SEQ,
+                &work,
+                &f.tauq,
+                ReflectorLayout::Columns,
+                &mut q,
+            );
+            let mut p = Mat::<f64>::zeros(n, n);
+            for i in 0..n {
+                p[(i, i)] = 1.0;
+            }
+            apply_reflectors_left::<f64, BlasOps>(
+                BlasOps::SEQ,
+                &work,
+                &f.taup,
+                ReflectorLayout::Rows,
+                &mut p,
+            );
 
-        let (u, d, e, vt) = bidiagonalize_tall(a.as_ref()).unwrap();
-
-        // Reconstruct bidiagonal matrix
-        let mut b: Mat<f64> = Mat::zeros(2, 2);
-        b[(0, 0)] = d[0];
-        if !e.is_empty() {
-            b[(0, 1)] = e[0];
-        }
-        b[(1, 1)] = d[1];
-
-        // Verify U * B * V^T = A
-        let mut ub: Mat<f64> = Mat::zeros(2, 2);
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    ub[(i, j)] = ub[(i, j)] + u[(i, k)] * b[(k, j)];
+            let mut b = Mat::<f64>::zeros(m, n);
+            for i in 0..n {
+                b[(i, i)] = f.d[i];
+                if i + 1 < n {
+                    b[(i, i + 1)] = f.e[i];
                 }
             }
-        }
-
-        let mut ubvt: Mat<f64> = Mat::zeros(2, 2);
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    ubvt[(i, j)] = ubvt[(i, j)] + ub[(i, k)] * vt[(k, j)];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut s = 0.0;
+                    for r in 0..m {
+                        for t in 0..n {
+                            s += q[(i, r)] * b[(r, t)] * p[(j, t)];
+                        }
+                    }
+                    assert!(
+                        approx_eq(s, a[(i, j)], 1e-12),
+                        "QBP^T[{i},{j}] = {s}, A = {}",
+                        a[(i, j)]
+                    );
                 }
-            }
-        }
-
-        for i in 0..2 {
-            for j in 0..2 {
-                assert!(
-                    approx_eq(ubvt[(i, j)], a[(i, j)], 1e-10),
-                    "UBV^T[{},{}] = {}, A = {}",
-                    i,
-                    j,
-                    ubvt[(i, j)],
-                    a[(i, j)]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_bidiagonalize_tall() {
-        // Test bidiagonalization on a tall matrix (3×2)
-        let a = Mat::from_rows(&[&[1.0f64, 2.0], &[3.0, 4.0], &[5.0, 6.0]]);
-
-        let (u, d, e, vt) = bidiagonalize_tall(a.as_ref()).unwrap();
-
-        // Reconstruct bidiagonal matrix (3×2)
-        let mut b: Mat<f64> = Mat::zeros(3, 2);
-        b[(0, 0)] = d[0];
-        if !e.is_empty() {
-            b[(0, 1)] = e[0];
-        }
-        b[(1, 1)] = d[1];
-
-        // Verify U * B * V^T = A
-        // First: U (3×3) * B (3×2) = 3×2
-        let mut ub: Mat<f64> = Mat::zeros(3, 2);
-        for i in 0..3 {
-            for j in 0..2 {
-                for k in 0..3 {
-                    ub[(i, j)] = ub[(i, j)] + u[(i, k)] * b[(k, j)];
-                }
-            }
-        }
-
-        // Then: UB (3×2) * V^T (2×2) = 3×2
-        let mut ubvt: Mat<f64> = Mat::zeros(3, 2);
-        for i in 0..3 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    ubvt[(i, j)] = ubvt[(i, j)] + ub[(i, k)] * vt[(k, j)];
-                }
-            }
-        }
-
-        for i in 0..3 {
-            for j in 0..2 {
-                assert!(
-                    approx_eq(ubvt[(i, j)], a[(i, j)], 1e-10),
-                    "UBV^T[{},{}] = {}, A = {}",
-                    i,
-                    j,
-                    ubvt[(i, j)],
-                    a[(i, j)]
-                );
             }
         }
     }
@@ -785,21 +675,94 @@ mod tests {
         ((*state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
     }
 
+    fn lcg_matrix(m: usize, n: usize, seed: u64) -> Mat<f64> {
+        let mut state = seed;
+        let mut a = Mat::<f64>::zeros(m, n);
+        for j in 0..n {
+            for i in 0..m {
+                a[(i, j)] = lcg(&mut state);
+            }
+        }
+        a
+    }
+
+    /// Accuracy metrics of an SVD of `a`.
+    struct Accuracy {
+        /// `‖A − UΣVᵀ‖_F / ‖A‖_F`.
+        resid: f64,
+        /// `max |UᵀU − I|` over the full `m×m` U.
+        orth_u: f64,
+        /// `max |VᵀV − I|` over the full `n×n` V.
+        orth_v: f64,
+    }
+
+    fn accuracy(a: &Mat<f64>, svd: &SvdDc<f64>) -> Accuracy {
+        let (m, n) = (a.nrows(), a.ncols());
+        let k = m.min(n);
+        let u = svd.u();
+        let vt = svd.vt();
+        let s = svd.singular_values();
+        let mut us = Mat::<f64>::zeros(m, k);
+        for j in 0..k {
+            for i in 0..m {
+                us[(i, j)] = u[(i, j)] * s[j];
+            }
+        }
+        let mut rec = Mat::<f64>::zeros(m, n);
+        oxiblas_blas::level3::gemm::gemm(
+            1.0,
+            us.as_ref(),
+            vt.submatrix(0, 0, k, n),
+            0.0,
+            rec.as_mut(),
+        );
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for j in 0..n {
+            for i in 0..m {
+                num += (rec[(i, j)] - a[(i, j)]).powi(2);
+                den += a[(i, j)].powi(2);
+            }
+        }
+        let gram_err = |x: MatRef<'_, f64>, trans_first: bool| {
+            let dim = if trans_first { x.ncols() } else { x.nrows() };
+            let mut g = Mat::<f64>::zeros(dim, dim);
+            let (ta, tb) = if trans_first {
+                (
+                    oxiblas_blas::level3::Trans::Trans,
+                    oxiblas_blas::level3::Trans::NoTrans,
+                )
+            } else {
+                (
+                    oxiblas_blas::level3::Trans::NoTrans,
+                    oxiblas_blas::level3::Trans::Trans,
+                )
+            };
+            oxiblas_blas::level3::gemm::gemm_transposed(ta, tb, 1.0, x, x, 0.0, g.as_mut());
+            let mut worst = 0.0f64;
+            for i in 0..dim {
+                for j in 0..dim {
+                    let expect = if i == j { 1.0 } else { 0.0 };
+                    worst = worst.max((g[(i, j)] - expect).abs());
+                }
+            }
+            worst
+        };
+        Accuracy {
+            resid: (num / den.max(f64::MIN_POSITIVE)).sqrt(),
+            orth_u: gram_err(u, true),
+            orth_v: gram_err(vt, false),
+        }
+    }
+
     #[test]
     fn test_svd_dc_vs_reference_across_sizes() {
         use crate::svd::{QrSvd, Svd};
 
-        // Sizes straddle the DIRECT_THRESHOLD (25): 5, 25 use the direct shifted
-        // QR path; 26, 50, 100, 200 exercise the divide-and-conquer secular
-        // merge with deflation.
+        // Sizes straddle SMLSIZ (25): 5, 25 use the bidiagonal QR iteration;
+        // 26, 50, 100, 200 exercise the divide-and-conquer merges with
+        // deflation.
         for &n in &[5usize, 25, 26, 50, 100, 200] {
-            let mut state: u64 = 0x2545_f491_4f6c_dd1d ^ (n as u64);
-            let mut a = Mat::<f64>::zeros(n, n);
-            for i in 0..n {
-                for j in 0..n {
-                    a[(i, j)] = lcg(&mut state);
-                }
-            }
+            let a = lcg_matrix(n, n, 0x2545_f491_4f6c_dd1d ^ (n as u64));
 
             let dc = SvdDc::compute(a.as_ref()).unwrap();
             // High-accuracy reference: one-sided Jacobi SVD (used for all sizes).
@@ -812,7 +775,7 @@ mod tests {
             // Singular values agree tightly with the Jacobi reference SVD.
             for k in 0..n {
                 assert!(
-                    (s_dc[k] - s_ref[k]).abs() < 1e-8 * smax,
+                    (s_dc[k] - s_ref[k]).abs() < 1e-12 * smax,
                     "n={n}: sigma[{k}] dc={} jacobi={}",
                     s_dc[k],
                     s_ref[k]
@@ -820,15 +783,14 @@ mod tests {
             }
 
             // Independent cross-check against the QR-based reference SVD
-            // (Golub–Kahan–Reinsch). QrSvd's convergence/deflation logic was
-            // fixed to be reliable at these sizes (direction-aware shifted
-            // sweeps, O(n^2) sweep budget), so this is a hard assertion.
+            // (Golub–Kahan–Reinsch), at the same tolerance as the Jacobi
+            // check (the two agree to about 2e-15·σ_max at these sizes).
             if n <= 50 {
                 let qr_reference = QrSvd::compute(a.as_ref()).unwrap();
                 let s_qr = qr_reference.singular_values();
                 for k in 0..n {
                     assert!(
-                        (s_dc[k] - s_qr[k]).abs() < 5e-3 * smax,
+                        (s_dc[k] - s_qr[k]).abs() < 1e-12 * smax,
                         "n={n}: sigma[{k}] dc={} qr={}",
                         s_dc[k],
                         s_qr[k]
@@ -836,22 +798,10 @@ mod tests {
                 }
             }
 
-            // UᵀU = I and VᵀV = I.
-            let u = dc.u();
-            let vt = dc.vt();
-            for i in 0..n {
-                for j in 0..n {
-                    let mut utu = 0.0;
-                    let mut vtv = 0.0;
-                    for k in 0..n {
-                        utu += u[(k, i)] * u[(k, j)];
-                        vtv += vt[(i, k)] * vt[(j, k)];
-                    }
-                    let expect = if i == j { 1.0 } else { 0.0 };
-                    assert!((utu - expect).abs() < 1e-6, "n={n}: UtU[{i},{j}]={utu}");
-                    assert!((vtv - expect).abs() < 1e-9, "n={n}: VtV[{i},{j}]={vtv}");
-                }
-            }
+            // UᵀU = I and VᵀV = I to working precision.
+            let acc = accuracy(&a, &dc);
+            assert!(acc.orth_u < 1e-12, "n={n}: UtU error {}", acc.orth_u);
+            assert!(acc.orth_v < 1e-12, "n={n}: VtV error {}", acc.orth_v);
 
             // Reconstruction ||A - U Σ Vᵀ|| is tight.
             let rec = dc.reconstruct();
@@ -862,9 +812,314 @@ mod tests {
                 }
             }
             assert!(
-                rec_err < 1e-8 * smax,
+                rec_err < 1e-12 * smax,
                 "n={n}: reconstruction error {rec_err}"
             );
+        }
+    }
+
+    /// Checks the SVD of `a` (`m × n`) against reference singular values
+    /// `s_ref` (descending): σ to `1e-12·σ_max`, the shapes of the full U and
+    /// V, the reconstruction and the orthogonality of U and V.
+    fn check_against_reference(what: &str, a: &Mat<f64>, s_ref: &[f64]) {
+        let (m, n) = (a.nrows(), a.ncols());
+        let k = m.min(n);
+        let dc = SvdDc::compute(a.as_ref()).unwrap();
+        assert_eq!(dc.singular_values().len(), k);
+        assert_eq!((dc.u().nrows(), dc.u().ncols()), (m, m));
+        assert_eq!((dc.vt().nrows(), dc.vt().ncols()), (n, n));
+        let s_dc = dc.singular_values();
+        for i in 0..k {
+            assert!(
+                (s_dc[i] - s_ref[i]).abs() < 1e-12 * s_ref[0],
+                "{what}: sigma[{i}] dc={} reference={}",
+                s_dc[i],
+                s_ref[i]
+            );
+        }
+        let acc = accuracy(a, &dc);
+        assert!(acc.resid < 1e-13, "{what}: residual {}", acc.resid);
+        assert!(acc.orth_u < 1e-12, "{what}: UtU error {}", acc.orth_u);
+        assert!(acc.orth_v < 1e-12, "{what}: VtV error {}", acc.orth_v);
+    }
+
+    /// Random `m × n` matrix checked against the one-sided Jacobi `Svd`.
+    ///
+    /// The Jacobi reference dominates the run time in the debug profile
+    /// (minutes for `300 × 31` or `500 × 500`), so the tests that use it for
+    /// large shapes are release-only; their debug counterparts use
+    /// [`check_prescribed`] at the same shapes.
+    fn check_random_vs_jacobi(m: usize, n: usize, seed: u64) {
+        use crate::svd::Svd;
+        let a = lcg_matrix(m, n, seed);
+        let jac = Svd::compute(a.as_ref()).unwrap();
+        check_against_reference(&format!("{m}x{n} random"), &a, jac.singular_values());
+    }
+
+    /// `m × n` matrix with prescribed singular values spread over three
+    /// decades (irregularly spaced, descending), checked against them.
+    fn check_prescribed(m: usize, n: usize, seed: u64) {
+        let k = m.min(n);
+        let mut state = seed;
+        let mut s: Vec<f64> = (0..k)
+            .map(|i| {
+                let t = if k > 1 {
+                    i as f64 / (k - 1) as f64
+                } else {
+                    0.0
+                };
+                10.0 * 10f64.powf(-3.0 * t) * (1.0 + 0.05 * lcg(&mut state))
+            })
+            .collect();
+        s.sort_by(|x, y| y.total_cmp(x));
+        let a = matrix_with_singular_values(m, n, &s, seed);
+        check_against_reference(&format!("{m}x{n} prescribed"), &a, &s);
+    }
+
+    /// n = 300: blocked bidiagonalisation and several levels of GEMM merges.
+    #[test]
+    fn test_svd_dc_accuracy_n300() {
+        check_prescribed(300, 300, 0x5eed_0000 ^ 300);
+    }
+
+    /// n = 500 (leading dimension 512, the former 4 KiB-stride slow case).
+    #[test]
+    fn test_svd_dc_accuracy_n500() {
+        check_prescribed(500, 500, 0x5eed_0000 ^ 500);
+    }
+
+    /// [`test_svd_dc_accuracy_n300`] on a random matrix, against Jacobi.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow in debug (one-sided Jacobi reference); run with --release"
+    )]
+    fn test_svd_dc_accuracy_n300_vs_jacobi() {
+        check_random_vs_jacobi(300, 300, 0x5eed_0000 ^ 300);
+    }
+
+    /// [`test_svd_dc_accuracy_n500`] on a random matrix, against Jacobi.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow in debug (one-sided Jacobi reference); run with --release"
+    )]
+    fn test_svd_dc_accuracy_n500_vs_jacobi() {
+        check_random_vs_jacobi(500, 500, 0x5eed_0000 ^ 500);
+    }
+
+    /// Tall and wide shapes (blocked and unblocked reductions, full U / V).
+    const TALL_AND_WIDE_SHAPES: [(usize, usize); 5] =
+        [(260, 150), (150, 260), (61, 7), (7, 61), (300, 31)];
+
+    /// Tall and wide shapes: the small ones (cheap even in debug) as random
+    /// matrices against Jacobi, the others with prescribed singular values.
+    #[test]
+    fn test_svd_dc_tall_and_wide_shapes() {
+        for &(m, n) in &TALL_AND_WIDE_SHAPES {
+            let seed = 0xabcd ^ (m * 1000 + n) as u64;
+            if m * n <= 1_000 {
+                check_random_vs_jacobi(m, n, seed);
+            } else {
+                check_prescribed(m, n, seed);
+            }
+        }
+    }
+
+    /// [`test_svd_dc_tall_and_wide_shapes`] with every shape a random matrix
+    /// checked against Jacobi.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "slow in debug (one-sided Jacobi reference); run with --release"
+    )]
+    fn test_svd_dc_tall_and_wide_shapes_vs_jacobi() {
+        for &(m, n) in &TALL_AND_WIDE_SHAPES {
+            check_random_vs_jacobi(m, n, 0xabcd ^ (m * 1000 + n) as u64);
+        }
+    }
+
+    /// `A = H·diag(σ)·Gᵀ` (`m × n`) where `H` and `G` are products of three
+    /// random Householder reflections, so the singular values of `A` are
+    /// exactly `σ` (descending) up to rounding.
+    fn matrix_with_singular_values(m: usize, n: usize, sigma: &[f64], seed: u64) -> Mat<f64> {
+        let mut a = Mat::<f64>::zeros(m, n);
+        for (i, &s) in sigma.iter().enumerate() {
+            a[(i, i)] = s;
+        }
+        let mut state = seed;
+        let mut unit = |len: usize| {
+            let mut v: Vec<f64> = (0..len).map(|_| lcg(&mut state)).collect();
+            let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            for x in v.iter_mut() {
+                *x /= nrm;
+            }
+            v
+        };
+        for _ in 0..3 {
+            // a ← (I − 2vvᵀ)·a
+            let v = unit(m);
+            for j in 0..n {
+                let dotp: f64 = (0..m).map(|i| v[i] * a[(i, j)]).sum();
+                for i in 0..m {
+                    a[(i, j)] -= 2.0 * dotp * v[i];
+                }
+            }
+            // a ← a·(I − 2wwᵀ)
+            let w = unit(n);
+            for i in 0..m {
+                let dotp: f64 = (0..n).map(|j| a[(i, j)] * w[j]).sum();
+                for j in 0..n {
+                    a[(i, j)] -= 2.0 * dotp * w[j];
+                }
+            }
+        }
+        a
+    }
+
+    /// f32 through the GEMM-backed pipeline (blocked sizes included).
+    #[test]
+    fn test_svd_dc_f32_large() {
+        for &(m, n) in &[(200usize, 200usize), (230, 140), (90, 170)] {
+            let a64 = lcg_matrix(m, n, 0xf32 ^ (m + n) as u64);
+            let mut a = Mat::<f32>::zeros(m, n);
+            for j in 0..n {
+                for i in 0..m {
+                    a[(i, j)] = a64[(i, j)] as f32;
+                }
+            }
+            let dc = SvdDc::compute(a.as_ref()).unwrap();
+            let k = m.min(n);
+            let (u, vt, s) = (dc.u(), dc.vt(), dc.singular_values());
+            let mut worst_u = 0.0f32;
+            for i in 0..m {
+                for j in 0..m {
+                    let mut g = 0.0f32;
+                    for r in 0..m {
+                        g += u[(r, i)] * u[(r, j)];
+                    }
+                    worst_u = worst_u.max((g - if i == j { 1.0 } else { 0.0 }).abs());
+                }
+            }
+            let mut worst_v = 0.0f32;
+            for i in 0..n {
+                for j in 0..n {
+                    let mut g = 0.0f32;
+                    for r in 0..n {
+                        g += vt[(i, r)] * vt[(j, r)];
+                    }
+                    worst_v = worst_v.max((g - if i == j { 1.0 } else { 0.0 }).abs());
+                }
+            }
+            let mut worst_rec = 0.0f32;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut x = 0.0f32;
+                    for l in 0..k {
+                        x += u[(i, l)] * s[l] * vt[(l, j)];
+                    }
+                    worst_rec = worst_rec.max((x - a[(i, j)]).abs());
+                }
+            }
+            // c·n·ε_f32 with c = 1 (observed: about 1e-6 and 2.5e-7·σ₁); the
+            // former BᵀB solver reached 3e-4·σ₁ on graded f32 spectra.
+            let tol = m.max(n) as f32 * f32::EPSILON;
+            assert!(worst_u < tol, "{m}x{n} f32 UtU {worst_u}");
+            assert!(worst_v < tol, "{m}x{n} f32 VtV {worst_v}");
+            assert!(worst_rec < tol * s[0], "{m}x{n} f32 recon {worst_rec}");
+        }
+    }
+
+    /// Zero and rank-one inputs: (almost) every column of U comes from the
+    /// orthonormal completion, which must still give orthogonal U and V.
+    ///
+    /// The exactly rank-one matrix also drives the trailing "noise of noise"
+    /// of the reduction into subnormal numbers, which once turned `larfg`'s
+    /// norm (and so the whole bidiagonal) into NaN.
+    #[test]
+    fn test_svd_dc_zero_and_rank_one() {
+        let z = Mat::<f64>::zeros(60, 45);
+        let dc = SvdDc::compute(z.as_ref()).unwrap();
+        assert!(dc.singular_values().iter().all(|&s| s == 0.0));
+        let acc = accuracy(&Mat::<f64>::zeros(60, 45), &dc);
+        assert!(
+            acc.orth_u < 1e-12 && acc.orth_v < 1e-12,
+            "zero matrix: UtU {} VtV {}",
+            acc.orth_u,
+            acc.orth_v
+        );
+
+        let n = 150;
+        let mut a = Mat::<f64>::zeros(n, n);
+        for j in 0..n {
+            for i in 0..n {
+                a[(i, j)] = ((i % 7) as f64 - 3.0) * ((j % 5) as f64 + 1.0);
+            }
+        }
+        let dc = SvdDc::compute(a.as_ref()).unwrap();
+        let s = dc.singular_values();
+        assert!(s[0] > 1.0);
+        assert!(s[1] < 1e-12 * s[0], "rank one: sigma[1] = {}", s[1]);
+        let acc = accuracy(&a, &dc);
+        assert!(acc.resid < 1e-13, "rank one residual {}", acc.resid);
+        assert!(acc.orth_u < 1e-12, "rank one UtU {}", acc.orth_u);
+        assert!(acc.orth_v < 1e-12, "rank one VtV {}", acc.orth_v);
+    }
+
+    /// The portable backend (used for scalars without a BLAS kernel, e.g.
+    /// `f16`) runs the same pipeline: same σ, orthogonal U and V.
+    #[test]
+    fn test_svd_dc_portable_backend() {
+        let (m, n) = (150usize, 140usize);
+        let a = lcg_matrix(m, n, 0x9047);
+        let reference = SvdDc::compute(a.as_ref()).unwrap();
+
+        let mut work = a.clone();
+        let mut u = Mat::<f64>::zeros(m, m);
+        let mut sigma = vec![0.0f64; n];
+        let mut v = Mat::<f64>::zeros(n, n);
+        svd_tall_into::<f64, PortableOps>(PortableOps, &mut work, &mut u, &mut sigma, &mut v)
+            .unwrap();
+        let s_ref = reference.singular_values();
+        for k in 0..n {
+            assert!(
+                (sigma[k] - s_ref[k]).abs() < 1e-12 * s_ref[0],
+                "sigma[{k}]: portable {} blas {}",
+                sigma[k],
+                s_ref[k]
+            );
+        }
+        let mut vt = Mat::<f64>::zeros(n, n);
+        transpose_into(v.as_ref(), vt.as_mut());
+        let portable = SvdDc { u, sigma, vt, m, n };
+        let acc = accuracy(&a, &portable);
+        assert!(acc.resid < 1e-13, "portable residual {}", acc.resid);
+        assert!(acc.orth_u < 1e-12, "portable UtU {}", acc.orth_u);
+        assert!(acc.orth_v < 1e-12, "portable VtV {}", acc.orth_v);
+    }
+
+    /// Rank-deficient input: the null-space part of U is completed with an
+    /// orthonormal basis and the reconstruction stays exact.
+    #[test]
+    fn test_svd_dc_rank_deficient() {
+        for &n in &[40usize, 200] {
+            // a[i, j] = i + j·n + 1 has rank 2.
+            let mut a = Mat::<f64>::zeros(n, n);
+            for j in 0..n {
+                for i in 0..n {
+                    a[(i, j)] = (i + j * n + 1) as f64;
+                }
+            }
+            let dc = SvdDc::compute(a.as_ref()).unwrap();
+            let s = dc.singular_values();
+            assert!(s[1] > 1e-6 * s[0]);
+            for (k, &sk) in s.iter().enumerate().skip(2) {
+                assert!(sk < 1e-10 * s[0], "n={n}: sigma[{k}] = {sk}");
+            }
+            let acc = accuracy(&a, &dc);
+            assert!(acc.resid < 1e-13, "n={n}: residual {}", acc.resid);
+            assert!(acc.orth_u < 1e-12, "n={n}: UtU error {}", acc.orth_u);
+            assert!(acc.orth_v < 1e-12, "n={n}: VtV error {}", acc.orth_v);
         }
     }
 }

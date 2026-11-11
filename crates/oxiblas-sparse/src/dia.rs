@@ -468,6 +468,23 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
         }
     }
 
+    /// Normalizes a caller-supplied list of diagonal offsets to what the
+    /// `DiaMatrix` invariant requires: offsets that address no position of an
+    /// `nrows x ncols` matrix (outside `-nrows < offset < ncols`, the bounds
+    /// [`DiaMatrix::new`] enforces) are dropped, and the rest are sorted and
+    /// deduplicated.
+    pub(crate) fn normalize_offsets(offsets: &mut Vec<isize>, nrows: usize, ncols: usize) {
+        offsets.retain(|&offset| {
+            if offset >= 0 {
+                offset.unsigned_abs() < ncols
+            } else {
+                offset.unsigned_abs() < nrows
+            }
+        });
+        offsets.sort_unstable();
+        offsets.dedup();
+    }
+
     /// Compute the length of a diagonal.
     #[inline]
     fn diag_length(offset: isize, nrows: usize, ncols: usize) -> usize {
@@ -622,7 +639,12 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
             row_ptrs[row + 1] = values.len();
         }
 
-        // Safety: we constructed valid CSR data
+        // SAFETY: `row_ptrs` starts as `nrows + 1` zeros and `row_ptrs[row +
+        // 1]` is set to the running `values.len()` after each row, so it starts
+        // at 0, never decreases and ends at nnz. Columns and values are pushed
+        // together; every column is checked `< ncols` above; the offsets are
+        // distinct (`DiaMatrix::new` / the `new_unchecked` contract), so each
+        // gives a different column `row + offset` and no row repeats a column.
         unsafe {
             crate::csr::CsrMatrix::new_unchecked(
                 self.nrows,
@@ -665,14 +687,16 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
     /// # Arguments
     ///
     /// * `dense` - Source dense matrix
-    /// * `offsets` - Diagonal offsets to extract (if None, extracts all non-empty diagonals)
+    /// * `offsets` - Diagonal offsets to extract (if None, extracts all non-empty diagonals).
+    ///   The list is sorted and deduplicated, and offsets that address no
+    ///   position of the matrix are ignored.
     pub fn from_dense(dense: &oxiblas_matrix::MatRef<'_, T>, offsets: Option<Vec<isize>>) -> Self
     where
         T: Field,
     {
         let (nrows, ncols) = dense.shape();
 
-        let offsets = offsets.unwrap_or_else(|| {
+        let mut offsets = offsets.unwrap_or_else(|| {
             // Find all non-empty diagonals
             let eps = <T as Scalar>::epsilon();
             let mut non_empty = std::collections::HashSet::new();
@@ -685,10 +709,9 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
                 }
             }
 
-            let mut offsets: Vec<_> = non_empty.into_iter().collect();
-            offsets.sort();
-            offsets
+            non_empty.into_iter().collect()
         });
+        Self::normalize_offsets(&mut offsets, nrows, ncols);
 
         let diag_len = nrows.max(ncols);
         let mut data = Vec::with_capacity(offsets.len());
@@ -712,7 +735,9 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
             data.push(diag);
         }
 
-        // Safety: we constructed valid data
+        // SAFETY: `normalize_offsets` left `offsets` sorted, distinct and in
+        // bounds, `data` holds one diagonal per offset, and every diagonal has
+        // the `max(nrows, ncols)` length `DiaMatrix` requires.
         unsafe { Self::new_unchecked(nrows, ncols, offsets, data) }
     }
 
@@ -791,7 +816,11 @@ impl<T: Scalar + Clone> DiaMatrix<T> {
             new_data.push(new_diag);
         }
 
-        // Safety: we constructed valid DIA data
+        // SAFETY: `self`'s offsets are distinct with `-nrows < k < ncols`, so
+        // the negated offsets are distinct with `-new_nrows < -k < new_ncols`
+        // (the bounds for the transposed shape), and they were sorted above;
+        // `new_data` holds one diagonal per offset, each of the
+        // `max(new_nrows, new_ncols)` length `DiaMatrix` requires.
         unsafe { Self::new_unchecked(new_nrows, new_ncols, new_offsets, new_data) }
     }
 }
@@ -946,6 +975,24 @@ mod tests {
         assert_eq!(dia.ndiag(), 3);
         assert_eq!(dia.get(0, 0), Some(&4.0));
         assert_eq!(dia.get(1, 1), Some(&5.0));
+    }
+
+    /// Regression: `from_dense` passed caller-supplied offsets to
+    /// `new_unchecked` as given, although `DiaMatrix` requires them sorted,
+    /// distinct and in range (`get` binary-searches them).
+    #[test]
+    fn test_dia_from_dense_normalizes_caller_offsets() {
+        use oxiblas_matrix::Mat;
+
+        // [1 0 2]
+        // [0 3 0]
+        let dense = Mat::from_rows(&[&[1.0f64, 0.0, 2.0], &[0.0, 3.0, 0.0]]);
+        let dia = DiaMatrix::from_dense(&dense.as_ref(), Some(vec![2, 0, 0, 7, -5]));
+        assert_eq!(dia.offsets(), &[0, 2]);
+        assert!(DiaMatrix::new(2, 3, dia.offsets().to_vec(), dia.data().to_vec()).is_ok());
+        assert_eq!(dia.get(0, 0), Some(&1.0));
+        assert_eq!(dia.get(0, 2), Some(&2.0));
+        assert_eq!(dia.get(1, 1), Some(&3.0));
     }
 
     #[test]

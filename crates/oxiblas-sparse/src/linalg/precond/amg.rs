@@ -1,5 +1,6 @@
 //! Algebraic Multigrid (AMG) preconditioner - classical Ruge-Stüben AMG.
 
+use super::tolerance::pivot_tolerance;
 use super::types::PreconditionerError;
 use crate::csr::CsrMatrix;
 use oxiblas_core::scalar::{Field, Scalar};
@@ -124,7 +125,18 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or setup fails.
+    /// Returns error if matrix is not square or setup fails, in particular
+    /// [`PreconditionerError::ZeroDiagonal`] when a diagonal entry of the
+    /// matrix of some level (the input or a Galerkin coarse-grid operator) is
+    /// missing or exactly zero, since the Jacobi smoother divides by it.
+    ///
+    /// The setup is scale-invariant: strength of connection compares entries
+    /// of a row with each other, only exact zero diagonals are rejected, and
+    /// the classical interpolation weights are dropped only when their
+    /// denominator cancels to rounding level relative to its own terms. So
+    /// `s·A` builds whenever `A` does, with the same hierarchy, and its
+    /// preconditioner is exactly `1/s` times that of `A` for a power-of-two
+    /// `s`.
     pub fn new(a: &CsrMatrix<T>, config: AMGConfig<T>) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -229,6 +241,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
     }
 
     /// Compute inverse of diagonal elements.
+    ///
+    /// Only a missing or exactly zero diagonal entry is an error (scale-free).
     fn compute_diag_inv(a: &CsrMatrix<T>) -> Result<Vec<T>, PreconditionerError> {
         let n = a.nrows();
         let mut diag_inv = vec![T::zero(); n];
@@ -241,7 +255,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let val = a.values()[k].clone();
-                    if Scalar::abs(val.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     diag_inv[i] = T::one() / val;
@@ -450,17 +464,29 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
                     }
                 } else {
                     // Classical interpolation formula
-                    // Sum of weak connections to add to diagonal
+                    // Sum of weak connections to add to diagonal, with the
+                    // magnitude of its terms (diagonal included) and their
+                    // count for the cancellation test below.
                     let mut weak_sum = T::zero();
+                    let mut term_magnitude = Scalar::abs(diag.clone());
+                    let mut term_count = 1usize;
                     for k in start..end {
                         let j = a.col_indices()[k];
                         if j != i && !strong_set.contains(&j) {
                             weak_sum = weak_sum + a.values()[k].clone();
+                            term_magnitude = term_magnitude + Scalar::abs(a.values()[k].clone());
+                            term_count += 1;
                         }
                     }
 
                     // Modified diagonal
                     let mod_diag = diag + weak_sum;
+                    // The modified diagonal is the denominator of every weight.
+                    // It counts as zero when it cancels to rounding level
+                    // relative to its own terms (`m · eps · Σ|terms|` bounds
+                    // the rounding error of an m-term sum), a scale-invariant
+                    // test.
+                    let cancellation_tol = pivot_tolerance(term_count, term_magnitude);
 
                     // For each strongly connected fine point, distribute to coarse
                     // This is simplified - full RS would distribute through fine points
@@ -493,7 +519,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> AMG<T> {
                     }
 
                     // Compute interpolation weights
-                    if Scalar::abs(mod_diag.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if Scalar::abs(mod_diag.clone()) > cancellation_tol {
                         for (c_idx, weight) in coarse_weights {
                             let p_val = T::zero() - weight / mod_diag.clone();
                             col_indices.push(c_idx);

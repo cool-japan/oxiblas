@@ -2,7 +2,9 @@
 //!
 //! This module provides enhanced packing functions with:
 //! - Cache-line aware packing
-//! - Software prefetching hints
+//! - Software prefetching hints in [`pack_a_optimized`], issued on x86_64
+//!   only (elsewhere the hint is a no-op and the hardware prefetchers follow
+//!   the column streams)
 //! - Optimized loop unrolling
 //! - Streaming-friendly memory access patterns
 //!
@@ -22,24 +24,202 @@
 //!            [ ... ]
 //! ```
 
+use crate::level3::gemm_kernel::GemmKernel;
+use core::cell::Cell;
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::MatRef;
 
-/// Prefetch distance in cache lines.
+// =============================================================================
+// Per-thread packing buffers
+// =============================================================================
+
+/// Which packing buffer a per-thread cache slot holds.
 ///
-/// Packing has streaming memory access patterns, so we can use a longer
-/// prefetch distance to hide memory latency. Apple Silicon's 128-byte
-/// cache lines and better memory bandwidth support this.
+/// Every element type with a micro-kernel in this crate (`f32`, `f64`,
+/// `Complex32`, `Complex64`) keeps one cached `A~` and one cached `B~` buffer
+/// per thread, so back-to-back GEMMs on a thread reuse their packing memory
+/// instead of allocating and zero-filling it on every call. The parallel
+/// driver takes `B` on the calling thread (the shared panel) and `A` on each
+/// worker (one per tile task).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackSlot {
+    /// The packed `op(A)` macro-panel (`MC × KC`).
+    A = 0,
+    /// The packed `op(B)` macro-panel (`KC × NC`).
+    B = 1,
+}
+
+/// Most packing-buffer bytes one thread keeps cached between GEMM calls, over
+/// all element types and both slots together.
+///
+/// Policy:
+/// - A buffer is moved *out of* its slot for the whole call (`Cell::take`) and
+///   put back when the call returns, so no borrow is held while the GEMM runs.
+///   A nested GEMM on the same thread (rayon work stealing while the outer one
+///   waits in a join) finds the slot empty and allocates its own buffer.
+/// - A cached buffer only grows. Growing frees the old allocation and
+///   allocates a zero-filled one, so every element handed out is initialized;
+///   a reused buffer is not cleared again (the packers overwrite every element
+///   they hand to the micro-kernel, including the zero padding of edge panels).
+/// - When putting a buffer back would raise the thread's cached total above
+///   this limit, the buffer is freed instead. A single large GEMM therefore
+///   never pins more than this much memory per thread after it returns (at
+///   most 8 MiB × the number of threads that ran GEMMs).
+pub const PACK_CACHE_MAX_BYTES: usize = 8 << 20;
+
+thread_local! {
+    /// Bytes currently parked in this thread's packing-buffer slots.
+    static PACK_CACHE_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Heap bytes owned by `buf`.
+#[inline]
+fn pack_bytes<T>(buf: &AlignedVec<T>) -> usize {
+    buf.capacity() * core::mem::size_of::<T>()
+}
+
+/// Moves this thread's cached buffer for `slot` out of the cache (an empty
+/// buffer if there is none).
+fn take_cached<T: GemmKernel>(slot: PackSlot) -> AlignedVec<T> {
+    let buf = T::with_pack_cache(slot, Cell::take).unwrap_or_default();
+    let bytes = pack_bytes(&buf);
+    if bytes > 0 {
+        let _ = PACK_CACHE_BYTES.try_with(|parked| parked.set(parked.get().saturating_sub(bytes)));
+    }
+    buf
+}
+
+/// Returns `buf` to this thread's cache slot, or frees it when the type keeps
+/// no cache or the size policy of [`PACK_CACHE_MAX_BYTES`] does not allow it.
+fn put_cached<T: GemmKernel>(slot: PackSlot, buf: AlignedVec<T>) {
+    let bytes = pack_bytes(&buf);
+    if bytes == 0 {
+        return;
+    }
+    let Ok(parked) = PACK_CACHE_BYTES.try_with(Cell::get) else {
+        return;
+    };
+    if parked.saturating_add(bytes) > PACK_CACHE_MAX_BYTES {
+        return;
+    }
+    let mut stored = false;
+    let previous = T::with_pack_cache(slot, |cell| {
+        stored = true;
+        cell.replace(buf)
+    });
+    if stored {
+        // `previous` is normally empty; a nested GEMM on this thread may have
+        // parked a buffer meanwhile, which `buf` replaces (and which is freed
+        // when `previous` drops here).
+        let freed = previous.as_ref().map_or(0, pack_bytes);
+        let _ = PACK_CACHE_BYTES.try_with(|total| {
+            total.set(total.get().saturating_add(bytes).saturating_sub(freed));
+        });
+    }
+}
+
+/// A packing buffer on loan from the calling thread's cache.
+///
+/// Dereferences to an [`AlignedVec`] of at least the requested length whose
+/// elements are all initialized. Dropping the loan returns the buffer to the
+/// cache (see [`PACK_CACHE_MAX_BYTES`] for the policy).
+pub(crate) struct PackBuffer<T: GemmKernel> {
+    buf: AlignedVec<T>,
+    slot: PackSlot,
+}
+
+impl<T: GemmKernel + bytemuck::Zeroable> PackBuffer<T> {
+    /// Borrows this thread's buffer for `slot`, growing it to at least `len`
+    /// elements.
+    pub(crate) fn take(slot: PackSlot, len: usize) -> Self {
+        let mut buf = take_cached::<T>(slot);
+        if buf.len() < len {
+            // Free the old allocation before making the zero-filled one, so a
+            // grow never holds both.
+            drop(core::mem::take(&mut buf));
+            buf = AlignedVec::zeros(len);
+        }
+        Self { buf, slot }
+    }
+}
+
+impl<T: GemmKernel> core::ops::Deref for PackBuffer<T> {
+    type Target = AlignedVec<T>;
+    #[inline]
+    fn deref(&self) -> &AlignedVec<T> {
+        &self.buf
+    }
+}
+
+impl<T: GemmKernel> core::ops::DerefMut for PackBuffer<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut AlignedVec<T> {
+        &mut self.buf
+    }
+}
+
+impl<T: GemmKernel> Drop for PackBuffer<T> {
+    fn drop(&mut self) {
+        put_cached(self.slot, core::mem::take(&mut self.buf));
+    }
+}
+
+/// Bytes cached in this thread's packing slots (test hook).
+#[cfg(test)]
+pub(crate) fn pack_cache_bytes() -> usize {
+    PACK_CACHE_BYTES.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Capacity, in elements, of this thread's cached `T` buffer for `slot`
+/// (test hook; 0 when the slot is empty or the type keeps no cache).
+#[cfg(test)]
+pub(crate) fn pack_cache_capacity<T: GemmKernel>(slot: PackSlot) -> usize {
+    T::with_pack_cache(slot, |cell| {
+        let buf = cell.take();
+        let cap = buf.capacity();
+        cell.set(buf);
+        cap
+    })
+    .unwrap_or(0)
+}
+
+/// How far ahead [`pack_a_optimized`] prefetches, in source columns (one
+/// prefetch every four columns), and the default of
+/// [`PackingConfig::prefetch_distance`].
+///
+/// Only x86_64 issues the prefetches: [`prefetch_read`] is a no-op on
+/// aarch64, where the hardware prefetchers track the column streams, so the
+/// aarch64 value only feeds `PackingConfig`.
 #[cfg(target_arch = "aarch64")]
-const PREFETCH_DISTANCE: usize = 6; // 6 cache lines = 768 bytes
+const PREFETCH_DISTANCE: usize = 6; // source columns ahead
 
 #[cfg(not(target_arch = "aarch64"))]
-const PREFETCH_DISTANCE: usize = 4; // 4 cache lines = 256 bytes
+const PREFETCH_DISTANCE: usize = 4; // source columns ahead
 
-/// Packs a panel of A with optimized memory access patterns.
+/// Returns whether rows `start..start + count` fit in `0..len`.
+#[inline]
+fn range_fits(start: usize, count: usize, len: usize) -> bool {
+    start <= len && count <= len - start
+}
+
+/// Packs a panel of A into `MR`-row micro-panels.
 ///
-/// This version uses 4-way unrolling and prefetching for better performance.
+/// Rows `row_start..row_start + nrows` and columns `col_start..col_start +
+/// ncols` of `a` become `⌈nrows / mr⌉` micro-panels of `mr × ncols` elements:
+/// micro-panel `b` holds, column after column, the `mr` elements
+/// `a[row_start + b·mr + ii, col_start + p]` (`ii < mr`), zero-padded past
+/// `nrows`. That is the layout the micro-kernels read; every element of the
+/// `⌈nrows / mr⌉ · mr · ncols` prefix of `pack` is written.
+///
+/// For plain column-major storage (`a.col_stride() == 1`) each column of a
+/// micro-panel is `mr` contiguous elements, copied with a compile-time `mr`
+/// for every micro-kernel height in this crate (2, 4, 6, 8, 16) so the copy is
+/// a few vector loads and stores rather than a `memcpy` call; other `mr` take
+/// a generic loop. Views whose rows are not adjacent in memory (for example a
+/// [`MatRef::transpose`] view) are read element by element, with the same
+/// layout.
 ///
 /// # Arguments
 ///
@@ -50,6 +230,11 @@ const PREFETCH_DISTANCE: usize = 4; // 4 cache lines = 256 bytes
 /// * `ncols` - Number of columns to pack
 /// * `pack` - Destination packed buffer
 /// * `mr` - Micro-kernel row block size
+///
+/// # Panics
+///
+/// Panics if `mr == 0`, if the region lies outside `a`, or if `pack` holds
+/// fewer than `⌈nrows / mr⌉ · mr · ncols` elements.
 #[inline]
 pub fn pack_a_optimized<T: Field>(
     a: &MatRef<'_, T>,
@@ -60,83 +245,164 @@ pub fn pack_a_optimized<T: Field>(
     pack: &mut AlignedVec<T>,
     mr: usize,
 ) {
-    let row_stride = a.row_stride();
-    let base_ptr = a.as_ptr();
+    assert!(mr > 0, "pack_a_optimized: mr must be positive");
+    assert!(
+        range_fits(row_start, nrows, a.nrows()) && range_fits(col_start, ncols, a.ncols()),
+        "pack_a_optimized: region outside the matrix"
+    );
+    let len = nrows.div_ceil(mr) * mr * ncols;
+    assert!(pack.len() >= len, "pack_a_optimized: buffer too small");
+    if len == 0 {
+        return;
+    }
+    if a.col_stride() != 1 {
+        pack_a_strided(
+            a,
+            row_start,
+            col_start,
+            nrows,
+            ncols,
+            &mut pack.as_mut_slice()[..len],
+            mr,
+        );
+        return;
+    }
+
+    let ld = a.row_stride();
     let dst = pack.as_mut_ptr();
+    // SAFETY: with unit row stride, element `(row_start + i, col_start + p)` of
+    // `a` lives at `row_start + i + (col_start + p) * ld` from `a.as_ptr()`, and
+    // the asserts above keep every `i < nrows`, `p < ncols` inside `a`; `src`
+    // is that element for `i = p = 0` (in bounds because `len > 0`). The
+    // packers write exactly the first `len <= pack.len()` elements of `dst`,
+    // a buffer distinct from `a`.
+    unsafe {
+        let src = a.as_ptr().add(row_start + col_start * ld);
+        match mr {
+            2 => pack_a_panels::<T, 2>(src, ld, nrows, ncols, dst),
+            4 => pack_a_panels::<T, 4>(src, ld, nrows, ncols, dst),
+            6 => pack_a_panels::<T, 6>(src, ld, nrows, ncols, dst),
+            8 => pack_a_panels::<T, 8>(src, ld, nrows, ncols, dst),
+            16 => pack_a_panels::<T, 16>(src, ld, nrows, ncols, dst),
+            _ => pack_a_panels_dyn(src, ld, nrows, ncols, dst, mr),
+        }
+    }
+}
 
-    let mut idx = 0;
-
-    // Pack in blocks of MR rows
-    for i in (0..nrows).step_by(mr) {
-        let ib = mr.min(nrows - i);
-
-        if ib == mr {
-            // Full block - use optimized 4-way unrolled path
-            let src_base = unsafe { base_ptr.add(row_start + i) };
-
-            // Process 4 columns at a time
-            let mut p = 0;
-            while p + 4 <= ncols {
-                // Prefetch next cache lines
-                if p + PREFETCH_DISTANCE < ncols {
-                    unsafe {
-                        let prefetch_ptr =
-                            src_base.add((col_start + p + PREFETCH_DISTANCE) * row_stride);
-                        prefetch_read(prefetch_ptr);
-                    }
-                }
-
-                unsafe {
-                    let src0 = src_base.add((col_start + p) * row_stride);
-                    let src1 = src_base.add((col_start + p + 1) * row_stride);
-                    let src2 = src_base.add((col_start + p + 2) * row_stride);
-                    let src3 = src_base.add((col_start + p + 3) * row_stride);
-                    let dst_ptr = dst.add(idx);
-
-                    // Copy MR elements for each of the 4 columns
-                    std::ptr::copy_nonoverlapping(src0, dst_ptr, mr);
-                    std::ptr::copy_nonoverlapping(src1, dst_ptr.add(mr), mr);
-                    std::ptr::copy_nonoverlapping(src2, dst_ptr.add(2 * mr), mr);
-                    std::ptr::copy_nonoverlapping(src3, dst_ptr.add(3 * mr), mr);
-                }
-                idx += 4 * mr;
-                p += 4;
+/// [`pack_a_optimized`] for a compile-time micro-panel height `MR`.
+///
+/// # Safety
+///
+/// `src` points at the top-left element of an `nrows × ncols` block with unit
+/// row stride and leading dimension `ld`, readable throughout, and `dst` is
+/// writable for `⌈nrows / MR⌉ · MR · ncols` elements and does not overlap it.
+#[inline(always)]
+unsafe fn pack_a_panels<T: Field, const MR: usize>(
+    src: *const T,
+    ld: usize,
+    nrows: usize,
+    ncols: usize,
+    dst: *mut T,
+) {
+    let full = nrows / MR;
+    for blk in 0..full {
+        let s = src.add(blk * MR);
+        let d = dst.add(blk * MR * ncols);
+        for p in 0..ncols {
+            if p.is_multiple_of(4) && p + PREFETCH_DISTANCE < ncols {
+                prefetch_read(s.add((p + PREFETCH_DISTANCE) * ld));
             }
-
-            // Handle remaining columns
-            while p < ncols {
-                unsafe {
-                    let src = src_base.add((col_start + p) * row_stride);
-                    std::ptr::copy_nonoverlapping(src, dst.add(idx), mr);
-                }
-                idx += mr;
-                p += 1;
+            // Compile-time length: a few vector moves, no `memcpy` call.
+            core::ptr::copy_nonoverlapping(s.add(p * ld), d.add(p * MR), MR);
+        }
+    }
+    let rem = nrows - full * MR;
+    if rem > 0 {
+        let s = src.add(full * MR);
+        let d = dst.add(full * MR * ncols);
+        for p in 0..ncols {
+            let col = s.add(p * ld);
+            let out = d.add(p * MR);
+            for ii in 0..rem {
+                *out.add(ii) = *col.add(ii);
             }
-        } else {
-            // Partial block - scalar path with zero padding
-            for p in 0..ncols {
-                for ii in 0..ib {
-                    unsafe {
-                        *dst.add(idx) =
-                            *base_ptr.add(row_start + i + ii + (col_start + p) * row_stride);
-                    }
-                    idx += 1;
-                }
-                // Pad with zeros
-                for _ in ib..mr {
-                    unsafe {
-                        *dst.add(idx) = T::zero();
-                    }
-                    idx += 1;
-                }
+            for ii in rem..MR {
+                *out.add(ii) = T::zero();
             }
         }
     }
 }
 
-/// Packs a panel of B with optimized memory access patterns.
+/// [`pack_a_optimized`] for a run-time micro-panel height.
 ///
-/// This version uses 4-way unrolling and cache-aware access for better performance.
+/// # Safety
+///
+/// As for [`pack_a_panels`] with `MR = mr`.
+unsafe fn pack_a_panels_dyn<T: Field>(
+    src: *const T,
+    ld: usize,
+    nrows: usize,
+    ncols: usize,
+    dst: *mut T,
+    mr: usize,
+) {
+    let mut idx = 0;
+    for i in (0..nrows).step_by(mr) {
+        let ib = mr.min(nrows - i);
+        for p in 0..ncols {
+            let col = src.add(i + p * ld);
+            core::ptr::copy_nonoverlapping(col, dst.add(idx), ib);
+            for ii in ib..mr {
+                *dst.add(idx + ii) = T::zero();
+            }
+            idx += mr;
+        }
+    }
+}
+
+/// Element-wise [`pack_a_optimized`] for views whose rows are not adjacent in
+/// memory; `out` is exactly the packed prefix.
+fn pack_a_strided<T: Field>(
+    a: &MatRef<'_, T>,
+    row_start: usize,
+    col_start: usize,
+    nrows: usize,
+    ncols: usize,
+    out: &mut [T],
+    mr: usize,
+) {
+    let mut chunks = out.chunks_exact_mut(mr);
+    for i in (0..nrows).step_by(mr) {
+        let ib = mr.min(nrows - i);
+        for p in 0..ncols {
+            let Some(chunk) = chunks.next() else {
+                return;
+            };
+            for (ii, slot) in chunk.iter_mut().enumerate() {
+                *slot = if ii < ib {
+                    a[(row_start + i + ii, col_start + p)]
+                } else {
+                    T::zero()
+                };
+            }
+        }
+    }
+}
+
+/// Packs a panel of B into `NR`-column micro-panels.
+///
+/// Rows `row_start..row_start + nrows` and columns `col_start..col_start +
+/// ncols` of `b` become `⌈ncols / nr⌉` micro-panels of `nrows × nr` elements,
+/// row-major inside a micro-panel: micro-panel `b` holds, row after row, the
+/// `nr` elements `b[row_start + p, col_start + b·nr + jj]` (`jj < nr`),
+/// zero-padded past `ncols`. Every element of the `⌈ncols / nr⌉ · nr · nrows`
+/// prefix of `pack` is written.
+///
+/// For plain column-major storage (`b.col_stride() == 1`) the gather runs with
+/// a compile-time `nr` for every micro-kernel width in this crate (2, 4, 6, 8,
+/// 16); on aarch64 the f64 `nr = 6` and f32 `nr = 8` panels are transposed in
+/// NEON registers. Other `nr` take a generic loop, and views whose rows are not
+/// adjacent in memory are read element by element, all with the same layout.
 ///
 /// # Arguments
 ///
@@ -147,6 +413,11 @@ pub fn pack_a_optimized<T: Field>(
 /// * `ncols` - Number of columns to pack
 /// * `pack` - Destination packed buffer
 /// * `nr` - Micro-kernel column block size
+///
+/// # Panics
+///
+/// Panics if `nr == 0`, if the region lies outside `b`, or if `pack` holds
+/// fewer than `⌈ncols / nr⌉ · nr · nrows` elements.
 #[inline]
 pub fn pack_b_optimized<T: Field>(
     b: &MatRef<'_, T>,
@@ -157,73 +428,278 @@ pub fn pack_b_optimized<T: Field>(
     pack: &mut AlignedVec<T>,
     nr: usize,
 ) {
-    let row_stride = b.row_stride();
-    let base_ptr = b.as_ptr();
+    assert!(nr > 0, "pack_b_optimized: nr must be positive");
+    assert!(
+        range_fits(row_start, nrows, b.nrows()) && range_fits(col_start, ncols, b.ncols()),
+        "pack_b_optimized: region outside the matrix"
+    );
+    let len = ncols.div_ceil(nr) * nr * nrows;
+    assert!(pack.len() >= len, "pack_b_optimized: buffer too small");
+    if len == 0 {
+        return;
+    }
+    if b.col_stride() != 1 {
+        pack_b_strided(
+            b,
+            row_start,
+            col_start,
+            nrows,
+            ncols,
+            &mut pack.as_mut_slice()[..len],
+            nr,
+        );
+        return;
+    }
+
+    let ld = b.row_stride();
     let dst = pack.as_mut_ptr();
+    // SAFETY: as in `pack_a_optimized`: unit row stride puts element
+    // `(row_start + p, col_start + j)` at `row_start + p + (col_start + j) * ld`,
+    // inside `b` for every `p < nrows`, `j < ncols` by the asserts; exactly the
+    // first `len <= pack.len()` elements of the distinct buffer `dst` are
+    // written.
+    unsafe {
+        let src = b.as_ptr().add(row_start + col_start * ld);
+        match nr {
+            2 => pack_b_panels::<T, 2>(src, ld, nrows, ncols, dst),
+            4 => pack_b_panels::<T, 4>(src, ld, nrows, ncols, dst),
+            6 => pack_b_panels::<T, 6>(src, ld, nrows, ncols, dst),
+            8 => pack_b_panels::<T, 8>(src, ld, nrows, ncols, dst),
+            16 => pack_b_panels::<T, 16>(src, ld, nrows, ncols, dst),
+            _ => pack_b_panels_dyn(src, ld, nrows, ncols, dst, nr),
+        }
+    }
+}
 
+/// [`pack_b_optimized`] for a compile-time micro-panel width `NR`.
+///
+/// # Safety
+///
+/// `src` points at the top-left element of an `nrows × ncols` block with unit
+/// row stride and leading dimension `ld`, readable throughout, and `dst` is
+/// writable for `⌈ncols / NR⌉ · NR · nrows` elements and does not overlap it.
+#[inline(always)]
+unsafe fn pack_b_panels<T: Field, const NR: usize>(
+    src: *const T,
+    ld: usize,
+    nrows: usize,
+    ncols: usize,
+    dst: *mut T,
+) {
+    let full = ncols / NR;
+    for blk in 0..full {
+        pack_b_full_panel::<T, NR>(src.add(blk * NR * ld), ld, nrows, dst.add(blk * NR * nrows));
+    }
+    let rem = ncols - full * NR;
+    if rem > 0 {
+        let s = src.add(full * NR * ld);
+        let d = dst.add(full * NR * nrows);
+        for p in 0..nrows {
+            let out = d.add(p * NR);
+            for jj in 0..rem {
+                *out.add(jj) = *s.add(p + jj * ld);
+            }
+            for jj in rem..NR {
+                *out.add(jj) = T::zero();
+            }
+        }
+    }
+}
+
+/// Packs one full `nrows × NR` micro-panel of B.
+///
+/// # Safety
+///
+/// `s` points at `NR` columns of `nrows` contiguous elements each, `ld`
+/// elements apart, and `d` is writable for `NR · nrows` elements that do not
+/// overlap them.
+#[inline(always)]
+unsafe fn pack_b_full_panel<T: Field, const NR: usize>(
+    s: *const T,
+    ld: usize,
+    nrows: usize,
+    d: *mut T,
+) {
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use core::any::TypeId;
+        if NR == 6 && TypeId::of::<T>() == TypeId::of::<f64>() {
+            // `T` is `f64`, so the casts only restate the element type.
+            pack_b_panel_f64x6_neon(s.cast::<f64>(), ld, nrows, d.cast::<f64>());
+            return;
+        }
+        if NR == 8 && TypeId::of::<T>() == TypeId::of::<f32>() {
+            // `T` is `f32`, as above.
+            pack_b_panel_f32x8_neon(s.cast::<f32>(), ld, nrows, d.cast::<f32>());
+            return;
+        }
+    }
+    let cols: [*const T; NR] = core::array::from_fn(|jj| s.wrapping_add(jj * ld));
+    for p in 0..nrows {
+        let out = d.add(p * NR);
+        for (jj, col) in cols.iter().enumerate() {
+            *out.add(jj) = *col.add(p);
+        }
+    }
+}
+
+/// Packs one full `nrows × 6` f64 micro-panel of B, two rows at a time:
+/// each column contributes a 2-row vector and `zip1`/`zip2` turn three column
+/// pairs into the two packed rows.
+///
+/// # Safety
+///
+/// As for [`pack_b_full_panel`] with `NR = 6`.
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+#[inline(always)]
+unsafe fn pack_b_panel_f64x6_neon(s: *const f64, ld: usize, nrows: usize, d: *mut f64) {
+    use core::arch::aarch64::{vld1q_f64, vst1q_f64, vzip1q_f64, vzip2q_f64};
+    let c: [*const f64; 6] = core::array::from_fn(|jj| s.wrapping_add(jj * ld));
+    let mut p = 0;
+    while p + 2 <= nrows {
+        let v0 = vld1q_f64(c[0].add(p));
+        let v1 = vld1q_f64(c[1].add(p));
+        let v2 = vld1q_f64(c[2].add(p));
+        let v3 = vld1q_f64(c[3].add(p));
+        let v4 = vld1q_f64(c[4].add(p));
+        let v5 = vld1q_f64(c[5].add(p));
+        let out = d.add(p * 6);
+        vst1q_f64(out, vzip1q_f64(v0, v1));
+        vst1q_f64(out.add(2), vzip1q_f64(v2, v3));
+        vst1q_f64(out.add(4), vzip1q_f64(v4, v5));
+        vst1q_f64(out.add(6), vzip2q_f64(v0, v1));
+        vst1q_f64(out.add(8), vzip2q_f64(v2, v3));
+        vst1q_f64(out.add(10), vzip2q_f64(v4, v5));
+        p += 2;
+    }
+    if p < nrows {
+        let out = d.add(p * 6);
+        for (jj, col) in c.iter().enumerate() {
+            *out.add(jj) = *col.add(p);
+        }
+    }
+}
+
+/// Packs one full `nrows × 8` f32 micro-panel of B, four rows at a time: each
+/// column contributes a 4-row vector, and two 4 × 4 register transposes turn
+/// the eight columns into four packed rows.
+///
+/// # Safety
+///
+/// As for [`pack_b_full_panel`] with `NR = 8`.
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+#[inline(always)]
+unsafe fn pack_b_panel_f32x8_neon(s: *const f32, ld: usize, nrows: usize, d: *mut f32) {
+    use core::arch::aarch64::{
+        float32x4_t, vld1q_f32, vreinterpretq_f32_f64, vreinterpretq_f64_f32, vst1q_f32,
+        vtrn1q_f32, vtrn1q_f64, vtrn2q_f32, vtrn2q_f64,
+    };
+
+    /// Transposes the 4 × 4 block whose columns are `a`, `b`, `c`, `e` into
+    /// its four rows.
+    #[inline(always)]
+    unsafe fn transpose4(
+        a: float32x4_t,
+        b: float32x4_t,
+        c: float32x4_t,
+        e: float32x4_t,
+    ) -> [float32x4_t; 4] {
+        let t0 = vreinterpretq_f64_f32(vtrn1q_f32(a, b)); // a0 b0 a2 b2
+        let t1 = vreinterpretq_f64_f32(vtrn2q_f32(a, b)); // a1 b1 a3 b3
+        let t2 = vreinterpretq_f64_f32(vtrn1q_f32(c, e)); // c0 e0 c2 e2
+        let t3 = vreinterpretq_f64_f32(vtrn2q_f32(c, e)); // c1 e1 c3 e3
+        [
+            vreinterpretq_f32_f64(vtrn1q_f64(t0, t2)), // a0 b0 c0 e0
+            vreinterpretq_f32_f64(vtrn1q_f64(t1, t3)), // a1 b1 c1 e1
+            vreinterpretq_f32_f64(vtrn2q_f64(t0, t2)), // a2 b2 c2 e2
+            vreinterpretq_f32_f64(vtrn2q_f64(t1, t3)), // a3 b3 c3 e3
+        ]
+    }
+
+    let c: [*const f32; 8] = core::array::from_fn(|jj| s.wrapping_add(jj * ld));
+    let mut p = 0;
+    while p + 4 <= nrows {
+        let lo = transpose4(
+            vld1q_f32(c[0].add(p)),
+            vld1q_f32(c[1].add(p)),
+            vld1q_f32(c[2].add(p)),
+            vld1q_f32(c[3].add(p)),
+        );
+        let hi = transpose4(
+            vld1q_f32(c[4].add(p)),
+            vld1q_f32(c[5].add(p)),
+            vld1q_f32(c[6].add(p)),
+            vld1q_f32(c[7].add(p)),
+        );
+        let out = d.add(p * 8);
+        for (r, (&left, &right)) in lo.iter().zip(hi.iter()).enumerate() {
+            vst1q_f32(out.add(r * 8), left);
+            vst1q_f32(out.add(r * 8 + 4), right);
+        }
+        p += 4;
+    }
+    while p < nrows {
+        let out = d.add(p * 8);
+        for (jj, col) in c.iter().enumerate() {
+            *out.add(jj) = *col.add(p);
+        }
+        p += 1;
+    }
+}
+
+/// [`pack_b_optimized`] for a run-time micro-panel width.
+///
+/// # Safety
+///
+/// As for [`pack_b_panels`] with `NR = nr`.
+unsafe fn pack_b_panels_dyn<T: Field>(
+    src: *const T,
+    ld: usize,
+    nrows: usize,
+    ncols: usize,
+    dst: *mut T,
+    nr: usize,
+) {
     let mut idx = 0;
-
-    // Pack in blocks of NR columns
     for j in (0..ncols).step_by(nr) {
         let jb = nr.min(ncols - j);
-
-        if jb == nr {
-            // Full block - optimized path with 4-way row unrolling
-            let col_base = col_start + j;
-
-            // Process 4 rows at a time
-            let mut p = 0;
-            while p + 4 <= nrows {
-                // Prefetch future rows
-                if p + PREFETCH_DISTANCE < nrows {
-                    unsafe {
-                        let prefetch_ptr =
-                            base_ptr.add(row_start + p + PREFETCH_DISTANCE + col_base * row_stride);
-                        prefetch_read(prefetch_ptr);
-                    }
-                }
-
-                unsafe {
-                    // For each of 4 rows, gather NR elements from consecutive columns
-                    for row_offset in 0..4 {
-                        let row_base =
-                            base_ptr.add(row_start + p + row_offset + col_base * row_stride);
-                        let dst_row = dst.add(idx + row_offset * nr);
-
-                        // Gather NR elements from strided columns
-                        for jj in 0..nr {
-                            *dst_row.add(jj) = *row_base.add(jj * row_stride);
-                        }
-                    }
-                }
-                idx += 4 * nr;
-                p += 4;
+        let s = src.add(j * ld);
+        for p in 0..nrows {
+            for jj in 0..jb {
+                *dst.add(idx + jj) = *s.add(p + jj * ld);
             }
-
-            // Handle remaining rows
-            while p < nrows {
-                unsafe {
-                    let row_base = base_ptr.add(row_start + p + col_base * row_stride);
-                    for jj in 0..nr {
-                        *dst.add(idx + jj) = *row_base.add(jj * row_stride);
-                    }
-                }
-                idx += nr;
-                p += 1;
+            for jj in jb..nr {
+                *dst.add(idx + jj) = T::zero();
             }
-        } else {
-            // Partial block - scalar path with zero padding
-            for p in 0..nrows {
-                unsafe {
-                    let row_base = base_ptr.add(row_start + p + (col_start + j) * row_stride);
-                    for jj in 0..jb {
-                        *dst.add(idx + jj) = *row_base.add(jj * row_stride);
-                    }
-                    for jj in jb..nr {
-                        *dst.add(idx + jj) = T::zero();
-                    }
-                }
-                idx += nr;
+            idx += nr;
+        }
+    }
+}
+
+/// Element-wise [`pack_b_optimized`] for views whose rows are not adjacent in
+/// memory; `out` is exactly the packed prefix.
+fn pack_b_strided<T: Field>(
+    b: &MatRef<'_, T>,
+    row_start: usize,
+    col_start: usize,
+    nrows: usize,
+    ncols: usize,
+    out: &mut [T],
+    nr: usize,
+) {
+    let mut chunks = out.chunks_exact_mut(nr);
+    for j in (0..ncols).step_by(nr) {
+        let jb = nr.min(ncols - j);
+        for p in 0..nrows {
+            let Some(chunk) = chunks.next() else {
+                return;
+            };
+            for (jj, slot) in chunk.iter_mut().enumerate() {
+                *slot = if jj < jb {
+                    b[(row_start + p, col_start + j + jj)]
+                } else {
+                    T::zero()
+                };
             }
         }
     }
@@ -257,7 +733,7 @@ pub fn pack_a_contiguous<T: Field>(
     // Column-major contiguity: the leading dimension equals the row count only
     // when columns sit back-to-back with no inter-column padding.
     let row_stride = a.row_stride();
-    let is_contiguous = row_stride == a.nrows();
+    let is_contiguous = row_stride == a.nrows() && a.col_stride() == 1;
 
     if is_contiguous
         && row_start == 0
@@ -268,12 +744,17 @@ pub fn pack_a_contiguous<T: Field>(
     {
         // The whole matrix is contiguous AND a single micro-row-block, so the
         // packed layout is exactly column-major and one bulk copy reproduces it.
+        assert!(
+            pack.len() >= nrows * ncols,
+            "pack_a_contiguous: buffer too small"
+        );
         let src = a.as_ptr();
         let dst = pack.as_mut_ptr();
-        // SAFETY: `row_stride == nrows` means the `nrows * ncols` elements are
-        // stored contiguously with no gaps, `src` points at the first of them
-        // (row_start == col_start == 0), and `dst` is a distinct AlignedVec the
-        // caller sized for the panel; the ranges do not overlap.
+        // SAFETY: unit row stride and `row_stride == nrows` mean the
+        // `nrows * ncols` elements are stored contiguously with no gaps, `src`
+        // points at the first of them (row_start == col_start == 0), and `dst`
+        // is a distinct buffer of at least that many elements (assert above);
+        // the ranges do not overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(src, dst, nrows * ncols);
         }
@@ -299,9 +780,8 @@ pub fn pack_a_contiguous<T: Field>(
 /// byte-for-byte identical to [`pack_b_optimized`] on every path: streaming only
 /// changes *how* the bytes reach memory, never their values or their order.
 ///
-/// (256-bit non-temporal stores, rather than 512-bit, are used deliberately: the
-/// AVX-512 `_mm512_stream_*` intrinsics only stabilized in Rust 1.89, above this
-/// workspace's MSRV, whereas `_mm256_stream_si256` has been stable since 1.27.)
+/// (The stores are 256-bit, which needs only AVX. A 512-bit variant using
+/// `_mm512_stream_si512`, stable since Rust 1.89, has not been written.)
 #[inline]
 pub fn pack_b_streaming<T: Field>(
     b: &MatRef<'_, T>,
@@ -321,14 +801,29 @@ pub fn pack_b_streaming<T: Field>(
         // divide 32 guarantees every lane boundary lands on a 32-byte-aligned
         // element offset.
         let elem_size = core::mem::size_of::<T>();
+        // The streaming path addresses B with unit row stride and writes the
+        // whole packed prefix unchecked, so its arguments are checked here as
+        // `pack_b_optimized` checks its own.
+        assert!(nr > 0, "pack_b_streaming: nr must be positive");
+        assert!(
+            range_fits(row_start, nrows, b.nrows()) && range_fits(col_start, ncols, b.ncols()),
+            "pack_b_streaming: region outside the matrix"
+        );
+        assert!(
+            pack.len() >= ncols.div_ceil(nr) * nr * nrows,
+            "pack_b_streaming: buffer too small"
+        );
         if is_x86_feature_detected!("avx")
+            && b.col_stride() == 1
             && elem_size != 0
             && 32 % elem_size == 0
-            && (pack.as_ptr() as usize) % 32 == 0
+            && (pack.as_ptr() as usize).is_multiple_of(32)
         {
-            // SAFETY: AVX is present, the destination base is 32-byte aligned, and
-            // the element size divides the 32-byte lane, so every streaming-store
-            // target is 32-byte aligned and in bounds.
+            // SAFETY: AVX is present, the destination base is 32-byte aligned,
+            // and the element size divides the 32-byte lane, so every
+            // streaming-store target is 32-byte aligned; the asserts above keep
+            // every read inside `b` (unit row stride) and every write inside
+            // `pack`.
             unsafe {
                 pack_b_streaming_avx(b, row_start, col_start, nrows, ncols, pack, nr);
             }
@@ -434,11 +929,17 @@ unsafe fn prefetch_read<T>(ptr: *const T) {
 }
 
 /// Packing configuration for different matrix shapes.
+///
+/// Descriptive only: no packing routine in this crate takes a
+/// `PackingConfig`; the packers choose their prefetching, unrolling and
+/// streaming themselves.
 #[derive(Debug, Clone, Copy)]
 pub struct PackingConfig {
     /// Use streaming stores (for large matrices).
     pub use_streaming: bool,
-    /// Prefetch distance in elements.
+    /// Prefetch distance in source columns of the packed block (not elements
+    /// or cache lines), the unit of the fixed distance [`pack_a_optimized`]
+    /// uses; the default is that distance.
     pub prefetch_distance: usize,
     /// Whether to use 4-way unrolling.
     pub use_unrolling: bool,
@@ -480,6 +981,38 @@ impl PackingConfig {
 // SIMD-Optimized Packing Functions
 // =============================================================================
 
+/// Checks the arguments of the SIMD `pack_a` wrappers as [`pack_a_optimized`]
+/// does, so their unchecked fast paths stay in bounds.
+///
+/// Returns `false` when the rows of `a` are not adjacent in memory (the fast
+/// paths assume unit row stride); the wrappers then use `pack_a_optimized`.
+///
+/// # Panics
+///
+/// Panics if `mr == 0`, if the region lies outside `a`, or if `pack` is too
+/// small for it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn simd_pack_a_args_ok<T: Field>(
+    a: &MatRef<'_, T>,
+    row_start: usize,
+    col_start: usize,
+    nrows: usize,
+    ncols: usize,
+    pack: &AlignedVec<T>,
+    mr: usize,
+) -> bool {
+    assert!(mr > 0, "pack_a: mr must be positive");
+    assert!(
+        range_fits(row_start, nrows, a.nrows()) && range_fits(col_start, ncols, a.ncols()),
+        "pack_a: region outside the matrix"
+    );
+    assert!(
+        pack.len() >= nrows.div_ceil(mr) * mr * ncols,
+        "pack_a: buffer too small"
+    );
+    a.col_stride() == 1
+}
+
 /// SIMD-optimized `pack_a` for f64.
 ///
 /// This crate's column-major storage keeps every column contiguous — element
@@ -501,8 +1034,13 @@ pub fn pack_a_simd_f64(
     mr: usize,
 ) {
     // A full AVX2 register holds 4 f64; below that the scalar path is faster.
-    if mr >= 4 && is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 confirmed available at runtime.
+    if mr >= 4
+        && simd_pack_a_args_ok(a, row_start, col_start, nrows, ncols, pack, mr)
+        && is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: AVX2 is available at runtime, and the checks above keep
+        // every element read inside `a` (unit row stride) and every write
+        // inside `pack`.
         unsafe {
             pack_a_simd_contiguous_f64(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -590,8 +1128,13 @@ pub fn pack_a_simd_f32(
     pack: &mut AlignedVec<f32>,
     mr: usize,
 ) {
-    if mr >= 8 && is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 confirmed available at runtime.
+    if mr >= 8
+        && simd_pack_a_args_ok(a, row_start, col_start, nrows, ncols, pack, mr)
+        && is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: AVX2 is available at runtime, and the checks above keep
+        // every element read inside `a` (unit row stride) and every write
+        // inside `pack`.
         unsafe {
             pack_a_simd_contiguous_f32(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -660,9 +1203,10 @@ unsafe fn pack_a_simd_contiguous_f32(
     }
 }
 
-/// SIMD-optimized pack_b for f64 using 8-way unrolling with prefetch.
-///
-/// This version is optimized for common NR values (4, 6, 8).
+/// `pack_b` for f64: delegates to [`pack_b_optimized`], which gathers with a
+/// compile-time `nr` for every kernel width (4, 6, 8, 16 on x86_64) and checks
+/// its arguments. (This used to be a separate, unchecked 8-way unrolled loop
+/// producing the same layout.)
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn pack_b_simd_f64(
@@ -674,87 +1218,11 @@ pub fn pack_b_simd_f64(
     pack: &mut AlignedVec<f64>,
     nr: usize,
 ) {
-    let row_stride = b.row_stride();
-    let base_ptr = b.as_ptr();
-    let dst = pack.as_mut_ptr();
-    let mut idx = 0;
-
-    for j in (0..ncols).step_by(nr) {
-        let jb = nr.min(ncols - j);
-
-        if jb == nr {
-            let col_base = col_start + j;
-
-            // 8-way unrolled loop for rows
-            let mut p = 0;
-            while p + 8 <= nrows {
-                unsafe {
-                    // Prefetch ahead
-                    if p + 16 < nrows {
-                        let prefetch_ptr = base_ptr.add(row_start + p + 16 + col_base * row_stride);
-                        prefetch_read(prefetch_ptr);
-                    }
-
-                    // Process 8 rows
-                    for row_off in 0..8 {
-                        let row_ptr = base_ptr.add(row_start + p + row_off + col_base * row_stride);
-                        let dst_row = dst.add(idx + row_off * nr);
-
-                        // Gather NR elements (strided access)
-                        for jj in 0..nr {
-                            *dst_row.add(jj) = *row_ptr.add(jj * row_stride);
-                        }
-                    }
-                }
-                idx += 8 * nr;
-                p += 8;
-            }
-
-            // Handle remaining rows (4-way unroll)
-            while p + 4 <= nrows {
-                unsafe {
-                    for row_off in 0..4 {
-                        let row_ptr = base_ptr.add(row_start + p + row_off + col_base * row_stride);
-                        let dst_row = dst.add(idx + row_off * nr);
-                        for jj in 0..nr {
-                            *dst_row.add(jj) = *row_ptr.add(jj * row_stride);
-                        }
-                    }
-                }
-                idx += 4 * nr;
-                p += 4;
-            }
-
-            // Handle remaining rows
-            while p < nrows {
-                unsafe {
-                    let row_ptr = base_ptr.add(row_start + p + col_base * row_stride);
-                    for jj in 0..nr {
-                        *dst.add(idx + jj) = *row_ptr.add(jj * row_stride);
-                    }
-                }
-                idx += nr;
-                p += 1;
-            }
-        } else {
-            // Partial block with zero padding
-            for p in 0..nrows {
-                unsafe {
-                    let row_ptr = base_ptr.add(row_start + p + (col_start + j) * row_stride);
-                    for jj in 0..jb {
-                        *dst.add(idx + jj) = *row_ptr.add(jj * row_stride);
-                    }
-                    for jj in jb..nr {
-                        *dst.add(idx + jj) = 0.0;
-                    }
-                }
-                idx += nr;
-            }
-        }
-    }
+    pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
 }
 
-/// SIMD-optimized pack_b for f32 using 8-way unrolling with prefetch.
+/// `pack_b` for f32: delegates to [`pack_b_optimized`]; see
+/// [`pack_b_simd_f64`].
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn pack_b_simd_f32(
@@ -766,77 +1234,7 @@ pub fn pack_b_simd_f32(
     pack: &mut AlignedVec<f32>,
     nr: usize,
 ) {
-    let row_stride = b.row_stride();
-    let base_ptr = b.as_ptr();
-    let dst = pack.as_mut_ptr();
-    let mut idx = 0;
-
-    for j in (0..ncols).step_by(nr) {
-        let jb = nr.min(ncols - j);
-
-        if jb == nr {
-            let col_base = col_start + j;
-
-            // 8-way unrolled loop for rows
-            let mut p = 0;
-            while p + 8 <= nrows {
-                unsafe {
-                    if p + 16 < nrows {
-                        let prefetch_ptr = base_ptr.add(row_start + p + 16 + col_base * row_stride);
-                        prefetch_read(prefetch_ptr);
-                    }
-
-                    for row_off in 0..8 {
-                        let row_ptr = base_ptr.add(row_start + p + row_off + col_base * row_stride);
-                        let dst_row = dst.add(idx + row_off * nr);
-                        for jj in 0..nr {
-                            *dst_row.add(jj) = *row_ptr.add(jj * row_stride);
-                        }
-                    }
-                }
-                idx += 8 * nr;
-                p += 8;
-            }
-
-            while p + 4 <= nrows {
-                unsafe {
-                    for row_off in 0..4 {
-                        let row_ptr = base_ptr.add(row_start + p + row_off + col_base * row_stride);
-                        let dst_row = dst.add(idx + row_off * nr);
-                        for jj in 0..nr {
-                            *dst_row.add(jj) = *row_ptr.add(jj * row_stride);
-                        }
-                    }
-                }
-                idx += 4 * nr;
-                p += 4;
-            }
-
-            while p < nrows {
-                unsafe {
-                    let row_ptr = base_ptr.add(row_start + p + col_base * row_stride);
-                    for jj in 0..nr {
-                        *dst.add(idx + jj) = *row_ptr.add(jj * row_stride);
-                    }
-                }
-                idx += nr;
-                p += 1;
-            }
-        } else {
-            for p in 0..nrows {
-                unsafe {
-                    let row_ptr = base_ptr.add(row_start + p + (col_start + j) * row_stride);
-                    for jj in 0..jb {
-                        *dst.add(idx + jj) = *row_ptr.add(jj * row_stride);
-                    }
-                    for jj in jb..nr {
-                        *dst.add(idx + jj) = 0.0;
-                    }
-                }
-                idx += nr;
-            }
-        }
-    }
+    pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
 }
 
 // =============================================================================
@@ -860,8 +1258,10 @@ pub fn pack_a_simd_f64(
     pack: &mut AlignedVec<f64>,
     mr: usize,
 ) {
-    if mr >= 2 {
-        // SAFETY: NEON is part of the aarch64 baseline, always available here.
+    if mr >= 2 && simd_pack_a_args_ok(a, row_start, col_start, nrows, ncols, pack, mr) {
+        // SAFETY: NEON is part of the aarch64 baseline, and the checks above
+        // keep every element read inside `a` (unit row stride) and every
+        // write inside `pack`.
         unsafe {
             pack_a_neon_contiguous_f64(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -945,8 +1345,10 @@ pub fn pack_a_simd_f32(
     pack: &mut AlignedVec<f32>,
     mr: usize,
 ) {
-    if mr >= 4 {
-        // SAFETY: NEON is part of the aarch64 baseline, always available here.
+    if mr >= 4 && simd_pack_a_args_ok(a, row_start, col_start, nrows, ncols, pack, mr) {
+        // SAFETY: NEON is part of the aarch64 baseline, and the checks above
+        // keep every element read inside `a` (unit row stride) and every
+        // write inside `pack`.
         unsafe {
             pack_a_neon_contiguous_f32(a, row_start, col_start, nrows, ncols, pack, mr);
         }
@@ -1013,7 +1415,9 @@ unsafe fn pack_a_neon_contiguous_f32(
     }
 }
 
-/// SIMD-optimized pack_b for f64 on ARM (uses 8-way unrolling).
+/// `pack_b` for f64 on ARM: delegates to [`pack_b_optimized`], which
+/// transposes `nr = 6` panels (the NEON f64 kernel's width) in NEON registers
+/// and gathers other widths with a compile-time `nr`.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn pack_b_simd_f64(
@@ -1025,11 +1429,11 @@ pub fn pack_b_simd_f64(
     pack: &mut AlignedVec<f64>,
     nr: usize,
 ) {
-    // Use the generic optimized version with 8-way unrolling
     pack_b_optimized(b, row_start, col_start, nrows, ncols, pack, nr);
 }
 
-/// SIMD-optimized pack_b for f32 on ARM.
+/// `pack_b` for f32 on ARM: delegates to [`pack_b_optimized`], which
+/// transposes `nr = 8` panels (the NEON f32 kernel's width) in NEON registers.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn pack_b_simd_f32(
@@ -1045,452 +1449,5 @@ pub fn pack_b_simd_f32(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use oxiblas_matrix::Mat;
-
-    #[test]
-    fn test_pack_a_optimized() {
-        let a: Mat<f64> = Mat::from_rows(&[
-            &[1.0, 2.0, 3.0, 4.0],
-            &[5.0, 6.0, 7.0, 8.0],
-            &[9.0, 10.0, 11.0, 12.0],
-            &[13.0, 14.0, 15.0, 16.0],
-        ]);
-
-        let mr = 2;
-        let mut pack: AlignedVec<f64> = AlignedVec::zeros(16);
-
-        pack_a_optimized(&a.as_ref(), 0, 0, 4, 4, &mut pack, mr);
-
-        // Check first block (rows 0-1, all columns)
-        // Should be: [1, 5, 2, 6, 3, 7, 4, 8, 9, 13, 10, 14, 11, 15, 12, 16]
-        assert!((pack[0] - 1.0).abs() < 1e-10);
-        assert!((pack[1] - 5.0).abs() < 1e-10);
-        assert!((pack[2] - 2.0).abs() < 1e-10);
-        assert!((pack[3] - 6.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_pack_b_optimized() {
-        let b: Mat<f64> = Mat::from_rows(&[
-            &[1.0, 2.0, 3.0, 4.0],
-            &[5.0, 6.0, 7.0, 8.0],
-            &[9.0, 10.0, 11.0, 12.0],
-            &[13.0, 14.0, 15.0, 16.0],
-        ]);
-
-        let nr = 2;
-        let mut pack: AlignedVec<f64> = AlignedVec::zeros(16);
-
-        pack_b_optimized(&b.as_ref(), 0, 0, 4, 4, &mut pack, nr);
-
-        // Check that packing produces correct layout
-        // First NR columns, then next NR columns
-        assert!((pack[0] - 1.0).abs() < 1e-10);
-        assert!((pack[1] - 2.0).abs() < 1e-10);
-        assert!((pack[2] - 5.0).abs() < 1e-10);
-        assert!((pack[3] - 6.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_pack_a_partial_block() {
-        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 9.0]]);
-
-        let mr = 4; // Larger than nrows, will need padding
-        let mut pack: AlignedVec<f64> = AlignedVec::zeros(12);
-
-        pack_a_optimized(&a.as_ref(), 0, 0, 3, 3, &mut pack, mr);
-
-        // First column: [1, 4, 7, 0] (padded)
-        assert!((pack[0] - 1.0).abs() < 1e-10);
-        assert!((pack[1] - 4.0).abs() < 1e-10);
-        assert!((pack[2] - 7.0).abs() < 1e-10);
-        assert!((pack[3] - 0.0).abs() < 1e-10); // padding
-    }
-
-    #[test]
-    fn test_packing_config() {
-        let config = PackingConfig::default();
-        assert!(!config.use_streaming);
-        assert!(config.use_unrolling);
-
-        let large_config = PackingConfig::for_large_matrix();
-        assert!(large_config.use_streaming);
-        assert_eq!(large_config.prefetch_distance, 8);
-
-        let small_config = PackingConfig::for_small_matrix();
-        assert!(!small_config.use_streaming);
-        assert!(!small_config.use_unrolling);
-    }
-
-    #[test]
-    fn test_pack_b_simd_f64() {
-        let b: Mat<f64> = Mat::from_rows(&[
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
-            &[17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0],
-            &[25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0],
-            &[33.0, 34.0, 35.0, 36.0, 37.0, 38.0, 39.0, 40.0],
-            &[41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 48.0],
-            &[49.0, 50.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0],
-            &[57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0],
-        ]);
-
-        let nr = 4;
-        let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(64);
-        let mut pack_simd: AlignedVec<f64> = AlignedVec::zeros(64);
-
-        pack_b_optimized(&b.as_ref(), 0, 0, 8, 8, &mut pack_opt, nr);
-        pack_b_simd_f64(&b.as_ref(), 0, 0, 8, 8, &mut pack_simd, nr);
-
-        // SIMD version should produce identical results
-        for i in 0..64 {
-            assert!(
-                (pack_opt[i] - pack_simd[i]).abs() < 1e-10,
-                "Mismatch at index {}: {} vs {}",
-                i,
-                pack_opt[i],
-                pack_simd[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_pack_b_simd_f32() {
-        let b: Mat<f32> = Mat::from_rows(&[
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
-            &[17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0],
-            &[25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0],
-            &[33.0, 34.0, 35.0, 36.0, 37.0, 38.0, 39.0, 40.0],
-            &[41.0, 42.0, 43.0, 44.0, 45.0, 46.0, 47.0, 48.0],
-            &[49.0, 50.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0],
-            &[57.0, 58.0, 59.0, 60.0, 61.0, 62.0, 63.0, 64.0],
-        ]);
-
-        let nr = 4;
-        let mut pack_opt: AlignedVec<f32> = AlignedVec::zeros(64);
-        let mut pack_simd: AlignedVec<f32> = AlignedVec::zeros(64);
-
-        pack_b_optimized(&b.as_ref(), 0, 0, 8, 8, &mut pack_opt, nr);
-        pack_b_simd_f32(&b.as_ref(), 0, 0, 8, 8, &mut pack_simd, nr);
-
-        for i in 0..64 {
-            assert!(
-                (pack_opt[i] - pack_simd[i]).abs() < 1e-5,
-                "Mismatch at index {}: {} vs {}",
-                i,
-                pack_opt[i],
-                pack_simd[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_pack_b_simd_large() {
-        // Test with a larger matrix to exercise the 8-way unrolling
-        let size = 32;
-        let data: Vec<Vec<f64>> = (0..size)
-            .map(|i| (0..size).map(|j| (i * size + j) as f64).collect())
-            .collect();
-        let b: Mat<f64> = Mat::from_rows(&data.iter().map(|r| r.as_slice()).collect::<Vec<_>>());
-
-        let nr = 8;
-        let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(size * size);
-        let mut pack_simd: AlignedVec<f64> = AlignedVec::zeros(size * size);
-
-        pack_b_optimized(&b.as_ref(), 0, 0, size, size, &mut pack_opt, nr);
-        pack_b_simd_f64(&b.as_ref(), 0, 0, size, size, &mut pack_simd, nr);
-
-        for i in 0..(size * size) {
-            assert!(
-                (pack_opt[i] - pack_simd[i]).abs() < 1e-10,
-                "Large matrix mismatch at {}: {} vs {}",
-                i,
-                pack_opt[i],
-                pack_simd[i]
-            );
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Regression tests for the packing correctness fixes.
-    // ------------------------------------------------------------------
-
-    /// Naive column-major reference for `pack_a`: re-tiles the panel into
-    /// `mr`-row blocks with zero padding for the trailing partial block, exactly
-    /// matching the layout contract of [`pack_a_optimized`].
-    fn pack_a_reference<T: Field>(
-        a: &MatRef<'_, T>,
-        row_start: usize,
-        col_start: usize,
-        nrows: usize,
-        ncols: usize,
-        mr: usize,
-    ) -> Vec<T> {
-        let mut out = Vec::new();
-        for i in (0..nrows).step_by(mr) {
-            let ib = mr.min(nrows - i);
-            for p in 0..ncols {
-                for ii in 0..mr {
-                    if ii < ib {
-                        out.push(a[(row_start + i + ii, col_start + p)]);
-                    } else {
-                        out.push(T::zero());
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Naive reference for `pack_b`: `nr`-column blocks, row-major within a
-    /// block, zero padding for the trailing partial block.
-    fn pack_b_reference<T: Field>(
-        b: &MatRef<'_, T>,
-        row_start: usize,
-        col_start: usize,
-        nrows: usize,
-        ncols: usize,
-        nr: usize,
-    ) -> Vec<T> {
-        let mut out = Vec::new();
-        for j in (0..ncols).step_by(nr) {
-            let jb = nr.min(ncols - j);
-            for p in 0..nrows {
-                for jj in 0..nr {
-                    if jj < jb {
-                        out.push(b[(row_start + p, col_start + j + jj)]);
-                    } else {
-                        out.push(T::zero());
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Row-major sequential test matrix `[[1,2,..],[..]]` of the given shape.
-    fn seq_mat_f64(nrows: usize, ncols: usize) -> Mat<f64> {
-        let rows: Vec<Vec<f64>> = (0..nrows)
-            .map(|i| (0..ncols).map(|j| (i * ncols + j + 1) as f64).collect())
-            .collect();
-        Mat::from_rows(&rows.iter().map(|r| r.as_slice()).collect::<Vec<_>>())
-    }
-
-    fn seq_mat_f32(nrows: usize, ncols: usize) -> Mat<f32> {
-        let rows: Vec<Vec<f32>> = (0..nrows)
-            .map(|i| (0..ncols).map(|j| (i * ncols + j + 1) as f32).collect())
-            .collect();
-        Mat::from_rows(&rows.iter().map(|r| r.as_slice()).collect::<Vec<_>>())
-    }
-
-    #[test]
-    fn test_pack_a_contiguous_matches_reference() {
-        // For every shape/`mr` the fast path and the fallback must both agree
-        // with the naive reference AND with the general `pack_a_optimized` path.
-        //
-        // The (8x8, mr=4) case is the direct regression for the original bug:
-        // the old flat-copy fast path fired for the whole contiguous matrix
-        // regardless of `mr`, emitting plain column-major order instead of the
-        // 4-row-tiled layout `pack_a_optimized` produces. The (8x4, mr=8) case
-        // covers the wrong `row_stride == ncols` contiguity test on a non-square
-        // matrix.
-        let cases = [
-            (8usize, 8usize, 8usize), // fast-path eligible on x86_64 (rs==nrows==mr)
-            (8, 8, 4),                // contiguous but multi-block -> must delegate
-            (8, 4, 8),                // non-square: old `== ncols` check was wrong
-            (5, 7, 3),                // padded (non-contiguous) -> fallback
-            (3, 3, 4),                // partial block with zero padding
-        ];
-
-        for (nrows, ncols, mr) in cases {
-            let a = seq_mat_f64(nrows, ncols);
-            let a_ref = a.as_ref();
-            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
-            let total = reference.len();
-
-            let mut pack_contig: AlignedVec<f64> = AlignedVec::zeros(total);
-            let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(total);
-            pack_a_contiguous(&a_ref, 0, 0, nrows, ncols, &mut pack_contig, mr);
-            pack_a_optimized(&a_ref, 0, 0, nrows, ncols, &mut pack_opt, mr);
-
-            for k in 0..total {
-                assert!(
-                    (pack_contig[k] - reference[k]).abs() < 1e-12,
-                    "pack_a_contiguous vs reference mismatch at {k} for {nrows}x{ncols} mr={mr}: {} vs {}",
-                    pack_contig[k],
-                    reference[k]
-                );
-                assert!(
-                    (pack_contig[k] - pack_opt[k]).abs() < 1e-12,
-                    "pack_a_contiguous vs pack_a_optimized mismatch at {k} for {nrows}x{ncols} mr={mr}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_pack_a_contiguous_fast_path_layout() {
-        // A genuinely contiguous, single-micro-panel matrix (row_stride == nrows,
-        // nrows == mr) that takes the flat-copy fast path. 16 rows is a multiple
-        // of the f64 cache-line element count under both 64-byte (8) and 128-byte
-        // (16) padding, so the matrix is contiguous on every supported target. We
-        // assert the precondition so the fast path is actually exercised, then
-        // check it reproduces the reference layout.
-        let nrows = 16;
-        let ncols = 6;
-        let a = seq_mat_f64(nrows, ncols);
-        let a_ref = a.as_ref();
-        assert_eq!(
-            a_ref.row_stride(),
-            a_ref.nrows(),
-            "expected a contiguous {nrows}-row matrix on this target"
-        );
-        let mr = a_ref.nrows();
-        let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
-        let mut pack: AlignedVec<f64> = AlignedVec::zeros(reference.len());
-        pack_a_contiguous(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
-        for k in 0..reference.len() {
-            assert!(
-                (pack[k] - reference[k]).abs() < 1e-12,
-                "fast-path mismatch at {k}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pack_b_streaming_matches_optimized_f64() {
-        // Shapes cover full blocks, zero-padded partial blocks, and total element
-        // counts that are and are not multiples of the 4-element (32-byte) AVX
-        // lane, exercising both the streaming lanes and the ordinary tail on AVX
-        // hardware. Elsewhere this validates the identical fallback.
-        let cases = [
-            (8usize, 8usize, 4usize),
-            (3, 4, 4), // total 12 -> three full lanes, no tail
-            (3, 6, 4), // partial second block (jb=2, zero-padded), total 24
-            (5, 5, 6), // nr > ncols -> single partial block, total 30 (tail 2)
-            (16, 12, 8),
-        ];
-        for (nrows, ncols, nr) in cases {
-            let b = seq_mat_f64(nrows, ncols);
-            let b_ref = b.as_ref();
-            let reference = pack_b_reference(&b_ref, 0, 0, nrows, ncols, nr);
-            let total = reference.len();
-
-            let mut pack_stream: AlignedVec<f64> = AlignedVec::zeros(total);
-            let mut pack_opt: AlignedVec<f64> = AlignedVec::zeros(total);
-            pack_b_streaming(&b_ref, 0, 0, nrows, ncols, &mut pack_stream, nr);
-            pack_b_optimized(&b_ref, 0, 0, nrows, ncols, &mut pack_opt, nr);
-
-            for k in 0..total {
-                assert!(
-                    (pack_stream[k] - reference[k]).abs() < 1e-12,
-                    "streaming vs reference mismatch at {k} for {nrows}x{ncols} nr={nr}: {} vs {}",
-                    pack_stream[k],
-                    reference[k]
-                );
-                assert!(
-                    (pack_stream[k] - pack_opt[k]).abs() < 1e-12,
-                    "streaming vs optimized mismatch at {k} for {nrows}x{ncols} nr={nr}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_pack_b_streaming_matches_optimized_f32() {
-        // f32 uses an 8-element (32-byte) lane; (5,3,2) yields total 20 = two
-        // full lanes plus a 4-element tail.
-        let cases = [(4usize, 8usize, 4usize), (7, 5, 4), (5, 3, 2), (20, 16, 8)];
-        for (nrows, ncols, nr) in cases {
-            let b = seq_mat_f32(nrows, ncols);
-            let b_ref = b.as_ref();
-            let reference = pack_b_reference(&b_ref, 0, 0, nrows, ncols, nr);
-            let total = reference.len();
-
-            let mut pack_stream: AlignedVec<f32> = AlignedVec::zeros(total);
-            pack_b_streaming(&b_ref, 0, 0, nrows, ncols, &mut pack_stream, nr);
-
-            for k in 0..total {
-                assert!(
-                    (pack_stream[k] - reference[k]).abs() < 1e-5,
-                    "f32 streaming mismatch at {k} for {nrows}x{ncols} nr={nr}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_pack_b_streaming_subregion() {
-        // Pack an interior region (row_start/col_start != 0) of a larger matrix,
-        // exercising the streaming gather with a non-zero origin and a padded
-        // leading dimension.
-        let b = seq_mat_f64(10, 10);
-        let b_ref = b.as_ref();
-        let (row_start, col_start, nrows, ncols, nr) = (2usize, 3usize, 6usize, 5usize, 4usize);
-        let reference = pack_b_reference(&b_ref, row_start, col_start, nrows, ncols, nr);
-        let total = reference.len();
-
-        let mut pack_stream: AlignedVec<f64> = AlignedVec::zeros(total);
-        pack_b_streaming(
-            &b_ref,
-            row_start,
-            col_start,
-            nrows,
-            ncols,
-            &mut pack_stream,
-            nr,
-        );
-
-        for k in 0..total {
-            assert!(
-                (pack_stream[k] - reference[k]).abs() < 1e-12,
-                "subregion streaming mismatch at {k}"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_pack_a_simd_f64_matches_reference() {
-        // With the corrected guard the AVX2 path fires for real column-major
-        // storage (any row_stride, including the padded strides these matrices
-        // have), so on AVX2 hardware this exercises `pack_a_simd_contiguous_f64`
-        // and checks it against the scalar reference.
-        let cases = [(8usize, 8usize, 4usize), (16, 5, 8), (10, 7, 4)];
-        for (nrows, ncols, mr) in cases {
-            let a = seq_mat_f64(nrows, ncols);
-            let a_ref = a.as_ref();
-            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
-            let mut pack: AlignedVec<f64> = AlignedVec::zeros(reference.len());
-            pack_a_simd_f64(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
-            for k in 0..reference.len() {
-                assert!(
-                    (pack[k] - reference[k]).abs() < 1e-12,
-                    "pack_a_simd_f64 mismatch at {k} for {nrows}x{ncols} mr={mr}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_pack_a_simd_f32_matches_reference() {
-        let cases = [(16usize, 8usize, 8usize), (20, 5, 8)];
-        for (nrows, ncols, mr) in cases {
-            let a = seq_mat_f32(nrows, ncols);
-            let a_ref = a.as_ref();
-            let reference = pack_a_reference(&a_ref, 0, 0, nrows, ncols, mr);
-            let mut pack: AlignedVec<f32> = AlignedVec::zeros(reference.len());
-            pack_a_simd_f32(&a_ref, 0, 0, nrows, ncols, &mut pack, mr);
-            for k in 0..reference.len() {
-                assert!(
-                    (pack[k] - reference[k]).abs() < 1e-5,
-                    "pack_a_simd_f32 mismatch at {k} for {nrows}x{ncols} mr={mr}"
-                );
-            }
-        }
-    }
-}
+#[path = "gemm_packing_tests.rs"]
+mod tests;

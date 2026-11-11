@@ -75,6 +75,15 @@ fn lower_packed_index(i: usize, j: usize, n: usize) -> usize {
 /// Only the specified triangle (upper or lower) is stored and updated.
 /// For a Hermitian matrix, A\[i,j\] = conj(A\[j,i\]) and diagonal is real.
 ///
+/// This is the packed twin of [`her2`](crate::level2::her2()) and gives the same
+/// results as `her2` on the same data (bitwise for NaN-free input; with NaN input
+/// the NaN sign/payload may differ). As in reference BLAS `?hpr2`, the imaginary
+/// part of every diagonal element is *set to zero* by the update
+/// (`A[j,j] = real(A[j,j]) + real(update)`), and a column with `x[j]` and `y[j]`
+/// both zero is skipped entirely (only `A[j,j] = real(A[j,j])` is applied), so an
+/// infinite or NaN neighbour cannot reach it. If `n == 0` or `alpha == 0` the
+/// packed array is left completely untouched (including an imaginary diagonal).
+///
 /// # Arguments
 ///
 /// * `uplo` - Specifies whether the upper or lower triangle is stored
@@ -140,50 +149,60 @@ pub fn hpr2<T: Field>(
         return Ok(());
     }
 
-    let alpha_conj = alpha.conj();
-
+    // The loops mirror `her2` operation for operation, including the reference temps
+    // `TEMP1 = ALPHA*DCONJG(Y(J))` and `TEMP2 = DCONJG(ALPHA*X(J))`, so packed and
+    // dense storage give the same results (bitwise for NaN-free input; with NaN
+    // input the NaN sign/payload may differ).
     match uplo {
         Hpr2Uplo::Upper => {
             // Update upper triangle:
             // A[i,j] += alpha * x[i] * conj(y[j]) + conj(alpha) * y[i] * conj(x[j]) for i <= j
             for j in 0..n {
-                let y_j_conj = y[j].conj();
-                let x_j_conj = x[j].conj();
-                let alpha_yj_conj = alpha * y_j_conj;
-                let alpha_conj_xj_conj = alpha_conj * x_j_conj;
+                let kjj = upper_packed_index(j, j);
+                // Reference ?HPR2 skips the column update when x(j) == 0 and
+                // y(j) == 0 (so an infinite or NaN neighbour cannot reach it as
+                // `x(i) * conj(0)`) and only drops the imaginary part of the diagonal.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    ap[kjj] = T::from_real(ap[kjj].real());
+                    continue;
+                }
+                let alpha_yj_conj = alpha * y[j].conj();
+                let conj_alpha_xj = (alpha * x[j]).conj();
 
                 for i in 0..j {
                     let kij = upper_packed_index(i, j);
-                    ap[kij] = ap[kij] + alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
+                    ap[kij] = ap[kij] + alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
                 }
 
-                // Diagonal: A[j,j] += alpha * x[j] * conj(y[j]) + conj(alpha) * y[j] * conj(x[j])
-                // This is 2 * Re(alpha * x[j] * conj(y[j])), which is real
-                let kjj = upper_packed_index(j, j);
-                let term = alpha * x[j] * y_j_conj;
-                // term + conj(term) = 2 * Re(term)
-                let diag_update = T::from_real(term.real() + term.real());
-                ap[kjj] = T::from_real(ap[kjj].real()) + diag_update;
+                // Diagonal: A[j,j] = real(A[j,j]) + real(alpha*x[j]*conj(y[j])
+                // + conj(alpha)*y[j]*conj(x[j])). The sum is real for a Hermitian
+                // update; like reference ?HPR2 the stored imaginary part is dropped,
+                // so the diagonal is exactly real afterwards.
+                let val = alpha_yj_conj * x[j] + conj_alpha_xj * y[j];
+                ap[kjj] = T::from_real(ap[kjj].real() + val.real());
             }
         }
         Hpr2Uplo::Lower => {
             // Update lower triangle:
             // A[i,j] += alpha * x[i] * conj(y[j]) + conj(alpha) * y[i] * conj(x[j]) for i >= j
             for j in 0..n {
-                let y_j_conj = y[j].conj();
-                let x_j_conj = x[j].conj();
-                let alpha_yj_conj = alpha * y_j_conj;
-                let alpha_conj_xj_conj = alpha_conj * x_j_conj;
-
-                // Diagonal: result must be real
                 let kjj = lower_packed_index(j, j, n);
-                let term = alpha * x[j] * y_j_conj;
-                let diag_update = T::from_real(term.real() + term.real());
-                ap[kjj] = T::from_real(ap[kjj].real()) + diag_update;
+                // Column skip for x(j) == 0 && y(j) == 0, as in the upper branch.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    ap[kjj] = T::from_real(ap[kjj].real());
+                    continue;
+                }
+                let alpha_yj_conj = alpha * y[j].conj();
+                let conj_alpha_xj = (alpha * x[j]).conj();
+
+                // Diagonal: real(A[j,j]) + real(update); stored imaginary part
+                // dropped, as in reference ?HPR2.
+                let val = alpha_yj_conj * x[j] + conj_alpha_xj * y[j];
+                ap[kjj] = T::from_real(ap[kjj].real() + val.real());
 
                 for i in (j + 1)..n {
                     let kij = lower_packed_index(i, j, n);
-                    ap[kij] = ap[kij] + alpha_yj_conj * x[i] + alpha_conj_xj_conj * y[i];
+                    ap[kij] = ap[kij] + alpha_yj_conj * x[i] + conj_alpha_xj * y[i];
                 }
             }
         }
@@ -248,19 +267,8 @@ mod tests {
 
         // x * y^H = [[1*1, 1*1], [i*1, i*1]] = [[1, 1], [i, i]]
         // y * x^H = [[1*1, 1*(-i)], [1*1, 1*(-i)]] = [[1, -i], [1, -i]]
-        // Sum: [[2, 1-i], [1+i, 2i-i]] but wait, let me recalculate
-        // x * y^H + y * x^H:
-        // [0,0]: 1*1 + 1*1 = 2
-        // [0,1]: 1*1 + (-i)*1 = 1-i
-        // [1,0]: i*1 + 1*1 = 1+i (but we store upper)
-        // [1,1]: i*1 + 1*(-i) = i - i = 0... wait
-        // Let me recalculate:
-        // [1,1] = x[1]*conj(y[1]) + y[1]*conj(x[1]) = i*1 + 1*(-i) = i - i = 0
-        // Hmm that's 0, let me verify
-        // Actually: x[1] = i, y[1] = 1
-        // x[1]*conj(y[1]) = i*1 = i
-        // y[1]*conj(x[1]) = 1*(-i) = -i
-        // Sum = i + (-i) = 0
+        // Sum: [[2, 1-i], [1+i, 0]]; the diagonal entry
+        // [1,1] = x[1]*conj(y[1]) + y[1]*conj(x[1]) = i*1 + 1*(-i) = 0.
 
         // Upper packed: [a00, a01, a11] = [2, 1-i, 0]
         assert!(approx_eq(ap[0].re, 2.0));
@@ -355,10 +363,8 @@ mod tests {
 
         hpr2(Hpr2Uplo::Upper, 2, c(1.0, 0.0), &x, &y, &mut ap).unwrap();
 
-        // x * y^H + y * x^H = [[2, 2], [2, 2]]
-        // Result: [1+2, 2+1+2, 3+2] = [3, 4+i (but off-diag stays complex), 5]
-        // Wait, off-diagonal should add properly
-        // ap[1] = (2+i) + 2 = 4+i
+        // x * y^H + y * x^H = [[2, 2], [2, 2]], added to [a00, a01, a11] = [1, 2+i, 3]:
+        // [1+2, (2+i)+2, 3+2] = [3, 4+i, 5] (the off-diagonal keeps its imaginary part).
         assert!(approx_eq(ap[0].re, 3.0));
         assert!(approx_eq(ap[0].im, 0.0));
         assert!(approx_eq_c(ap[1], c(4.0, 1.0)));
@@ -505,5 +511,131 @@ mod tests {
         assert!(approx_eq_c(ap[4], c(1.0, 0.0)));
         assert!(approx_eq(ap[5].re, 2.0));
         assert!(approx_eq(ap[5].im, 0.0));
+    }
+
+    fn bits(z: Complex64) -> (u64, u64) {
+        (z.re.to_bits(), z.im.to_bits())
+    }
+
+    fn finite(z: Complex64) -> bool {
+        z.re.is_finite() && z.im.is_finite()
+    }
+
+    /// Issue #14: reference ?HPR2 skips column `j` when `x(j) == 0` and
+    /// `y(j) == 0` and only sets `AP(jj) = real(AP(jj))`, so an infinite neighbour
+    /// cannot reach the column as `Inf * 0 = NaN`.
+    #[test]
+    fn test_issue_14_hpr2_zero_column_skip() {
+        let inf = f64::INFINITY;
+        let alpha = c(0.75, -0.5);
+
+        // Lower packed [A00, A10, A20, A11, A21, A22] with an imaginary diagonal:
+        // column 0 (x0 == y0 == 0) holds row 1, where x1 is infinite.
+        let ap0 = [
+            c(1.0, 0.5),
+            c(0.2, 0.1),
+            c(0.3, -0.2),
+            c(2.0, 0.7),
+            c(0.4, 0.6),
+            c(3.0, -0.8),
+        ];
+        let mut ap = ap0;
+        let x = [c(0.0, 0.0), c(inf, 0.0), c(1.0, 0.5)];
+        let y = [c(-0.0, 0.0), c(1.0, -1.0), c(0.5, 2.0)];
+        hpr2(Hpr2Uplo::Lower, 3, alpha, &x, &y, &mut ap).unwrap();
+        assert_eq!(bits(ap[1]), bits(ap0[1]));
+        assert_eq!(bits(ap[2]), bits(ap0[2]));
+        assert_eq!(bits(ap[0]), bits(c(1.0, 0.0)));
+        // Column 1 is updated with temp2 = conj(alpha * Inf).
+        assert!(!finite(ap[3]) && !finite(ap[4]));
+
+        // Upper packed [A00, A01, A11, A02, A12, A22] with an imaginary diagonal:
+        // column 2 (x2 == y2 == 0) holds row 1, where x1 is infinite.
+        let ap0 = [
+            c(1.0, 0.5),
+            c(0.2, 0.1),
+            c(2.0, 0.7),
+            c(0.3, -0.2),
+            c(0.4, 0.6),
+            c(3.0, -0.8),
+        ];
+        let mut ap = ap0;
+        let x = [c(1.0, 0.5), c(inf, 0.0), c(0.0, -0.0)];
+        let y = [c(0.5, 2.0), c(1.0, -1.0), c(-0.0, 0.0)];
+        hpr2(Hpr2Uplo::Upper, 3, alpha, &x, &y, &mut ap).unwrap();
+        assert_eq!(bits(ap[3]), bits(ap0[3]));
+        assert_eq!(bits(ap[4]), bits(ap0[4]));
+        assert_eq!(bits(ap[5]), bits(c(3.0, 0.0)));
+        assert!(!finite(ap[1]) && !finite(ap[2]));
+    }
+
+    /// Issue #13 / #14: `hpr2` is the packed twin of `her2` (same column skip, same
+    /// temps, same diagonal expression), so both give bitwise identical results on
+    /// this NaN-free data, NaN generated from Inf included.
+    #[test]
+    fn test_issue_14_hpr2_matches_her2_bitwise() {
+        use crate::level2::{Her2Uplo, her2};
+        use oxiblas_matrix::Mat;
+        let inf = f64::INFINITY;
+        let n = 4;
+        let xs = [
+            [c(0.0, 0.0), c(inf, 0.0), c(1.0, -2.0), c(-0.0, 0.0)],
+            [c(0.3, 0.7), c(-1.1, 0.2), c(0.0, inf), c(2.5, -0.5)],
+            [c(0.1, -0.2), c(0.3, 0.4), c(-0.5, 0.6), c(0.7, 0.8)],
+        ];
+        let ys = [
+            [c(-0.0, 0.0), c(0.5, 1.5), c(0.0, 0.0), c(0.0, 0.0)],
+            [c(1.0, 0.0), c(0.0, -0.0), c(0.25, -0.75), c(inf, 1.0)],
+            [c(0.9, 0.1), c(-0.3, 0.2), c(0.6, -0.4), c(0.2, 0.5)],
+        ];
+        for (uplo, her2_uplo) in [
+            (Hpr2Uplo::Lower, Her2Uplo::Lower),
+            (Hpr2Uplo::Upper, Her2Uplo::Upper),
+        ] {
+            for (x, y) in xs.iter().zip(&ys) {
+                for alpha in [c(0.75, -0.5), c(-1.25, 0.0)] {
+                    let mut a: Mat<Complex64> = Mat::filled(n, n, c(f64::NAN, f64::NAN));
+                    let mut ap = vec![c(0.0, 0.0); n * (n + 1) / 2];
+                    for j in 0..n {
+                        let rows = match uplo {
+                            Hpr2Uplo::Upper => 0..j + 1,
+                            Hpr2Uplo::Lower => j..n,
+                        };
+                        for i in rows {
+                            let k = match uplo {
+                                Hpr2Uplo::Upper => upper_packed_index(i, j),
+                                Hpr2Uplo::Lower => lower_packed_index(i, j, n),
+                            };
+                            // The diagonal carries an imaginary part to be dropped.
+                            let v = c(
+                                0.25 * (i + 1) as f64 - 0.5 * j as f64,
+                                0.125 * (i + 2 * j) as f64 + 0.0625,
+                            );
+                            a[(i, j)] = v;
+                            ap[k] = v;
+                        }
+                    }
+                    hpr2(uplo, n, alpha, x, y, &mut ap).unwrap();
+                    her2(her2_uplo, alpha, x, y, a.as_mut()).unwrap();
+                    for j in 0..n {
+                        let rows = match uplo {
+                            Hpr2Uplo::Upper => 0..j + 1,
+                            Hpr2Uplo::Lower => j..n,
+                        };
+                        for i in rows {
+                            let k = match uplo {
+                                Hpr2Uplo::Upper => upper_packed_index(i, j),
+                                Hpr2Uplo::Lower => lower_packed_index(i, j, n),
+                            };
+                            assert_eq!(
+                                bits(ap[k]),
+                                bits(a[(i, j)]),
+                                "{uplo:?} alpha={alpha} x={x:?} y={y:?} ({i},{j})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

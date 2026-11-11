@@ -46,7 +46,8 @@ mod tests_2 {
             GemmKernelKind::Sse42 => ((4, 2), (4, 4)),
             #[cfg(target_arch = "aarch64")]
             GemmKernelKind::Neon => ((8, 6), (8, 8)),
-            _ => ((4, 4), (4, 4)),
+            GemmKernelKind::Scalar => ((4, 4), (4, 4)),
+            other => panic!("kernel kind {other:?} cannot be selected on this target"),
         };
 
         let s64 = f64::micro_kernel_shape();
@@ -103,6 +104,12 @@ mod tests_2 {
                     }
                 }
 
+                // SAFETY: `micro_kernel_shape()` and `micro_kernel` both use
+                // the kernel picked by `selected_kernel_kind()`, so `a` (k *
+                // mr elements) and `b` (k * nr) are packed for exactly the
+                // kernel that runs, and `c_test` holds its `mr x nr` tile with
+                // leading dimension `stride = mr`; the three vectors are
+                // distinct allocations.
                 unsafe {
                     <$ty as GemmKernel>::micro_kernel(
                         k,
@@ -174,6 +181,9 @@ mod tests_2 {
         let b: Vec<f64> = (0..k * NR).map(|i| (i as f64) * 0.1 - 0.2).collect();
         let mut c = vec![f64::NAN; MR * NR];
 
+        // SAFETY: the scalar 4 x 4 kernel needs no CPU feature; `a` holds k *
+        // MR and `b` k * NR packed elements, and `c` holds the MR x NR tile
+        // with leading dimension MR.
         unsafe {
             micro_kernel_f64_scalar(k, 1.5, a.as_ptr(), b.as_ptr(), 0.0, c.as_mut_ptr(), MR);
         }
@@ -200,6 +210,9 @@ mod tests_2 {
         let b: Vec<f32> = (0..k * NR).map(|i| (i as f32) * 0.1 - 0.2).collect();
         let mut c = vec![f32::NAN; MR * NR];
 
+        // SAFETY: the scalar 4 x 4 kernel needs no CPU feature; `a` holds k *
+        // MR and `b` k * NR packed elements, and `c` holds the MR x NR tile
+        // with leading dimension MR.
         unsafe {
             micro_kernel_f32_scalar(k, 1.5, a.as_ptr(), b.as_ptr(), 0.0, c.as_mut_ptr(), MR);
         }
@@ -246,6 +259,10 @@ mod tests_2 {
                 let b: Vec<f64> = (0..k * NR).map(|i| (i as f64) * 0.1 - 0.2).collect();
                 let mut c = vec![c_init; MR * NR];
 
+                // SAFETY: SSE4.2 was detected at the top of the test and SSE2
+                // is part of the x86_64 baseline (the kernel's target
+                // features); `a` holds k * MR and `b` k * NR packed elements
+                // and `c` the 4 x 2 tile with leading dimension MR.
                 unsafe {
                     super::micro_kernel_f64_sse42(
                         k,
@@ -295,6 +312,10 @@ mod tests_2 {
                 let b: Vec<f32> = (0..k * NR).map(|i| (i as f32) * 0.1 - 0.2).collect();
                 let mut c = vec![c_init; MR * NR];
 
+                // SAFETY: SSE4.2 was detected at the top of the test and SSE2
+                // is part of the x86_64 baseline (the kernel's target
+                // features); `a` holds k * MR and `b` k * NR packed elements
+                // and `c` the 4 x 4 tile with leading dimension MR.
                 unsafe {
                     super::micro_kernel_f32_sse42(
                         k,
@@ -428,6 +449,9 @@ mod tests_2 {
 
         let mut c = [zero; 4]; // c[i + j*2]
 
+        // SAFETY: the scalar complex kernel is 2 x 2 and needs no CPU feature:
+        // with k = 2, `a` and `b` hold the 4 packed elements each it reads and
+        // `c` the 2 x 2 tile with leading dimension 2.
         unsafe {
             micro_kernel_c64_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
         }
@@ -471,6 +495,9 @@ mod tests_2 {
         let alpha2 = Complex64::new(2.0, 0.0);
         let beta2 = Complex64::new(0.0, 0.0);
         let mut c2 = [Complex64::new(99.0, 99.0); 4];
+        // SAFETY: the scalar complex kernel is 2 x 2: with k = 2, `a2` and
+        // `b2` hold the 4 packed elements each it reads and `c2` the 2 x 2
+        // tile with leading dimension 2.
         unsafe {
             micro_kernel_c64_scalar(
                 2,
@@ -508,6 +535,9 @@ mod tests_2 {
             Complex64::new(0.0, 0.0),
         ];
         let beta3 = Complex64::new(1.0, 0.0);
+        // SAFETY: the scalar complex kernel is 2 x 2: with k = 2, `a2` and
+        // `b2` hold the 4 packed elements each it reads and `c3` the 2 x 2
+        // tile with leading dimension 2.
         unsafe {
             micro_kernel_c64_scalar(
                 2,
@@ -553,6 +583,9 @@ mod tests_2 {
         let beta = Complex32::new(0.0, 0.0);
         let mut c = [zero; 4];
 
+        // SAFETY: the scalar complex kernel is 2 x 2 and needs no CPU feature:
+        // with k = 2, `a` and `b` hold the 4 packed elements each it reads and
+        // `c` the 2 x 2 tile with leading dimension 2.
         unsafe {
             micro_kernel_c32_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
         }
@@ -591,6 +624,9 @@ mod tests_2 {
         // C is poisoned with NaN everywhere; beta==0 must mean it is never read.
         let nan = Complex64::new(f64::NAN, f64::NAN);
         let mut c = [nan; 4];
+        // SAFETY: the scalar complex kernel is 2 x 2: with k = 2, `a` and `b`
+        // hold the 4 packed elements each it reads and `c` the 2 x 2 tile with
+        // leading dimension 2.
         unsafe {
             micro_kernel_c64_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
         }
@@ -625,6 +661,9 @@ mod tests_2 {
         let beta = Complex32::new(0.0, 0.0);
         let nan = Complex32::new(f32::NAN, f32::NAN);
         let mut c = [nan; 4];
+        // SAFETY: the scalar complex kernel is 2 x 2: with k = 2, `a` and `b`
+        // hold the 4 packed elements each it reads and `c` the 2 x 2 tile with
+        // leading dimension 2.
         unsafe {
             micro_kernel_c32_scalar(2, alpha, a.as_ptr(), b.as_ptr(), beta, c.as_mut_ptr(), 2);
         }

@@ -8,19 +8,46 @@
 //! cache utilization by processing the matrix in blocks that fit in L1/L2 cache.
 //! Block sizes are tuned for modern CPU cache hierarchies.
 //!
+//! ## SIMD kernels
+//!
+//! On aarch64, `f64` and `f32` matrices whose rows are adjacent
+//! (`col_stride() == 1`: column-major storage or a submatrix of it) run on the
+//! NEON kernels of the `neon` submodule for every size: an axpy-form kernel for
+//! `NoTrans` and a four-column dot-form kernel for `Trans` / `ConjTrans`. The
+//! `force-scalar` feature and all other views and element types keep the
+//! portable code below.
+//!
 //! ## Parallelization
 //!
 //! When the `parallel` feature is enabled, GEMV operations are parallelized:
 //! - For `NoTrans`: parallelizes over output rows
-//! - For Trans/ConjTrans: uses thread-local accumulators with reduction
+//! - For Trans/ConjTrans: uses thread-local accumulators with reduction, except
+//!   for the aarch64 NEON path below
+//!
+//! On aarch64 the column-major `f64` / `f32` cases split the rows (`NoTrans`)
+//! or the columns (`Trans` / `ConjTrans`, so each thread owns a disjoint slice
+//! of `y` and no per-thread buffers or reduction are needed) and run the
+//! sequential kernels on each part; their results equal the sequential ones bit
+//! for bit. The portable `NoTrans` loops also match the sequential driver bit
+//! for bit; the Trans/ConjTrans reduction (and, on `x86_64` with AVX2, the f64
+//! `NoTrans` kernel of the sequential driver) round differently.
 
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::MatRef;
 
-/// Block size for the column dimension (K blocking).
-/// Tuned for L1 cache (32KB typically holds ~4K doubles).
-/// Increased to 512 for better vector reuse in x.
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+mod neon;
+
+/// Block size for the column dimension (K blocking) of the portable blocked
+/// kernels: the sequential `gemv_blocked` paths (including the `x86_64` AVX2
+/// `f64` `NoTrans` kernel) and the portable parallel kernels. These serve
+/// every target other than aarch64, `force-scalar` builds, element types other
+/// than `f64` / `f32`, and views with `col_stride() != 1`. The aarch64 NEON
+/// kernels do not use it (see the `neon` submodule). A block covers 512
+/// entries of `x` (4 KiB of `f64`), which leaves room in a typical 32 KiB L1
+/// data cache for the rows of `A` being streamed; it is a fixed heuristic, not
+/// selected per CPU.
 const KC_BLOCK: usize = 512;
 
 /// Block size for the row dimension (M blocking).
@@ -54,10 +81,19 @@ pub enum GemvTrans {
 ///
 /// * `trans` - Whether to transpose A
 /// * `alpha` - Scalar multiplier for A·x
-/// * `a` - The matrix A (m×n for `NoTrans`, n×m for Trans)
-/// * `x` - The input vector
+/// * `a` - The matrix A, always m×n as stored (`op(A)` is m×n for `NoTrans` and
+///   n×m for `Trans` / `ConjTrans`)
+/// * `x` - The input vector (n elements for `NoTrans`, m otherwise)
 /// * `beta` - Scalar multiplier for y
-/// * `y` - The output vector (modified in place)
+/// * `y` - The output vector (m elements for `NoTrans`, n otherwise; modified
+///   in place)
+///
+/// # Reference semantics
+///
+/// Like reference BLAS `?gemv`: if `A` is empty (`m == 0` or `n == 0`) the call
+/// returns immediately and `y` is left untouched (it is *not* scaled by `beta`);
+/// `beta == 0` overwrites `y` without reading it; and `alpha == 0` never reads
+/// `A` or `x`.
 ///
 /// # Panics
 ///
@@ -100,6 +136,12 @@ pub fn gemv<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], bet
     );
     assert_eq!(y.len(), rows, "y length must match number of rows of op(A)");
 
+    // Reference quick return: for an empty A (m == 0 or n == 0) y is left
+    // untouched -- not even beta-scaled or zero-filled.
+    if m == 0 || n == 0 {
+        return;
+    }
+
     // Handle beta = 0 case (avoid multiplying uninitialized values)
     if beta == T::zero() {
         for yi in y.iter_mut() {
@@ -116,12 +158,63 @@ pub fn gemv<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], bet
         return;
     }
 
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if gemv_neon_dispatch(trans, alpha, a, x, y) {
+            return;
+        }
+    }
+
     // Use blocked algorithm for large matrices
     if m * n > 4096 {
         gemv_blocked(trans, alpha, a, x, y, m, n);
     } else {
         gemv_unblocked(trans, alpha, a, x, y, m, n);
     }
+}
+
+/// Computes `y += alpha·op(A)·x` on the NEON kernels when `T` is `f64` or `f32`
+/// and `A` has adjacent rows (`col_stride() == 1`); returns `false` without
+/// touching `y` otherwise. `ConjTrans` is `Trans` for real data.
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+#[inline]
+fn gemv_neon_dispatch<T: Field>(
+    trans: GemvTrans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    x: &[T],
+    y: &mut [T],
+) -> bool {
+    use crate::level1::typed::{same_matref, same_slice, same_slice_mut, same_value};
+
+    if a.col_stride() != 1 {
+        return false;
+    }
+    if let (Some(a64), Some(x64), Some(alpha64)) = (
+        same_matref::<T, f64>(a),
+        same_slice::<T, f64>(x),
+        same_value::<T, f64>(alpha),
+    ) && let Some(y64) = same_slice_mut::<T, f64>(y)
+    {
+        match trans {
+            GemvTrans::NoTrans => neon::notrans_f64(alpha64, a64, x64, y64),
+            GemvTrans::Trans | GemvTrans::ConjTrans => neon::trans_f64(alpha64, a64, x64, y64),
+        }
+        return true;
+    }
+    if let (Some(a32), Some(x32), Some(alpha32)) = (
+        same_matref::<T, f32>(a),
+        same_slice::<T, f32>(x),
+        same_value::<T, f32>(alpha),
+    ) && let Some(y32) = same_slice_mut::<T, f32>(y)
+    {
+        match trans {
+            GemvTrans::NoTrans => neon::notrans_f32(alpha32, a32, x32, y32),
+            GemvTrans::Trans | GemvTrans::ConjTrans => neon::trans_f32(alpha32, a32, x32, y32),
+        }
+        return true;
+    }
+    false
 }
 
 /// Unblocked GEMV for small matrices.
@@ -266,6 +359,13 @@ fn gemv_blocked<T: Field>(
 }
 
 /// SIMD-optimized blocked GEMV for `NoTrans` case.
+///
+/// The f64 SIMD kernel addresses `A[row, col]` as `a[row + col * row_stride()]`,
+/// the layout of a view whose rows are adjacent (`col_stride() == 1`: column-major
+/// storage or a submatrix of it). Any other view -- a transposed one
+/// (`MatRef::transpose` swaps the two strides) or one with a non-unit row step --
+/// takes the stride-aware generic path. (On aarch64 the column-major f64/f32
+/// cases never get here: `gemv` hands them to the NEON kernels first.)
 #[inline]
 fn gemv_blocked_notrans<T: Field>(
     alpha: T,
@@ -275,28 +375,18 @@ fn gemv_blocked_notrans<T: Field>(
     m: usize,
     n: usize,
 ) {
-    // Try SIMD path for f64
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
-            unsafe {
-                let a_ptr = a.as_ptr().cast::<f64>();
-                let x_ptr = x.as_ptr().cast::<f64>();
-                let y_ptr = y.as_mut_ptr().cast::<f64>();
-                let alpha_f64 = *(&raw const alpha).cast::<f64>();
-                let row_stride = a.row_stride();
-                gemv_blocked_notrans_f64_neon(alpha_f64, a_ptr, row_stride, x_ptr, y_ptr, m, n);
-            }
-            return;
-        }
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+        if a.col_stride() == 1
+            && std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
             && is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("fma")
         {
+            // SAFETY: as in the aarch64 branch -- `T` is `f64` (`TypeId`),
+            // `col_stride() == 1` makes the kernel's `a[row + col * row_stride]`
+            // addressing valid, and only `A[..m, ..n]`, `x[..n]` and `y[..m]` are
+            // touched -- and AVX2 + FMA, which the kernel is compiled for, were
+            // detected at runtime just above.
             unsafe {
                 let a_ptr = a.as_ptr() as *const f64;
                 let x_ptr = x.as_ptr() as *const f64;
@@ -309,7 +399,8 @@ fn gemv_blocked_notrans<T: Field>(
         }
     }
 
-    // Generic fallback
+    // Generic fallback: stride-aware `MatRef` indexing, so it also serves every
+    // view with a non-unit `col_stride`.
     gemv_blocked_notrans_generic(alpha, a, x, y, m, n);
 }
 
@@ -354,85 +445,6 @@ fn gemv_blocked_notrans_generic<T: Field>(
                 }
 
                 y[row_idx] += alpha * sum;
-            }
-        }
-    }
-}
-
-/// NEON-optimized GEMV for f64.
-///
-/// For column-major matrix A with leading dimension (`row_stride)`:
-/// A[row, col] = a[row + col * `row_stride`]
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn gemv_blocked_notrans_f64_neon(
-    alpha: f64,
-    a: *const f64,
-    row_stride: usize,
-    x: *const f64,
-    y: *mut f64,
-    m: usize,
-    n: usize,
-) {
-    use core::arch::aarch64::{vdupq_n_f64, vfmaq_laneq_f64, vgetq_lane_f64, vld1q_f64};
-
-    for jb in (0..n).step_by(KC_BLOCK) {
-        let jn = KC_BLOCK.min(n - jb);
-
-        for ib in (0..m).step_by(MC_BLOCK) {
-            let im = MC_BLOCK.min(m - ib);
-
-            // Process 4 rows at a time for better register utilization
-            let mut i = 0;
-            while i + 4 <= im {
-                let row0 = ib + i;
-                let row1 = ib + i + 1;
-                let row2 = ib + i + 2;
-                let row3 = ib + i + 3;
-
-                let mut sum0 = vdupq_n_f64(0.0);
-                let mut sum1 = vdupq_n_f64(0.0);
-                let mut sum2 = vdupq_n_f64(0.0);
-                let mut sum3 = vdupq_n_f64(0.0);
-
-                // Process column by column - for column-major, each column is contiguous
-                for j in 0..jn {
-                    let col = jb + j;
-                    let xj = vdupq_n_f64(*x.add(col));
-                    let col_ptr = a.add(col * row_stride);
-
-                    // Load 4 consecutive elements from this column (rows row0..row3)
-                    let a_vec = vld1q_f64(col_ptr.add(row0));
-                    let a_vec2 = vld1q_f64(col_ptr.add(row2));
-
-                    // Extract individual values and accumulate
-                    sum0 = vfmaq_laneq_f64::<0>(sum0, xj, a_vec);
-                    sum1 = vfmaq_laneq_f64::<1>(sum1, xj, a_vec);
-                    sum2 = vfmaq_laneq_f64::<0>(sum2, xj, a_vec2);
-                    sum3 = vfmaq_laneq_f64::<1>(sum3, xj, a_vec2);
-                }
-
-                // Store results
-                *y.add(row0) += alpha * vgetq_lane_f64::<0>(sum0);
-                *y.add(row1) += alpha * vgetq_lane_f64::<0>(sum1);
-                *y.add(row2) += alpha * vgetq_lane_f64::<0>(sum2);
-                *y.add(row3) += alpha * vgetq_lane_f64::<0>(sum3);
-
-                i += 4;
-            }
-
-            // Handle remaining rows one at a time
-            while i < im {
-                let row = ib + i;
-                let mut sum = 0.0;
-
-                for j in 0..jn {
-                    let col = jb + j;
-                    sum += *a.add(row + col * row_stride) * *x.add(col);
-                }
-
-                *y.add(row) += alpha * sum;
-                i += 1;
             }
         }
     }
@@ -534,6 +546,11 @@ pub fn gemv_with_par<T: Field + Send + Sync>(
     );
     assert_eq!(y.len(), rows, "y length must match number of rows of op(A)");
 
+    // Reference quick return (see `gemv`): an empty A leaves y untouched.
+    if m == 0 || n == 0 {
+        return;
+    }
+
     // Suppress unused warning when parallel feature is disabled
     let _ = &par;
 
@@ -580,12 +597,101 @@ fn gemv_sequential<T: Field>(
         return;
     }
 
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if gemv_neon_dispatch(trans, alpha, a, x, y) {
+            return;
+        }
+    }
+
     // Use blocked algorithm for large matrices
     if m * n > 4096 {
         gemv_blocked(trans, alpha, a, x, y, m, n);
     } else {
         gemv_unblocked(trans, alpha, a, x, y, m, n);
     }
+}
+
+/// Parallel counterpart of [`gemv_neon_dispatch`]: `NoTrans` splits the rows
+/// and `Trans` / `ConjTrans` the columns of `A` (that is, disjoint slices of
+/// `y`) between threads and runs the sequential NEON kernel on each part, so
+/// the result equals the sequential one bit for bit. Returns `false` without
+/// touching `y` when the kernels do not apply.
+#[cfg(all(
+    feature = "parallel",
+    target_arch = "aarch64",
+    not(feature = "force-scalar")
+))]
+fn gemv_neon_parallel_dispatch<T: Field + Send + Sync>(
+    trans: GemvTrans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    x: &[T],
+    y: &mut [T],
+    par: Par,
+) -> bool {
+    use crate::level1::typed::{same_matref, same_slice, same_slice_mut, same_value};
+
+    /// Rows (columns) per thread, rounded up to `align` so every part starts
+    /// on a full vector step.
+    fn part_len(total: usize, threads: usize, align: usize) -> usize {
+        total.div_ceil(threads.max(1)).div_ceil(align).max(1) * align
+    }
+
+    if a.col_stride() != 1 {
+        return false;
+    }
+    let (m, n) = (a.nrows(), a.ncols());
+    let threads = par.num_threads();
+    if let (Some(a64), Some(x64), Some(alpha64)) = (
+        same_matref::<T, f64>(a),
+        same_slice::<T, f64>(x),
+        same_value::<T, f64>(alpha),
+    ) && let Some(y64) = same_slice_mut::<T, f64>(y)
+    {
+        match trans {
+            GemvTrans::NoTrans => {
+                let rows = part_len(m, threads, 8);
+                y64.par_chunks_mut(rows).enumerate().for_each(|(k, yc)| {
+                    let part = a64.submatrix(k * rows, 0, yc.len(), n);
+                    neon::notrans_f64(alpha64, part, x64, yc);
+                });
+            }
+            GemvTrans::Trans | GemvTrans::ConjTrans => {
+                let cols = part_len(n, threads, 4);
+                y64.par_chunks_mut(cols).enumerate().for_each(|(k, yc)| {
+                    let part = a64.submatrix(0, k * cols, m, yc.len());
+                    neon::trans_f64(alpha64, part, x64, yc);
+                });
+            }
+        }
+        return true;
+    }
+    if let (Some(a32), Some(x32), Some(alpha32)) = (
+        same_matref::<T, f32>(a),
+        same_slice::<T, f32>(x),
+        same_value::<T, f32>(alpha),
+    ) && let Some(y32) = same_slice_mut::<T, f32>(y)
+    {
+        match trans {
+            GemvTrans::NoTrans => {
+                let rows = part_len(m, threads, 16);
+                y32.par_chunks_mut(rows).enumerate().for_each(|(k, yc)| {
+                    let part = a32.submatrix(k * rows, 0, yc.len(), n);
+                    neon::notrans_f32(alpha32, part, x32, yc);
+                });
+            }
+            GemvTrans::Trans | GemvTrans::ConjTrans => {
+                let cols = part_len(n, threads, 4);
+                y32.par_chunks_mut(cols).enumerate().for_each(|(k, yc)| {
+                    let part = a32.submatrix(0, k * cols, m, yc.len());
+                    neon::trans_f32(alpha32, part, x32, yc);
+                });
+            }
+        }
+        return true;
+    }
+    false
 }
 
 /// Parallel GEMV implementation.
@@ -636,6 +742,13 @@ fn gemv_parallel<T: Field + Send + Sync>(
     // Early exit if alpha is zero
     if alpha == T::zero() {
         return;
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if gemv_neon_parallel_dispatch(trans, alpha, a, x, y, par) {
+            return;
+        }
     }
 
     match trans {
@@ -781,6 +894,8 @@ fn gemv_parallel_trans<T: Field + Send + Sync>(
             .step_by(chunk_size)
             .for_each(|start| {
                 let end = (start + chunk_size).min(n);
+                // SAFETY: the `step_by(chunk_size)` starts partition `0..n`, so each task
+                // writes only its own range `start..end` of `y`, which outlives the loop.
                 unsafe {
                     let y_ptr = y_ptr as *mut T;
                     for j in start..end {
@@ -871,6 +986,8 @@ fn gemv_parallel_conjtrans<T: Field + Send + Sync>(
             .step_by(chunk_size)
             .for_each(|start| {
                 let end = (start + chunk_size).min(n);
+                // SAFETY: the `step_by(chunk_size)` starts partition `0..n`, so each task
+                // writes only its own range `start..end` of `y`, which outlives the loop.
                 unsafe {
                     let y_ptr = y_ptr as *mut T;
                     for j in start..end {
@@ -1035,6 +1152,12 @@ pub fn gemv_add_inplace<T: Field>(
 
     assert_eq!(x.len(), cols, "x length must match columns of op(A)");
     assert_eq!(y.len(), rows, "y length must match rows of op(A)");
+
+    // Empty op(A) adds nothing (same quick return as `gemv`; it also keeps an
+    // infinite/NaN alpha from turning `alpha * 0` into NaN in y).
+    if m == 0 || n == 0 {
+        return;
+    }
 
     if alpha == T::zero() {
         return;
@@ -1303,3 +1426,6 @@ pub fn gemv_sum2<T: Field>(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod kernel_tests;

@@ -157,13 +157,16 @@ pub struct FgmresResult<T> {
 pub struct IdrSResult<T> {
     /// Solution vector
     pub x: Vec<T>,
-    /// Number of iterations performed
+    /// Number of products with `A` performed by the iteration, at most
+    /// `max_iter` (see the [`idrs`](mod@super::idrs) module documentation for
+    /// exactly what is counted)
     pub iterations: usize,
-    /// Final residual norm
+    /// Final residual norm (the true residual `‖b − A x‖`)
     pub residual_norm: T,
     /// Whether convergence was achieved
     pub converged: bool,
-    /// History of residual norms
+    /// History of residual norms: the initial one, then one per residual
+    /// update (the true norm whenever the update was confirmed or replaced)
     pub residual_history: Vec<T>,
 }
 

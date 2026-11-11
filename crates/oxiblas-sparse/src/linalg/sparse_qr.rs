@@ -477,6 +477,12 @@ fn sparse_householder_qr(
 
     // Safety: constructed to satisfy the CSC invariants (see finalize/build).
     let r_factor = unsafe { CscMatrix::new_unchecked(n, n, r_col_ptrs, r_rows, r_vals) };
+    // SAFETY: `vp` has `n + 1` entries; `vp[k]` (set at the start of step
+    // `k`) and `vp[n]` record the running `vi.len()`, so they are
+    // non-decreasing. Each step pushes exactly one `vx` value per `vi` entry
+    // it added (`p1..vend`), so `vi` and `vx` have equal lengths. Every row in
+    // `vi` (`k`, `pr`, or a propagated `row`) was first used to index `w` or
+    // `x`, both of length `m2`, so it is `< m2`.
     let v_factor = unsafe { CscMatrix::new_unchecked(m2, n, vp, vi, vx) };
 
     SparseFactors {

@@ -487,7 +487,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> PolynomialFilte
     /// filter approximating the indicator of `[target_low, target_high]` over
     /// the spectral range `[lambda_min, lambda_max]`.
     ///
-    /// Returns `c_k = g_k * mu_k`, consumed by [`apply_filter`] which evaluates
+    /// Returns `c_k = g_k * mu_k`, consumed by \[`apply_filter`\] which evaluates
     /// `p(A) v = sum_k c_k * T_k((A - center*I)/half_width) v` via the
     /// Chebyshev three-term recurrence, where the affine map
     /// `x(lambda) = (2*lambda - lambda_max - lambda_min)/(lambda_max - lambda_min)`

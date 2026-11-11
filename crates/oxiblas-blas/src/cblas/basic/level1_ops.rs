@@ -1,6 +1,5 @@
 //! CBLAS Level 1 (vector-vector) real operations.
 
-use super::super::validate::inc_valid;
 use super::vector_start_offset;
 use crate::level1;
 
@@ -8,7 +7,10 @@ use crate::level1;
 ///
 /// Computes: x · y
 ///
-/// Uses optimized SIMD implementation for unit stride vectors.
+/// Unit stride vectors go through `level1::dot`, which runs a NEON kernel on
+/// aarch64 (unless the `force-scalar` feature is enabled); on other targets it
+/// is a portable four-accumulator loop. Other increments use the reference
+/// strided loop.
 ///
 /// # Safety
 ///
@@ -40,12 +42,12 @@ pub unsafe extern "C" fn cblas_ddot(
     y: *const f64,
     incy: i32,
 ) -> f64 {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // return the DDOT identity (0) instead. A zero increment aliases every
-    // logical element onto element 0 (meaningless for a reduction), and a
-    // null operand would be dereferenced unconditionally by the loop below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` yields the DDOT identity (0), as in the reference. A null
+    // operand would be dereferenced unconditionally by the loop below and a C
+    // ABI cannot surface an error (a panic reaching it would abort the
+    // process), so it yields 0 too. A zero increment is valid (Netlib 3.12):
+    // the reference loop simply re-reads element 0 on every iteration.
+    if n <= 0 || x.is_null() || y.is_null() {
         return 0.0;
     }
 
@@ -53,12 +55,23 @@ pub unsafe extern "C" fn cblas_ddot(
 
     // Fast path: unit stride - use optimized implementation
     if incx == 1 && incy == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above) and each
+        // holds `n` readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts(y, n);
         return level1::dot(x_slice, y_slice);
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -75,7 +88,10 @@ pub unsafe extern "C" fn cblas_ddot(
 
 /// Single precision dot product.
 ///
-/// Uses optimized SIMD implementation for unit stride vectors.
+/// Unit stride vectors go through `level1::dot`, which runs a NEON kernel on
+/// aarch64 (unless the `force-scalar` feature is enabled); on other targets it
+/// is a portable four-accumulator loop. Other increments use the reference
+/// strided loop.
 ///
 /// # Safety
 ///
@@ -107,12 +123,12 @@ pub unsafe extern "C" fn cblas_sdot(
     y: *const f32,
     incy: i32,
 ) -> f32 {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // return the SDOT identity (0) instead. A zero increment aliases every
-    // logical element onto element 0 (meaningless for a reduction), and a
-    // null operand would be dereferenced unconditionally by the loop below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` yields the SDOT identity (0), as in the reference. A null
+    // operand would be dereferenced unconditionally by the loop below and a C
+    // ABI cannot surface an error (a panic reaching it would abort the
+    // process), so it yields 0 too. A zero increment is valid (Netlib 3.12):
+    // the reference loop simply re-reads element 0 on every iteration.
+    if n <= 0 || x.is_null() || y.is_null() {
         return 0.0;
     }
 
@@ -120,12 +136,23 @@ pub unsafe extern "C" fn cblas_sdot(
 
     // Fast path: unit stride - use optimized implementation
     if incx == 1 && incy == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above) and each
+        // holds `n` readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts(y, n);
         return level1::dot(x_slice, y_slice);
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -142,7 +169,13 @@ pub unsafe extern "C" fn cblas_sdot(
 
 /// Double precision Euclidean norm.
 ///
-/// Uses Blue's algorithm for numerical stability with unit stride.
+/// Never overflows or underflows for very large or very small elements. Unit
+/// stride goes through `level1::nrm2`: on aarch64 (unless the `force-scalar`
+/// feature is enabled) vectors of 8 or more elements run the one-pass LAPACK
+/// 3.12 `dnrm2.f90` algorithm (Blue's three scaled accumulators) as a NEON
+/// kernel; shorter vectors, other targets and other increments (inline here)
+/// use a dlassq-style scaled sum of squares (a single `(scale, ssq)`
+/// accumulator).
 ///
 /// # Safety
 ///
@@ -163,27 +196,42 @@ pub unsafe extern "C" fn cblas_sdot(
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dnrm2(n: i32, x: *const f64, incx: i32) -> f64 {
-    // Reference DNRM2 is defined only for incx >= 1; anything else returns 0.
+    // Netlib >= 3.10 DNRM2 (`dnrm2.f90`) accepts every increment: a
+    // negative `incx` walks the vector backwards from `(1 - n) * incx`, and
+    // `incx == 0` reads x[0] on every iteration (sqrt(n) * |x[0]|). Only
+    // `n <= 0` returns 0 (the pre-3.10 rule also returned 0 for incx <= 0).
     // A null `x` would be dereferenced unconditionally by the loop below.
-    if n <= 0 || incx <= 0 || x.is_null() {
+    if n <= 0 || x.is_null() {
         return 0.0;
     }
 
     let n = n as usize;
 
-    // Fast path: unit stride - use optimized implementation with Blue's algorithm
+    // Fast path: unit stride - `level1::nrm2` (Blue's algorithm on aarch64 for
+    // n >= 8, the dlassq-style scaled sum of squares otherwise)
     if incx == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::nrm2(x_slice);
     }
 
-    // Fallback: strided. Use Blue's scaled sum-of-squares (mirroring the core
-    // `level1::nrm2` implementation) instead of a naive Σx² so that vectors with
-    // very large or very small magnitudes do not overflow/underflow to inf/0.
+    // Fallback: strided (any sign of incx, including zero, starting at the
+    // reference offset). Use the dlassq-style scaled sum-of-squares (mirroring
+    // the portable `level1::nrm2` loop) instead of a naive Σx² so that
+    // vectors with very large or very small magnitudes do not overflow/underflow
+    // to inf/0.
     let incx = incx as isize;
     let mut scale = 0.0f64;
     let mut ssq = 1.0f64;
-    let mut ix = 0isize;
+    let mut ix = vector_start_offset(n, incx);
     for _ in 0..n {
         let abs_xi = (*x.offset(ix)).abs();
         // `!= 0.0` (not `> 0.0`): a NaN element must still enter this branch
@@ -206,7 +254,13 @@ pub unsafe extern "C" fn cblas_dnrm2(n: i32, x: *const f64, incx: i32) -> f64 {
 
 /// Single precision Euclidean norm.
 ///
-/// Uses Blue's algorithm for numerical stability with unit stride.
+/// Never overflows or underflows for very large or very small elements. Unit
+/// stride goes through `level1::nrm2`: on aarch64 (unless the `force-scalar`
+/// feature is enabled) vectors of 8 or more elements run the one-pass LAPACK
+/// 3.12 `snrm2.f90` algorithm (Blue's three scaled accumulators) as a NEON
+/// kernel; shorter vectors, other targets and other increments (inline here)
+/// use a dlassq-style scaled sum of squares (a single `(scale, ssq)`
+/// accumulator).
 ///
 /// # Safety
 ///
@@ -227,27 +281,42 @@ pub unsafe extern "C" fn cblas_dnrm2(n: i32, x: *const f64, incx: i32) -> f64 {
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_snrm2(n: i32, x: *const f32, incx: i32) -> f32 {
-    // Reference SNRM2 is defined only for incx >= 1; anything else returns 0.
+    // Netlib >= 3.10 SNRM2 (`snrm2.f90`) accepts every increment: a
+    // negative `incx` walks the vector backwards from `(1 - n) * incx`, and
+    // `incx == 0` reads x[0] on every iteration (sqrt(n) * |x[0]|). Only
+    // `n <= 0` returns 0 (the pre-3.10 rule also returned 0 for incx <= 0).
     // A null `x` would be dereferenced unconditionally by the loop below.
-    if n <= 0 || incx <= 0 || x.is_null() {
+    if n <= 0 || x.is_null() {
         return 0.0;
     }
 
     let n = n as usize;
 
-    // Fast path: unit stride - use optimized implementation with Blue's algorithm
+    // Fast path: unit stride - `level1::nrm2` (Blue's algorithm on aarch64 for
+    // n >= 8, the dlassq-style scaled sum of squares otherwise)
     if incx == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::nrm2(x_slice);
     }
 
-    // Fallback: strided. Use Blue's scaled sum-of-squares (mirroring the core
-    // `level1::nrm2` implementation) instead of a naive Σx² so that vectors with
-    // very large or very small magnitudes do not overflow/underflow to inf/0.
+    // Fallback: strided (any sign of incx, including zero, starting at the
+    // reference offset). Use the dlassq-style scaled sum-of-squares (mirroring
+    // the portable `level1::nrm2` loop) instead of a naive Σx² so that
+    // vectors with very large or very small magnitudes do not overflow/underflow
+    // to inf/0.
     let incx = incx as isize;
     let mut scale = 0.0f32;
     let mut ssq = 1.0f32;
-    let mut ix = 0isize;
+    let mut ix = vector_start_offset(n, incx);
     for _ in 0..n {
         let abs_xi = (*x.offset(ix)).abs();
         // `!= 0.0` (not `> 0.0`): a NaN element must still enter this branch
@@ -301,6 +370,15 @@ pub unsafe extern "C" fn cblas_dasum(n: i32, x: *const f64, incx: i32) -> f64 {
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::asum(x_slice);
     }
@@ -350,6 +428,15 @@ pub unsafe extern "C" fn cblas_sasum(n: i32, x: *const f32, incx: i32) -> f32 {
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return 0.0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::asum(x_slice);
     }
@@ -400,6 +487,15 @@ pub unsafe extern "C" fn cblas_idamax(n: i32, x: *const f64, incx: i32) -> i32 {
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return 0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::iamax(x_slice) as i32;
     }
@@ -455,6 +551,15 @@ pub unsafe extern "C" fn cblas_isamax(n: i32, x: *const f32, incx: i32) -> i32 {
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: return the identity (0) instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return 0;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable elements (caller contract), and `n` elements fit in
+        // `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         return level1::iamax(x_slice) as i32;
     }
@@ -509,6 +614,15 @@ pub unsafe extern "C" fn cblas_dscal(n: i32, alpha: f64, x: *mut f64, incx: i32)
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts_mut`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable and writable elements (caller contract), and `n` elements fit
+        // in `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts_mut(x, n);
         level1::scal(alpha, x_slice);
         return;
@@ -556,6 +670,15 @@ pub unsafe extern "C" fn cblas_sscal(n: i32, alpha: f32, x: *mut f32, incx: i32)
 
     // Fast path: unit stride
     if incx == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts_mut`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return;
+        }
+        // SAFETY: unit stride; `x` is non-null (checked above) and holds `n`
+        // readable and writable elements (caller contract), and `n` elements fit
+        // in `isize::MAX` bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts_mut(x, n);
         level1::scal(alpha, x_slice);
         return;
@@ -605,12 +728,14 @@ pub unsafe extern "C" fn cblas_daxpy(
     y: *mut f64,
     incy: i32,
 ) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // Netlib ?AXPY: `IF (N.LE.0) RETURN` then `IF (DA.EQ.0) RETURN`, so `y` is
+    // never touched for alpha == 0 on any stride (NaN/Inf in `x` cannot leak
+    // in and signed zeros in `y` survive). A null operand would be
+    // dereferenced unconditionally by the loops below; a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses x[0] (incx == 0) or accumulates every term into y[0] (incy == 0).
+    if n <= 0 || alpha == 0.0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -618,13 +743,25 @@ pub unsafe extern "C" fn cblas_daxpy(
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above), `x`
+        // holds `n` readable and `y` `n` readable and writable elements that do
+        // not overlap (caller contract), and `n` elements fit in `isize::MAX`
+        // bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::axpy(alpha, x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -671,12 +808,14 @@ pub unsafe extern "C" fn cblas_saxpy(
     y: *mut f32,
     incy: i32,
 ) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // Netlib ?AXPY: `IF (N.LE.0) RETURN` then `IF (DA.EQ.0) RETURN`, so `y` is
+    // never touched for alpha == 0 on any stride (NaN/Inf in `x` cannot leak
+    // in and signed zeros in `y` survive). A null operand would be
+    // dereferenced unconditionally by the loops below; a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses x[0] (incx == 0) or accumulates every term into y[0] (incy == 0).
+    if n <= 0 || alpha == 0.0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -684,13 +823,25 @@ pub unsafe extern "C" fn cblas_saxpy(
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above), `x`
+        // holds `n` readable and `y` `n` readable and writable elements that do
+        // not overlap (caller contract), and `n` elements fit in `isize::MAX`
+        // bytes (the `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::axpy(alpha, x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -730,12 +881,13 @@ pub unsafe extern "C" fn cblas_saxpy(
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dcopy(n: i32, x: *const f64, incx: i32, y: *mut f64, incy: i32) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` is a no-op, as in the reference. A null operand would be
+    // dereferenced unconditionally by the loops below and a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses element 0 on every iteration (e.g. LAPACK's
+    // `dcopy(n, zero, 0, x, 1)` broadcast).
+    if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -743,13 +895,25 @@ pub unsafe extern "C" fn cblas_dcopy(n: i32, x: *const f64, incx: i32, y: *mut f
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above), `x`
+        // holds `n` readable and `y` `n` writable elements that do not overlap
+        // (caller contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::copy(x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -789,12 +953,13 @@ pub unsafe extern "C" fn cblas_dcopy(n: i32, x: *const f64, incx: i32, y: *mut f
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_scopy(n: i32, x: *const f32, incx: i32, y: *mut f32, incy: i32) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` is a no-op, as in the reference. A null operand would be
+    // dereferenced unconditionally by the loops below and a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // re-uses element 0 on every iteration (e.g. LAPACK's
+    // `dcopy(n, zero, 0, x, 1)` broadcast).
+    if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -802,13 +967,25 @@ pub unsafe extern "C" fn cblas_scopy(n: i32, x: *const f32, incx: i32, y: *mut f
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above), `x`
+        // holds `n` readable and `y` `n` writable elements that do not overlap
+        // (caller contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::copy(x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -848,12 +1025,13 @@ pub unsafe extern "C" fn cblas_scopy(n: i32, x: *const f32, incx: i32, y: *mut f
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_dswap(n: i32, x: *mut f64, incx: i32, y: *mut f64, incy: i32) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` is a no-op, as in the reference. A null operand would be
+    // dereferenced unconditionally by the loops below and a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // swaps against element 0 on every iteration, and the final values follow
+    // the reference loop order.
+    if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -861,13 +1039,25 @@ pub unsafe extern "C" fn cblas_dswap(n: i32, x: *mut f64, incx: i32, y: *mut f64
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f64s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts_mut`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f64>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above) and each
+        // holds `n` readable and writable elements, without overlap (caller
+        // contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts_mut(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::swap(x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);
@@ -907,12 +1097,13 @@ pub unsafe extern "C" fn cblas_dswap(n: i32, x: *mut f64, incx: i32, y: *mut f64
 ///   pointer equal to an input pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cblas_sswap(n: i32, x: *mut f32, incx: i32, y: *mut f32, incy: i32) {
-    // Reference BLAS calls xerbla and returns on invalid arguments; a C ABI
-    // cannot surface an error code and unwinding across it would be UB, so we
-    // no-op. A zero increment aliases every logical element onto element 0
-    // (meaningless for a mutating routine), and a null operand would be
-    // dereferenced unconditionally by the loops below.
-    if n <= 0 || !inc_valid(incx) || !inc_valid(incy) || x.is_null() || y.is_null() {
+    // `n <= 0` is a no-op, as in the reference. A null operand would be
+    // dereferenced unconditionally by the loops below and a C ABI cannot
+    // surface an error (a panic reaching it would abort the process), so it
+    // no-ops too. A zero increment is valid (Netlib 3.12): the reference loop
+    // swaps against element 0 on every iteration, and the final values follow
+    // the reference loop order.
+    if n <= 0 || x.is_null() || y.is_null() {
         return;
     }
 
@@ -920,13 +1111,25 @@ pub unsafe extern "C" fn cblas_sswap(n: i32, x: *mut f32, incx: i32, y: *mut f32
 
     // Fast path: unit stride
     if incx == 1 && incy == 1 {
+        // `n` f32s spanning more than `isize::MAX` bytes (possible on 32-bit
+        // targets only) cannot be a real buffer, and `slice::from_raw_parts_mut`
+        // forbids such a length: no-op instead.
+        if !level1::fits_isize_bytes::<f32>(n) {
+            return;
+        }
+        // SAFETY: unit strides; `x` and `y` are non-null (checked above) and each
+        // holds `n` readable and writable elements, without overlap (caller
+        // contract), and `n` elements fit in `isize::MAX` bytes (the
+        // `fits_isize_bytes` guard above).
         let x_slice = std::slice::from_raw_parts_mut(x, n);
         let y_slice = std::slice::from_raw_parts_mut(y, n);
         level1::swap(x_slice, y_slice);
         return;
     }
 
-    // Fallback: non-unit stride (incx/incy may be negative — a spec-valid input).
+    // Fallback: non-unit stride. incx/incy may be negative (back-to-front walk
+    // from `vector_start_offset`) or zero (element 0 re-used every iteration);
+    // both are spec-valid and follow the reference loop exactly.
     let incx = incx as isize;
     let incy = incy as isize;
     let mut ix = vector_start_offset(n, incx);

@@ -539,6 +539,13 @@ impl<'a, T: Scalar> PackedRef<'a, T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         self.packed_index(row, col)
+            // SAFETY: `packed_index` returns `Some(idx)` only for
+            // `row, col < n` inside the stored triangle; for both layouts the
+            // index grows with `row` and `col`, so its maximum (element
+            // `(n - 1, n - 1)`) is `n * (n + 1) / 2 - 1 = packed_len(n) - 1`.
+            // The `PackedRef::new` contract guarantees at least
+            // `packed_len(n)` initialized elements, valid and immutable for
+            // `'a`, so `idx` is in bounds.
             .map(|idx| unsafe { &*self.ptr.add(idx) })
     }
 
@@ -549,7 +556,12 @@ impl<'a, T: Scalar> PackedRef<'a, T> {
     }
 }
 
+// SAFETY: `PackedRef` is a shared, read-only borrow of `packed_len(n)`
+// elements (like `&'a [T]`), which is `Send` when `T: Sync`; every
+// `T: Scalar` is `Sync` (`Scalar: Send + Sync`), so the bound here suffices.
 unsafe impl<'a, T: Scalar + Send> Send for PackedRef<'a, T> {}
+// SAFETY: sharing a `&PackedRef` across threads only allows concurrent reads
+// of `T` through shared references, which is sound for `T: Sync`.
 unsafe impl<'a, T: Scalar + Sync> Sync for PackedRef<'a, T> {}
 
 /// A mutable view into packed matrix data.
@@ -657,6 +669,11 @@ impl<'a, T: Scalar> PackedMut<'a, T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         self.packed_index(row, col)
+            // SAFETY: as in `PackedRef::get`, `idx <= packed_len(n) - 1`, and
+            // the `PackedMut::new` contract guarantees at least
+            // `packed_len(n)` initialized elements borrowed exclusively for
+            // `'a`; the `&T` borrows `self` immutably, so no `&mut` to the
+            // element can be handed out while it lives.
             .map(|idx| unsafe { &*self.ptr.add(idx) })
     }
 
@@ -664,6 +681,11 @@ impl<'a, T: Scalar> PackedMut<'a, T> {
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut T> {
         self.packed_index(row, col)
+            // SAFETY: `idx <= packed_len(n) - 1` (see `PackedRef::get`), so it
+            // is in bounds of the initialized, exclusively borrowed
+            // allocation of at least `packed_len(n)` elements (`PackedMut::new`
+            // contract); the `&mut T` borrows `self` mutably, so it is the
+            // only live reference to the element.
             .map(|idx| unsafe { &mut *self.ptr.add(idx) })
     }
 
@@ -680,6 +702,10 @@ impl<'a, T: Scalar> PackedMut<'a, T> {
             dim: self.n,
             kind: self.kind,
         })?;
+        // SAFETY: `idx` came from `packed_index`, so `idx <= packed_len(n) - 1`
+        // (see `PackedRef::get`) is in bounds of the initialized, exclusively
+        // borrowed allocation (`PackedMut::new` contract); `&mut self` rules
+        // out other references through this view.
         unsafe {
             *self.ptr.add(idx) = value;
         }
@@ -716,7 +742,13 @@ impl<'a, T: Scalar> PackedMut<'a, T> {
     }
 }
 
+// SAFETY: `PackedMut` is an exclusive borrow (like `&'a mut [T]`), which is
+// `Send` when `T: Send`: moving it to another thread moves the only access.
 unsafe impl<'a, T: Scalar + Send> Send for PackedMut<'a, T> {}
+// SAFETY: a shared `&PackedMut` only reaches the `&self` methods (`get`, `rb`,
+// `packed_index`, `as_ptr`, ...), which hand out shared `&T` / `PackedRef`;
+// all mutation needs `&mut self`. That matches `&'a mut [T]: Sync` for
+// `T: Sync`.
 unsafe impl<'a, T: Scalar + Sync> Sync for PackedMut<'a, T> {}
 
 #[cfg(test)]

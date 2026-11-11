@@ -929,9 +929,9 @@ impl<T: Scalar<Real = T> + Clone + Field + Real> LuSpa<T> {
 
 /// Sorts every column of a CSC triple in place by ascending row index.
 ///
-/// This both satisfies the crate's CSC invariant (sorted row indices per column)
-/// and places the unit diagonal of `L` first / the diagonal of `U` last, matching
-/// what the sparse triangular solvers expect.
+/// The crate's CSC type does not require sorted rows, but the sparse triangular
+/// solvers used here expect them: sorting places the unit diagonal of `L` first
+/// and the diagonal of `U` last in each column.
 fn sort_csc_columns<T: Clone>(col_ptrs: &[usize], rows: &mut [usize], vals: &mut [T]) {
     let ncols = col_ptrs.len().saturating_sub(1);
     for j in 0..ncols {
@@ -970,7 +970,12 @@ fn sparse_lu_left_looking<T: Scalar<Real = T> + Clone + Field + Real>(
     let n = a.nrows();
     if n == 0 {
         // Empty factorization: 0x0 L and U.
+        // SAFETY: empty 0 x 0 factor: `col_ptrs == [0]` has `ncols + 1 == 1`
+        // entry (trivially monotone), and `row_indices`/`values` are both
+        // empty, so their lengths match and there is no row index to bound.
         let l = unsafe { CscMatrix::new_unchecked(0, 0, vec![0usize], Vec::new(), Vec::new()) };
+        // SAFETY: the same empty 0 x 0 structure as `l` (`col_ptrs == [0]`,
+        // empty `row_indices`/`values`), valid for the same reasons.
         let u = unsafe { CscMatrix::new_unchecked(0, 0, vec![0usize], Vec::new(), Vec::new()) };
         return Ok(SparseLuFactors {
             l,
@@ -1103,6 +1108,12 @@ fn sparse_lu_left_looking<T: Scalar<Real = T> + Clone + Field + Real>(
     // Safety: columns are sorted by row index with no duplicates, and both
     // factors are square n x n, satisfying the CSC invariants.
     let l = unsafe { CscMatrix::new_unchecked(n, n, l_col_ptrs, l_rows, l_vals) };
+    // SAFETY: `u_col_ptrs` has `n + 1` entries; `u_col_ptrs[k]` (set at the
+    // start of step `k`) and `u_col_ptrs[n]` record the running
+    // `u_rows.len()`, so they are non-decreasing. `u_rows`/`u_vals` are only
+    // pushed together, and `sort_csc_columns` just permutes within each
+    // column. Every row pushed is `k < n` or `pinv[i]` with `pinv[i] >= 0`,
+    // i.e. a position `< k` assigned by `pinv[ipiv] = k as isize` earlier.
     let u = unsafe { CscMatrix::new_unchecked(n, n, u_col_ptrs, u_rows, u_vals) };
 
     Ok(SparseLuFactors {

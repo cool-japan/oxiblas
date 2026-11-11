@@ -4,11 +4,17 @@
 //!
 //! This module provides:
 //!
-//! - **SymmetricEvd**: For symmetric/Hermitian matrices. Eigenvalues are always real.
+//! - **SymmetricEvd**: For real symmetric matrices (implicit QR). Eigenvalues are
+//!   always real.
+//! - **SymmetricEvdDc**: Divide and conquer for real symmetric matrices (`DSYEVD`).
+//! - **HermitianEvd** / **HermitianEvdDc**: For complex Hermitian matrices (QR, and
+//!   divide and conquer as in `ZHEEVD`). Eigenvalues are always real.
 //! - **GeneralEvd**: For general (non-symmetric) matrices. Eigenvalues may be complex.
 //! - **SymmetricGeneralizedEvd**: For generalized symmetric-definite problems A*x = λ*B*x.
-//! - **GeneralizedEvd**: For general matrix pencils.
-//! - **Qz**: QZ algorithm for generalized Schur decomposition.
+//! - **GeneralizedEvd**: For general matrix pencils with a nonsingular B (reduces
+//!   to the eigenproblem of `B⁻¹·A`; not a QZ decomposition).
+//! - **Qz**: QZ algorithm for generalized Schur decomposition; also handles a
+//!   singular B.
 //! - **Hessenberg**: Reduction to upper Hessenberg form.
 //! - **ComplexHessenberg**: Reduction to upper Hessenberg form for complex matrices.
 //! - **Schur**: Schur decomposition (real Schur form).
@@ -50,6 +56,7 @@ pub mod balance;
 mod complex_general;
 mod complex_hessenberg;
 mod complex_schur;
+mod dc_merge;
 mod general;
 mod generalized;
 mod hermitian;
@@ -59,6 +66,11 @@ mod hessenberg;
 mod mrrr;
 mod qz;
 mod schur;
+mod sym_kernels;
+mod sym_steqr;
+#[cfg(test)]
+mod sym_tests;
+mod sym_tridiag;
 mod symmetric;
 mod symmetric_dc;
 mod tridiag_evd;
@@ -84,7 +96,7 @@ pub use hessenberg::{
     unghr, unmhr,
 };
 pub use mrrr::{MrrrError, MrrrEvd};
-pub use qz::{GeneralizedEigenvalue, Qz, QzError};
+pub use qz::{GeneralizedEigenvalue, Qz, QzError, QzOrdering, QzReorderError};
 pub use randomized::{
     RandomizedEvd, RandomizedEvdConfig, RandomizedEvdError, RandomizedEvdResult,
     RandomizedEvdTarget,

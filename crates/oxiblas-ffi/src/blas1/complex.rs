@@ -211,7 +211,7 @@ pub unsafe extern "C" fn oblas_scnrm2(n: c_int, x: *const OblasComplex32, incx: 
     let incx = incx.max(1) as usize;
     let x_slice = slice::from_raw_parts(x, n * incx);
 
-    // Use Blue's algorithm for numerical stability
+    // Scaled sum of squares (LAPACK LASSQ style), so the squares cannot overflow
     let mut scale = 0.0f32;
     let mut ssq = 1.0f32;
 
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn oblas_dznrm2(n: c_int, x: *const OblasComplex64, incx: 
     let incx = incx.max(1) as usize;
     let x_slice = slice::from_raw_parts(x, n * incx);
 
-    // Use Blue's algorithm for numerical stability
+    // Scaled sum of squares (LAPACK LASSQ style), so the squares cannot overflow
     let mut scale = 0.0f64;
     let mut ssq = 1.0f64;
 

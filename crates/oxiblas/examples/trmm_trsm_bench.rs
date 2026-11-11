@@ -1,6 +1,9 @@
 //! TRMM/TRSM benchmark
 //!
-//! Compares naive vs optimized TRMM (GEMM-based) and TRSM operations.
+//! Compares textbook triple loops with the blocked TRMM and TRSM: both pack
+//! each diagonal block of order 128 of the triangle and multiply (TRMM) or
+//! solve (TRSM) it with register-tiled kernels, and apply the off-diagonal
+//! blocks with in-place GEMM, for every size.
 
 use oxiblas::prelude::*;
 use oxiblas_blas::level3::trmm::{TrmmDiag, TrmmSide, TrmmTrans, TrmmUplo, trmm};
@@ -63,7 +66,7 @@ fn bench_trmm(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             let _ = trmm_naive(&l, &b);
             naive_times.push(start.elapsed().as_secs_f64());
         }
-        naive_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        naive_times.sort_by(|x, y| x.total_cmp(y));
         let naive_median = naive_times[n_samples / 2];
 
         // Warmup optimized
@@ -94,12 +97,12 @@ fn bench_trmm(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             );
             opt_times.push(start.elapsed().as_secs_f64());
         }
-        opt_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        opt_times.sort_by(|x, y| x.total_cmp(y));
         let opt_median = opt_times[n_samples / 2];
 
-        // TRMM has ~n²·m flops (for left multiply with m×n result)
-        // For square matrices: ~n³ (but only half of A is used)
-        let flops = 2.0 * (n as f64) * (n as f64) * (n as f64);
+        // Left TRMM with an m×m triangle and an m×n B performs about m²·n/2
+        // multiply-adds (m²·n flops, half of a GEMM); for square matrices n³.
+        let flops = (n as f64) * (n as f64) * (n as f64);
         let naive_gflops = flops / naive_median / 1e9;
         let opt_gflops = flops / opt_median / 1e9;
         let speedup = naive_median / opt_median;
@@ -176,7 +179,7 @@ fn bench_trsm(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             let _ = trsm_naive(&l, &b);
             naive_times.push(start.elapsed().as_secs_f64());
         }
-        naive_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        naive_times.sort_by(|x, y| x.total_cmp(y));
         let naive_median = naive_times[n_samples / 2];
 
         // Warmup blocked
@@ -207,10 +210,11 @@ fn bench_trsm(sizes: &[(usize, &str)], n_warmup: usize, n_samples: usize) {
             );
             blocked_times.push(start.elapsed().as_secs_f64());
         }
-        blocked_times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        blocked_times.sort_by(|x, y| x.total_cmp(y));
         let blocked_median = blocked_times[n_samples / 2];
 
-        // TRSM has ~n²·m flops for solving L·X = B where X is m×n
+        // Left TRSM with an m×m triangle and an m×n B performs about m²·n/2
+        // multiply-adds (m²·n flops); for square matrices n³.
         let flops = (n as f64) * (n as f64) * (n as f64);
         let naive_gflops = flops / naive_median / 1e9;
         let blocked_gflops = flops / blocked_median / 1e9;
@@ -231,8 +235,13 @@ fn main() {
     println!("TRMM: B = α·op(A)·B or B = α·B·op(A) where A is triangular");
     println!("TRSM: Solve A·X = α·B or X·A = α·B where A is triangular");
     println!();
-    println!("TRMM is optimized by expanding triangular matrix to full");
-    println!("matrix and using the optimized GEMM kernel.");
+    println!("TRMM multiplies only the referenced triangle, in place: diagonal");
+    println!("blocks of order 128 are packed and multiplied by register-tiled");
+    println!("kernels, and off-diagonal blocks are applied with in-place GEMM");
+    println!("(about half the multiply-adds of a dense GEMM).");
+    println!("TRSM packs each diagonal block of order 128 once, with the");
+    println!("reciprocals of its diagonal, solves it with register-tiled kernels,");
+    println!("and applies the off-diagonal blocks with in-place GEMM.");
 
     let sizes = [(128, "128"), (256, "256"), (512, "512"), (1024, "1024")];
 
@@ -240,6 +249,6 @@ fn main() {
     bench_trsm(&sizes, 2, 5);
 
     println!();
-    println!("Note: TRMM optimized for n >= 32 using GEMM-based approach.");
-    println!("      TRSM optimized for n >= 64 using blocked algorithm with GEMM.");
+    println!("Note: TRMM and TRSM take the same blocked path for every size;");
+    println!("      the Naive columns are textbook triple loops for reference.");
 }

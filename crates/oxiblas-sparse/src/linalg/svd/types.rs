@@ -517,8 +517,9 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> TruncatedSVD<T>
             })
             .collect();
         let v = lanczos_result.eigenvectors;
-        let u = if self.config.compute_vectors && v.is_some() {
-            let v_vecs = v.as_ref().expect("value should be present");
+        let u = if self.config.compute_vectors
+            && let Some(v_vecs) = v.as_ref()
+        {
             let mut u_vecs = Vec::with_capacity(singular_values.len());
             for (i, v_i) in v_vecs.iter().enumerate() {
                 let mut av = vec![T::zero(); m];
@@ -576,8 +577,9 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> TruncatedSVD<T>
             })
             .collect();
         let u = lanczos_result.eigenvectors;
-        let v = if self.config.compute_vectors && u.is_some() {
-            let u_vecs = u.as_ref().expect("value should be present");
+        let v = if self.config.compute_vectors
+            && let Some(u_vecs) = u.as_ref()
+        {
             let mut v_vecs = Vec::with_capacity(singular_values.len());
             for (i, u_i) in u_vecs.iter().enumerate() {
                 let mut atu = vec![T::zero(); n];

@@ -38,6 +38,14 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(
+    all(
+        feature = "sve-nightly",
+        target_arch = "aarch64",
+        target_feature = "sve"
+    ),
+    feature(stdarch_aarch64_sve)
+)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]

@@ -237,12 +237,12 @@ impl<const ALIGN: usize> Arena<ALIGN> {
     #[allow(clippy::mut_from_ref)]
     pub fn alloc<T>(&self, count: usize) -> &mut [MaybeUninit<T>] {
         let align = align_of::<T>().max(ALIGN);
-        let bytes = count
-            .checked_mul(size_of::<T>())
-            .expect("Arena overflow: allocation size (count * size_of::<T>()) overflows usize");
-        let (aligned_offset, new_offset) = self
-            .compute_bounds(align, bytes)
-            .expect("Arena overflow: allocation offset overflows usize");
+        let Some(bytes) = count.checked_mul(size_of::<T>()) else {
+            panic!("Arena overflow: allocation size (count * size_of::<T>()) overflows usize");
+        };
+        let Some((aligned_offset, new_offset)) = self.compute_bounds(align, bytes) else {
+            panic!("Arena overflow: allocation offset overflows usize");
+        };
 
         assert!(
             new_offset <= self.buffer.len(),
@@ -271,6 +271,12 @@ impl<const ALIGN: usize> Arena<ALIGN> {
     /// Allocates zero-initialized memory for `count` elements of type `T`.
     ///
     /// Returns a mutable slice of properly initialized (zeroed) elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Arena::alloc`]: insufficient
+    /// remaining capacity, or a size/offset computation that overflows
+    /// `usize`. Use [`Arena::try_alloc_zeroed`] for a non-panicking variant.
     #[allow(clippy::mut_from_ref)]
     pub fn alloc_zeroed<T: bytemuck::Zeroable>(&self, count: usize) -> &mut [T] {
         let slice = self.alloc::<T>(count);
@@ -285,6 +291,12 @@ impl<const ALIGN: usize> Arena<ALIGN> {
     ///
     /// This is the recommended way to get multiple concurrent allocations
     /// from the same arena. Each ArenaVec can be used independently.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Arena::alloc`]: insufficient
+    /// remaining capacity, or a size/offset computation that overflows
+    /// `usize`.
     pub fn alloc_vec<T: bytemuck::Zeroable>(&self, len: usize) -> ArenaVec<'_, T, ALIGN> {
         let slice = self.alloc_zeroed::<T>(len);
         ArenaVec {
@@ -929,6 +941,30 @@ mod arena_tests {
         let arena: Arena = Arena::with_capacity(1024);
         let huge = usize::MAX / core::mem::size_of::<f64>() + 1;
         let _buf = arena.alloc::<f64>(huge);
+    }
+
+    #[test]
+    #[should_panic(expected = "Arena overflow: allocation offset overflows usize")]
+    fn test_arena_alloc_offset_overflow_panics() {
+        // `usize::MAX` single-byte elements fit in `count * size_of` but not
+        // on top of a non-zero (aligned) offset: the offset computation in
+        // `compute_bounds` overflows, which `alloc` reports as a panic.
+        let arena: Arena = Arena::with_capacity(1024);
+        let _first = arena.alloc::<u8>(1);
+        let _buf = arena.alloc::<u8>(usize::MAX);
+    }
+
+    #[test]
+    fn test_arena_try_alloc_offset_overflow_is_none() {
+        let arena: Arena = Arena::with_capacity(1024);
+        let _first = arena.alloc::<u8>(1);
+        let used = arena.used();
+        assert!(arena.try_alloc::<u8>(usize::MAX).is_none());
+        assert_eq!(
+            arena.used(),
+            used,
+            "a failed attempt must not move the offset"
+        );
     }
 
     #[test]

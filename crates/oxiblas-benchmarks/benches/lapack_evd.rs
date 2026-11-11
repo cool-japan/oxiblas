@@ -1,9 +1,56 @@
 //! Benchmarks for LAPACK eigenvalue decomposition operations.
+//!
+//! The symmetric drivers are measured on two inputs:
+//!
+//! - `symmetric_evd*` / `symmetric_evd_dc*`: a diagonally dominant matrix
+//!   whose eigenvalues are clustered (deflation-friendly for divide and
+//!   conquer);
+//! - `symmetric_evd_random` / `symmetric_evd_dc_random`: dense random
+//!   symmetric matrices (entries uniform in `[-1, 1)`), the common case,
+//!   where divide and conquer deflates little.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use oxiblas_lapack::evd::{GeneralEvd, Hessenberg, Schur, SymmetricEvd, SymmetricEvdDc};
 use oxiblas_matrix::Mat;
 use std::hint::black_box;
+
+/// Diagonally dominant symmetric matrix with clustered eigenvalues.
+fn clustered_symmetric(n: usize) -> Mat<f64> {
+    let mut a: Mat<f64> = Mat::zeros(n, n);
+    for i in 0..n {
+        for j in 0..=i {
+            let val = if i == j {
+                (n as f64) + ((i * 17) % 10) as f64
+            } else {
+                ((i + j) % 10) as f64 * 0.1
+            };
+            a[(i, j)] = val;
+            a[(j, i)] = val;
+        }
+    }
+    a
+}
+
+/// Dense symmetric matrix with deterministic pseudo-random entries in
+/// `[-1, 1)` (64-bit LCG, fixed seed per size).
+fn random_symmetric(n: usize) -> Mat<f64> {
+    let mut state = 0x2545_F491_4F6C_DD1D_u64 ^ n as u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+    let mut a: Mat<f64> = Mat::zeros(n, n);
+    for j in 0..n {
+        for i in 0..=j {
+            let v = next();
+            a[(i, j)] = v;
+            a[(j, i)] = v;
+        }
+    }
+    a
+}
 
 fn bench_symmetric_evd(c: &mut Criterion) {
     let mut group = c.benchmark_group("symmetric_evd");
@@ -12,20 +59,7 @@ fn bench_symmetric_evd(c: &mut Criterion) {
         let n = *size;
         // Symmetric EVD: O(n^3) FLOPs
         group.throughput(Throughput::Elements((n * n * n) as u64));
-
-        // Create SPD matrix
-        let mut a: Mat<f64> = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in 0..=i {
-                let val = if i == j {
-                    (n as f64) + ((i * 17) % 10) as f64
-                } else {
-                    ((i + j) % 10) as f64 * 0.1
-                };
-                a[(i, j)] = val;
-                a[(j, i)] = val;
-            }
-        }
+        let a = clustered_symmetric(n);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
             bench.iter(|| {
@@ -44,19 +78,7 @@ fn bench_symmetric_evd_dc(c: &mut Criterion) {
         let n = *size;
         // Divide and conquer: more efficient for larger matrices
         group.throughput(Throughput::Elements((n * n * n) as u64));
-
-        let mut a: Mat<f64> = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in 0..=i {
-                let val = if i == j {
-                    (n as f64) + ((i * 17) % 10) as f64
-                } else {
-                    ((i + j) % 10) as f64 * 0.1
-                };
-                a[(i, j)] = val;
-                a[(j, i)] = val;
-            }
-        }
+        let a = clustered_symmetric(n);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
             bench.iter(|| {
@@ -70,28 +92,74 @@ fn bench_symmetric_evd_dc(c: &mut Criterion) {
 
 fn bench_symmetric_evd_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("symmetric_evd_large");
+    group.sample_size(10);
 
-    for size in [300, 500].iter() {
+    for size in [300, 500, 1000].iter() {
         let n = *size;
         // Larger matrices for Symmetric EVD
         group.throughput(Throughput::Elements((n * n * n) as u64));
-
-        let mut a: Mat<f64> = Mat::zeros(n, n);
-        for i in 0..n {
-            for j in 0..=i {
-                let val = if i == j {
-                    (n as f64) + ((i * 17) % 10) as f64
-                } else {
-                    ((i + j) % 10) as f64 * 0.1
-                };
-                a[(i, j)] = val;
-                a[(j, i)] = val;
-            }
-        }
+        let a = clustered_symmetric(n);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
             bench.iter(|| {
                 let _ = SymmetricEvd::compute(black_box(a.as_ref()));
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_symmetric_evd_dc_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("symmetric_evd_dc_large");
+    group.sample_size(10);
+
+    for size in [300, 500, 1000].iter() {
+        let n = *size;
+        group.throughput(Throughput::Elements((n * n * n) as u64));
+        let a = clustered_symmetric(n);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
+            bench.iter(|| {
+                let _ = SymmetricEvdDc::compute(black_box(a.as_ref()));
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_symmetric_evd_random(c: &mut Criterion) {
+    let mut group = c.benchmark_group("symmetric_evd_random");
+    group.sample_size(10);
+
+    for size in [100, 200, 500, 1000].iter() {
+        let n = *size;
+        group.throughput(Throughput::Elements((n * n * n) as u64));
+        let a = random_symmetric(n);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
+            bench.iter(|| {
+                let _ = SymmetricEvd::compute(black_box(a.as_ref()));
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_symmetric_evd_dc_random(c: &mut Criterion) {
+    let mut group = c.benchmark_group("symmetric_evd_dc_random");
+    group.sample_size(10);
+
+    for size in [100, 200, 500, 1000].iter() {
+        let n = *size;
+        group.throughput(Throughput::Elements((n * n * n) as u64));
+        let a = random_symmetric(n);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), size, |bench, _| {
+            bench.iter(|| {
+                let _ = SymmetricEvdDc::compute(black_box(a.as_ref()));
             });
         });
     }
@@ -213,6 +281,9 @@ criterion_group!(
     bench_symmetric_evd,
     bench_symmetric_evd_dc,
     bench_symmetric_evd_large,
+    bench_symmetric_evd_dc_large,
+    bench_symmetric_evd_random,
+    bench_symmetric_evd_dc_random,
     bench_general_evd,
     bench_general_eigenvalues_only,
     bench_hessenberg,

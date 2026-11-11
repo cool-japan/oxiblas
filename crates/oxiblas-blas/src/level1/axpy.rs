@@ -2,8 +2,11 @@
 //!
 //! One of the most fundamental BLAS operations.
 //!
-//! This module provides optimized implementations using SIMD instructions
-//! on supported platforms (AVX2 on `x86_64`, NEON on aarch64).
+//! The typed entry points [`axpy_f64`] and [`axpy_f32`] use explicit SIMD
+//! kernels (AVX2/FMA on `x86_64` when detected at run time, NEON on aarch64)
+//! with a scalar fallback. The generic [`axpy`] is a portable loop unrolled by
+//! eight (`α·x + y`, not fused) that relies on compiler auto-vectorisation for
+//! every element type, `f64` and `f32` included.
 
 use oxiblas_core::scalar::Field;
 
@@ -53,6 +56,11 @@ pub fn axpy_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `axpy_f64_avx2`, were detected at run time just above. The
+            // kernel reads `x` and writes `y` only at indices below `x.len()`,
+            // and `y.len() == x.len()` is asserted at the top of this
+            // function.
             unsafe {
                 axpy_f64_avx2(alpha, x, y);
             }
@@ -62,6 +70,10 @@ pub fn axpy_f64(alpha: f64, x: &[f64], y: &mut [f64]) {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, so the intrinsics of
+        // `axpy_f64_neon` are available. The kernel reads `x` and writes `y`
+        // only at indices below `x.len()`, and `y.len() == x.len()` is
+        // asserted at the top of this function.
         unsafe {
             axpy_f64_neon(alpha, x, y);
         }
@@ -85,6 +97,11 @@ pub fn axpy_f32(alpha: f32, x: &[f32], y: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `axpy_f32_avx2`, were detected at run time just above. The
+            // kernel reads `x` and writes `y` only at indices below `x.len()`,
+            // and `y.len() == x.len()` is asserted at the top of this
+            // function.
             unsafe {
                 axpy_f32_avx2(alpha, x, y);
             }
@@ -94,6 +111,10 @@ pub fn axpy_f32(alpha: f32, x: &[f32], y: &mut [f32]) {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, so the intrinsics of
+        // `axpy_f32_neon` are available. The kernel reads `x` and writes `y`
+        // only at indices below `x.len()`, and `y.len() == x.len()` is
+        // asserted at the top of this function.
         unsafe {
             axpy_f32_neon(alpha, x, y);
         }

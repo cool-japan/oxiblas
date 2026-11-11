@@ -695,3 +695,243 @@ fn test_gemv_sum2_large() {
         );
     }
 }
+
+// ========================================================================
+// Issue #13: reference ?GEMV quick-returns when m == 0 or n == 0, leaving y
+// untouched (no beta scaling). The old code scaled/zero-filled y first.
+// ========================================================================
+
+#[test]
+fn test_issue_13_gemv_trans_empty_a_leaves_y_untouched() {
+    // Reporter's repro: A is 0x1, op(A) = A^T is 1x0, so x is empty and y has 1 element.
+    let a: Mat<f64> = Mat::zeros(0, 1);
+    let x: [f64; 0] = [];
+    let mut y = [1.0f64];
+
+    gemv(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.5, &mut y);
+
+    assert_eq!(y, [1.0]);
+}
+
+#[test]
+fn test_issue_13_gemv_empty_a_leaves_y_untouched_for_every_trans_and_beta() {
+    for trans in [GemvTrans::NoTrans, GemvTrans::Trans, GemvTrans::ConjTrans] {
+        for beta in [0.0f64, 0.5, 1.0, 2.0] {
+            // n == 0: A is 2x0 (NoTrans: x empty, y has 2; Trans: x has 2, y empty).
+            let a: Mat<f64> = Mat::zeros(2, 0);
+            let (x, mut y): (Vec<f64>, Vec<f64>) = match trans {
+                GemvTrans::NoTrans => (vec![], vec![f64::NAN, 3.0]),
+                _ => (vec![1.0, 2.0], vec![]),
+            };
+            let before = y.clone();
+            gemv(trans, 1.0, a.as_ref(), &x, beta, &mut y);
+            assert_eq!(y.len(), before.len());
+            for (got, want) in y.iter().zip(before.iter()) {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "{trans:?} beta={beta} n=0: y changed from {want} to {got}"
+                );
+            }
+
+            // m == 0: A is 0x3 (NoTrans: x has 3, y empty; Trans: x empty, y has 3).
+            let a: Mat<f64> = Mat::zeros(0, 3);
+            let (x, mut y): (Vec<f64>, Vec<f64>) = match trans {
+                GemvTrans::NoTrans => (vec![1.0, 2.0, 3.0], vec![]),
+                _ => (vec![], vec![f64::NAN, 1.0, 2.0]),
+            };
+            let before = y.clone();
+            gemv(trans, 1.0, a.as_ref(), &x, beta, &mut y);
+            assert_eq!(y.len(), before.len());
+            for (got, want) in y.iter().zip(before.iter()) {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "{trans:?} beta={beta} m=0: y changed from {want} to {got}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_issue_13_gemv_with_par_empty_a_leaves_y_untouched() {
+    let a: Mat<f64> = Mat::zeros(0, 1);
+    let x: [f64; 0] = [];
+
+    let mut y = [1.0f64];
+    gemv_with_par(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.5, &mut y, Par::Seq);
+    assert_eq!(y, [1.0]);
+
+    // beta == 0 must not zero-fill y either.
+    let mut y = [f64::NAN];
+    gemv_with_par(GemvTrans::Trans, 1.0, a.as_ref(), &x, 0.0, &mut y, Par::Seq);
+    assert!(y[0].is_nan());
+
+    #[cfg(feature = "parallel")]
+    {
+        let mut y = [1.0f64];
+        gemv_with_par(
+            GemvTrans::Trans,
+            1.0,
+            a.as_ref(),
+            &x,
+            0.5,
+            &mut y,
+            Par::Rayon,
+        );
+        assert_eq!(y, [1.0]);
+    }
+}
+
+/// The fused `y += alpha * op(A) * x` entry points follow the same rule: an
+/// empty A adds nothing, even for an infinite alpha (`alpha * 0` would be NaN).
+#[test]
+fn test_issue_13_gemv_add_empty_a_leaves_y_untouched() {
+    let a: Mat<f64> = Mat::zeros(2, 0);
+    let x: [f64; 0] = [];
+
+    let mut y = vec![1.0f64, 2.0];
+    gemv_add_inplace(GemvTrans::NoTrans, f64::INFINITY, a.as_ref(), &x, &mut y);
+    assert_eq!(y, [1.0, 2.0]);
+
+    let z = gemv_add(
+        GemvTrans::NoTrans,
+        f64::INFINITY,
+        a.as_ref(),
+        &x,
+        vec![3.0, 4.0],
+    );
+    assert_eq!(z, [3.0, 4.0]);
+
+    // m == 0: A is 0x3, so Trans gives a 3-element y and an empty x.
+    let a: Mat<f64> = Mat::zeros(0, 3);
+    let mut y = vec![5.0f64, 6.0, 7.0];
+    gemv_add_inplace(GemvTrans::Trans, f64::INFINITY, a.as_ref(), &x, &mut y);
+    assert_eq!(y, [5.0, 6.0, 7.0]);
+}
+
+/// Non-empty operands are unaffected by the quick return (control).
+#[test]
+fn test_issue_13_gemv_non_empty_still_scales_y() {
+    let a = Mat::from_rows(&[&[1.0f64, 2.0]]);
+    let x = [1.0, 1.0];
+    let mut y = [4.0f64];
+
+    gemv(GemvTrans::NoTrans, 1.0, a.as_ref(), &x, 0.5, &mut y);
+
+    assert!((y[0] - 5.0).abs() < 1e-12);
+}
+
+// ========================================================================
+// Blocked NoTrans GEMV on strided views: the f64 SIMD kernels address
+// `A[i, j]` as `a[i + j * row_stride()]`, which is only valid for a view with
+// adjacent rows (`col_stride() == 1`). They used to be selected for every f64
+// view with m·n > 4096 and read the wrong elements of transposed / row-strided
+// views.
+// ========================================================================
+
+/// Small-integer, non-uniform entries: every dot product below is exact in f64,
+/// so any kernel must agree with the naive loop bit for bit, while a kernel that
+/// reads the wrong elements gives a visibly different sum.
+fn strided_view_entry(i: usize, j: usize) -> f64 {
+    ((7 * i + 3 * j) % 11) as f64 - 5.0
+}
+
+/// Naive `beta * y0 + alpha * A * x`, indexing `a` through both of its strides.
+fn notrans_reference(alpha: f64, a: MatRef<'_, f64>, x: &[f64], beta: f64, y0: &[f64]) -> Vec<f64> {
+    (0..a.nrows())
+        .map(|i| {
+            let dot: f64 = (0..a.ncols()).map(|j| a[(i, j)] * x[j]).sum();
+            beta * y0[i] + alpha * dot
+        })
+        .collect()
+}
+
+/// Runs `gemv` and `gemv_with_par(.., Par::Seq)` (NoTrans) on `a` and compares
+/// both with the naive reference. `a` must be large enough (m·n > 4096) to take
+/// the blocked path.
+fn assert_blocked_notrans_matches_reference(a: MatRef<'_, f64>, what: &str) {
+    let (m, n) = (a.nrows(), a.ncols());
+    assert!(
+        m * n > 4096,
+        "{what}: {m}x{n} does not reach the blocked path"
+    );
+    let x: Vec<f64> = (0..n).map(|j| (j % 5) as f64 - 2.0).collect();
+    let y0: Vec<f64> = (0..m).map(|i| (i % 3) as f64 - 1.0).collect();
+    let (alpha, beta) = (1.5, -0.5);
+    let expected = notrans_reference(alpha, a, &x, beta, &y0);
+
+    let mut y = y0.clone();
+    gemv(GemvTrans::NoTrans, alpha, a, &x, beta, &mut y);
+    assert_eq!(y, expected, "{what}: gemv");
+
+    let mut y = y0.clone();
+    gemv_with_par(GemvTrans::NoTrans, alpha, a, &x, beta, &mut y, Par::Seq);
+    assert_eq!(y, expected, "{what}: gemv_with_par(Seq)");
+}
+
+/// `gemv(NoTrans, alpha, b.transpose(), ..)`: the transposed view has
+/// `row_stride == 1` and `col_stride == lda(b)`.
+#[test]
+fn test_gemv_blocked_notrans_transposed_view() {
+    let (m, n) = (80, 70);
+    let mut b: Mat<f64> = Mat::zeros(n, m);
+    for j in 0..m {
+        for i in 0..n {
+            b[(i, j)] = strided_view_entry(j, i);
+        }
+    }
+    let a = b.as_ref().transpose();
+    assert_eq!(a.shape(), (m, n));
+    assert_eq!(a.row_stride(), 1);
+    assert_ne!(a.col_stride(), 1);
+    for i in 0..m {
+        for j in 0..n {
+            assert_eq!(a[(i, j)], strided_view_entry(i, j));
+        }
+    }
+    assert_blocked_notrans_matches_reference(a, "transposed view");
+}
+
+/// Every other row of a 160x70 column-major buffer (`col_stride == 2`); the odd
+/// rows hold junk that a kernel reading adjacent rows would pick up.
+#[test]
+fn test_gemv_blocked_notrans_row_strided_view() {
+    let (m, n) = (80, 70);
+    let ld = 2 * m;
+    let mut buf = vec![0.0f64; ld * n];
+    for j in 0..n {
+        for r in 0..ld {
+            buf[r + j * ld] = if r % 2 == 0 {
+                strided_view_entry(r / 2, j)
+            } else {
+                1000.0 + j as f64
+            };
+        }
+    }
+    // `from_strided(slice, nrows, ncols, row_stride, col_stride)`: `row_stride`
+    // is the column-to-column distance and `col_stride` the row-to-row one.
+    let a = MatRef::from_strided(&buf, m, n, ld, 2).expect("the view fits its buffer");
+    assert_eq!(a.col_stride(), 2);
+    for i in 0..m {
+        for j in 0..n {
+            assert_eq!(a[(i, j)], strided_view_entry(i, j));
+        }
+    }
+    assert_blocked_notrans_matches_reference(a, "row-strided view");
+}
+
+/// Control: a submatrix of a column-major matrix keeps `col_stride == 1` (with a
+/// leading dimension larger than its row count) and stays on the fast path.
+#[test]
+fn test_gemv_blocked_notrans_column_major_submatrix() {
+    let mut big: Mat<f64> = Mat::zeros(100, 90);
+    for j in 0..90 {
+        for i in 0..100 {
+            big[(i, j)] = strided_view_entry(i, j);
+        }
+    }
+    let a = big.as_ref().submatrix(5, 7, 80, 70);
+    assert_eq!(a.col_stride(), 1);
+    assert!(a.row_stride() >= 100);
+    assert_blocked_notrans_matches_reference(a, "column-major submatrix");
+}

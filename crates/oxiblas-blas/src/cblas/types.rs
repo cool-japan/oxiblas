@@ -1,8 +1,11 @@
-//! CBLAS-compatible interface for BLAS-TESTER compatibility.
+//! CBLAS-compatible C ABI: the shared enums.
 //!
-//! This module provides a C-compatible interface that follows the standard
-//! CBLAS specification, enabling interoperability with BLAS test suites
-//! like BLAS-TESTER.
+//! This module defines the `#[repr(C)]` enums taken by the `cblas_*` entry
+//! points, with the discriminants of `cblas.h`. The entry points follow the
+//! semantics of reference CBLAS for valid calls. Because these are Rust enums,
+//! a value outside the set defined here is undefined behaviour rather than an
+//! error exit; there is no `cblas_xerbla` to report it to (see
+//! [`crate::cblas`] for the other deviations from reference CBLAS).
 //!
 //! # Layout
 //!
@@ -12,9 +15,14 @@
 //!
 //! # Performance
 //!
-//! For unit stride vectors (incx=1, incy=1), this module uses the optimized
-//! internal BLAS implementations with SIMD acceleration. For non-unit strides,
-//! scalar fallbacks are used.
+//! This module only defines the shared CBLAS enums. The wrappers that use them
+//! validate their arguments (invalid input is a silent no-op), map row-major
+//! requests onto the column-major natives and call the native kernels of
+//! [`crate::level1`], [`crate::level2`] and [`crate::level3`], gathering and
+//! scattering strided vectors where a kernel needs contiguous input. A few
+//! simple routines (real `gemv`, the complex dot products and `gemm`, Level 1
+//! calls with a non-unit increment) run reference-order scalar loops in the
+//! wrapper instead; see the individual modules.
 
 /// CBLAS layout ordering.
 #[repr(C)]

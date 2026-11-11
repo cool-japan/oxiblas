@@ -46,12 +46,12 @@ impl SimdRegister for F64x2 {
 
     #[inline]
     fn zero() -> Self {
-        unsafe { F64x2(f64x2_splat(0.0)) }
+        F64x2(f64x2_splat(0.0))
     }
 
     #[inline]
     fn splat(value: f64) -> Self {
-        unsafe { F64x2(f64x2_splat(value)) }
+        F64x2(f64x2_splat(value))
     }
 
     #[inline]
@@ -76,22 +76,22 @@ impl SimdRegister for F64x2 {
 
     #[inline]
     fn add(self, other: Self) -> Self {
-        unsafe { F64x2(f64x2_add(self.0, other.0)) }
+        F64x2(f64x2_add(self.0, other.0))
     }
 
     #[inline]
     fn sub(self, other: Self) -> Self {
-        unsafe { F64x2(f64x2_sub(self.0, other.0)) }
+        F64x2(f64x2_sub(self.0, other.0))
     }
 
     #[inline]
     fn mul(self, other: Self) -> Self {
-        unsafe { F64x2(f64x2_mul(self.0, other.0)) }
+        F64x2(f64x2_mul(self.0, other.0))
     }
 
     #[inline]
     fn div(self, other: Self) -> Self {
-        unsafe { F64x2(f64x2_div(self.0, other.0)) }
+        F64x2(f64x2_div(self.0, other.0))
     }
 
     /// Computes `self * a + b`.
@@ -168,7 +168,7 @@ impl SimdRegister for F64x2 {
         unsafe {
             let mut arr: [f64; 2] = core::mem::transmute(self.0);
             arr[index] = value;
-            F64x2(core::mem::transmute(arr))
+            F64x2(core::mem::transmute::<[f64; 2], v128>(arr))
         }
     }
 }
@@ -184,12 +184,12 @@ impl SimdRegister for F32x4 {
 
     #[inline]
     fn zero() -> Self {
-        unsafe { F32x4(f32x4_splat(0.0)) }
+        F32x4(f32x4_splat(0.0))
     }
 
     #[inline]
     fn splat(value: f32) -> Self {
-        unsafe { F32x4(f32x4_splat(value)) }
+        F32x4(f32x4_splat(value))
     }
 
     #[inline]
@@ -214,22 +214,22 @@ impl SimdRegister for F32x4 {
 
     #[inline]
     fn add(self, other: Self) -> Self {
-        unsafe { F32x4(f32x4_add(self.0, other.0)) }
+        F32x4(f32x4_add(self.0, other.0))
     }
 
     #[inline]
     fn sub(self, other: Self) -> Self {
-        unsafe { F32x4(f32x4_sub(self.0, other.0)) }
+        F32x4(f32x4_sub(self.0, other.0))
     }
 
     #[inline]
     fn mul(self, other: Self) -> Self {
-        unsafe { F32x4(f32x4_mul(self.0, other.0)) }
+        F32x4(f32x4_mul(self.0, other.0))
     }
 
     #[inline]
     fn div(self, other: Self) -> Self {
-        unsafe { F32x4(f32x4_div(self.0, other.0)) }
+        F32x4(f32x4_div(self.0, other.0))
     }
 
     /// Computes `self * a + b`.
@@ -332,21 +332,17 @@ impl SimdRegister for F64x4 {
 
     #[inline]
     fn zero() -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_splat(0.0),
-                hi: f64x2_splat(0.0),
-            }
+        F64x4 {
+            lo: f64x2_splat(0.0),
+            hi: f64x2_splat(0.0),
         }
     }
 
     #[inline]
     fn splat(value: f64) -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_splat(value),
-                hi: f64x2_splat(value),
-            }
+        F64x4 {
+            lo: f64x2_splat(value),
+            hi: f64x2_splat(value),
         }
     }
 
@@ -380,41 +376,33 @@ impl SimdRegister for F64x4 {
 
     #[inline]
     fn add(self, other: Self) -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_add(self.lo, other.lo),
-                hi: f64x2_add(self.hi, other.hi),
-            }
+        F64x4 {
+            lo: f64x2_add(self.lo, other.lo),
+            hi: f64x2_add(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn sub(self, other: Self) -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_sub(self.lo, other.lo),
-                hi: f64x2_sub(self.hi, other.hi),
-            }
+        F64x4 {
+            lo: f64x2_sub(self.lo, other.lo),
+            hi: f64x2_sub(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn mul(self, other: Self) -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_mul(self.lo, other.lo),
-                hi: f64x2_mul(self.hi, other.hi),
-            }
+        F64x4 {
+            lo: f64x2_mul(self.lo, other.lo),
+            hi: f64x2_mul(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn div(self, other: Self) -> Self {
-        unsafe {
-            F64x4 {
-                lo: f64x2_div(self.lo, other.lo),
-                hi: f64x2_div(self.hi, other.hi),
-            }
+        F64x4 {
+            lo: f64x2_div(self.lo, other.lo),
+            hi: f64x2_div(self.hi, other.hi),
         }
     }
 
@@ -502,7 +490,7 @@ impl SimdRegister for F64x4 {
                 let mut arr: [f64; 2] = core::mem::transmute(self.lo);
                 arr[index] = value;
                 F64x4 {
-                    lo: core::mem::transmute(arr),
+                    lo: core::mem::transmute::<[f64; 2], v128>(arr),
                     hi: self.hi,
                 }
             } else {
@@ -510,7 +498,7 @@ impl SimdRegister for F64x4 {
                 arr[index - 2] = value;
                 F64x4 {
                     lo: self.lo,
-                    hi: core::mem::transmute(arr),
+                    hi: core::mem::transmute::<[f64; 2], v128>(arr),
                 }
             }
         }
@@ -530,21 +518,17 @@ impl SimdRegister for F32x8 {
 
     #[inline]
     fn zero() -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_splat(0.0),
-                hi: f32x4_splat(0.0),
-            }
+        F32x8 {
+            lo: f32x4_splat(0.0),
+            hi: f32x4_splat(0.0),
         }
     }
 
     #[inline]
     fn splat(value: f32) -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_splat(value),
-                hi: f32x4_splat(value),
-            }
+        F32x8 {
+            lo: f32x4_splat(value),
+            hi: f32x4_splat(value),
         }
     }
 
@@ -578,41 +562,33 @@ impl SimdRegister for F32x8 {
 
     #[inline]
     fn add(self, other: Self) -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_add(self.lo, other.lo),
-                hi: f32x4_add(self.hi, other.hi),
-            }
+        F32x8 {
+            lo: f32x4_add(self.lo, other.lo),
+            hi: f32x4_add(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn sub(self, other: Self) -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_sub(self.lo, other.lo),
-                hi: f32x4_sub(self.hi, other.hi),
-            }
+        F32x8 {
+            lo: f32x4_sub(self.lo, other.lo),
+            hi: f32x4_sub(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn mul(self, other: Self) -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_mul(self.lo, other.lo),
-                hi: f32x4_mul(self.hi, other.hi),
-            }
+        F32x8 {
+            lo: f32x4_mul(self.lo, other.lo),
+            hi: f32x4_mul(self.hi, other.hi),
         }
     }
 
     #[inline]
     fn div(self, other: Self) -> Self {
-        unsafe {
-            F32x8 {
-                lo: f32x4_div(self.lo, other.lo),
-                hi: f32x4_div(self.hi, other.hi),
-            }
+        F32x8 {
+            lo: f32x4_div(self.lo, other.lo),
+            hi: f32x4_div(self.hi, other.hi),
         }
     }
 

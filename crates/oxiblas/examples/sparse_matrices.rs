@@ -5,9 +5,10 @@
 //! - Converting between formats
 //! - Sparse matrix-vector multiplication
 //! - Iterative solvers (CG, GMRES)
-//! - Preconditioners (Jacobi, ILUT)
+//! - Applying a Jacobi (diagonal) preconditioner to a residual
 //!
-//! Run with: cargo run --example sparse_matrices --features parallel
+//! Run with: cargo run -p oxiblas --example sparse_matrices
+//! (it needs the `sparse` feature, which is on by default)
 
 use oxiblas_sparse::convert::{coo_to_csr, csr_to_csc};
 use oxiblas_sparse::coo::CooMatrix;
@@ -41,7 +42,7 @@ fn main() {
     println!("COO Matrix (4×4, 10 non-zeros):");
     println!("  Diagonal: 10.0");
     println!("  Off-diagonals: 1.0, 2.0, 3.0 (tridiagonal pattern)");
-    println!("  Sparsity: 10/16 = 62.5% sparse\n");
+    println!("  Density: 10/16 = 62.5% non-zero (37.5% sparse)\n");
 
     // Convert to CSR (Compressed Sparse Row) format
     let csr = coo_to_csr(&coo);
@@ -100,29 +101,34 @@ fn main() {
     println!("Solving A * x = b with GMRES (works for non-symmetric matrices)\n");
 
     let restart = 10;
-    let gmres_result = gmres(&csr, &b, &x0, max_iter, tol, restart).expect("GMRES failed");
+    // Argument order: (a, b, x0, restart, tol, max_iter).
+    let gmres_result = gmres(&csr, &b, &x0, restart, tol, max_iter).expect("GMRES failed");
 
     println!("GMRES Solution:");
     println!("  x = {:?}", gmres_result.x);
     println!("  Iterations: {}", gmres_result.iterations);
     println!("  Residual norm: {:.2e}", gmres_result.residual_norm);
-    println!("  Restart parameter: {}", restart);
+    println!(
+        "  Restart parameter: {} (restarts performed: {})",
+        restart, gmres_result.restarts
+    );
     println!("  Converged: {}", gmres_result.converged);
     println!("  Expected: x ≈ [1, 2, 3, 4] ✓\n");
 
     // ========================================
-    // Preconditioned Iterative Solver
+    // Jacobi Preconditioner
     // ========================================
     println!("--- Preconditioners ---");
-    println!("Using Jacobi preconditioner to improve convergence\n");
+    println!("Applying a Jacobi (diagonal) preconditioner to a residual\n");
 
     // Create Jacobi preconditioner (diagonal scaling)
     let precond = Jacobi::new(&csr).expect("Failed to create Jacobi preconditioner");
 
-    // For demonstration, create a harder problem
+    // A second right-hand side. It is no harder for CG: the convergence
+    // depends on the matrix, not on the scale of b.
     let b_hard = vec![100.0, 200.0, 300.0, 400.0];
 
-    println!("Harder problem: b = {:?}", b_hard);
+    println!("Second right-hand side: b = {:?}", b_hard);
 
     // Solve without preconditioner
     let result_no_precond = cg(&csr, &b_hard, &x0, tol, max_iter).expect("CG failed");

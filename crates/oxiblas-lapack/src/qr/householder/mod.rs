@@ -315,7 +315,7 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     /// # Arguments
     ///
     /// * `a` - The matrix to factor
-    /// * `nb` - Block size (number of columns per panel)
+    /// * `nb` - Block size (number of columns per panel); 0 is treated as 1
     ///
     /// # Returns
     ///
@@ -341,6 +341,8 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
     pub fn compute_blocked(a: MatRef<'_, T>, nb: usize) -> Result<Self, QrError> {
         use oxiblas_blas::level3::gemm::gemm;
 
+        // A zero-width panel would never advance the blocked loop.
+        let nb = nb.max(1);
         let m = a.nrows();
         let n = a.ncols();
 
@@ -897,7 +899,7 @@ impl<T: Field + Real + oxiblas_blas::level3::gemm_kernel::GemmKernel + bytemuck:
 /// Returns (tau, beta) where beta is the new diagonal element.
 fn householder_vector<T: Field + Real>(qr: &mut Mat<T>, j: usize, m: usize, _n: usize) -> (T, T) {
     // Compute the norm of the column below the diagonal using a scaled
-    // accumulation (Blue's algorithm) instead of a naive sum of squares,
+    // accumulation (dlassq style) instead of a naive sum of squares,
     // to avoid overflow/underflow for columns containing extreme-magnitude
     // values (e.g. squaring a value near 1e200 would overflow f64 well
     // before the true norm does). This mirrors the scaled-accumulation

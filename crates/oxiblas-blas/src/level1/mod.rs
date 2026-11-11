@@ -6,11 +6,14 @@
 //! - `dotc` - Conjugate dot product (for complex vectors)
 //! - `axpy` - y = α·x + y
 //! - `scal` - x = α·x
+//! - `scal_real`/`csscal`/`zdscal` - Complex x scaled by a real α
 //! - `copy` - Copy a vector
 //! - `swap` - Swap two vectors
 //! - `nrm2` - Euclidean (L2) norm
+//! - `cnrm2`/`scnrm2`/`dznrm2` - Complex Euclidean norm
 //! - `asum` - Sum of absolute values (L1 norm)
 //! - `casum`/`scasum`/`dzasum` - Complex ASUM (`|Re|+|Im|` metric)
+//! - `cabs1`/`scabs1`/`dcabs1` - The `|Re|+|Im|` metric itself
 //! - `iamax` - Index of maximum absolute value
 //! - `rotg` - Generate a Givens plane rotation
 //! - `rot` - Apply a plane rotation
@@ -18,6 +21,8 @@
 //! - `rotm` - Apply a modified Givens rotation
 //! - `crotg` - Generate a complex Givens plane rotation (`ZROTG`/`CROTG`)
 //! - `zdrot` - Apply a real-valued Givens rotation to complex vectors
+//! - `*_strided` - The above with reference-BLAS increments (positive,
+//!   negative and, where the reference allows it, zero)
 //!
 //! # Example
 //!
@@ -45,27 +50,36 @@ mod axpy;
 mod copy;
 mod dot;
 mod dot_extended;
+#[cfg(target_arch = "aarch64")]
+mod dot_neon;
 mod iamax;
 mod nrm2;
+#[cfg(target_arch = "aarch64")]
+mod nrm2_blue;
 pub mod parallel;
 mod rot;
 mod scal;
 mod strided;
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+pub(crate) mod typed;
 
-pub use asum::{ComplexRotgResult, asum, casum, crotg, dzasum, scasum, zdrot};
+pub use asum::{
+    ComplexRotgResult, asum, cabs1, casum, crotg, dcabs1, dzasum, scabs1, scasum, zdrot,
+};
 pub use axpy::{axpy, axpy_f32, axpy_f64};
 pub use copy::copy;
 pub use dot::{dot, dot_f32, dot_f64, dotc, dotc_c32, dotc_c64, dotu_c32, dotu_c64};
 pub use dot_extended::{dot_kahan, dot_pairwise, dsdot, sdsdot};
 pub use iamax::{iamax, iamin};
-pub use nrm2::{nrm2, nrm2_f32, nrm2_f64, nrm2_sq};
+pub use nrm2::{cnrm2, dznrm2, nrm2, nrm2_f32, nrm2_f64, nrm2_sq, scnrm2};
 pub use parallel::{asum_par, axpy_par, dot_par, nrm2_par, scal_par};
 pub use rot::{RotgResult, RotmParams, rot, rotg, rotm, rotmg};
-pub use scal::scal;
+pub use scal::{csscal, scal, scal_real, zdscal};
+pub(crate) use strided::fits_isize_bytes;
 pub use strided::{
-    StridedSlice, StridedSliceMut, asum_strided, axpy_strided, copy_strided, dot_strided,
-    dotc_strided, iamax_strided, iamin_strided, nrm2_strided, rot_strided, scal_strided,
-    swap_strided,
+    StridedSlice, StridedSliceMut, asum_strided, axpy_strided, cnrm2_strided, copy_strided,
+    dot_strided, dotc_strided, iamax_strided, iamin_strided, nrm2_strided, rot_strided,
+    rotm_strided, scal_strided, swap_strided, zdrot_strided,
 };
 
 /// Swaps two vectors.

@@ -5,7 +5,9 @@
 //! - x86_64: AVX2 (256-bit), AVX512F (512-bit), SSE4.2 (128-bit)
 //! - AArch64: NEON (128-bit), 256-bit emulated
 //! - WASM32: SIMD128 (128-bit), 256-bit emulated
-//! - Scalar fallback for unsupported platforms
+//! - Every other architecture (riscv64, powerpc64, s390x, loongarch64, armv7,
+//!   i686, ...): portable array-backed registers from [`portable`], so the
+//!   generic path compiles and gives correct results everywhere
 //!
 //! The design uses runtime feature detection to dispatch to the best
 //! available implementation.
@@ -40,15 +42,14 @@
 //!
 //! The 128-bit SSE register methods are sound on x86_64 because SSE2 is part of
 //! the x86_64 baseline (the FMA path is selected at compile time via
-//! `#[cfg(target_feature = "fma")]`). The **256-bit (AVX2) and 512-bit
-//! (AVX-512) register methods are declared as safe `fn`s but emit AVX2/AVX-512
-//! instructions without an internal runtime feature guard**. Executing those
-//! instructions on a CPU that lacks the feature is undefined behavior, so a
-//! caller MUST confirm the feature is present (e.g. via
-//! `is_x86_feature_detected!("avx2")`) before constructing or operating on
-//! those register types. This unguarded contract is the reason the tuned
-//! kernels — and this module's own tests — gate every wide-register use behind
-//! runtime detection rather than calling the abstraction blindly.
+//! `#[cfg(target_feature = "fma")]`). The 256-bit (AVX2) and 512-bit (AVX-512)
+//! register methods are safe `fn`s that check the CPU on every call: they run
+//! the intrinsic when `has_avx2_fma()` / `has_avx512f()` holds and otherwise
+//! fall back to scalar lane loops, so they never execute an unsupported
+//! instruction. Under `std` the check is runtime detection; under `no_std` it
+//! is the compile-time `target_feature` flags. The per-call check is the reason
+//! the tuned kernels gate on detection once instead of going through this
+//! abstraction.
 //!
 //! # Complex SIMD
 //!
@@ -67,6 +68,7 @@ pub mod wasm32;
 pub mod complex;
 pub mod dispatch;
 pub mod multiver;
+pub mod portable;
 pub mod scalar;
 
 use crate::scalar::{Field, Real, Scalar};
@@ -126,30 +128,16 @@ pub fn detect_simd_level() -> SimdLevel {
     {
         let detected = detect_simd_level_raw();
 
-        // Apply maximum SIMD level limits from feature flags
+        // Apply maximum SIMD level limits from feature flags (`max-simd-128`
+        // wins when both are enabled).
         #[cfg(feature = "max-simd-128")]
-        {
-            return if detected > SimdLevel::Simd128 {
-                SimdLevel::Simd128
-            } else {
-                detected
-            };
-        }
-
-        #[cfg(feature = "max-simd-256")]
-        #[cfg(not(feature = "max-simd-128"))]
-        {
-            return if detected > SimdLevel::Simd256 {
-                SimdLevel::Simd256
-            } else {
-                detected
-            };
-        }
-
+        let cap = SimdLevel::Simd128;
+        #[cfg(all(feature = "max-simd-256", not(feature = "max-simd-128")))]
+        let cap = SimdLevel::Simd256;
         #[cfg(not(any(feature = "max-simd-128", feature = "max-simd-256")))]
-        {
-            detected
-        }
+        let cap = SimdLevel::Simd512;
+
+        if detected > cap { cap } else { detected }
     }
 }
 
@@ -709,11 +697,9 @@ mod tests {
     /// other test exercises the chunked load / FMA-accumulate / reduce path
     /// together on a real wide register.
     ///
-    /// # Safety
-    /// The 256-bit register methods emit AVX2/FMA instructions with no internal
-    /// runtime guard (see the module-level docs), so the whole body is gated
-    /// behind `is_x86_feature_detected!`; on hardware without AVX2+FMA the check
-    /// is skipped rather than risking undefined behavior.
+    /// The whole body is gated behind `is_x86_feature_detected!`: on hardware
+    /// without AVX2+FMA the register methods take their scalar fallback, so the
+    /// check is skipped instead of exercising the wide path.
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn test_abstraction_level1_dot_matches_scalar() {

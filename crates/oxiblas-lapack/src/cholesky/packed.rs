@@ -5,15 +5,15 @@
 //!
 //! For an n×n symmetric matrix:
 //! - Storage required: n*(n+1)/2 elements
-//! - Lower packed: A[i,j] with i >= j stored at index j*n - j*(j+1)/2 + i
-//! - Upper packed: A[i,j] with i <= j stored at index i + j*(j+1)/2
+//! - Lower packed: `A[i,j]` with i >= j stored at index j*n - j*(j+1)/2 + i
+//! - Upper packed: `A[i,j]` with i <= j stored at index i + j*(j+1)/2
 //!
 //! # Factorizations
 //!
 //! - **PackedCholesky** (pptrf/ppsv): For symmetric positive definite matrices
 //! - **PackedLdlt** (sptrf/spsv): For general symmetric matrices (may be indefinite)
 
-use num_traits::FromPrimitive;
+use crate::lu::tolerance::{finite_max, into_pivot_tolerances, raise_finite};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -211,6 +211,10 @@ pub fn packed_upper_to_dense<T: Scalar + bytemuck::Zeroable>(ap: &[T], n: usize)
 ///
 /// For a symmetric positive definite matrix A stored in packed format,
 /// computes the Cholesky factorization A = L*L^T or A = U^T*U.
+///
+/// [`PackedCholeskyError::NotPositiveDefinite`] is reported when the radicand
+/// of column `j` is at or below `eps · n · a_jj`, the original diagonal entry
+/// (a NaN, infinite or negative one counts as 0).
 #[derive(Clone, Debug)]
 pub struct PackedCholesky<T: Scalar> {
     /// Packed factor (L or U depending on uplo).
@@ -266,6 +270,20 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedCholesky<T> {
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the finite diagonal entries of A.
+        let col_tol = into_pivot_tolerances(
+            n,
+            (0..n)
+                .map(|j| {
+                    finite_max([match uplo {
+                        Uplo::Lower => ap[packed_lower_index(n, j, j)],
+                        Uplo::Upper => ap[packed_upper_index(n, j, j)],
+                    }])
+                })
+                .collect(),
+        );
+
         let mut factor = ap.to_vec();
 
         match uplo {
@@ -282,9 +300,8 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedCholesky<T> {
                         ajj = ajj - ljk * ljk;
                     }
 
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(T::one());
-                    if ajj <= tol {
+                    // Positive definiteness test (a NaN radicand propagates)
+                    if ajj <= col_tol[j] {
                         return Err(PackedCholeskyError::NotPositiveDefinite { index: j });
                     }
 
@@ -319,9 +336,8 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedCholesky<T> {
                         ajj = ajj - ukj * ukj;
                     }
 
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(T::one());
-                    if ajj <= tol {
+                    // Positive definiteness test (a NaN radicand propagates)
+                    if ajj <= col_tol[j] {
                         return Err(PackedCholeskyError::NotPositiveDefinite { index: j });
                     }
 
@@ -481,6 +497,11 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedCholesky<T> {
 /// For a symmetric matrix A stored in packed format,
 /// computes the LDL^T factorization A = L*D*L^T or A = U*D*U^T
 /// where L (or U) is unit triangular and D is diagonal.
+///
+/// [`PackedLdltError::Singular`] is reported when the pivot `d_j` satisfies
+/// `|d_j| <= eps · n · s_j`, where `s_j = max_i |a_ij|` is taken over the
+/// finite entries of the whole column `j` of the symmetric matrix: the stored
+/// entries of column `j` and, mirrored, those of row `j`.
 #[derive(Clone, Debug)]
 pub struct PackedLdlt<T: Scalar> {
     /// Packed factor containing L (or U) and D.
@@ -535,6 +556,35 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedLdlt<T> {
             });
         }
 
+        // Per-column singularity thresholds `eps · n · s_j`, where `s_j` is
+        // `max_i |a_ij|` over the finite entries of the whole symmetric
+        // column j. D may be negative for an indefinite matrix and LDL^T does
+        // not pivot, so the off-diagonal entries count: a pivot that is tiny
+        // next to its column would produce huge multipliers. One pass over
+        // the stored triangle; each entry raises its column and its row.
+        let mut scales = vec![T::zero(); n];
+        match uplo {
+            Uplo::Lower => {
+                for j in 0..n {
+                    for i in j..n {
+                        let value = Scalar::abs(ap[packed_lower_index(n, i, j)]);
+                        raise_finite(&mut scales[j], value);
+                        raise_finite(&mut scales[i], value);
+                    }
+                }
+            }
+            Uplo::Upper => {
+                for j in 0..n {
+                    for i in 0..=j {
+                        let value = Scalar::abs(ap[packed_upper_index(n, i, j)]);
+                        raise_finite(&mut scales[j], value);
+                        raise_finite(&mut scales[i], value);
+                    }
+                }
+            }
+        }
+        let col_tol = into_pivot_tolerances(n, scales);
+
         let mut factor = ap.to_vec();
         let mut diagonal = vec![T::zero(); n];
 
@@ -551,9 +601,8 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedLdlt<T> {
                         dj = dj - ljk * ljk * diagonal[k];
                     }
 
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(T::one());
-                    if Scalar::abs(dj) <= tol {
+                    // Singularity test (a NaN pivot propagates)
+                    if Scalar::abs(dj) <= col_tol[j] {
                         return Err(PackedLdltError::Singular { index: j });
                     }
 
@@ -588,9 +637,8 @@ impl<T: Field + Real + bytemuck::Zeroable> PackedLdlt<T> {
                         dj = dj - ukj * ukj * diagonal[k];
                     }
 
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(T::one());
-                    if Scalar::abs(dj) <= tol {
+                    // Singularity test (a NaN pivot propagates)
+                    if Scalar::abs(dj) <= col_tol[j] {
                         return Err(PackedLdltError::Singular { index: j });
                     }
 

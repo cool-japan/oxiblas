@@ -95,7 +95,18 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or if a zero pivot is encountered.
+    /// Returns an error only if the matrix is not square.
+    ///
+    /// # Pivots
+    ///
+    /// A pivot `d_j = w_jᵀ A z_j` is not reported as an error. It is
+    /// *negligible* when `|d_j| <= eps·‖w_j‖·‖A z_j‖` (the Cauchy–Schwarz
+    /// bound of the inner product, so the test is scale-invariant) or NaN; a
+    /// negligible pivot is regularized to `1e-10·‖w_j‖·‖A z_j‖` (to
+    /// `D⁻¹_jj = 0` when `A z_j = 0`), and later columns are not
+    /// biorthogonalized against it. Every decision is invariant under scaling
+    /// `A`, so `s·A` builds whenever `A` does and, for a power-of-two `s`,
+    /// gives the same `Z` and `W` and exactly `1/s` times the `D⁻¹` of `A`.
     pub fn new(a: &CsrMatrix<T>, config: AINVConfig) -> Result<Self, PreconditionerError> {
         if a.nrows() != a.ncols() {
             return Err(PreconditionerError::InvalidMatrix(
@@ -126,6 +137,11 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
         let mut z_cols: Vec<Vec<(usize, T)>> = vec![Vec::new(); n];
         let mut w_cols: Vec<Vec<(usize, T)>> = vec![Vec::new(); n];
         let mut d_inv = vec![T::zero(); n];
+        // `negligible_pivot[k]`: d_k was negligible and regularized; later
+        // columns are not biorthogonalized against z_k / w_k.
+        let mut negligible_pivot = vec![false; n];
+        // Regularized pivot relative to its Cauchy–Schwarz bound.
+        let pivot_reg = T::from_f64(1e-10).unwrap_or(<T as Scalar>::epsilon());
 
         // Working vectors for A*z and A^T*w
         let mut az = vec![T::zero(); n];
@@ -152,6 +168,12 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
                 // partial sum over the sparse structure of a single factor is
                 // NOT the A-inner-product and yields the wrong coefficient.
                 for k in 0..j {
+                    // Skip orthogonalization against a numerically negligible
+                    // (regularized) pivot.
+                    if negligible_pivot[k] {
+                        continue;
+                    }
+
                     // az = A * z_k and atw = A^T * w_k (dense, over all n rows).
                     Self::sparse_mv_csc(&a_csc, &z_cols[k], &mut az, n);
                     Self::sparse_mv_at(a, &w_cols[k], &mut atw);
@@ -166,23 +188,17 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
                         wjt_a_zk = wjt_a_zk + w_j[i].clone() * az[i].clone();
                     }
 
-                    // Skip orthogonalization against a numerically negligible pivot.
-                    let tiny = T::from_f64(1e-14).unwrap_or(T::zero());
-                    if Scalar::abs(d_inv[k].clone()) > tiny.clone() {
-                        // d_k = 1 / d_inv[k]
-                        let dk = T::one() / d_inv[k].clone();
-                        if Scalar::abs(dk.clone()) > tiny {
-                            // z_j <- z_j - (w_k^T A z_j / d_k) * z_k
-                            let alpha = wkt_a_zj / dk.clone();
-                            for (row, val) in &z_cols[k] {
-                                z_j[*row] = z_j[*row].clone() - alpha.clone() * val.clone();
-                            }
-                            // w_j <- w_j - (w_j^T A z_k / d_k) * w_k
-                            let beta = wjt_a_zk / dk;
-                            for (row, val) in &w_cols[k] {
-                                w_j[*row] = w_j[*row].clone() - beta.clone() * val.clone();
-                            }
-                        }
+                    // d_k = 1 / d_inv[k] (nonzero: the pivot was not negligible)
+                    let dk = T::one() / d_inv[k].clone();
+                    // z_j <- z_j - (w_k^T A z_j / d_k) * z_k
+                    let alpha = wkt_a_zj / dk.clone();
+                    for (row, val) in &z_cols[k] {
+                        z_j[*row] = z_j[*row].clone() - alpha.clone() * val.clone();
+                    }
+                    // w_j <- w_j - (w_j^T A z_k / d_k) * w_k
+                    let beta = wjt_a_zk / dk;
+                    for (row, val) in &w_cols[k] {
+                        w_j[*row] = w_j[*row].clone() - beta.clone() * val.clone();
                     }
                 }
             }
@@ -192,15 +208,29 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AINV<T> {
             Self::compute_mv(a, &z_j, &mut az);
 
             let mut d_j = T::zero();
+            let mut w_sq = T::zero();
+            let mut az_sq = T::zero();
             for i in 0..n {
                 d_j = d_j + w_j[i].clone() * az[i].clone();
+                w_sq = w_sq + w_j[i].clone() * w_j[i].clone();
+                az_sq = az_sq + az[i].clone() * az[i].clone();
             }
 
-            // Store d_j^{-1}
+            // Store d_j^{-1}. The pivot is negligible when it is at or below
+            // eps times its Cauchy–Schwarz bound ||w_j||·||A z_j|| (zero
+            // included, and NaN, which fails the comparison); it is then
+            // regularized relative to that bound, which keeps the
+            // factorization scale-invariant. A z_j = 0 leaves no scale to
+            // regularize with: the direction is dropped (D⁻¹_jj = 0).
             let drop_tol = T::from_f64(config.drop_tolerance).unwrap_or(T::zero());
-            if Scalar::abs(d_j.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
-                // Use regularization for zero pivot
-                d_inv[j] = T::from_f64(1e10).unwrap_or(T::one());
+            let pivot_bound = Real::sqrt(w_sq) * Real::sqrt(az_sq);
+            if !(Scalar::abs(d_j.clone()) > <T as Scalar>::epsilon() * pivot_bound.clone()) {
+                negligible_pivot[j] = true;
+                d_inv[j] = if pivot_bound > T::zero() {
+                    T::one() / (pivot_reg.clone() * pivot_bound)
+                } else {
+                    T::zero()
+                };
             } else {
                 d_inv[j] = T::one() / d_j;
             }

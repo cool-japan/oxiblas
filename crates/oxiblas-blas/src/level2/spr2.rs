@@ -71,7 +71,12 @@ fn lower_packed_index(i: usize, j: usize, n: usize) -> usize {
 
 /// Performs the symmetric packed rank-2 update: A = alpha * x * y^T + alpha * y * x^T + A
 ///
-/// Only the specified triangle (upper or lower) is stored and updated.
+/// Only the specified triangle (upper or lower) is stored and updated. As in
+/// reference BLAS `?spr2`, column `j` is updated as
+/// `A[i,j] = A[i,j] + x[i] * (alpha * y[j]) + y[i] * (alpha * x[j])` (evaluated
+/// left to right), and a column with `x[j]` and `y[j]` both zero is skipped
+/// entirely, so an infinite or NaN neighbour cannot reach it. If `n == 0` or
+/// `alpha == 0` the packed array is left untouched.
 ///
 /// # Arguments
 ///
@@ -131,22 +136,33 @@ pub fn spr2<T: Real>(
         Spr2Uplo::Upper => {
             // Update upper triangle: A[i,j] += alpha * (x[i]*y[j] + y[i]*x[j]) for i <= j
             for j in 0..n {
-                let alpha_yj = alpha * y[j];
-                let alpha_xj = alpha * x[j];
+                // Reference ?SPR2 skips the column when x(j) == 0 and y(j) == 0, so
+                // an infinite or NaN neighbour cannot reach it as `Inf * 0`.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    continue;
+                }
+                // Reference temps and evaluation order:
+                // AP(k) + x(i)*temp1 + y(i)*temp2, left to right.
+                let temp1 = alpha * y[j];
+                let temp2 = alpha * x[j];
                 for i in 0..=j {
                     let kij = upper_packed_index(i, j);
-                    ap[kij] = ap[kij] + alpha_yj * x[i] + alpha_xj * y[i];
+                    ap[kij] = ap[kij] + x[i] * temp1 + y[i] * temp2;
                 }
             }
         }
         Spr2Uplo::Lower => {
             // Update lower triangle: A[i,j] += alpha * (x[i]*y[j] + y[i]*x[j]) for i >= j
             for j in 0..n {
-                let alpha_yj = alpha * y[j];
-                let alpha_xj = alpha * x[j];
+                // Column skip for x(j) == 0 && y(j) == 0, as in the upper branch.
+                if x[j] == T::zero() && y[j] == T::zero() {
+                    continue;
+                }
+                let temp1 = alpha * y[j];
+                let temp2 = alpha * x[j];
                 for i in j..n {
                     let kij = lower_packed_index(i, j, n);
-                    ap[kij] = ap[kij] + alpha_yj * x[i] + alpha_xj * y[i];
+                    ap[kij] = ap[kij] + x[i] * temp1 + y[i] * temp2;
                 }
             }
         }
@@ -403,5 +419,54 @@ mod tests {
         assert!(approx_eq(ap[3], 18.0));
         assert!(approx_eq(ap[4], 27.0));
         assert!(approx_eq(ap[5], 36.0));
+    }
+
+    /// Issue #14: reference ?SPR2 skips column `j` when `x(j) == 0` and
+    /// `y(j) == 0`, so an infinite neighbour cannot reach it as `Inf * 0 = NaN`. A
+    /// column with only one of the two zero is updated.
+    #[test]
+    fn test_issue_14_spr2_zero_column_skip() {
+        let inf = f64::INFINITY;
+        let ap0 = [1.0f64, 0.5, 0.25, 2.0, 0.75, 3.0];
+
+        // Lower packed [A00, A10, A20, A11, A21, A22]: column 0 (x0 == y0 == 0)
+        // holds row 1, where x1 is infinite.
+        let mut ap = ap0;
+        let (x, y) = ([0.0, inf, 1.0], [-0.0, 2.0, 3.0]);
+        spr2(Spr2Uplo::Lower, 3, 1.5, &x, &y, &mut ap).unwrap();
+        for k in 0..3 {
+            assert_eq!(ap[k].to_bits(), ap0[k].to_bits(), "Lower slot {k}");
+        }
+        // Column 1: temp2 = 1.5 * x1 = Inf reaches A11 and A21.
+        assert_eq!((ap[3], ap[4]), (inf, inf));
+        assert_eq!(ap[5], 3.0 + 1.0 * 4.5 + 3.0 * 1.5);
+
+        // Only x0 == 0: column 0 is updated, A10 = 0.5 + x1 * (1.5 * 5) + y1 * 0.
+        let mut ap = ap0;
+        spr2(Spr2Uplo::Lower, 3, 1.5, &x, &[5.0, 2.0, 3.0], &mut ap).unwrap();
+        assert_eq!(ap[1], inf);
+
+        // Upper packed [A00, A01, A11, A02, A12, A22]: column 2 (x2 == y2 == 0)
+        // holds row 1, where x1 is infinite.
+        let mut ap = ap0;
+        let (x, y) = ([1.0, inf, 0.0], [3.0, 2.0, -0.0]);
+        spr2(Spr2Uplo::Upper, 3, 1.5, &x, &y, &mut ap).unwrap();
+        for k in 3..6 {
+            assert_eq!(ap[k].to_bits(), ap0[k].to_bits(), "Upper slot {k}");
+        }
+        assert_eq!((ap[1], ap[2]), (inf, inf));
+        assert_eq!(ap[0], 1.0 + 1.0 * 4.5 + 3.0 * 1.5);
+    }
+
+    /// Issue #14: the element update follows reference ?SPR2,
+    /// `AP(k) + x(i)*(alpha*y(j)) + y(i)*(alpha*x(j))`, evaluated left to right (see
+    /// the `syr2` twin of this test for the rounding argument).
+    #[test]
+    fn test_issue_14_spr2_reference_evaluation_order() {
+        let e = f64::EPSILON;
+        // Lower packed [A00, A10, A11].
+        let mut ap = [1.0f64, 1.0, 1.0];
+        spr2(Spr2Uplo::Lower, 2, 1.0, &[1.0, 1.0], &[e / 2.0, e], &mut ap).unwrap();
+        assert_eq!(ap[1], 1.0 + e);
     }
 }

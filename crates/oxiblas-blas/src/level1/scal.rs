@@ -1,8 +1,11 @@
 //! SCAL: x = α·x
 //!
-//! Scales a vector by a constant.
+//! Scales a vector by a constant: [`scal`] (scalar of the vector's own type)
+//! and [`scal_real`] / [`csscal`] / [`zdscal`] (complex vector, real scalar).
 
-use oxiblas_core::scalar::Field;
+use num_complex::{Complex32, Complex64};
+use num_traits::One;
+use oxiblas_core::scalar::{ComplexScalar, Field};
 
 /// Scales a vector by a constant: x = α·x
 ///
@@ -75,6 +78,52 @@ pub fn scal<T: Field>(alpha: T, x: &mut [T]) {
     for i in 0..remainder {
         x[base + i] = alpha * x[base + i];
     }
+}
+
+/// Scales a complex vector by a **real** scalar: `x = α·x` with `α` real
+/// (the generic form of `CSSCAL`/`ZDSCAL`).
+///
+/// Mirrors Netlib `CSSCAL`/`ZDSCAL` (3.12): `alpha == 1` returns immediately,
+/// and every other `alpha` -- including `0` -- scales both components,
+/// `x[i] = (α·Re(x[i]), α·Im(x[i]))`. Like [`scal`], `alpha == 0` does not
+/// scrub NaN/Inf to zero. Scaling component-wise (rather than a complex
+/// multiply by `α + 0i`) never forms `0·∞` cross terms, so e.g.
+/// `2·(∞ + 0i) = ∞ + 0i` instead of `∞ + NaN·i`.
+///
+/// # Example
+///
+/// ```
+/// use oxiblas_blas::level1::scal_real;
+/// use oxiblas_core::scalar::c64;
+///
+/// let mut x = [c64(1.0, -2.0), c64(3.0, 4.0)];
+/// scal_real(0.5, &mut x);
+/// assert_eq!(x, [c64(0.5, -1.0), c64(1.5, 2.0)]);
+/// ```
+pub fn scal_real<T: ComplexScalar>(alpha: T::Real, x: &mut [T]) {
+    if x.is_empty() || alpha == T::Real::one() {
+        return;
+    }
+    for xi in x.iter_mut() {
+        let z = *xi;
+        *xi = T::from_real_imag(alpha * z.real(), alpha * z.imag());
+    }
+}
+
+/// `CSSCAL`: scales a single-precision complex vector by a real scalar.
+///
+/// Thin concrete wrapper over [`scal_real`] matching the reference BLAS name.
+#[inline]
+pub fn csscal(alpha: f32, x: &mut [Complex32]) {
+    scal_real(alpha, x);
+}
+
+/// `ZDSCAL`: scales a double-precision complex vector by a real scalar.
+///
+/// Thin concrete wrapper over [`scal_real`] matching the reference BLAS name.
+#[inline]
+pub fn zdscal(alpha: f64, x: &mut [Complex64]) {
+    scal_real(alpha, x);
 }
 
 #[cfg(test)]
@@ -153,5 +202,66 @@ mod tests {
         assert!(x[0].is_nan());
         assert!(x[1].is_nan());
         assert_eq!(x[2], 0.0);
+    }
+
+    // =========================================================================
+    // Issue #15: complex vector times real scalar (scal_real/csscal/zdscal)
+    // =========================================================================
+
+    fn bits(z: &[Complex64]) -> Vec<(u64, u64)> {
+        z.iter().map(|v| (v.re.to_bits(), v.im.to_bits())).collect()
+    }
+
+    #[test]
+    fn test_issue_15_zdscal_csscal_match_reference_componentwise() {
+        // Reference: ZX(I) = DCMPLX(DA*DBLE(ZX(I)), DA*DIMAG(ZX(I))).
+        let x0 = [
+            Complex64::new(1.0, -2.0),
+            Complex64::new(-3.5, 0.25),
+            Complex64::new(0.0, 7.0),
+        ];
+        let mut x = x0;
+        zdscal(-1.5, &mut x);
+        for (got, orig) in x.iter().zip(&x0) {
+            assert_eq!(*got, Complex64::new(-1.5 * orig.re, -1.5 * orig.im));
+        }
+        let mut xs = [Complex32::new(2.0, -4.0), Complex32::new(-1.0, 0.5)];
+        csscal(0.5, &mut xs);
+        assert_eq!(xs, [Complex32::new(1.0, -2.0), Complex32::new(-0.5, 0.25)]);
+        let mut generic = x0;
+        scal_real(-1.5, &mut generic);
+        assert_eq!(generic, x);
+        let mut empty: [Complex64; 0] = [];
+        zdscal(3.0, &mut empty);
+    }
+
+    #[test]
+    fn test_issue_15_zdscal_alpha_one_and_zero_semantics() {
+        // DA.EQ.ONE is a quick return: nothing changes, not even NaN payloads.
+        let x0 = [
+            Complex64::new(f64::NAN, -0.0),
+            Complex64::new(f64::INFINITY, 1.0),
+        ];
+        let mut x = x0;
+        zdscal(1.0, &mut x);
+        assert_eq!(bits(&x), bits(&x0));
+
+        // alpha == 0 multiplies (no zero-fill): NaN/Inf -> NaN, signs of zero
+        // follow IEEE-754 (0 * -3 = -0.0).
+        let mut x = [
+            Complex64::new(f64::NAN, -3.0),
+            Complex64::new(f64::INFINITY, 2.0),
+        ];
+        zdscal(0.0, &mut x);
+        assert!(x[0].re.is_nan());
+        assert!(x[0].im == 0.0 && x[0].im.is_sign_negative());
+        assert!(x[1].re.is_nan());
+        assert!(x[1].im == 0.0 && x[1].im.is_sign_positive());
+
+        // Component-wise scaling never forms 0*inf cross terms:
+        // 2 * (inf + 0i) = inf + 0i, whereas (2 + 0i) * (inf + 0i) = inf + NaN i.
+        let mut x = [Complex64::new(f64::INFINITY, 0.0)];
+        zdscal(2.0, &mut x);
+        assert_eq!(x[0], Complex64::new(f64::INFINITY, 0.0));
     }
 }

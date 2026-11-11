@@ -5,7 +5,7 @@
 //!
 //! This is more general than Cholesky (LLT) as it works for indefinite matrices.
 
-use num_traits::{FromPrimitive, One};
+use crate::lu::tolerance::{pivot_tolerance, symmetric_column_max_abs_finite};
 use oxiblas_core::scalar::{Field, Real, Scalar};
 use oxiblas_matrix::{Mat, MatRef};
 
@@ -69,12 +69,36 @@ impl std::error::Error for LdltError {}
 ///
 /// - Fails for singular matrices (when a diagonal element becomes zero)
 /// - For highly indefinite matrices, consider Bunch-Kaufman pivoting
+///
+/// # Tolerances
+///
+/// Both thresholds are relative to the column of the pivot. With
+/// `s_j = max_i |a_ij|` taken over the finite entries of the whole column `j`
+/// of the symmetric input (the stored entries of column `j` and, mirrored,
+/// those of row `j`), a pivot with `|d_j| <= eps · n · s_j` is reported as
+/// [`LdltError::Singular`] by default, and [`Self::inertia`] counts
+/// `|d_j| <= eps · s_j` as zero.
+///
+/// The off-diagonal entries count because LDLᵀ does not pivot: in
+/// `[[1e-17, 1], [1, 1e-17]]` the first pivot `1e-17` is tiny next to its
+/// column, whose maximum is 1, and would produce multipliers of `1e17`.
+/// Scaling the matrix by a power of two changes neither the outcome nor the
+/// inertia, as long as no entry or intermediate value overflows or
+/// underflows. A symmetric scaling `D · A · D` leaves them unchanged too
+/// while each column's maximum stays on its diagonal (for instance a
+/// diagonal matrix such as `diag(1e20, 1)`, which factors); in general it can
+/// change them, because the off-diagonal entries of column `j` scale by
+/// `d_i · d_j` while its pivot scales by `d_j²`.
 #[derive(Clone, Debug)]
 pub struct Ldlt<T: Scalar> {
     /// Combined storage: L (strictly lower) and D (diagonal).
     /// The diagonal of `ld` stores D.
     /// The strictly lower triangular part stores L (unit diagonal is implicit).
     ld: Mat<T>,
+    /// `s_j = max_i |a_ij|` over the finite entries of the whole symmetric
+    /// column `j` of the input: the reference magnitudes of the singularity
+    /// test and of the zero threshold of `inertia`.
+    scales: Vec<T>,
 }
 
 impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
@@ -102,7 +126,11 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
     /// # Arguments
     ///
     /// * `a` - A symmetric matrix
-    /// * `tol` - Optional tolerance for detecting singularity
+    /// * `tol` - Optional absolute tolerance for detecting singularity: a pivot
+    ///   with `|d_j| <= tol` is treated as zero. If None, uses
+    ///   `eps · n · s_j`, where `s_j = max_i |a_ij|` is taken over the finite
+    ///   entries of the whole symmetric column `j` of `a` (see the type-level
+    ///   documentation), which does not depend on the scale of `a`.
     pub fn compute_with_tol(a: MatRef<'_, T>, tol: Option<T>) -> Result<Self, LdltError> {
         let n = a.nrows();
 
@@ -116,8 +144,16 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
         if n == 0 {
             return Ok(Ldlt {
                 ld: Mat::zeros(0, 0),
+                scales: Vec::new(),
             });
         }
+
+        // Reference magnitude of every column of A: `max_i |a_ij|` over the
+        // finite entries of the whole symmetric column, read from the lower
+        // triangle (the only part the factorization reads) in one pass. D may
+        // be negative for an indefinite matrix and no pivoting takes place,
+        // so the diagonal alone does not bound the pivots.
+        let scales = symmetric_column_max_abs_finite(a);
 
         // Copy lower triangle of A
         let mut ld = Mat::zeros(n, n);
@@ -126,11 +162,6 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
                 ld[(i, j)] = a[(i, j)];
             }
         }
-
-        // Default tolerance
-        let default_tol = <T as Scalar>::epsilon()
-            * <T as FromPrimitive>::from_usize(n).unwrap_or(<T as One>::one());
-        let tolerance = tol.unwrap_or(default_tol);
 
         // LDL^T factorization (no pivoting)
         for j in 0..n {
@@ -142,7 +173,12 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
                 d_j = d_j - l_jk * l_jk * d_k;
             }
 
-            // Check for singularity
+            // Check for singularity (a NaN pivot propagates). An explicit
+            // tolerance is used as given; the default is relative to column j.
+            let tolerance = match tol {
+                Some(tol) => tol,
+                None => pivot_tolerance(n, scales[j]),
+            };
             if Scalar::abs(d_j) <= tolerance {
                 return Err(LdltError::Singular { index: j });
             }
@@ -160,7 +196,7 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
             }
         }
 
-        Ok(Ldlt { ld })
+        Ok(Ldlt { ld, scales })
     }
 
     /// Returns the size of the matrix (n for an n×n matrix).
@@ -223,14 +259,19 @@ impl<T: Field + Real + bytemuck::Zeroable> Ldlt<T> {
     /// elements of D have the same sign distribution as the eigenvalues.
     ///
     /// Returns (positive_count, negative_count, zero_count).
+    ///
+    /// The entry `d_j` of D counts as zero when `|d_j| <= eps · s_j`, where
+    /// `s_j = max_i |a_ij|` is taken over the finite entries of the whole
+    /// symmetric column `j` of the input: a threshold relative to the column
+    /// of the pivot, as for the singularity test.
     pub fn inertia(&self) -> (usize, usize, usize) {
         let n = self.size();
         let mut pos = 0;
         let mut neg = 0;
-        let zero_tol = <T as Scalar>::epsilon();
 
         for i in 0..n {
             let d = self.ld[(i, i)];
+            let zero_tol = <T as Scalar>::epsilon() * self.scales[i];
             if d > zero_tol {
                 pos += 1;
             } else if d < -zero_tol {

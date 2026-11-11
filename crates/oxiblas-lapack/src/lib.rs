@@ -29,6 +29,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::module_name_repetitions)]
 // LAPACK code often uses manual assign patterns for clarity
 #![allow(clippy::assign_op_pattern)]

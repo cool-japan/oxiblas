@@ -104,7 +104,25 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or has zero diagonal elements.
+    /// Returns error if matrix is not square or has zero diagonal elements
+    /// ([`PreconditionerError::ZeroDiagonal`] for a missing or exactly zero
+    /// diagonal entry). Only an exact zero is rejected, and the eigenvalue
+    /// bounds refer to the scale-free `D⁻¹A`, so `s·A` builds whenever `A`
+    /// does and its preconditioner is exactly `1/s` times that of `A` for a
+    /// power-of-two `s`.
+    ///
+    /// For [`PolynomialType::Chebyshev`], the interval `[λmin, λmax]` (from
+    /// `config`, with Gershgorin estimates for a bound that is not given) must
+    /// satisfy `0 < λmin <= λmax < ∞`, with a finite center `(λmax + λmin)/2`;
+    /// otherwise [`PreconditionerError::InvalidMatrix`] is returned (the
+    /// variant the constructor already uses for invalid input). Bounds outside
+    /// this range make the Chebyshev recurrence divide by zero or produce
+    /// non-finite coefficients (`λmin + λmax = 0` gives a zero center,
+    /// `λmin > λmax` a negative half-width, NaN or `±∞` propagate), and the
+    /// preconditioner is only positive definite for a positive interval. The
+    /// degenerate interval `λmin = λmax > 0` is valid: one step is then exact
+    /// for a single eigenvalue. [`PolynomialType::Neumann`] does not use the
+    /// bounds and does not validate them.
     pub fn new(
         a: &CsrMatrix<T>,
         poly_type: PolynomialType,
@@ -128,7 +146,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
             for k in start..end {
                 if a.col_indices()[k] == i {
                     let diag_val = a.values()[k].clone();
-                    if Scalar::abs(diag_val.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if diag_val == T::zero() {
                         return Err(PreconditionerError::ZeroDiagonal(i));
                     }
                     diag_inv[i] = T::one() / diag_val;
@@ -150,6 +168,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
         let center = (lambda_max.clone() + lambda_min.clone()) / two.clone();
         let half_width = (lambda_max.clone() - lambda_min.clone()) / two;
 
+        if poly_type == PolynomialType::Chebyshev {
+            Self::validate_chebyshev_bounds(&lambda_min, &lambda_max, &center, &half_width)?;
+        }
+
         Ok(Self {
             matrix: a.clone(),
             diag_inv,
@@ -160,6 +182,34 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
             center,
             half_width,
         })
+    }
+
+    /// Checks the Chebyshev interval `[λmin, λmax]` and its derived center and
+    /// half-width: `0 < λmin <= λmax`, all four finite (see [`Self::new`]).
+    fn validate_chebyshev_bounds(
+        lambda_min: &T,
+        lambda_max: &T,
+        center: &T,
+        half_width: &T,
+    ) -> Result<(), PreconditionerError> {
+        let finite = |v: &T| v.clone() - v.clone() == T::zero();
+        let problem = if !finite(lambda_min) || !finite(lambda_max) {
+            Some("bounds must be finite")
+        } else if !(*lambda_min > T::zero()) {
+            Some("lambda_min must be positive (the interval must not contain 0)")
+        } else if !(*lambda_max >= *lambda_min) {
+            Some("lambda_max must not be smaller than lambda_min")
+        } else if !finite(center) || !finite(half_width) {
+            Some("the center (lambda_max + lambda_min) / 2 must be finite")
+        } else {
+            None
+        };
+        match problem {
+            Some(reason) => Err(PreconditionerError::InvalidMatrix(format!(
+                "invalid Chebyshev eigenvalue bounds [{lambda_min}, {lambda_max}] of D^-1 A: {reason}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Estimate eigenvalue bounds using Gershgorin circles.
@@ -213,8 +263,9 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
             }
         }
 
-        // Ensure positive bounds for stability
-        if gershgorin_min <= T::zero() {
+        // Ensure positive bounds for stability (also for an empty matrix,
+        // which has no Gershgorin discs)
+        if n == 0 || gershgorin_min <= T::zero() {
             gershgorin_min = T::from_f64(0.1).unwrap_or(T::one());
         }
         if gershgorin_max <= gershgorin_min.clone() {
@@ -293,7 +344,17 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
 
     /// Apply Chebyshev polynomial preconditioner.
     ///
-    /// Uses the three-term Chebyshev recurrence for optimal polynomial approximation.
+    /// Runs `degree` steps of the Chebyshev iteration (Saad, *Iterative
+    /// Methods for Sparse Linear Systems*, Algorithm 12.1) on
+    /// `D⁻¹A z = D⁻¹r` from `z = 0`, for the interval `[λmin, λmax]` assumed to
+    /// contain the spectrum of `D⁻¹A`. With `c = (λmax + λmin)/2` and
+    /// `d = (λmax − λmin)/2`, `k` steps leave the residual `R_k(D⁻¹A) D⁻¹r`,
+    /// where `R_k(λ) = T_k((c − λ)/d) / T_k(c/d)` is the polynomial with
+    /// `R_k(0) = 1` that is smallest in maximum norm on the interval:
+    /// `|R_k| <= 1/T_k(c/d) < 1` there, so the preconditioner is positive
+    /// definite on that interval. Degree 0 is plain diagonal scaling and
+    /// degree 1 is `D⁻¹r / c`; a zero-width interval stops after one step,
+    /// which is then exact.
     fn apply_chebyshev(&self, r: &[T], z: &mut [T]) {
         let n = self.matrix.nrows();
 
@@ -308,69 +369,43 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
         let two = T::from_f64(2.0).unwrap_or(T::one() + T::one());
         let one = T::one();
 
-        // Chebyshev parameters
-        // θ = 1/c where c is the center
+        // θ = 1/c, so the first step is z_1 = θ·D⁻¹r; it is also the first
+        // update direction.
         let theta = one.clone() / self.center.clone();
-        // δ = d/c where d is the half-width
-        let delta = self.half_width.clone() / self.center.clone();
-
-        // z_0 = θ * D^{-1} * r
+        let mut direction = vec![T::zero(); n];
         for i in 0..n {
             z[i] = theta.clone() * self.diag_inv[i].clone() * r[i].clone();
+            direction[i] = z[i].clone();
         }
 
-        if self.degree == 1 {
+        if self.degree == 1 || self.half_width == T::zero() {
             return;
         }
 
-        // Work arrays
-        let mut z_prev = vec![T::zero(); n]; // z_{k-1}
-        let mut z_curr = z.to_vec(); // z_k
+        // σ₁ = c/d and ρ₀ = 1/σ₁; then ρ_k = 1/(2σ₁ − ρ_{k−1}) and
+        //   dir_k = ρ_k·ρ_{k−1}·dir_{k−1} + (2ρ_k/d)·r_k,
+        //   z_{k+1} = z_k + dir_k,
+        // with the residual r_k = D⁻¹r − D⁻¹A·z_k.
+        let sigma1 = self.center.clone() / self.half_width.clone();
+        let mut rho_prev = one.clone() / sigma1.clone();
         let mut temp = vec![T::zero(); n]; // A * z_k
-        let mut w = vec![T::zero(); n]; // D^{-1} * A * z_k
-
-        // Initial sigma
-        let mut sigma_prev = one.clone();
-        let mut sigma = delta.clone();
 
         for _k in 1..self.degree {
-            // Compute temp = A * z_curr
-            self.spmv(&z_curr, &mut temp);
+            self.spmv(z, &mut temp);
 
-            // Compute w = D^{-1} * temp
+            let rho = one.clone() / (two.clone() * sigma1.clone() - rho_prev.clone());
+            let direction_coeff = rho.clone() * rho_prev.clone();
+            let residual_coeff = two.clone() * rho.clone() / self.half_width.clone();
+
             for i in 0..n {
-                w[i] = self.diag_inv[i].clone() * temp[i].clone();
+                let residual = self.diag_inv[i].clone() * r[i].clone()
+                    - self.diag_inv[i].clone() * temp[i].clone();
+                direction[i] = direction_coeff.clone() * direction[i].clone()
+                    + residual_coeff.clone() * residual;
+                z[i] = z[i].clone() + direction[i].clone();
             }
 
-            // Update sigma
-            let sigma_next = two.clone() * delta.clone() * sigma.clone() - sigma_prev.clone();
-
-            // Chebyshev coefficient
-            let rho = sigma.clone() / sigma_next.clone();
-
-            // z_{k+1} = rho * (2 * θ * (D^{-1}*r - D^{-1}*A*z_k) + 2*σ*z_k) - rho * σ_{k-1}/σ * z_{k-1}
-            // Simplified: z_{k+1} = 2*ρ*θ*D^{-1}*r - 2*ρ*θ*w + 2*ρ*δ*z_k - (ρ*σ_{k-1}/σ)*z_{k-1}
-
-            let coeff1 = two.clone() * rho.clone() * theta.clone(); // coefficient for D^{-1}*r
-            let coeff2 = two.clone() * rho.clone() * delta.clone(); // coefficient for z_k
-            let coeff3 = rho.clone() * sigma_prev.clone() / sigma.clone(); // coefficient for z_{k-1}
-
-            // z_{k+1} = coeff1 * D^{-1}*r - coeff1 * w + coeff2 * z_k - coeff3 * z_{k-1}
-            for i in 0..n {
-                let dr = self.diag_inv[i].clone() * r[i].clone();
-                z[i] = coeff1.clone() * dr - coeff1.clone() * w[i].clone()
-                    + coeff2.clone() * z_curr[i].clone()
-                    - coeff3.clone() * z_prev[i].clone();
-            }
-
-            // Shift for next iteration
-            for i in 0..n {
-                z_prev[i] = z_curr[i].clone();
-                z_curr[i] = z[i].clone();
-            }
-
-            sigma_prev = sigma;
-            sigma = sigma_next;
+            rho_prev = rho;
         }
     }
 
@@ -404,5 +439,196 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd> Polynomial<T> {
     /// Returns the estimated eigenvalue bounds.
     pub fn eigenvalue_bounds(&self) -> (T, T) {
         (self.lambda_min.clone(), self.lambda_max.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tridiagonal matrix with unit diagonal and off-diagonal `off` (so
+    /// `D⁻¹A = A`), whose eigenvalues are `1 + 2·off·cos(jπ/(n+1))`.
+    fn unit_diagonal_tridiagonal(n: usize, off: f64) -> CsrMatrix<f64> {
+        let mut values = Vec::new();
+        let mut col_indices = Vec::new();
+        let mut row_ptrs = vec![0];
+        for i in 0..n {
+            if i > 0 {
+                values.push(off);
+                col_indices.push(i - 1);
+            }
+            values.push(1.0);
+            col_indices.push(i);
+            if i + 1 < n {
+                values.push(off);
+                col_indices.push(i + 1);
+            }
+            row_ptrs.push(values.len());
+        }
+        CsrMatrix::new(n, n, row_ptrs, col_indices, values).unwrap()
+    }
+
+    fn norm2(v: &[f64]) -> f64 {
+        v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+
+    /// Chebyshev polynomial `T_k(x)` for `x >= 1`.
+    fn chebyshev_t(k: usize, x: f64) -> f64 {
+        (k as f64 * x.acosh()).cosh()
+    }
+
+    /// `degree` Chebyshev steps for an interval containing the spectrum of
+    /// `D⁻¹A` leave the residual `R_k(D⁻¹A) D⁻¹r` with
+    /// `max |R_k| = 1 / T_k(c/d)` on the interval, so
+    /// `‖D⁻¹(r − A z)‖ <= ‖D⁻¹r‖ / T_k(c/d)`, and the preconditioner is
+    /// positive definite (`rᵀz > 0`). The recurrence used to grow the
+    /// normalisation with `2·(d/c)` instead of `2·(c/d)`, which breaks both.
+    #[test]
+    fn test_chebyshev_residual_meets_chebyshev_bound() {
+        let n = 40;
+        // Eigenvalues 1 - 0.9 cos(jπ/41) lie in (0.1, 1.9).
+        let a = unit_diagonal_tridiagonal(n, -0.45);
+        let (lambda_min, lambda_max) = (0.1, 1.9);
+        let (c, d) = (
+            (lambda_max + lambda_min) / 2.0,
+            (lambda_max - lambda_min) / 2.0,
+        );
+        for degree in 1..=12 {
+            let config = PolynomialConfig {
+                degree,
+                lambda_min: Some(lambda_min),
+                lambda_max: Some(lambda_max),
+            };
+            let poly = Polynomial::new(&a, PolynomialType::Chebyshev, config).unwrap();
+            let bound = 1.0 / chebyshev_t(degree, c / d);
+            for seed in 0..4u64 {
+                let r: Vec<f64> = (0..n)
+                    .map(|i| {
+                        (((i as u64 + 1) * (seed + 3) * 2_654_435_761) % 1000) as f64 / 500.0 - 1.0
+                    })
+                    .collect();
+                let mut z = vec![0.0; n];
+                poly.apply(&r, &mut z);
+                let mut az = vec![0.0; n];
+                poly.spmv(&z, &mut az);
+                let residual: Vec<f64> = r.iter().zip(&az).map(|(ri, ai)| ri - ai).collect();
+                let ratio = norm2(&residual) / norm2(&r);
+                assert!(
+                    ratio <= bound * (1.0 + 1e-10),
+                    "degree {degree}, seed {seed}: residual ratio {ratio} exceeds the Chebyshev bound {bound}"
+                );
+                let rz: f64 = r.iter().zip(&z).map(|(ri, zi)| ri * zi).sum();
+                assert!(rz > 0.0, "degree {degree}, seed {seed}: r^T z = {rz}");
+            }
+        }
+    }
+
+    /// One eigenvalue (`λmin = λmax = c`): `z = D⁻¹r / c` is exact and the
+    /// zero half-width must not produce NaN.
+    #[test]
+    fn test_chebyshev_degenerate_interval() {
+        let a = unit_diagonal_tridiagonal(5, 0.0);
+        let config = PolynomialConfig {
+            degree: 4,
+            lambda_min: Some(1.0),
+            lambda_max: Some(1.0),
+        };
+        let poly = Polynomial::new(&a, PolynomialType::Chebyshev, config).unwrap();
+        let r = vec![1.0, -2.0, 3.0, -4.0, 5.0];
+        let mut z = vec![0.0; 5];
+        poly.apply(&r, &mut z);
+        assert_eq!(z, r);
+    }
+
+    fn chebyshev_with_bounds(
+        lambda_min: Option<f64>,
+        lambda_max: Option<f64>,
+    ) -> Result<Polynomial<f64>, PreconditionerError> {
+        let a = unit_diagonal_tridiagonal(6, -0.25);
+        let config = PolynomialConfig {
+            degree: 4,
+            lambda_min,
+            lambda_max,
+        };
+        Polynomial::new(&a, PolynomialType::Chebyshev, config)
+    }
+
+    /// Bounds for which the Chebyshev recurrence divides by zero or produces
+    /// non-finite coefficients are rejected by the constructor: a zero center
+    /// (`λmin + λmax = 0`), a reversed interval, a non-positive interval (the
+    /// Chebyshev preconditioner of an SPD `D⁻¹A` needs `0 < λmin`) and
+    /// non-finite bounds. They used to be accepted, and `apply` returned
+    /// `Inf`/`NaN`.
+    #[test]
+    fn test_chebyshev_invalid_bounds_rejected() {
+        let invalid: [(f64, f64); 11] = [
+            (-1.0, 1.0),
+            (2.0, 1.0),
+            (1.0, 0.5),
+            (0.0, 2.0),
+            (-0.5, 2.0),
+            (-3.0, -1.0),
+            (f64::NAN, 2.0),
+            (0.1, f64::NAN),
+            (0.1, f64::INFINITY),
+            (f64::NEG_INFINITY, 1.0),
+            (f64::MAX, f64::MAX),
+        ];
+        for (lambda_min, lambda_max) in invalid {
+            let result = chebyshev_with_bounds(Some(lambda_min), Some(lambda_max));
+            assert!(
+                matches!(result, Err(PreconditionerError::InvalidMatrix(_))),
+                "bounds [{lambda_min}, {lambda_max}] must be rejected"
+            );
+        }
+        // A provided bound that is inconsistent with the estimated other one.
+        assert!(matches!(
+            chebyshev_with_bounds(Some(5.0), None),
+            Err(PreconditionerError::InvalidMatrix(_))
+        ));
+        assert!(matches!(
+            chebyshev_with_bounds(None, Some(-1.0)),
+            Err(PreconditionerError::InvalidMatrix(_))
+        ));
+    }
+
+    /// Valid bounds (including the degenerate `λmin = λmax > 0`) build, and
+    /// `apply` stays finite.
+    #[test]
+    fn test_chebyshev_valid_bounds_give_finite_output() {
+        let r = vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0];
+        for (lambda_min, lambda_max) in [
+            (Some(0.1), Some(1.9)),
+            (Some(1.0), Some(1.0)),
+            (Some(1e-300), Some(1e300)),
+            (None, None),
+            (Some(0.2), None),
+            (None, Some(3.0)),
+        ] {
+            let poly = chebyshev_with_bounds(lambda_min, lambda_max)
+                .unwrap_or_else(|e| panic!("bounds {lambda_min:?}, {lambda_max:?} rejected: {e}"));
+            let mut z = vec![0.0; r.len()];
+            poly.apply(&r, &mut z);
+            assert!(
+                z.iter().all(|v| v.is_finite()),
+                "bounds {lambda_min:?}, {lambda_max:?}: z = {z:?}"
+            );
+        }
+    }
+
+    /// The Neumann series ignores the eigenvalue bounds, so it does not
+    /// validate them.
+    #[test]
+    fn test_neumann_ignores_bounds() {
+        let a = unit_diagonal_tridiagonal(4, -0.25);
+        let config = PolynomialConfig {
+            degree: 3,
+            lambda_min: Some(-1.0),
+            lambda_max: Some(1.0),
+        };
+        let poly = Polynomial::new(&a, PolynomialType::Neumann, config).unwrap();
+        let mut z = vec![0.0; 4];
+        poly.apply(&[1.0, 2.0, 3.0, 4.0], &mut z);
+        assert!(z.iter().all(|v| v.is_finite()));
     }
 }

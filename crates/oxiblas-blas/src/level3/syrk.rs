@@ -9,6 +9,18 @@
 //!
 //! Only the specified triangle (upper or lower) of C is updated.
 //!
+//! # Algorithm
+//!
+//! Larger problems run on the triangle-only blocked kernel shared with SYR2K
+//! and GEMMT: the GEMM packers read `A` in place (the transposed operand
+//! through their transposed fast path) and the GEMM micro-kernel computes
+//! only the micro-tiles that meet the `uplo` triangle, accumulating straight
+//! into C. No transposed copy of `A` and no `n × n` temporary are formed.
+//! Small problems, and complex `NoTrans` problems of every size (where the
+//! column updates of the loops measured faster than the scalar complex
+//! micro-kernel), use the loops of reference ?SYRK; the measured switch-over
+//! points are documented on the private `use_blocked`.
+//!
 //! # `ConjTrans` and complex element types
 //!
 //! SYRK is the *symmetric* rank-k update and always uses the plain transpose
@@ -20,8 +32,8 @@
 //! real element types `ConjTrans` is accepted and behaves like `Trans`, and for
 //! complex element types it is rejected with [`SyrkError::InvalidTrans`].
 
-use crate::level3::gemm::gemm;
 use crate::level3::gemm_kernel::GemmKernel;
+use crate::level3::tri_gemm::{KSegment, tri_update};
 use crate::level3::trsm::{Trans, Uplo};
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::{Mat, MatMut, MatRef};
@@ -141,96 +153,90 @@ pub fn syrk<T: Field + GemmKernel + bytemuck::Zeroable>(
         return Ok(());
     }
 
-    // For larger matrices, use optimized GEMM
-    // Threshold: when GEMM overhead is amortized
-    const GEMM_THRESHOLD: usize = 32;
-
-    if n >= GEMM_THRESHOLD && k >= 8 {
-        syrk_via_gemm(uplo, trans, alpha, a, beta, c, n, k)
+    // alpha == 0 never reads A (reference ?SYRK: C := beta * C on the triangle);
+    // both paths honour that, the naive one is simply cheaper for it.
+    if alpha != T::zero() && use_blocked::<T>(trans, n, k, beta == T::zero()) {
+        syrk_blocked(uplo, trans, alpha, a, beta, c);
+        Ok(())
     } else {
         syrk_naive(uplo, trans, alpha, a, beta, c, n, k)
     }
 }
 
-/// SYRK via optimized GEMM for larger matrices.
-fn syrk_via_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
+/// Whether [`syrk`] runs the blocked triangle-only kernel (otherwise the
+/// reference loops of `syrk_naive`) for an `n × n` C and inner dimension `k`.
+///
+/// Chosen from the time of the blocked kernel over the time of the loops,
+/// measured on an Apple M3 (one thread, f64 and f32; the rules follow f64,
+/// where the loops fare relatively better). With `beta == 0` (`beta_is_zero`):
+///
+/// - real `NoTrans` (the loops are column updates `C[:, j] += t·A[:, l]`):
+///   the kernel wins from `k >= 8` at `n = 6..12` (ratio 0.68-0.86), from
+///   `k >= 4` at `n = 16..32` (0.70-0.88), from `k >= 2` at `n = 48..128`
+///   (0.73-0.93) and for every `k` from `n = 256` (0.72-0.75 at `k = 1`);
+///   with `k = 1` the loops stay ahead up to `n = 128` (1.14 at `n = 64`);
+/// - real `Trans` (the loops form dot products, `A[:, i]·A[:, j]`): from
+///   `k >= 8` at `n = 12` (0.80), from `k >= 4` at `n = 16` (0.78) and for
+///   every `k` from `n = 24` (0.74 at `k = 1`);
+/// - complex `NoTrans`: never. Against the column updates of the loops, the
+///   scalar `2 × 2` complex micro-kernel does not pay off: with `k >= 16` the
+///   kernel took 0.98-1.08 times as long for Complex64 at `n = 32..1024`
+///   (0.81-0.97 at `n = 8..16`, under a microsecond) and 1.2-2.4 times as
+///   long for Complex32 at `n >= 16`; smaller `k` favour the loops more;
+/// - complex `Trans` (dot products): from `k >= 128` at `n >= 32`
+///   (Complex64: 0.78-0.97 for `n = 32..1024`, except 1.11 at
+///   `n = k = 1024`).
+///
+/// With `beta != 0` the kernel also scales the triangle up front and reads C
+/// back in every tile, which small `k` cannot amortize (`beta = 0.5`, f64,
+/// `n = 16..64`): real `NoTrans` wins from `k >= 8` at `n >= 16` (0.61-0.83)
+/// and from `k >= 4` at `n = 64` (0.92), but took 1.10-1.50 times as long
+/// with `k = 2..3` at `n = 48..64`; real `Trans` wins from `k >= 8` at
+/// `n = 16` (0.88), `k >= 3` at `n = 24` (0.77), `k >= 2` at `n = 32` (0.88)
+/// and for every `k` from `n = 48` (0.65-0.73 at `k = 1`). Shapes without a
+/// `beta != 0` measurement keep the loops (the path they took before the
+/// blocked kernel existed). The complex rule needs a long `k`, which
+/// amortizes the extra pass, and applies unchanged.
+fn use_blocked<T: Field>(trans: Trans, n: usize, k: usize, beta_is_zero: bool) -> bool {
+    match (T::is_real(), trans, beta_is_zero) {
+        (true, Trans::NoTrans, true) => {
+            (n >= 6 && k >= 8) || (n >= 16 && k >= 4) || (n >= 48 && k >= 2) || n >= 256
+        }
+        (true, Trans::NoTrans, false) => (n >= 16 && k >= 8) || (n >= 64 && k >= 4),
+        (true, Trans::Trans | Trans::ConjTrans, true) => {
+            (n >= 12 && k >= 8) || (n >= 16 && k >= 4) || n >= 24
+        }
+        (true, Trans::Trans | Trans::ConjTrans, false) => {
+            (n >= 16 && k >= 8) || (n >= 24 && k >= 3) || (n >= 32 && k >= 2) || n >= 48
+        }
+        (false, Trans::NoTrans, _) => false,
+        (false, Trans::Trans | Trans::ConjTrans, _) => n >= 32 && k >= 128,
+    }
+}
+
+/// Blocked SYRK: one triangle-only pass of the GEMM packers and micro-kernel.
+///
+/// `NoTrans` computes `C := beta·C + alpha·A·Aᵀ` as the k-segment `(A, Aᵀ)`,
+/// `Trans` (and, for real types, `ConjTrans`) computes `alpha·Aᵀ·A` as
+/// `(Aᵀ, A)`. Both operands are packed straight from `A` (the transposed one
+/// through the packers' transposed fast path); no transposed copy and no
+/// `n × n` temporary are formed, and only the micro-tiles that meet the
+/// `uplo` triangle are computed.
+fn syrk_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     uplo: Uplo,
     trans: Trans,
     alpha: T,
     a: MatRef<'_, T>,
     beta: T,
-    mut c: MatMut<'_, T>,
-    n: usize,
-    k: usize,
-) -> Result<(), SyrkError> {
-    // Create transposed copy of A
-    let a_t: Mat<T> = match trans {
-        Trans::NoTrans => {
-            // A is n×k, need A^T which is k×n
-            let mut t = Mat::zeros(k, n);
-            for i in 0..n {
-                for j in 0..k {
-                    t[(j, i)] = a[(i, j)];
-                }
-            }
-            t
-        }
-        Trans::Trans | Trans::ConjTrans => {
-            // A is k×n, need A^T which is n×k
-            let mut t = Mat::zeros(n, k);
-            for i in 0..k {
-                for j in 0..n {
-                    t[(j, i)] = a[(i, j)];
-                }
-            }
-            t
-        }
+    c: MatMut<'_, T>,
+) {
+    let segment = match trans {
+        Trans::NoTrans => KSegment::new(a, Trans::NoTrans, a, Trans::Trans),
+        // `ConjTrans` only reaches here for real types (complex is rejected
+        // above), where it is the plain transpose.
+        Trans::Trans | Trans::ConjTrans => KSegment::new(a, Trans::Trans, a, Trans::NoTrans),
     };
-
-    // Compute full result using GEMM
-    // For NoTrans: A (n×k) × A^T (k×n) → temp (n×n)
-    // For Trans: A^T (n×k) × A (k×n) → temp (n×n)
-    let mut temp: Mat<T> = Mat::zeros(n, n);
-    match trans {
-        Trans::NoTrans => {
-            // C = α·A·A^T: A is n×k, A^T is k×n
-            gemm(alpha, a, a_t.as_ref(), T::zero(), temp.as_mut());
-        }
-        Trans::Trans | Trans::ConjTrans => {
-            // C = α·A^T·A: A^T (transposed view) is n×k, A is k×n
-            gemm(alpha, a_t.as_ref(), a, T::zero(), temp.as_mut());
-        }
-    }
-
-    // Copy triangle to C with beta scaling
-    match uplo {
-        Uplo::Lower => {
-            for j in 0..n {
-                for i in j..n {
-                    let val = if beta == T::zero() {
-                        temp[(i, j)]
-                    } else {
-                        temp[(i, j)] + beta * c[(i, j)]
-                    };
-                    c.set(i, j, val);
-                }
-            }
-        }
-        Uplo::Upper => {
-            for j in 0..n {
-                for i in 0..=j {
-                    let val = if beta == T::zero() {
-                        temp[(i, j)]
-                    } else {
-                        temp[(i, j)] + beta * c[(i, j)]
-                    };
-                    c.set(i, j, val);
-                }
-            }
-        }
-    }
-
-    Ok(())
+    tri_update(uplo, alpha, &[segment], beta, c);
 }
 
 /// Direct SYRK computation for small matrices.
@@ -400,6 +406,10 @@ pub fn syrk_new<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     Ok(c)
 }
+
+#[cfg(test)]
+#[path = "syrk_family_tests.rs"]
+mod family_tests;
 
 #[cfg(test)]
 mod tests {
@@ -669,9 +679,8 @@ mod tests {
     /// For real element types, `ConjTrans` is accepted (not rejected) and must compute
     /// exactly the same result as `Trans`, since conjugation is the identity on reals.
     /// This is the documented "no-op" branch of the ConjTrans validation. (Complex
-    /// element types would be rejected with `SyrkError::InvalidTrans`, but SYRK's
-    /// `GemmKernel` bound is only satisfied by f32/f64, so that path is not runtime
-    /// reachable here.)
+    /// element types are rejected with `SyrkError::InvalidTrans`; that branch is
+    /// covered by `complex_syrk_conj_trans_rejected` in `syrk_family_tests.rs`.)
     #[test]
     fn test_syrk_conj_trans_real_matches_trans() {
         let a = Mat::from_rows(&[&[1.0f64, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
@@ -705,7 +714,7 @@ mod tests {
         }
     }
 
-    /// Regression: `beta == 0` must not read C on the GEMM path (`syrk_via_gemm`); a
+    /// Regression: `beta == 0` must not read C on the blocked path (`syrk_blocked`); a
     /// NaN in the output buffer must not survive via `0*NaN`.
     #[test]
     fn test_syrk_beta_zero_ignores_nan_c() {

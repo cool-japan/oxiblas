@@ -4,6 +4,10 @@
 //! allowing the same code to work on any platform.
 
 use crate::simd::SimdRegister;
+// Inherent `f32`/`f64` float methods (`mul_add`, `sqrt`, ...) live in `std`,
+// so they are called through `num_traits::Float`: with `std` that forwards to
+// the inherent method (bit-identical), without it to `libm`.
+use num_traits::Float;
 
 /// Scalar "register" for f64 - processes one element at a time.
 #[derive(Clone, Copy, Debug)]
@@ -66,17 +70,17 @@ impl SimdRegister for ScalarF64 {
 
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        ScalarF64(self.0.mul_add(a.0, b.0))
+        ScalarF64(Float::mul_add(self.0, a.0, b.0))
     }
 
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        ScalarF64(self.0.mul_add(a.0, -b.0))
+        ScalarF64(Float::mul_add(self.0, a.0, -b.0))
     }
 
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
-        ScalarF64((-self.0).mul_add(a.0, b.0))
+        ScalarF64(Float::mul_add(-self.0, a.0, b.0))
     }
 
     #[inline]
@@ -166,17 +170,17 @@ impl SimdRegister for ScalarF32 {
 
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        ScalarF32(self.0.mul_add(a.0, b.0))
+        ScalarF32(Float::mul_add(self.0, a.0, b.0))
     }
 
     #[inline]
     fn mul_sub(self, a: Self, b: Self) -> Self {
-        ScalarF32(self.0.mul_add(a.0, -b.0))
+        ScalarF32(Float::mul_add(self.0, a.0, -b.0))
     }
 
     #[inline]
     fn neg_mul_add(self, a: Self, b: Self) -> Self {
-        ScalarF32((-self.0).mul_add(a.0, b.0))
+        ScalarF32(Float::mul_add(-self.0, a.0, b.0))
     }
 
     #[inline]

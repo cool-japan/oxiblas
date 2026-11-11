@@ -744,7 +744,7 @@ where
     // Determine sign of determinant
     let det_sign = if min_diag == T::zero() {
         0
-    } else if num_swaps % 2 == 0 {
+    } else if num_swaps.is_multiple_of(2) {
         1
     } else {
         -1

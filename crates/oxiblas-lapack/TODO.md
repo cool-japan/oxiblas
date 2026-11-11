@@ -33,10 +33,10 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] General eigenvalues (Schur-based)
 - [x] Left and right eigenvectors
 - [x] Generalized symmetric eigenvalues (partial)
-- [x] QZ algorithm
+- [x] QZ algorithm - `Qz::compute` is a LAPACK DGGES equivalent (`SORT='N'`) since 0.2.3; the 0.2.2 iteration returned wrong factors and eigenvalues (#6)
 
 ### Missing
-- [x] Divide-and-conquer symmetric EVD (SymmetricEvdDc, HermitianEvdDc)
+- [x] Divide-and-conquer symmetric EVD (SymmetricEvdDc, HermitianEvdDc) — 0.2.3: `SymmetricEvdDc` rebuilt as LAPACK `DSYEVD` (blocked tridiagonal reduction, `DLAED`-style merges with GEMM, compact-WY back-transformation) and `HermitianEvdDc` as `ZHEEVD` on the same real divide and conquer; `HermitianEvdDc` returned non-finite or wrong eigenvalues for n > 100 before
 - [x] MRRR algorithm (MrrrEvd with LDL representation and inverse iteration)
 - [x] Bisection + inverse iteration (TridiagEvd)
 - [x] Selected eigenvalues only (range or index) (EigenvalueSelector)
@@ -44,6 +44,8 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Eigenvector refinement (trevc) - trevc_right, trevc_left, Schur::eigenvectors
 - [x] Balancing (gebal/gebak)
 - [x] Randomized EVD (HMT algorithm) - RandomizedEvd with power iteration, f64/f32 (v0.2.0)
+- [x] Generalized eigenvalue reordering - `Qz::compute_sorted` (DGGES `SORT='S'`) and `Qz::reorder` (DTGSEN `IJOB=0`), `QzOrdering`, `QzReorderError` (both `#[non_exhaustive]`) (0.2.3, #6)
+- [ ] DTGSEN condition estimates (`IJOB != 0`: PL/PR/DIF via DTGSYL/DLATDF/DLACN2)
 
 ---
 
@@ -51,7 +53,7 @@ LAPACK (Linear Algebra Package) implementations.
 
 ### Current Status
 - [x] Jacobi SVD
-- [x] Divide-and-conquer SVD
+- [x] Divide-and-conquer SVD — 0.2.3: `SvdDc` follows `dgesdd` with a port of `dbdsdc` on the bidiagonal; the 0.2.2 version (Cuppen on `BᵀB`) was not backward stable for graded spectra and depended on the input magnitude
 - [x] Bidiagonal SVD
 
 ### Missing
@@ -176,10 +178,12 @@ LAPACK (Linear Algebra Package) implementations.
 ## Performance
 
 ### Optimizations Completed
-- [x] Blocked LU factorization with GEMM (Lu::compute_blocked) - **up to 23x speedup**
-- [x] Blocked Cholesky factorization with GEMM (Cholesky::compute_blocked) - **up to 10x speedup**
+- [x] Blocked LU factorization with GEMM (Lu::compute_blocked) - up to 23x over the row-walking unblocked LU of 2025-12 — 0.2.3: in place, with recursive (`?getrf2`) panels, TRSM and one GEMM per panel; the unblocked LU runs column by column, so the blocked/unblocked ratio is now 2.2-3.5x (20.5-37.9 GFLOPS blocked, measured 2026-11-09)
+- [x] Blocked Cholesky factorization with GEMM (Cholesky::compute_blocked) - up to 10x over the unblocked Cholesky of 2025-12 — 0.2.3: in place, GEMM on the lower off-diagonal blocks and a triangle-only SYRK on the diagonal blocks; the unblocked Cholesky runs column by column, so the blocked/unblocked ratio is now 2.5-3.6x (29.3-41.3 GFLOPS blocked, measured 2026-11-09)
 
 ### Blocked LU Performance (vs unblocked)
+
+*Measured 2025-12, before the 0.2.3 LU and Cholesky rewrites. Current figures are in [Performance](../../README.md#performance) in the root README.*
 
 | Size | Unblocked | Blocked | Speedup |
 |------|-----------|---------|---------|
@@ -189,6 +193,8 @@ LAPACK (Linear Algebra Package) implementations.
 | 1024 | 0.35 Gf/s | 6.99 Gf/s | 19.74x |
 
 ### Blocked Cholesky Performance (vs unblocked)
+
+*Measured 2025-12, before the 0.2.3 LU and Cholesky rewrites. Current figures are in [Performance](../../README.md#performance) in the root README.*
 
 | Size | Unblocked | Blocked | Speedup |
 |------|-----------|---------|---------|
@@ -201,17 +207,19 @@ LAPACK (Linear Algebra Package) implementations.
 - [x] Blocked Hessenberg reduction (Hessenberg::compute_blocked)
 - [x] Blocked bidiagonalization (BidiagFactors::compute_blocked)
 - [x] Parallel eigenvalue computation (ParallelSymmetricEvd, parallel_bisection_eigenvalues)
-- [x] Parallel SVD computation (ParallelSvdDc)
+- [x] Parallel SVD computation (ParallelSvdDc) — 0.2.3: returned `Ok` with wrong factors for most inputs larger than 3x3; now `SvdDc::compute_with_par(a, Par::Rayon)`, bitwise equal to `SvdDc::compute`
 
 ### Targets
 
+No MKL comparison exists yet: the `comparison` bench measures OpenBLAS only, and the "Current" figures once listed here were never measured.
+
 | Operation | Size | Current | Target |
 |-----------|------|---------|--------|
-| LU | 1000x1000 | ~75% MKL | 85% MKL |
-| Cholesky | 1000x1000 | ~80% MKL | 90% MKL |
-| QR | 1000x1000 | ~70% MKL | 80% MKL |
-| SVD | 1000x1000 | ~60% MKL | 75% MKL |
-| Symmetric EVD | 1000x1000 | ~65% MKL | 80% MKL |
+| LU | 1000x1000 | not measured | 85% MKL |
+| Cholesky | 1000x1000 | not measured | 90% MKL |
+| QR | 1000x1000 | not measured | 80% MKL |
+| SVD | 1000x1000 | not measured | 75% MKL |
+| Symmetric EVD | 1000x1000 | not measured | 80% MKL |
 
 ---
 

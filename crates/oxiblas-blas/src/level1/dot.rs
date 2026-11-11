@@ -28,8 +28,27 @@ use oxiblas_core::scalar::Field;
 /// let result = dot(&x, &y);
 /// assert!((result - 32.0).abs() < 1e-10);
 /// ```
+///
+/// On aarch64, `f64` and `f32` vectors run on the NEON kernels behind
+/// [`dot_f64`] / [`dot_f32`] (unless the `force-scalar` feature is enabled);
+/// other element types and targets use the portable loop below.
 pub fn dot<T: Field>(x: &[T], y: &[T]) -> T {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        use super::typed::{same_slice, same_value};
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f64>(x), same_slice::<T, f64>(y))
+            && let Some(r) = same_value::<f64, T>(super::dot_neon::dot_f64(xs, ys))
+        {
+            return r;
+        }
+        if let (Some(xs), Some(ys)) = (same_slice::<T, f32>(x), same_slice::<T, f32>(y))
+            && let Some(r) = same_value::<f32, T>(super::dot_neon::dot_f32(xs, ys))
+        {
+            return r;
+        }
+    }
 
     let n = x.len();
     if n == 0 {
@@ -86,12 +105,29 @@ pub fn dotc<T: Field>(x: &[T], y: &[T]) -> T {
 /// SIMD-optimized dot product for f64.
 ///
 /// Uses NEON FMA on aarch64 and AVX2/FMA on `x86_64` for performance.
-/// For very large vectors, uses blocked accumulation for better cache utilization.
+/// On aarch64 a single 8-accumulator kernel serves every length (its two-level
+/// summation bounds error growth on long vectors); elsewhere very large vectors
+/// use blocked accumulation.
 #[inline]
 #[must_use]
 pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dot_neon::dot_f64(x, y)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f64_portable(x, y)
+    }
+}
+
+/// [`dot_f64`] on targets other than aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f64_portable(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
     if n == 0 {
         return 0.0;
@@ -104,30 +140,29 @@ pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
 
     // For medium vectors, use SIMD directly
     if n < 8192 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return unsafe { dot_f64_neon(x, y) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal).
                 return unsafe { dot_f64_avx2(x, y) };
             }
         }
     }
 
     // For large vectors, use blocked approach for better cache efficiency
-    #[cfg(target_arch = "aarch64")]
-    {
-        return dot_f64_blocked(x, y);
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return dot_f64_blocked(x, y);
         }
+    }
+
+    // Other architectures: the blocked driver falls back to the unrolled
+    // scalar kernel per block, which bounds error growth on long vectors.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return dot_f64_blocked(x, y);
     }
 
     #[allow(unreachable_code)]
@@ -142,6 +177,21 @@ pub fn dot_f64(x: &[f64], y: &[f64]) -> f64 {
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     assert_eq!(x.len(), y.len(), "Vector lengths must match");
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::dot_neon::dot_f32(x, y)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_f32_portable(x, y)
+    }
+}
+
+/// [`dot_f32`] on targets other than aarch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f32_portable(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
     if n == 0 {
         return 0.0;
@@ -154,25 +204,17 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
 
     // For medium vectors, use SIMD directly
     if n < 8192 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            return unsafe { dot_f32_neon(x, y) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal).
                 return unsafe { dot_f32_avx2(x, y) };
             }
         }
     }
 
     // For large vectors, use blocked approach
-    #[cfg(target_arch = "aarch64")]
-    {
-        return dot_f32_blocked(x, y);
-    }
-
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -180,11 +222,19 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
         }
     }
 
+    // Other architectures: the blocked driver falls back to the unrolled
+    // scalar kernel per block, which bounds error growth on long vectors.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        return dot_f32_blocked(x, y);
+    }
+
     #[allow(unreachable_code)]
     dot_f32_scalar(x, y)
 }
 
-/// Scalar dot product for f64 with 8-way unrolling.
+/// Scalar dot product for f64, unrolled 4-way into four FMA accumulators.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_f64_scalar(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
@@ -213,7 +263,8 @@ fn dot_f64_scalar(x: &[f64], y: &[f64]) -> f64 {
     (acc0 + acc1) + (acc2 + acc3)
 }
 
-/// Scalar dot product for f32 with 8-way unrolling.
+/// Scalar dot product for f32, unrolled 4-way into four FMA accumulators.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len();
@@ -245,6 +296,7 @@ fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
 /// Blocked dot product for f64 (better cache efficiency for large vectors).
 ///
 /// Processes the vector in blocks that fit well in L1/L2 cache.
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
     const BLOCK_SIZE: usize = 1024; // ~8KB per vector block, fits in L1 cache
 
@@ -257,21 +309,18 @@ fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
         let start = block * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(n);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            total += unsafe { dot_f64_neon(&x[start..end], &y[start..end]) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only the two equal-length block slices.
                 total += unsafe { dot_f64_avx2(&x[start..end], &y[start..end]) };
             } else {
                 total += dot_f64_scalar(&x[start..end], &y[start..end]);
             }
         }
 
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         {
             total += dot_f64_scalar(&x[start..end], &y[start..end]);
         }
@@ -281,6 +330,7 @@ fn dot_f64_blocked(x: &[f64], y: &[f64]) -> f64 {
 }
 
 /// Blocked dot product for f32.
+#[cfg(not(target_arch = "aarch64"))]
 fn dot_f32_blocked(x: &[f32], y: &[f32]) -> f32 {
     const BLOCK_SIZE: usize = 2048; // ~8KB per vector block, fits in L1 cache
 
@@ -293,131 +343,24 @@ fn dot_f32_blocked(x: &[f32], y: &[f32]) -> f32 {
         let start = block * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(n);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            total += unsafe { dot_f32_neon(&x[start..end], &y[start..end]) };
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: AVX2 and FMA were detected at run time just above, and the
+                // kernel reads only the two equal-length block slices.
                 total += unsafe { dot_f32_avx2(&x[start..end], &y[start..end]) };
             } else {
                 total += dot_f32_scalar(&x[start..end], &y[start..end]);
             }
         }
 
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         {
             total += dot_f32_scalar(&x[start..end], &y[start..end]);
         }
     }
 
     total
-}
-
-/// NEON optimized dot product for f64.
-///
-/// Processes 8 elements per iteration (4 NEON registers × 2 f64 each).
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_f64_neon(x: &[f64], y: &[f64]) -> f64 {
-    use core::arch::aarch64::{vaddq_f64, vaddvq_f64, vdupq_n_f64, vfmaq_f64, vld1q_f64};
-
-    let n = x.len();
-
-    let mut sum_vec0 = vdupq_n_f64(0.0);
-    let mut sum_vec1 = vdupq_n_f64(0.0);
-    let mut sum_vec2 = vdupq_n_f64(0.0);
-    let mut sum_vec3 = vdupq_n_f64(0.0);
-
-    let chunks = n / 8;
-    let remainder = n % 8;
-
-    for i in 0..chunks {
-        let base = i * 8;
-        let x_ptr = x.as_ptr().add(base);
-        let y_ptr = y.as_ptr().add(base);
-
-        let x0 = vld1q_f64(x_ptr);
-        let x1 = vld1q_f64(x_ptr.add(2));
-        let x2 = vld1q_f64(x_ptr.add(4));
-        let x3 = vld1q_f64(x_ptr.add(6));
-
-        let y0 = vld1q_f64(y_ptr);
-        let y1 = vld1q_f64(y_ptr.add(2));
-        let y2 = vld1q_f64(y_ptr.add(4));
-        let y3 = vld1q_f64(y_ptr.add(6));
-
-        sum_vec0 = vfmaq_f64(sum_vec0, x0, y0);
-        sum_vec1 = vfmaq_f64(sum_vec1, x1, y1);
-        sum_vec2 = vfmaq_f64(sum_vec2, x2, y2);
-        sum_vec3 = vfmaq_f64(sum_vec3, x3, y3);
-    }
-
-    // Combine accumulators
-    let sum_01 = vaddq_f64(sum_vec0, sum_vec1);
-    let sum_23 = vaddq_f64(sum_vec2, sum_vec3);
-    let sum_all = vaddq_f64(sum_01, sum_23);
-    let mut sum = vaddvq_f64(sum_all);
-
-    // Handle remainder
-    let base = chunks * 8;
-    for i in 0..remainder {
-        sum = x[base + i].mul_add(y[base + i], sum);
-    }
-
-    sum
-}
-
-/// NEON optimized dot product for f32.
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_f32_neon(x: &[f32], y: &[f32]) -> f32 {
-    use core::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
-
-    let n = x.len();
-
-    let mut sum_vec0 = vdupq_n_f32(0.0);
-    let mut sum_vec1 = vdupq_n_f32(0.0);
-    let mut sum_vec2 = vdupq_n_f32(0.0);
-    let mut sum_vec3 = vdupq_n_f32(0.0);
-
-    let chunks = n / 16;
-    let remainder = n % 16;
-
-    for i in 0..chunks {
-        let base = i * 16;
-        let x_ptr = x.as_ptr().add(base);
-        let y_ptr = y.as_ptr().add(base);
-
-        let x0 = vld1q_f32(x_ptr);
-        let x1 = vld1q_f32(x_ptr.add(4));
-        let x2 = vld1q_f32(x_ptr.add(8));
-        let x3 = vld1q_f32(x_ptr.add(12));
-
-        let y0 = vld1q_f32(y_ptr);
-        let y1 = vld1q_f32(y_ptr.add(4));
-        let y2 = vld1q_f32(y_ptr.add(8));
-        let y3 = vld1q_f32(y_ptr.add(12));
-
-        sum_vec0 = vfmaq_f32(sum_vec0, x0, y0);
-        sum_vec1 = vfmaq_f32(sum_vec1, x1, y1);
-        sum_vec2 = vfmaq_f32(sum_vec2, x2, y2);
-        sum_vec3 = vfmaq_f32(sum_vec3, x3, y3);
-    }
-
-    // Combine accumulators
-    let sum_01 = vaddq_f32(sum_vec0, sum_vec1);
-    let sum_23 = vaddq_f32(sum_vec2, sum_vec3);
-    let sum_all = vaddq_f32(sum_01, sum_23);
-    let mut sum = vaddvq_f32(sum_all);
-
-    // Handle remainder
-    let base = chunks * 16;
-    for i in 0..remainder {
-        sum = x[base + i].mul_add(y[base + i], sum);
-    }
-
-    sum
 }
 
 /// AVX2/FMA optimized dot product for f64.
@@ -558,12 +501,18 @@ pub fn dotc_c64(x: &[Complex64], y: &[Complex64]) -> Complex64 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotc_c64_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotc_c64_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotc_c64_avx2(x, y) };
         }
     }
@@ -592,12 +541,18 @@ pub fn dotc_c32(x: &[Complex32], y: &[Complex32]) -> Complex32 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotc_c32_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotc_c32_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotc_c32_avx2(x, y) };
         }
     }
@@ -626,12 +581,18 @@ pub fn dotu_c64(x: &[Complex64], y: &[Complex64]) -> Complex64 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotu_c64_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotu_c64_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotu_c64_avx2(x, y) };
         }
     }
@@ -660,12 +621,18 @@ pub fn dotu_c32(x: &[Complex32], y: &[Complex32]) -> Complex32 {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the kernel reads only
+        // `x[..n]` and `y[..n]` (lengths asserted equal above).
         return unsafe { dotu_c32_neon(x, y) };
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: `avx2` and `fma`, the `#[target_feature]`s of
+            // `dotu_c32_avx2`, were detected at run time just above, and the
+            // kernel reads only `x[..n]` and `y[..n]` (lengths asserted equal
+            // above).
             return unsafe { dotu_c32_avx2(x, y) };
         }
     }
@@ -1365,634 +1332,5 @@ unsafe fn dotu_c32_avx2(x: &[Complex32], y: &[Complex32]) -> Complex32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dot_f64() {
-        let x = [1.0f64, 2.0, 3.0, 4.0, 5.0];
-        let y = [5.0f64, 4.0, 3.0, 2.0, 1.0];
-
-        // 1*5 + 2*4 + 3*3 + 4*2 + 5*1 = 5 + 8 + 9 + 8 + 5 = 35
-        let result = dot(&x, &y);
-        assert!((result - 35.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_dot_f32() {
-        let x = [1.0f32, 2.0, 3.0];
-        let y = [4.0f32, 5.0, 6.0];
-
-        let result = dot(&x, &y);
-        assert!((result - 32.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_dot_empty() {
-        let x: [f64; 0] = [];
-        let y: [f64; 0] = [];
-
-        let result = dot(&x, &y);
-        assert_eq!(result, 0.0);
-    }
-
-    #[test]
-    fn test_dot_single() {
-        let x = [3.0f64];
-        let y = [4.0f64];
-
-        let result = dot(&x, &y);
-        assert!((result - 12.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_dot_large() {
-        let n = 1000;
-        let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
-        let y: Vec<f64> = vec![1.0; n];
-
-        // Sum of 1 to n = n*(n+1)/2 = 500500
-        let result = dot(&x, &y);
-        assert!((result - 500500.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dot_f64_simd() {
-        let n = 1000;
-        let x: Vec<f64> = (1..=n).map(|i| i as f64).collect();
-        let y: Vec<f64> = vec![1.0; n];
-
-        let result = dot_f64(&x, &y);
-        let expected = 500500.0;
-        assert!(
-            (result - expected).abs() < 1e-6,
-            "Expected {}, got {}",
-            expected,
-            result
-        );
-    }
-
-    #[test]
-    fn test_dot_f32_simd() {
-        let n = 1000;
-        let x: Vec<f32> = (1..=n).map(|i| i as f32).collect();
-        let y: Vec<f32> = vec![1.0; n];
-
-        let result = dot_f32(&x, &y);
-        let expected = 500500.0f32;
-        assert!(
-            (result - expected).abs() < 1.0, // f32 has less precision
-            "Expected {}, got {}",
-            expected,
-            result
-        );
-    }
-
-    #[test]
-    fn test_dot_f64_large() {
-        // Test with large vector to exercise blocked path
-        let n = 100000;
-        let x: Vec<f64> = vec![1.0; n];
-        let y: Vec<f64> = vec![1.0; n];
-
-        let result = dot_f64(&x, &y);
-        assert!(
-            (result - n as f64).abs() < 1e-6,
-            "Expected {}, got {}",
-            n,
-            result
-        );
-    }
-
-    #[test]
-    fn test_dot_f32_large() {
-        // Test with large vector to exercise blocked path
-        let n = 100000;
-        let x: Vec<f32> = vec![1.0; n];
-        let y: Vec<f32> = vec![1.0; n];
-
-        let result = dot_f32(&x, &y);
-        assert!(
-            (result - n as f32).abs() < 100.0, // f32 accumulation error grows
-            "Expected {}, got {}",
-            n,
-            result
-        );
-    }
-
-    #[test]
-    fn test_dot_f64_consistency() {
-        // Test that SIMD and generic implementations give consistent results
-        let n = 500;
-        let x: Vec<f64> = (0..n).map(|i| (i as f64) * 0.1).collect();
-        let y: Vec<f64> = (0..n).map(|i| (n - i) as f64 * 0.1).collect();
-
-        let result_generic = dot(&x, &y);
-        let result_simd = dot_f64(&x, &y);
-
-        assert!(
-            (result_generic - result_simd).abs() / result_generic.abs() < 1e-10,
-            "Generic: {}, SIMD: {}",
-            result_generic,
-            result_simd
-        );
-    }
-
-    #[test]
-    fn test_dot_edge_cases() {
-        // Empty vectors
-        let x: Vec<f64> = vec![];
-        let y: Vec<f64> = vec![];
-        assert_eq!(dot_f64(&x, &y), 0.0);
-
-        // Single element
-        let x = vec![5.0f64];
-        let y = vec![3.0f64];
-        assert!((dot_f64(&x, &y) - 15.0).abs() < 1e-10);
-
-        // Odd length
-        let x = vec![1.0f64, 2.0, 3.0, 4.0, 5.0];
-        let y = vec![1.0f64, 1.0, 1.0, 1.0, 1.0];
-        assert!((dot_f64(&x, &y) - 15.0).abs() < 1e-10);
-    }
-
-    // =============================================================================
-    // Complex dot product tests
-    // =============================================================================
-
-    #[test]
-    fn test_dotc_c64_basic() {
-        // Test conjugate dot product
-        // x = [1+2i, 3+4i], y = [5+6i, 7+8i]
-        // conj(x) * y = (1-2i)(5+6i) + (3-4i)(7+8i)
-        //             = (5+12) + (6-10)i + (21+32) + (24-28)i
-        //             = 17 + (-4)i + 53 + (-4)i
-        //             = 70 + (-8)i
-        let x = vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
-        let y = vec![Complex64::new(5.0, 6.0), Complex64::new(7.0, 8.0)];
-
-        let result = dotc_c64(&x, &y);
-        assert!((result.re - 70.0).abs() < 1e-10, "re: {}", result.re);
-        assert!((result.im - (-8.0)).abs() < 1e-10, "im: {}", result.im);
-    }
-
-    #[test]
-    fn test_dotu_c64_basic() {
-        // Test unconjugated dot product
-        // x = [1+2i, 3+4i], y = [5+6i, 7+8i]
-        // x * y = (1+2i)(5+6i) + (3+4i)(7+8i)
-        //       = (5-12) + (6+10)i + (21-32) + (24+28)i
-        //       = -7 + 16i + (-11) + 52i
-        //       = -18 + 68i
-        let x = vec![Complex64::new(1.0, 2.0), Complex64::new(3.0, 4.0)];
-        let y = vec![Complex64::new(5.0, 6.0), Complex64::new(7.0, 8.0)];
-
-        let result = dotu_c64(&x, &y);
-        assert!((result.re - (-18.0)).abs() < 1e-10, "re: {}", result.re);
-        assert!((result.im - 68.0).abs() < 1e-10, "im: {}", result.im);
-    }
-
-    #[test]
-    fn test_dotc_c32_basic() {
-        let x = vec![Complex32::new(1.0, 2.0), Complex32::new(3.0, 4.0)];
-        let y = vec![Complex32::new(5.0, 6.0), Complex32::new(7.0, 8.0)];
-
-        let result = dotc_c32(&x, &y);
-        assert!((result.re - 70.0).abs() < 1e-5, "re: {}", result.re);
-        assert!((result.im - (-8.0)).abs() < 1e-5, "im: {}", result.im);
-    }
-
-    #[test]
-    fn test_dotu_c32_basic() {
-        let x = vec![Complex32::new(1.0, 2.0), Complex32::new(3.0, 4.0)];
-        let y = vec![Complex32::new(5.0, 6.0), Complex32::new(7.0, 8.0)];
-
-        let result = dotu_c32(&x, &y);
-        assert!((result.re - (-18.0)).abs() < 1e-5, "re: {}", result.re);
-        assert!((result.im - 68.0).abs() < 1e-5, "im: {}", result.im);
-    }
-
-    #[test]
-    fn test_dotc_c64_empty() {
-        let x: Vec<Complex64> = vec![];
-        let y: Vec<Complex64> = vec![];
-
-        let result = dotc_c64(&x, &y);
-        assert_eq!(result, Complex64::new(0.0, 0.0));
-    }
-
-    #[test]
-    fn test_dotc_c64_single() {
-        let x = vec![Complex64::new(3.0, 4.0)];
-        let y = vec![Complex64::new(1.0, 2.0)];
-
-        // conj(3+4i) * (1+2i) = (3-4i)(1+2i) = 3 + 6i - 4i - 8i^2 = 3 + 2i + 8 = 11 + 2i
-        let result = dotc_c64(&x, &y);
-        assert!((result.re - 11.0).abs() < 1e-10);
-        assert!((result.im - 2.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_dotc_c64_medium() {
-        // Medium-sized test to exercise SIMD path but verify correctness
-        let n = 100;
-        let x: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(i as f64, (i as f64) * 0.5))
-            .collect();
-        let y: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(1.0, 0.1 * i as f64))
-            .collect();
-
-        let result_simd = dotc_c64(&x, &y);
-
-        // Compare with scalar implementation
-        let result_scalar = dotc_c64_scalar(&x, &y);
-
-        assert!(
-            (result_simd.re - result_scalar.re).abs() < 1e-6,
-            "re: simd={}, scalar={}",
-            result_simd.re,
-            result_scalar.re
-        );
-        assert!(
-            (result_simd.im - result_scalar.im).abs() < 1e-6,
-            "im: simd={}, scalar={}",
-            result_simd.im,
-            result_scalar.im
-        );
-    }
-
-    #[test]
-    fn test_dotc_c64_large() {
-        // Large test to exercise SIMD path
-        let n = 10000;
-        let x: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new((i % 100) as f64, ((i + 50) % 100) as f64))
-            .collect();
-        let y: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(((i + 25) % 100) as f64, ((i + 75) % 100) as f64))
-            .collect();
-
-        let result_simd = dotc_c64(&x, &y);
-
-        // Compare with scalar implementation
-        let result_scalar = dotc_c64_scalar(&x, &y);
-
-        let re_err = (result_simd.re - result_scalar.re).abs() / result_scalar.re.abs().max(1.0);
-        let im_err = (result_simd.im - result_scalar.im).abs() / result_scalar.im.abs().max(1.0);
-
-        assert!(
-            re_err < 1e-10,
-            "re: simd={}, scalar={}, rel_err={}",
-            result_simd.re,
-            result_scalar.re,
-            re_err
-        );
-        assert!(
-            im_err < 1e-10,
-            "im: simd={}, scalar={}, rel_err={}",
-            result_simd.im,
-            result_scalar.im,
-            im_err
-        );
-    }
-
-    #[test]
-    fn test_dotu_c64_large() {
-        let n = 10000;
-        let x: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new((i % 100) as f64, ((i + 50) % 100) as f64))
-            .collect();
-        let y: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(((i + 25) % 100) as f64, ((i + 75) % 100) as f64))
-            .collect();
-
-        let result_simd = dotu_c64(&x, &y);
-        let result_scalar = dotu_c64_scalar(&x, &y);
-
-        let re_err = (result_simd.re - result_scalar.re).abs() / result_scalar.re.abs().max(1.0);
-        let im_err = (result_simd.im - result_scalar.im).abs() / result_scalar.im.abs().max(1.0);
-
-        assert!(
-            re_err < 1e-10,
-            "re: simd={}, scalar={}, rel_err={}",
-            result_simd.re,
-            result_scalar.re,
-            re_err
-        );
-        assert!(
-            im_err < 1e-10,
-            "im: simd={}, scalar={}, rel_err={}",
-            result_simd.im,
-            result_scalar.im,
-            im_err
-        );
-    }
-
-    #[test]
-    fn test_dotc_c32_large() {
-        let n = 10000;
-        let x: Vec<Complex32> = (0..n)
-            .map(|i| Complex32::new((i % 100) as f32, ((i + 50) % 100) as f32))
-            .collect();
-        let y: Vec<Complex32> = (0..n)
-            .map(|i| Complex32::new(((i + 25) % 100) as f32, ((i + 75) % 100) as f32))
-            .collect();
-
-        let result_simd = dotc_c32(&x, &y);
-        let result_scalar = dotc_c32_scalar(&x, &y);
-
-        let re_err = (result_simd.re - result_scalar.re).abs() / result_scalar.re.abs().max(1.0);
-        let im_err = (result_simd.im - result_scalar.im).abs() / result_scalar.im.abs().max(1.0);
-
-        assert!(
-            re_err < 1e-4,
-            "re: simd={}, scalar={}, rel_err={}",
-            result_simd.re,
-            result_scalar.re,
-            re_err
-        );
-        assert!(
-            im_err < 1e-4,
-            "im: simd={}, scalar={}, rel_err={}",
-            result_simd.im,
-            result_scalar.im,
-            im_err
-        );
-    }
-
-    #[test]
-    fn test_dotu_c32_large() {
-        let n = 10000;
-        let x: Vec<Complex32> = (0..n)
-            .map(|i| Complex32::new((i % 100) as f32, ((i + 50) % 100) as f32))
-            .collect();
-        let y: Vec<Complex32> = (0..n)
-            .map(|i| Complex32::new(((i + 25) % 100) as f32, ((i + 75) % 100) as f32))
-            .collect();
-
-        let result_simd = dotu_c32(&x, &y);
-        let result_scalar = dotu_c32_scalar(&x, &y);
-
-        let re_err = (result_simd.re - result_scalar.re).abs() / result_scalar.re.abs().max(1.0);
-        let im_err = (result_simd.im - result_scalar.im).abs() / result_scalar.im.abs().max(1.0);
-
-        assert!(
-            re_err < 1e-4,
-            "re: simd={}, scalar={}, rel_err={}",
-            result_simd.re,
-            result_scalar.re,
-            re_err
-        );
-        assert!(
-            im_err < 1e-4,
-            "im: simd={}, scalar={}, rel_err={}",
-            result_simd.im,
-            result_scalar.im,
-            im_err
-        );
-    }
-
-    #[test]
-    fn test_dotc_c64_self_dot() {
-        // Dot product with conjugate should give real result for x^H * x
-        let n = 100;
-        let x: Vec<Complex64> = (0..n)
-            .map(|i| Complex64::new(i as f64, (i as f64) * 0.5))
-            .collect();
-
-        let result = dotc_c64(&x, &x);
-
-        // x^H * x should be purely real (imaginary part should be ~0)
-        assert!(
-            result.im.abs() < 1e-10,
-            "x^H * x should be real, but im={}",
-            result.im
-        );
-
-        // x^H * x should equal sum of |x[i]|^2
-        let expected_re: f64 = x.iter().map(|c| c.norm_sqr()).sum();
-        assert!(
-            (result.re - expected_re).abs() < 1e-6,
-            "re: {}, expected: {}",
-            result.re,
-            expected_re
-        );
-    }
-
-    #[test]
-    fn test_complex_dot_remainder_handling() {
-        // Test various sizes to exercise remainder handling
-        for n in [1, 2, 3, 5, 7, 9, 15, 17, 31, 33, 63, 65] {
-            let x: Vec<Complex64> = (0..n).map(|i| Complex64::new(i as f64, 1.0)).collect();
-            let y: Vec<Complex64> = (0..n).map(|i| Complex64::new(1.0, i as f64)).collect();
-
-            let result_simd = dotc_c64(&x, &y);
-            let result_scalar = dotc_c64_scalar(&x, &y);
-
-            assert!(
-                (result_simd.re - result_scalar.re).abs() < 1e-10,
-                "n={}: re mismatch",
-                n
-            );
-            assert!(
-                (result_simd.im - result_scalar.im).abs() < 1e-10,
-                "n={}: im mismatch",
-                n
-            );
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Regression: reversed sign-mask lane order in the AVX2 ZDOTU/CDOTU kernels
-    // negated the real part of the unconjugated complex dot product. These tests
-    // pin the kernels against an independent reference using GENUINELY ASYMMETRIC
-    // complex vectors (re and im differ in sign and magnitude, with negatives).
-    // A symmetric or real-only test vector would NOT expose a flipped real sign,
-    // which is why the historic bug went unnoticed.
-    // -------------------------------------------------------------------------
-
-    /// Independent, straightforward reference for the unconjugated complex dot
-    /// product: `Σ x[i] * y[i]` with re = re*re - im*im, im = re*im + im*re.
-    fn dotu_c64_reference(x: &[Complex64], y: &[Complex64]) -> Complex64 {
-        let mut re = 0.0f64;
-        let mut im = 0.0f64;
-        for (a, b) in x.iter().zip(y.iter()) {
-            re += a.re * b.re - a.im * b.im;
-            im += a.re * b.im + a.im * b.re;
-        }
-        Complex64::new(re, im)
-    }
-
-    /// Independent reference for the conjugated complex dot product:
-    /// `Σ conj(x[i]) * y[i]` with re = re*re + im*im, im = re*im - im*re.
-    fn dotc_c64_reference(x: &[Complex64], y: &[Complex64]) -> Complex64 {
-        let mut re = 0.0f64;
-        let mut im = 0.0f64;
-        for (a, b) in x.iter().zip(y.iter()) {
-            re += a.re * b.re + a.im * b.im;
-            im += a.re * b.im - a.im * b.re;
-        }
-        Complex64::new(re, im)
-    }
-
-    /// Build asymmetric Complex64 test vectors of length `n`: components mix
-    /// positive and negative values and re/im magnitudes differ per element.
-    fn asymmetric_c64(n: usize) -> (Vec<Complex64>, Vec<Complex64>) {
-        let x: Vec<Complex64> = (0..n)
-            .map(|i| {
-                let ii = i as f64;
-                let re = if i % 2 == 0 { ii + 1.0 } else { -(ii + 1.0) };
-                let im = ii - 13.0; // spans negative and positive
-                Complex64::new(re, im)
-            })
-            .collect();
-        let y: Vec<Complex64> = (0..n)
-            .map(|i| {
-                let ii = i as f64;
-                let re = ii - 7.0; // spans negative and positive
-                let im = if i % 3 == 0 {
-                    -(2.0 * ii + 1.0)
-                } else {
-                    2.0 * ii + 1.0
-                };
-                Complex64::new(re, im)
-            })
-            .collect();
-        (x, y)
-    }
-
-    #[test]
-    fn test_dotu_c64_avx2_asymmetric_signs() {
-        // n odd and > 16 so the AVX2 path runs (chunks + scalar remainder).
-        let (x, y) = asymmetric_c64(37);
-
-        let expected = dotu_c64_reference(&x, &y);
-        let simd = dotu_c64(&x, &y);
-        let scalar = dotu_c64_scalar(&x, &y);
-
-        // Guard the test itself: the real part must be large and non-zero so a
-        // flipped sign (the historic bug) is unambiguously observable.
-        assert!(
-            expected.re.abs() > 100.0,
-            "test data too weak to catch a sign flip: re={}",
-            expected.re
-        );
-
-        assert!(
-            (simd.re - expected.re).abs() < 1e-8,
-            "re: simd={}, expected={}",
-            simd.re,
-            expected.re
-        );
-        assert!(
-            (simd.im - expected.im).abs() < 1e-8,
-            "im: simd={}, expected={}",
-            simd.im,
-            expected.im
-        );
-        assert!(
-            (scalar.re - expected.re).abs() < 1e-8,
-            "scalar re: {} vs expected {}",
-            scalar.re,
-            expected.re
-        );
-        assert!(
-            (scalar.im - expected.im).abs() < 1e-8,
-            "scalar im: {} vs expected {}",
-            scalar.im,
-            expected.im
-        );
-    }
-
-    #[test]
-    fn test_dotc_c64_avx2_asymmetric_signs() {
-        // Independently guard the conjugated kernel against the same bug class.
-        let (x, y) = asymmetric_c64(37);
-
-        let expected = dotc_c64_reference(&x, &y);
-        let simd = dotc_c64(&x, &y);
-
-        assert!(
-            expected.im.abs() > 100.0,
-            "test data too weak to catch an imag sign flip: im={}",
-            expected.im
-        );
-
-        assert!(
-            (simd.re - expected.re).abs() < 1e-8,
-            "re: simd={}, expected={}",
-            simd.re,
-            expected.re
-        );
-        assert!(
-            (simd.im - expected.im).abs() < 1e-8,
-            "im: simd={}, expected={}",
-            simd.im,
-            expected.im
-        );
-    }
-
-    #[test]
-    fn test_dotu_c32_avx2_asymmetric_signs() {
-        // n > 32 so the CDOTU AVX2 path runs. Keep magnitudes modest and use a
-        // relative tolerance because f32 accumulation order differs across the
-        // SIMD, scalar, and reference paths; the historic sign flip produces a
-        // ~200% error, far above this tolerance.
-        let n = 41usize;
-        let x: Vec<Complex32> = (0..n)
-            .map(|i| {
-                let ii = i as f32;
-                let re = if i % 2 == 0 { ii + 1.0 } else { -(ii + 1.0) };
-                Complex32::new(re, ii - 13.0)
-            })
-            .collect();
-        let y: Vec<Complex32> = (0..n)
-            .map(|i| {
-                let ii = i as f32;
-                let im = if i % 3 == 0 {
-                    -(2.0 * ii + 1.0)
-                } else {
-                    2.0 * ii + 1.0
-                };
-                Complex32::new(ii - 7.0, im)
-            })
-            .collect();
-
-        // f64 reference for accuracy, then compare in f32 magnitudes.
-        let x64: Vec<Complex64> = x
-            .iter()
-            .map(|c| Complex64::new(c.re as f64, c.im as f64))
-            .collect();
-        let y64: Vec<Complex64> = y
-            .iter()
-            .map(|c| Complex64::new(c.re as f64, c.im as f64))
-            .collect();
-        let expected = dotu_c64_reference(&x64, &y64);
-
-        let simd = dotu_c32(&x, &y);
-
-        assert!(
-            expected.re.abs() > 100.0,
-            "test data too weak to catch a sign flip: re={}",
-            expected.re
-        );
-
-        let re_err = (simd.re as f64 - expected.re).abs() / expected.re.abs();
-        let im_err = (simd.im as f64 - expected.im).abs() / expected.im.abs().max(1.0);
-        assert!(
-            re_err < 1e-3,
-            "re: simd={}, expected={}, rel_err={}",
-            simd.re,
-            expected.re,
-            re_err
-        );
-        assert!(
-            im_err < 1e-3,
-            "im: simd={}, expected={}, rel_err={}",
-            simd.im,
-            expected.im,
-            im_err
-        );
-    }
-}
+#[path = "dot_tests.rs"]
+mod tests;

@@ -7,22 +7,40 @@
 //! on small MR × NR blocks. They are optimized for specific architectures
 //! using SIMD intrinsics.
 
-// Allow MSRV incompatibility for AVX-512 intrinsics that require Rust 1.89+
-// We gate these with runtime CPU feature detection
-#![allow(clippy::incompatible_msrv)]
-
 #[cfg(target_arch = "x86_64")]
 use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
+use super::gemm_packing::PackSlot;
+use core::cell::Cell;
 use num_complex::{Complex32, Complex64};
+use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Field;
 use oxiblas_core::simd::dispatch::GemmKernelKind;
 /// Describes the shape of a micro-kernel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MicroKernelShape {
     /// Number of rows processed by the micro-kernel.
     pub mr: usize,
     /// Number of columns processed by the micro-kernel.
     pub nr: usize,
+}
+
+/// Function-pointer form of [`GemmKernel::micro_kernel`]:
+/// `(k, alpha, a, b, beta, c, c_stride)`, with the same safety contract.
+pub type MicroKernelFn<T> = unsafe fn(usize, T, *const T, *const T, T, *mut T, usize);
+
+/// A micro-kernel and its shape, taken from one dispatch decision.
+///
+/// The GEMM drivers resolve this once per call (or per macro panel) and then
+/// call `kernel` for every micro-tile, instead of re-running the CPU dispatch
+/// inside [`GemmKernel::micro_kernel`] for each tile. Because `shape` and
+/// `kernel` come from the same decision, the packed layout always matches the
+/// kernel that consumes it.
+#[derive(Debug, Clone, Copy)]
+pub struct MicroKernel<T> {
+    /// Register-block shape (`MR × NR`) the packed panels must use.
+    pub shape: MicroKernelShape,
+    /// The kernel itself, operating on `MR × K` / `K × NR` packed panels.
+    pub kernel: MicroKernelFn<T>,
 }
 /// The single source of truth for which micro-kernel this build + CPU uses.
 ///
@@ -40,7 +58,8 @@ pub struct MicroKernelShape {
 /// It also honors the crate's SIMD-control features so they change the kernel
 /// that actually executes, not merely the capability-reporting API:
 /// `force-scalar` forces the portable kernel; `max-simd-128` / `max-simd-256`
-/// clamp the SIMD width (see [`cap_kernel_kind`]).
+/// clamp the SIMD width (see `cap_kernel_kind`, which `force-scalar` builds
+/// leave out).
 #[inline]
 fn selected_kernel_kind() -> GemmKernelKind {
     #[cfg(feature = "force-scalar")]
@@ -105,7 +124,10 @@ pub trait GemmKernel: Field {
     /// * `b` - Pointer to packed B data (K × NR, packed column-panel)
     /// * `beta` - Scalar multiplier for C
     /// * `c` - Pointer to C matrix
-    /// * `c_stride` - Row stride of C
+    /// * `c_stride` - Leading dimension of C (column-major): the distance in
+    ///   elements between consecutive columns, so `C(i, j)` is at
+    ///   `c + i + j * c_stride`. This is what `MatRef::row_stride` /
+    ///   `MatMut::row_stride` return, not the distance between rows.
     ///
     /// # Safety
     ///
@@ -122,20 +144,80 @@ pub trait GemmKernel: Field {
         c: *mut Self,
         c_stride: usize,
     );
+
+    /// Returns the shape and the function of the micro-kernel this build and
+    /// CPU use, from a single dispatch decision.
+    ///
+    /// Hot loops resolve this once and call [`MicroKernel::kernel`] per
+    /// micro-tile. The default pairs [`GemmKernel::micro_kernel_shape`] with
+    /// [`GemmKernel::micro_kernel`] (which then dispatches on every call).
+    #[inline]
+    fn micro_kernel_dispatch() -> MicroKernel<Self> {
+        MicroKernel {
+            shape: Self::micro_kernel_shape(),
+            kernel: Self::micro_kernel,
+        }
+    }
+
+    /// Runs `f` on this thread's cached packing buffer for `slot`.
+    ///
+    /// Implementation detail of the GEMM drivers' packing-buffer reuse (see
+    /// [`PackSlot`]). Returns `None` when the element type keeps no cache, which
+    /// is the default, or when the thread-local storage is already destroyed;
+    /// the drivers then allocate a fresh buffer.
+    #[doc(hidden)]
+    #[inline]
+    fn with_pack_cache<R>(
+        slot: PackSlot,
+        f: impl FnOnce(&Cell<AlignedVec<Self>>) -> R,
+    ) -> Option<R> {
+        let _ = (slot, f);
+        None
+    }
 }
+
+thread_local! {
+    // Per-thread packing-buffer slots, indexed by `PackSlot as usize`. Only the
+    // element types with micro-kernels in this crate keep one; buffers are
+    // moved out with `Cell::take` for the duration of a GEMM, so no borrow is
+    // ever held while a GEMM (or a nested one on the same thread) runs.
+    static PACK_CACHE_F64: [Cell<AlignedVec<f64>>; 2] =
+        const { [Cell::new(AlignedVec::new()), Cell::new(AlignedVec::new())] };
+    static PACK_CACHE_F32: [Cell<AlignedVec<f32>>; 2] =
+        const { [Cell::new(AlignedVec::new()), Cell::new(AlignedVec::new())] };
+    static PACK_CACHE_C64: [Cell<AlignedVec<Complex64>>; 2] =
+        const { [Cell::new(AlignedVec::new()), Cell::new(AlignedVec::new())] };
+    static PACK_CACHE_C32: [Cell<AlignedVec<Complex32>>; 2] =
+        const { [Cell::new(AlignedVec::new()), Cell::new(AlignedVec::new())] };
+}
+
+/// The f64 micro-kernel (shape and function) for a dispatch decision.
+///
+/// The single place that pairs each f64 shape with its kernel, so
+/// [`GemmKernel::micro_kernel_shape`], [`GemmKernel::micro_kernel`] and
+/// [`GemmKernel::micro_kernel_dispatch`] cannot disagree.
+#[inline]
+fn f64_kernel_for(kind: GemmKernelKind) -> MicroKernel<f64> {
+    let (mr, nr, kernel): (usize, usize, MicroKernelFn<f64>) = match kind {
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Avx512 => (16, 6, micro_kernel_f64_avx512),
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Avx2 => (8, 6, micro_kernel_f64_avx2),
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Sse42 => (4, 2, micro_kernel_f64_sse42),
+        #[cfg(target_arch = "aarch64")]
+        GemmKernelKind::Neon => (8, 6, micro_kernel_f64_neon),
+        _ => (4, 4, micro_kernel_f64_scalar),
+    };
+    MicroKernel {
+        shape: MicroKernelShape { mr, nr },
+        kernel,
+    }
+}
+
 impl GemmKernel for f64 {
     fn micro_kernel_shape() -> MicroKernelShape {
-        match selected_kernel_kind() {
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 6 },
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => MicroKernelShape { mr: 8, nr: 6 },
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => MicroKernelShape { mr: 4, nr: 2 },
-            #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => MicroKernelShape { mr: 8, nr: 6 },
-            _ => MicroKernelShape { mr: 4, nr: 4 },
-        }
+        f64_kernel_for(selected_kernel_kind()).shape
     }
     #[inline]
     unsafe fn micro_kernel(
@@ -147,17 +229,20 @@ impl GemmKernel for f64 {
         c: *mut Self,
         c_stride: usize,
     ) {
-        match selected_kernel_kind() {
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => micro_kernel_f64_avx512(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => micro_kernel_f64_avx2(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => micro_kernel_f64_sse42(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => micro_kernel_f64_neon(k, alpha, a, b, beta, c, c_stride),
-            _ => micro_kernel_f64_scalar(k, alpha, a, b, beta, c, c_stride),
-        }
+        (f64_kernel_for(selected_kernel_kind()).kernel)(k, alpha, a, b, beta, c, c_stride);
+    }
+    #[inline]
+    fn micro_kernel_dispatch() -> MicroKernel<Self> {
+        f64_kernel_for(selected_kernel_kind())
+    }
+    #[inline]
+    fn with_pack_cache<R>(
+        slot: PackSlot,
+        f: impl FnOnce(&Cell<AlignedVec<Self>>) -> R,
+    ) -> Option<R> {
+        PACK_CACHE_F64
+            .try_with(|slots| f(&slots[slot as usize]))
+            .ok()
     }
 }
 /// Scalar micro-kernel for f64.
@@ -676,19 +761,30 @@ unsafe fn micro_kernel_f64_neon(
         store_column_fma!(5, acc50, acc51, acc52, acc53, beta_vec);
     }
 }
+/// The f32 micro-kernel (shape and function) for a dispatch decision; see
+/// [`f64_kernel_for`].
+#[inline]
+fn f32_kernel_for(kind: GemmKernelKind) -> MicroKernel<f32> {
+    let (mr, nr, kernel): (usize, usize, MicroKernelFn<f32>) = match kind {
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Avx512 => (16, 16, micro_kernel_f32_avx512),
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Avx2 => (8, 8, micro_kernel_f32_avx2),
+        #[cfg(target_arch = "x86_64")]
+        GemmKernelKind::Sse42 => (4, 4, micro_kernel_f32_sse42),
+        #[cfg(target_arch = "aarch64")]
+        GemmKernelKind::Neon => (8, 8, micro_kernel_f32_neon),
+        _ => (4, 4, micro_kernel_f32_scalar),
+    };
+    MicroKernel {
+        shape: MicroKernelShape { mr, nr },
+        kernel,
+    }
+}
+
 impl GemmKernel for f32 {
     fn micro_kernel_shape() -> MicroKernelShape {
-        match selected_kernel_kind() {
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => MicroKernelShape { mr: 16, nr: 16 },
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => MicroKernelShape { mr: 8, nr: 8 },
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => MicroKernelShape { mr: 4, nr: 4 },
-            #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => MicroKernelShape { mr: 8, nr: 8 },
-            _ => MicroKernelShape { mr: 4, nr: 4 },
-        }
+        f32_kernel_for(selected_kernel_kind()).shape
     }
     #[inline]
     unsafe fn micro_kernel(
@@ -700,17 +796,20 @@ impl GemmKernel for f32 {
         c: *mut Self,
         c_stride: usize,
     ) {
-        match selected_kernel_kind() {
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx512 => micro_kernel_f32_avx512(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Avx2 => micro_kernel_f32_avx2(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "x86_64")]
-            GemmKernelKind::Sse42 => micro_kernel_f32_sse42(k, alpha, a, b, beta, c, c_stride),
-            #[cfg(target_arch = "aarch64")]
-            GemmKernelKind::Neon => micro_kernel_f32_neon(k, alpha, a, b, beta, c, c_stride),
-            _ => micro_kernel_f32_scalar(k, alpha, a, b, beta, c, c_stride),
-        }
+        (f32_kernel_for(selected_kernel_kind()).kernel)(k, alpha, a, b, beta, c, c_stride);
+    }
+    #[inline]
+    fn micro_kernel_dispatch() -> MicroKernel<Self> {
+        f32_kernel_for(selected_kernel_kind())
+    }
+    #[inline]
+    fn with_pack_cache<R>(
+        slot: PackSlot,
+        f: impl FnOnce(&Cell<AlignedVec<Self>>) -> R,
+    ) -> Option<R> {
+        PACK_CACHE_F32
+            .try_with(|slots| f(&slots[slot as usize]))
+            .ok()
     }
 }
 /// Scalar micro-kernel for f32.
@@ -1232,6 +1331,15 @@ impl GemmKernel for Complex64 {
     ) {
         micro_kernel_c64_scalar(k, alpha, a, b, beta, c, c_stride);
     }
+    #[inline]
+    fn with_pack_cache<R>(
+        slot: PackSlot,
+        f: impl FnOnce(&Cell<AlignedVec<Self>>) -> R,
+    ) -> Option<R> {
+        PACK_CACHE_C64
+            .try_with(|slots| f(&slots[slot as usize]))
+            .ok()
+    }
 }
 /// Scalar micro-kernel for Complex64 (2×2 tile).
 ///
@@ -1292,6 +1400,15 @@ impl GemmKernel for Complex32 {
         c_stride: usize,
     ) {
         micro_kernel_c32_scalar(k, alpha, a, b, beta, c, c_stride);
+    }
+    #[inline]
+    fn with_pack_cache<R>(
+        slot: PackSlot,
+        f: impl FnOnce(&Cell<AlignedVec<Self>>) -> R,
+    ) -> Option<R> {
+        PACK_CACHE_C32
+            .try_with(|slots| f(&slots[slot as usize]))
+            .ok()
     }
 }
 /// Scalar micro-kernel for Complex32 (2×2 tile).

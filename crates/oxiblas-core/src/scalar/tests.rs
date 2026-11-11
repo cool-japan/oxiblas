@@ -699,6 +699,69 @@ fn test_real_signum_matches_ieee754_semantics() {
     assert!(<f64 as Real>::signum(f64::NAN).is_nan());
 }
 
+#[cfg(feature = "f16")]
+#[test]
+fn test_real_signum_matches_ieee754_semantics_f16() {
+    use half::f16;
+    let one = f16::ONE;
+    let sig = <f16 as Real>::signum;
+    assert_eq!(sig(f16::from_f32(3.5)), one);
+    assert_eq!(sig(f16::from_f32(-3.5)), -one);
+    assert_eq!(sig(f16::ZERO), one);
+    assert_eq!(sig(f16::NEG_ZERO), -one);
+    assert!(sig(f16::NEG_ZERO).is_sign_negative());
+    assert_eq!(sig(f16::INFINITY), one);
+    assert_eq!(sig(f16::NEG_INFINITY), -one);
+    assert!(sig(f16::NAN).is_nan());
+    // Smallest positive subnormal / negative subnormal and min-positive normal.
+    assert_eq!(sig(f16::from_bits(0x0001)), one);
+    assert_eq!(sig(f16::from_bits(0x8001)), -one);
+    assert_eq!(sig(f16::MIN_POSITIVE), one);
+}
+
+#[cfg(feature = "f128")]
+#[test]
+fn test_real_signum_matches_ieee754_semantics_quadfloat() {
+    use super::extended::QuadFloat;
+    use num_traits::Float as NumFloat;
+
+    let one = QuadFloat::from(1.0);
+    let neg_one = QuadFloat::from(-1.0);
+    let samples = [
+        (3.5_f64, 1.0_f64),
+        (-3.5, -1.0),
+        (0.0, 1.0),
+        (-0.0, -1.0),
+        (f64::INFINITY, 1.0),
+        (f64::NEG_INFINITY, -1.0),
+        (f64::MIN_POSITIVE, 1.0),
+        (-f64::MIN_POSITIVE, -1.0),
+        (5e-324, 1.0),
+        (-5e-324, -1.0),
+    ];
+    for (x, expected) in samples {
+        let q = QuadFloat::from(x);
+        let want = if expected > 0.0 { one } else { neg_one };
+        let real = <QuadFloat as Real>::signum(q);
+        let float = <QuadFloat as NumFloat>::signum(q);
+        assert_eq!(real, want, "Real::signum({x:e})");
+        assert_eq!(float, want, "Float::signum({x:e})");
+        assert_eq!(
+            real.is_sign_negative(),
+            expected < 0.0,
+            "Real::signum({x:e}) sign"
+        );
+        assert_eq!(
+            float.is_sign_negative(),
+            expected < 0.0,
+            "Float::signum({x:e}) sign"
+        );
+    }
+    let nan = QuadFloat::from(f64::NAN);
+    assert!(<QuadFloat as Real>::signum(nan).is_nan());
+    assert!(<QuadFloat as NumFloat>::signum(nan).is_nan());
+}
+
 /// Finding: `iamax_batch` used `Iterator::max_by`, which returns the LAST
 /// maximum on ties and treats incomparable (NaN) values as `Equal`. This
 /// diverges from reference BLAS IxAMAX, which keeps the FIRST index on

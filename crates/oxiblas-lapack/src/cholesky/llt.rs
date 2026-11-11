@@ -1,18 +1,150 @@
 //! LL^T Cholesky decomposition.
 //!
 //! Standard Cholesky factorization for symmetric positive definite matrices.
-//! For large matrices, uses blocked algorithm with GEMM/TRSM for cache efficiency.
+//! [`Cholesky::compute`] always runs the unblocked (column-by-column)
+//! algorithm, whatever the size. The blocked algorithm with TRSM, GEMM and the
+//! triangle-only SYRK, for cache efficiency on large matrices, is used by
+//! [`Cholesky::compute_blocked`] / [`Cholesky::compute_with_block_size`] (once
+//! the order reaches the block size) and by [`Cholesky::compute_auto`], which
+//! calls `compute_blocked` from order 128.
 
-use num_traits::{FromPrimitive, One};
-use oxiblas_blas::level3::gemm::gemm;
-#[cfg(feature = "parallel")]
-use oxiblas_blas::level3::gemm::gemm_with_par;
+use crate::lu::tolerance::llt_pivot_tolerances;
+use oxiblas_blas::level3::gemm::gemm_transposed_with_par;
 use oxiblas_blas::level3::gemm_kernel::GemmKernel;
-use oxiblas_blas::level3::trsm::{Diag, Side, Trans, Uplo, trsm_in_place};
-#[cfg(feature = "parallel")]
+use oxiblas_blas::level3::syrk::syrk;
+use oxiblas_blas::level3::trsm::{Diag, Side, Trans, TrsmError, Uplo, trsm_in_place_with_par};
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::{Field, Real, Scalar};
-use oxiblas_matrix::{Mat, MatRef};
+use oxiblas_matrix::{Mat, MatMut, MatRef};
+
+/// Order up to which [`lower_update`] updates a diagonal block with a single
+/// triangle-only SYRK instead of splitting it further.
+const LOWER_UPDATE_LEAF: usize = 64;
+
+/// `C := C − A · Aᵀ` on the lower triangle of the square view `c`, where `a`
+/// has as many rows as `c` (the symmetric rank-k update of a blocked
+/// Cholesky, LAPACK `?syrk` with `uplo = 'L'`).
+///
+/// The triangle is split recursively: the off-diagonal rectangle `C₂₁ −=
+/// A₂ · A₁ᵀ` is one GEMM, the two diagonal halves recurse, and diagonal blocks
+/// of order at most [`LOWER_UPDATE_LEAF`] are updated by one call of the
+/// triangle-only `oxiblas_blas` SYRK. That does about half the multiply-adds
+/// of a full `C −= A · Aᵀ`, in a few large GEMMs. Only the lower triangle of
+/// `c` is read or written, so the zero strict upper triangle the drivers
+/// start from stays exactly zero.
+///
+/// `Aᵀ` is read in place by the transpose-aware GEMM and by SYRK (no copy).
+/// `par` is passed to every rectangle GEMM; a SYRK leaf runs on the thread
+/// that reaches it.
+///
+/// # Errors
+///
+/// Returns [`CholeskyError::DimensionMismatch`] if SYRK rejects the shapes,
+/// which the callers' views rule out.
+fn lower_update<T: Field + GemmKernel + bytemuck::Zeroable>(
+    c: MatMut<'_, T>,
+    a: MatRef<'_, T>,
+    par: Par,
+) -> Result<(), CholeskyError> {
+    let m = c.nrows();
+    if m == 0 {
+        return Ok(());
+    }
+    if m <= LOWER_UPDATE_LEAF {
+        return syrk(Uplo::Lower, Trans::NoTrans, -T::one(), a, T::one(), c).map_err(|_| {
+            CholeskyError::DimensionMismatch {
+                expected: m,
+                actual: a.nrows(),
+            }
+        });
+    }
+    let m1 = m / 2;
+    let (c_left, c_right) = c.split_cols(m1);
+    let (c11, c21) = c_left.split_rows(m1);
+    let (_, c22) = c_right.split_rows(m1);
+    let (a1, a2) = a.split_rows(m1);
+    let rectangle = move || {
+        gemm_transposed_with_par(
+            Trans::NoTrans,
+            Trans::Trans,
+            -T::one(),
+            a2,
+            a1,
+            T::one(),
+            c21,
+            par,
+        );
+    };
+    // The three blocks are disjoint and read only `a`, so with a parallel
+    // `par` they are updated concurrently (the small diagonal leaves would
+    // otherwise run one after another); every block gets the same result
+    // either way.
+    #[cfg(feature = "parallel")]
+    if !par.is_sequential() {
+        let ((), (upper_half, lower_half)) = rayon::join(rectangle, || {
+            rayon::join(|| lower_update(c11, a1, par), || lower_update(c22, a2, par))
+        });
+        return upper_half.and(lower_half);
+    }
+    rectangle();
+    lower_update(c11, a1, par)?;
+    lower_update(c22, a2, par)
+}
+
+/// Finishes the block column of the factored diagonal block `jb..jb + w` and
+/// updates the rest of the trailing block `jb + w..stop`, in place on `l`:
+///
+/// 1. `L21 := A21 · L11⁻ᵀ` (TRSM with the lower triangle of the diagonal
+///    block), for the rows `jb + w..stop`;
+/// 2. `A22 := A22 − L21 · L21ᵀ` on the lower triangle of the trailing
+///    diagonal block `jb + w..stop` ([`lower_update`]).
+///
+/// Every operand is a view of `l`; TRSM reads only the lower triangle of
+/// `L11` and nothing writes above the diagonal of `l`. `par` is passed to
+/// TRSM and GEMM, which give bitwise the same result for every `Par` (the
+/// SYRK leaves of [`lower_update`] are sequential).
+fn update_trailing<T: Field + Real + GemmKernel + bytemuck::Zeroable>(
+    l: &mut Mat<T>,
+    jb: usize,
+    w: usize,
+    stop: usize,
+    par: Par,
+) -> Result<(), CholeskyError> {
+    let end = jb + w;
+    if end >= stop {
+        return Ok(());
+    }
+    let r = stop - end;
+
+    let (left, right) = l.as_mut().split_cols(end);
+    let (l11, mut a21) = left.submatrix(jb, jb, w + r, w).split_rows(w);
+    let l11 = l11.rb();
+
+    let solved = trsm_in_place_with_par(
+        Side::Right,
+        Uplo::Lower,
+        Trans::Trans,
+        Diag::NonUnit,
+        l11,
+        a21.rb_mut(),
+        par,
+    );
+    // The diagonal of L11 holds square roots of radicands that passed the
+    // positive-definiteness test, so it has no zero and the shapes come from
+    // the block: TRSM cannot fail. Report a failure rather than ignore it.
+    debug_assert!(solved.is_ok(), "TRSM of a factored Cholesky block failed");
+    solved.map_err(|err| match err {
+        TrsmError::Singular => CholeskyError::NotPositiveDefinite {
+            index: jb + (0..w).find(|&i| l11[(i, i)] == T::zero()).unwrap_or(0),
+        },
+        TrsmError::NotSquare | TrsmError::DimensionMismatch => CholeskyError::DimensionMismatch {
+            expected: w,
+            actual: a21.ncols(),
+        },
+    })?;
+
+    lower_update(right.submatrix(end, 0, r, r), a21.rb(), par)
+}
 
 /// Error returned when Cholesky decomposition fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +195,20 @@ impl std::error::Error for CholeskyError {}
 ///
 /// For a symmetric positive definite matrix A, computes L such that A = LL^T,
 /// where L is lower triangular with positive diagonal entries.
+///
+/// Every variant reports [`CholeskyError::NotPositiveDefinite`] when the
+/// radicand `a_jj - Σ l_jk²` of column `j` is at or below `eps · n · a_jj`,
+/// where `a_jj` is the original diagonal entry (a NaN or infinite `a_jj`
+/// counts as 0, as does a negative one). The threshold is relative to each
+/// column: a symmetric scaling `D · A · D` by powers of two scales the radicand
+/// and `a_jj` by `d_j²` alike, so it changes neither the outcome nor the
+/// reported index (L becomes `D · L`), as long as no entry or intermediate
+/// value overflows or underflows. A badly scaled but positive definite matrix
+/// such as `diag(1e20, 1)` therefore factors.
+///
+/// A NaN radicand fails the comparison and propagates into L instead of being
+/// reported, like the NaN pivots of this crate's LU factorizations. LAPACK
+/// `dpotrf` differs here: it reports a NaN radicand as `INFO = j`.
 #[derive(Clone, Debug)]
 pub struct Cholesky<T: Scalar> {
     /// The L factor (lower triangular).
@@ -126,41 +272,79 @@ impl<T: Field + Real + bytemuck::Zeroable> Cholesky<T> {
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the finite diagonal entries of A.
+        let col_tol = llt_pivot_tolerances(a);
+
+        // Copy lower triangular part of A
         let mut l = Mat::zeros(n, n);
-
-        // Cholesky-Banachiewicz algorithm
-        for i in 0..n {
-            for j in 0..=i {
-                let mut sum = T::zero();
-
-                if j == i {
-                    // Diagonal element
-                    for k in 0..j {
-                        sum = sum + l[(j, k)] * l[(j, k)];
-                    }
-
-                    let diag = a[(i, i)] - sum;
-
-                    // Check for positive definiteness
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(<T as One>::one());
-                    if diag <= tol {
-                        return Err(CholeskyError::NotPositiveDefinite { index: i });
-                    }
-
-                    l[(i, j)] = Real::sqrt(diag);
-                } else {
-                    // Off-diagonal element
-                    for k in 0..j {
-                        sum = sum + l[(i, k)] * l[(j, k)];
-                    }
-
-                    l[(i, j)] = (a[(i, j)] - sum) / l[(j, j)];
-                }
+        for j in 0..n {
+            for i in j..n {
+                l[(i, j)] = a[(i, j)];
             }
         }
 
+        // Cholesky-Banachiewicz arithmetic, evaluated column by column
+        Self::unblocked_factor_block(&mut l, 0, n, &col_tol)?;
+
         Ok(Cholesky { l })
+    }
+
+    /// Unblocked Cholesky of the diagonal block `jb..jb + jb_size`, in place
+    /// (the whole factorization for `jb = 0`, `jb_size = n`).
+    ///
+    /// Cholesky-Banachiewicz (dot-product) arithmetic, evaluated column by
+    /// column: entry `(g, gi)` becomes `(a_{g,gi} − Σ_k l_{g,k} · l_{gi,k}) /
+    /// l_{gi,gi}`, the sum running over the block's earlier columns `k` in
+    /// increasing order from zero. The sums of one column are accumulated
+    /// together, streaming down the contiguous columns `k` of the
+    /// column-major storage, which gives every entry bit for bit the result
+    /// of evaluating its dot product along the (strided) rows. Only the lower
+    /// triangle of the block is read or written; rows below it are left to
+    /// TRSM.
+    ///
+    /// `col_tol[j]` is the positive-definiteness threshold of column `j`,
+    /// computed from the input matrix before factorizing.
+    fn unblocked_factor_block(
+        l: &mut Mat<T>,
+        jb: usize,
+        jb_size: usize,
+        col_tol: &[T],
+    ) -> Result<(), CholeskyError> {
+        let ld = l.row_stride();
+        let end = jb + jb_size;
+        let data = l.raw_data_mut();
+        // acc[g - jb] accumulates the dot product of rows g and gi
+        let mut acc = vec![T::zero(); jb_size];
+
+        for gi in jb..end {
+            let sums = &mut acc[gi - jb..];
+            sums.fill(T::zero());
+            for k in jb..gi {
+                // Rows gi..end of column k; its first entry is l[gi, k].
+                let col = &data[k * ld + gi..k * ld + end];
+                let l_ik = col[0];
+                for (sum, &l_gk) in sums.iter_mut().zip(col) {
+                    *sum = *sum + l_gk * l_ik;
+                }
+            }
+
+            let col = &mut data[gi * ld + gi..gi * ld + end];
+            let diag = col[0] - sums[0];
+
+            // Check for positive definiteness (a NaN radicand propagates)
+            if diag <= col_tol[gi] {
+                return Err(CholeskyError::NotPositiveDefinite { index: gi });
+            }
+
+            let l_ii = Real::sqrt(diag);
+            col[0] = l_ii;
+            for (l_gi, &sum) in col[1..].iter_mut().zip(&sums[1..]) {
+                *l_gi = (*l_gi - sum) / l_ii;
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the size of the matrix (n for an n×n matrix).
@@ -312,7 +496,11 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     }
 
     /// Computes Cholesky decomposition with a specified block size.
+    ///
+    /// A block size of 0 is treated as 1 (one column per diagonal block).
     pub fn compute_with_block_size(a: MatRef<'_, T>, nb: usize) -> Result<Self, CholeskyError> {
+        // A zero-width block would never advance the blocked loop.
+        let nb = nb.max(1);
         let n = a.nrows();
 
         if n != a.ncols() {
@@ -328,6 +516,10 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the original diagonal, shared by every path below.
+        let col_tol = llt_pivot_tolerances(a);
+
         // Copy lower triangular part of A
         let mut l = Mat::zeros(n, n);
         for j in 0..n {
@@ -338,16 +530,33 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
 
         // Use blocked algorithm for larger matrices
         if n >= nb {
-            Self::blocked_factor(&mut l, n, nb)?;
+            Self::blocked_factor(&mut l, n, nb, &col_tol, Par::Seq)?;
         } else {
-            Self::unblocked_factor(&mut l, n, 0)?;
+            Self::unblocked_factor_block(&mut l, 0, n, &col_tol)?;
         }
 
         Ok(Cholesky { l })
     }
 
-    /// Blocked Cholesky factorization using GEMM for symmetric updates.
-    fn blocked_factor(l: &mut Mat<T>, n: usize, nb: usize) -> Result<(), CholeskyError> {
+    /// Blocked right-looking Cholesky factorization (LAPACK `?potrf`).
+    ///
+    /// Each diagonal block of `nb` columns is factored by
+    /// [`Self::unblocked_factor_block`]; [`update_trailing`] then solves for
+    /// the block column below it with TRSM and updates the lower triangle of
+    /// the trailing submatrix with GEMM and SYRK, in place on `l`. `par` is
+    /// passed to TRSM and GEMM; the diagonal blocks are factored on the
+    /// calling thread. The strict upper triangle of `l` is never written, so
+    /// it keeps the zeros it starts with.
+    ///
+    /// `col_tol[j]` is the positive-definiteness threshold of column `j`,
+    /// computed from the input matrix before factorizing.
+    fn blocked_factor(
+        l: &mut Mat<T>,
+        n: usize,
+        nb: usize,
+        col_tol: &[T],
+        par: Par,
+    ) -> Result<(), CholeskyError> {
         let mut jb = 0;
 
         while jb < n {
@@ -355,146 +564,12 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
             let jb_size = nb.min(n - jb);
 
             // Factor diagonal block A11 using unblocked Cholesky
-            Self::unblocked_factor_block(l, n, jb, jb_size)?;
+            Self::unblocked_factor_block(l, jb, jb_size, col_tol)?;
 
-            // If there are more rows below this block
-            if jb + jb_size < n {
-                let rows_remaining = n - jb - jb_size;
-
-                // Extract L11 (the diagonal block we just factored)
-                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
-                for i in 0..jb_size {
-                    for j in 0..=i {
-                        l11[(i, j)] = l[(jb + i, jb + j)];
-                    }
-                }
-
-                // Extract A21 block (will become L21)
-                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l21[(i, j)] = l[(jb + jb_size + i, jb + j)];
-                    }
-                }
-
-                // Solve L21 = A21 * L11^(-T) using TRSM: L11 * L21^T = A21^T
-                // Equivalently: L21 = A21 * inv(L11^T)
-                // TRSM: Right, Lower, Trans => B = B * inv(L^T)
-                let _ = trsm_in_place(
-                    Side::Right,
-                    Uplo::Lower,
-                    Trans::Trans,
-                    Diag::NonUnit,
-                    l11.as_ref(),
-                    l21.as_mut(),
-                );
-
-                // Copy L21 back
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l[(jb + jb_size + i, jb + j)] = l21[(i, j)];
-                    }
-                }
-
-                // Update A22 -= L21 * L21^T using GEMM (symmetric rank-k update)
-                // A22 is the trailing (rows_remaining x rows_remaining) block
-                let l21_t = l21.transpose();
-                let mut update: Mat<T> = Mat::zeros(rows_remaining, rows_remaining);
-                gemm(
-                    T::one(),
-                    l21.as_ref(),
-                    l21_t.as_ref(),
-                    T::zero(),
-                    update.as_mut(),
-                );
-
-                // Subtract update from lower triangular part of A22
-                for j in 0..rows_remaining {
-                    for i in j..rows_remaining {
-                        l[(jb + jb_size + i, jb + jb_size + j)] =
-                            l[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
-                    }
-                }
-            }
+            // L21 and the lower triangle of the trailing submatrix
+            update_trailing(l, jb, jb_size, n, par)?;
 
             jb += jb_size;
-        }
-
-        Ok(())
-    }
-
-    /// Unblocked Cholesky for a diagonal block only (rows/cols jb to jb+jb_size).
-    fn unblocked_factor_block(
-        l: &mut Mat<T>,
-        n: usize,
-        jb: usize,
-        jb_size: usize,
-    ) -> Result<(), CholeskyError> {
-        for i in 0..jb_size {
-            let gi = jb + i; // Global index
-
-            // Compute diagonal element
-            let mut sum = T::zero();
-            for k in jb..gi {
-                sum = sum + l[(gi, k)] * l[(gi, k)];
-            }
-
-            let diag = l[(gi, gi)] - sum;
-
-            // Check for positive definiteness
-            let tol = <T as Scalar>::epsilon()
-                * <T as FromPrimitive>::from_usize(n).unwrap_or(<T as One>::one());
-            if diag <= tol {
-                return Err(CholeskyError::NotPositiveDefinite { index: gi });
-            }
-
-            l[(gi, gi)] = Real::sqrt(diag);
-
-            // Compute off-diagonal elements in this column (within the block only)
-            for j in (i + 1)..jb_size {
-                let gj = jb + j;
-                let mut sum = T::zero();
-                for k in jb..gi {
-                    sum = sum + l[(gj, k)] * l[(gi, k)];
-                }
-                l[(gj, gi)] = (l[(gj, gi)] - sum) / l[(gi, gi)];
-            }
-            // Note: Elements below the block (L21) are computed via TRSM, not here
-        }
-
-        Ok(())
-    }
-
-    /// Unblocked Cholesky factorization (for small matrices).
-    fn unblocked_factor(l: &mut Mat<T>, n: usize, start: usize) -> Result<(), CholeskyError> {
-        for i in start..n {
-            for j in start..=i {
-                let mut sum = T::zero();
-
-                if j == i {
-                    // Diagonal element
-                    for k in start..j {
-                        sum = sum + l[(j, k)] * l[(j, k)];
-                    }
-
-                    let diag = l[(i, i)] - sum;
-
-                    let tol = <T as Scalar>::epsilon()
-                        * <T as FromPrimitive>::from_usize(n).unwrap_or(<T as One>::one());
-                    if diag <= tol {
-                        return Err(CholeskyError::NotPositiveDefinite { index: i });
-                    }
-
-                    l[(i, j)] = Real::sqrt(diag);
-                } else {
-                    // Off-diagonal element
-                    for k in start..j {
-                        sum = sum + l[(i, k)] * l[(j, k)];
-                    }
-
-                    l[(i, j)] = (l[(i, j)] - sum) / l[(j, j)];
-                }
-            }
         }
 
         Ok(())
@@ -513,11 +588,14 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     ///
     /// 1. Factor the top-left quadrant A11 recursively to get L11
     /// 2. Solve L21 = A21 * L11^{-T} via TRSM
-    /// 3. Update A22 -= L21 * L21^T via SYRK (symmetric rank-k update)
+    /// 3. Update the lower triangle of A22 -= L21 * L21^T (symmetric rank-k
+    ///    update) with GEMM on its off-diagonal blocks and the triangle-only
+    ///    SYRK on its diagonal blocks
     /// 4. Factor the updated A22 recursively to get L22
     ///
-    /// For matrices smaller than the recursion threshold (64), falls back to the
-    /// unblocked algorithm which is more efficient at that scale.
+    /// Every step works in place on the factor's storage. Blocks of order at
+    /// most the recursion threshold (64) are factored by the unblocked
+    /// algorithm, which is more efficient at that scale.
     ///
     /// # Arguments
     ///
@@ -563,6 +641,10 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the original diagonal, shared by every path below.
+        let col_tol = llt_pivot_tolerances(a);
+
         // Copy lower triangular part of A into L
         let mut l = Mat::zeros(n, n);
         for j in 0..n {
@@ -571,7 +653,7 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
             }
         }
 
-        Self::recursive_factor(&mut l, n, 0)?;
+        Self::recursive_factor(&mut l, n, 0, &col_tol)?;
 
         Ok(Cholesky { l })
     }
@@ -580,88 +662,33 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
     ///
     /// Operates in-place on the lower triangular part of `l`.
     /// The submatrix from (offset, offset) to (offset+size-1, offset+size-1) is factored.
-    fn recursive_factor(l: &mut Mat<T>, size: usize, offset: usize) -> Result<(), CholeskyError> {
+    /// Nothing above the diagonal is written.
+    ///
+    /// `col_tol[j]` is the positive-definiteness threshold of column `j`,
+    /// computed from the input matrix before factorizing.
+    fn recursive_factor(
+        l: &mut Mat<T>,
+        size: usize,
+        offset: usize,
+        col_tol: &[T],
+    ) -> Result<(), CholeskyError> {
         // Base case: use unblocked algorithm for small matrices
         if size <= Self::RECURSIVE_THRESHOLD {
-            let full_n = l.nrows();
-            Self::unblocked_factor_block(l, full_n, offset, size)?;
-            return Ok(());
+            return Self::unblocked_factor_block(l, offset, size, col_tol);
         }
 
         // Split: n1 = size/2 (upper half), n2 = size - n1 (lower half)
         let n1 = size / 2;
-        let n2 = size - n1;
 
         // Step 1: Recursively factor A11 (top-left n1 x n1 block)
-        Self::recursive_factor(l, n1, offset)?;
+        Self::recursive_factor(l, n1, offset, col_tol)?;
 
-        // Step 2: Solve L21 = A21 * L11^{-T} via TRSM
-        // Extract L11 (lower triangular, already factored)
-        let mut l11 = Mat::zeros(n1, n1);
-        for i in 0..n1 {
-            for j in 0..=i {
-                l11[(i, j)] = l[(offset + i, offset + j)];
-            }
-        }
-
-        // Extract A21 (the block that will become L21)
-        let mut l21 = Mat::zeros(n2, n1);
-        for j in 0..n1 {
-            for i in 0..n2 {
-                l21[(i, j)] = l[(offset + n1 + i, offset + j)];
-            }
-        }
-
-        // TRSM: B = B * inv(L11^T), where B = L21
-        // Side::Right, Uplo::Lower, Trans::Trans, Diag::NonUnit
-        let _ = trsm_in_place(
-            Side::Right,
-            Uplo::Lower,
-            Trans::Trans,
-            Diag::NonUnit,
-            l11.as_ref(),
-            l21.as_mut(),
-        );
-
-        // Copy L21 back into l
-        for j in 0..n1 {
-            for i in 0..n2 {
-                l[(offset + n1 + i, offset + j)] = l21[(i, j)];
-            }
-        }
-
-        // Step 3: Symmetric rank-k update on A22
-        // A22 -= L21 * L21^T (only lower triangle)
-        let mut a22 = Mat::zeros(n2, n2);
-        for j in 0..n2 {
-            for i in j..n2 {
-                a22[(i, j)] = l[(offset + n1 + i, offset + n1 + j)];
-            }
-        }
-
-        use oxiblas_blas::level3::syrk::syrk;
-
-        // SYRK: C = alpha*A*A^T + beta*C  =>  A22 = -1*L21*L21^T + 1*A22
-        let _ = syrk(
-            Uplo::Lower,
-            Trans::NoTrans,
-            -T::one(),
-            l21.as_ref(),
-            T::one(),
-            a22.as_mut(),
-        );
-
-        // Copy updated A22 back into l (lower triangle only)
-        for j in 0..n2 {
-            for i in j..n2 {
-                l[(offset + n1 + i, offset + n1 + j)] = a22[(i, j)];
-            }
-        }
+        // Steps 2 and 3: L21 = A21 * L11^{-T} (TRSM), then the lower triangle
+        // of A22 -= L21 * L21^T (GEMM and SYRK), in place
+        update_trailing(l, offset, n1, offset + size, Par::Seq)?;
 
         // Step 4: Recursively factor updated A22
-        Self::recursive_factor(l, n2, offset + n1)?;
-
-        Ok(())
+        Self::recursive_factor(l, size - n1, offset + n1, col_tol)
     }
 }
 
@@ -713,8 +740,13 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable> Cholesky<T> {
 impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T> {
     /// Computes the Cholesky decomposition using a parallel blocked algorithm.
     ///
-    /// Parallelizes the GEMM (symmetric rank-k) updates within the blocked
-    /// factorization using Rayon. For matrices smaller than the block size,
+    /// Same algorithm as [`Self::compute_blocked`], with the TRSM (block
+    /// column of L) and GEMM/SYRK (symmetric rank-k) updates of every block
+    /// run on the Rayon pool; the diagonal blocks themselves are factored on
+    /// the calling thread. TRSM and GEMM give bitwise the same result for any
+    /// number of threads and each SYRK leaf runs on one thread, so this
+    /// returns exactly the factor of
+    /// [`Self::compute_blocked`]. For matrices smaller than the block size,
     /// falls back to the sequential unblocked algorithm.
     ///
     /// # Arguments
@@ -736,10 +768,15 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T
     }
 
     /// Computes parallel blocked Cholesky decomposition with a specified block size.
+    ///
+    /// Returns exactly the factor of [`Self::compute_with_block_size`] with
+    /// the same `nb`; a block size of 0 is treated as 1 there and here.
     pub fn compute_blocked_par_with_block_size(
         a: MatRef<'_, T>,
         nb: usize,
     ) -> Result<Self, CholeskyError> {
+        // A zero-width block would never advance the blocked loop.
+        let nb = nb.max(1);
         let n = a.nrows();
 
         if n != a.ncols() {
@@ -755,6 +792,10 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T
             });
         }
 
+        // Per-column positive-definiteness thresholds `eps · n · a_jj`, from
+        // the original diagonal, shared by every path below.
+        let col_tol = llt_pivot_tolerances(a);
+
         // Copy lower triangular part of A
         let mut l = Mat::zeros(n, n);
         for j in 0..n {
@@ -763,89 +804,17 @@ impl<T: Field + Real + GemmKernel + bytemuck::Zeroable + Send + Sync> Cholesky<T
             }
         }
 
-        // Use blocked parallel algorithm for larger matrices
+        // Blocked algorithm with parallel TRSM/GEMM updates for larger matrices
         if n >= nb {
-            Self::blocked_factor_par(&mut l, n, nb)?;
+            Self::blocked_factor(&mut l, n, nb, &col_tol, Par::Rayon)?;
         } else {
-            Self::unblocked_factor(&mut l, n, 0)?;
+            Self::unblocked_factor_block(&mut l, 0, n, &col_tol)?;
         }
 
         Ok(Cholesky { l })
     }
-
-    /// Blocked Cholesky factorization with parallel GEMM for symmetric updates.
-    fn blocked_factor_par(l: &mut Mat<T>, n: usize, nb: usize) -> Result<(), CholeskyError> {
-        let mut jb = 0;
-
-        while jb < n {
-            // Current block size (may be smaller for last block)
-            let jb_size = nb.min(n - jb);
-
-            // Factor diagonal block A11 using unblocked Cholesky (sequential -- panel is small)
-            Self::unblocked_factor_block(l, n, jb, jb_size)?;
-
-            // If there are more rows below this block
-            if jb + jb_size < n {
-                let rows_remaining = n - jb - jb_size;
-
-                // Extract L11 (the diagonal block we just factored)
-                let mut l11: Mat<T> = Mat::zeros(jb_size, jb_size);
-                for i in 0..jb_size {
-                    for j in 0..=i {
-                        l11[(i, j)] = l[(jb + i, jb + j)];
-                    }
-                }
-
-                // Extract A21 block (will become L21)
-                let mut l21: Mat<T> = Mat::zeros(rows_remaining, jb_size);
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l21[(i, j)] = l[(jb + jb_size + i, jb + j)];
-                    }
-                }
-
-                // Solve L21 = A21 * L11^(-T) using TRSM
-                // TRSM internally uses parallel GEMM when the "parallel" feature is active
-                let _ = trsm_in_place(
-                    Side::Right,
-                    Uplo::Lower,
-                    Trans::Trans,
-                    Diag::NonUnit,
-                    l11.as_ref(),
-                    l21.as_mut(),
-                );
-
-                // Copy L21 back
-                for j in 0..jb_size {
-                    for i in 0..rows_remaining {
-                        l[(jb + jb_size + i, jb + j)] = l21[(i, j)];
-                    }
-                }
-
-                // Update A22 -= L21 * L21^T using parallel GEMM (symmetric rank-k update)
-                let l21_t = l21.transpose();
-                let mut update: Mat<T> = Mat::zeros(rows_remaining, rows_remaining);
-                gemm_with_par(
-                    T::one(),
-                    l21.as_ref(),
-                    l21_t.as_ref(),
-                    T::zero(),
-                    update.as_mut(),
-                    Par::Rayon,
-                );
-
-                // Subtract update from lower triangular part of A22
-                for j in 0..rows_remaining {
-                    for i in j..rows_remaining {
-                        l[(jb + jb_size + i, jb + jb_size + j)] =
-                            l[(jb + jb_size + i, jb + jb_size + j)] - update[(i, j)];
-                    }
-                }
-            }
-
-            jb += jb_size;
-        }
-
-        Ok(())
-    }
 }
+
+#[cfg(test)]
+#[path = "llt_tests.rs"]
+mod tests;

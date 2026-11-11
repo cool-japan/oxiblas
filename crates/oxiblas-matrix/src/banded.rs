@@ -40,14 +40,13 @@ use oxiblas_core::scalar::Scalar;
 /// Panics if `kl + ku + 1` overflows `usize`.
 #[inline]
 fn checked_ldab(kl: usize, ku: usize) -> usize {
-    kl.checked_add(ku)
-        .and_then(|s| s.checked_add(1))
-        .unwrap_or_else(|| {
-            panic!(
-                "BandedMat: leading dimension overflow (kl + ku + 1 exceeds usize::MAX; \
+    match kl.checked_add(ku).and_then(|s| s.checked_add(1)) {
+        Some(ldab) => ldab,
+        None => panic!(
+            "BandedMat: leading dimension overflow (kl + ku + 1 exceeds usize::MAX; \
              kl={kl}, ku={ku})"
-            )
-        })
+        ),
+    }
 }
 
 /// Computes the band-storage element count `ldab * ncols` with checked
@@ -64,12 +63,13 @@ fn checked_ldab(kl: usize, ku: usize) -> usize {
 /// Panics if `ldab * ncols` overflows `usize`.
 #[inline]
 fn checked_band_len(ldab: usize, ncols: usize) -> usize {
-    ldab.checked_mul(ncols).unwrap_or_else(|| {
-        panic!(
+    match ldab.checked_mul(ncols) {
+        Some(len) => len,
+        None => panic!(
             "BandedMat: band storage size overflow ({ldab} * {ncols} exceeds \
              usize::MAX); requested matrix dimensions are too large to allocate"
-        )
-    })
+        ),
+    }
 }
 
 /// A banded matrix using BLAS-style band storage.
@@ -128,6 +128,10 @@ impl<T: Scalar> BandedMat<T> {
     /// - `ncols`: Number of columns
     /// - `kl`: Number of subdiagonals
     /// - `ku`: Number of superdiagonals
+    ///
+    /// # Panics
+    /// Panics if `kl + ku + 1` or the band storage size
+    /// `(kl + ku + 1) * ncols` overflows `usize`.
     pub fn zeros(nrows: usize, ncols: usize, kl: usize, ku: usize) -> Self
     where
         T: bytemuck::Zeroable,
@@ -146,6 +150,10 @@ impl<T: Scalar> BandedMat<T> {
     }
 
     /// Creates a new banded matrix filled with a specific value.
+    ///
+    /// # Panics
+    /// Panics if `kl + ku + 1` or the band storage size
+    /// `(kl + ku + 1) * ncols` overflows `usize`.
     pub fn filled(nrows: usize, ncols: usize, kl: usize, ku: usize, value: T) -> Self {
         let ldab = checked_ldab(kl, ku);
         let total = checked_band_len(ldab, ncols);
@@ -170,7 +178,8 @@ impl<T: Scalar> BandedMat<T> {
     /// - `data`: Band storage data in column-major order
     ///
     /// # Panics
-    /// Panics if the slice length doesn't match `(kl + ku + 1) * ncols`.
+    /// Panics if the slice length doesn't match `(kl + ku + 1) * ncols`, or
+    /// if `kl + ku + 1` or that product overflows `usize`.
     pub fn from_slice(nrows: usize, ncols: usize, kl: usize, ku: usize, data: &[T]) -> Self {
         let ldab = checked_ldab(kl, ku);
         let expected = checked_band_len(ldab, ncols);
@@ -295,12 +304,13 @@ impl<T: Scalar> BandedMat<T> {
     /// Sets the element at (row, col).
     ///
     /// # Panics
-    /// Panics if the element is outside the bandwidth.
+    /// Panics if the element is outside the bandwidth (this includes indices
+    /// outside the matrix bounds).
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let idx = self
-            .band_index(row, col)
-            .expect("Element outside bandwidth");
+        let Some(idx) = self.band_index(row, col) else {
+            panic!("Element outside bandwidth");
+        };
         self.data[idx] = value;
     }
 
@@ -469,6 +479,10 @@ impl<T: Scalar> BandedMat<T> {
     /// Creates a banded matrix from a dense matrix.
     ///
     /// Elements outside the specified bandwidth are ignored (assumed zero).
+    ///
+    /// # Panics
+    /// Panics if `kl + ku + 1` or the band storage size
+    /// `(kl + ku + 1) * ncols` overflows `usize`.
     pub fn from_dense(mat: &crate::MatRef<'_, T>, kl: usize, ku: usize) -> Self
     where
         T: bytemuck::Zeroable,
@@ -603,6 +617,10 @@ impl<T: Scalar> SymmetricBandedMat<T> {
     /// - `n`: Matrix dimension
     /// - `k`: Half-bandwidth (number of sub/superdiagonals)
     /// - `uplo`: Whether to store upper or lower triangle
+    ///
+    /// # Panics
+    /// Panics if `k + 1` or the band storage size `(k + 1) * n` overflows
+    /// `usize`.
     pub fn zeros(n: usize, k: usize, uplo: super::packed::TriangularKind) -> Self
     where
         T: bytemuck::Zeroable,
@@ -738,11 +756,15 @@ impl<T: Scalar> SymmetricBandedMat<T> {
     /// Sets the element at (row, col).
     ///
     /// For symmetric matrices, this also implicitly sets (col, row).
+    ///
+    /// # Panics
+    /// Panics if the element is outside the bandwidth (this includes indices
+    /// outside the matrix bounds).
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let idx = self
-            .band_index(row, col)
-            .expect("Element outside bandwidth");
+        let Some(idx) = self.band_index(row, col) else {
+            panic!("Element outside bandwidth");
+        };
         self.data[idx] = value;
     }
 
@@ -951,6 +973,13 @@ impl<'a, T: Scalar> BandedRef<'a, T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         self.band_index(row, col)
+            // SAFETY: `band_index` returns `Some(idx)` only after `in_band`
+            // saw `col < ncols` and a signed difference `row - col` in
+            // `-ku..=kl`, so `band_row = ku + row - col` lies in `0..=kl + ku`
+            // and `idx = band_row + col * ldab <= (kl + ku) + (ncols - 1) * ldab`.
+            // The `BandedRef::new` contract (`ldab >= kl + ku + 1`, at least
+            // `ldab * ncols` initialized elements, immutable for `'a`) makes
+            // that at most `ldab * ncols - 1`, so `idx` is in bounds.
             .map(|idx| unsafe { &*self.ptr.add(idx) })
     }
 
@@ -961,7 +990,12 @@ impl<'a, T: Scalar> BandedRef<'a, T> {
     }
 }
 
+// SAFETY: `BandedRef` is a shared, read-only borrow of `ldab * ncols` elements
+// (like `&'a [T]`), which is `Send` when `T: Sync`; every `T: Scalar` is
+// `Sync` (`Scalar: Send + Sync`), so the bound here suffices.
 unsafe impl<'a, T: Scalar + Send> Send for BandedRef<'a, T> {}
+// SAFETY: sharing a `&BandedRef` across threads only allows concurrent reads
+// of `T` through shared references, which is sound for `T: Sync`.
 unsafe impl<'a, T: Scalar + Sync> Sync for BandedRef<'a, T> {}
 
 /// A mutable view into banded matrix data.
@@ -1086,6 +1120,11 @@ impl<'a, T: Scalar> BandedMut<'a, T> {
     #[inline]
     pub fn get(&self, row: usize, col: usize) -> Option<&T> {
         self.band_index(row, col)
+            // SAFETY: as in `BandedRef::get`, `idx <= ldab * ncols - 1`, which
+            // the `BandedMut::new` contract (`ldab >= kl + ku + 1`, at least
+            // `ldab * ncols` initialized elements borrowed exclusively for
+            // `'a`) puts in bounds; the `&T` borrows `self` immutably, so no
+            // `&mut` to the element can be handed out while it lives.
             .map(|idx| unsafe { &*self.ptr.add(idx) })
     }
 
@@ -1093,15 +1132,27 @@ impl<'a, T: Scalar> BandedMut<'a, T> {
     #[inline]
     pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut T> {
         self.band_index(row, col)
+            // SAFETY: `idx <= ldab * ncols - 1` (see `BandedRef::get`), so it
+            // is in bounds of the initialized, exclusively borrowed
+            // allocation (`BandedMut::new` contract); the `&mut T` borrows
+            // `self` mutably, so it is the only live reference to the element.
             .map(|idx| unsafe { &mut *self.ptr.add(idx) })
     }
 
     /// Sets element at (row, col).
+    ///
+    /// # Panics
+    /// Panics if the element is outside the bandwidth (this includes indices
+    /// outside the matrix bounds).
     #[inline]
     pub fn set(&mut self, row: usize, col: usize, value: T) {
-        let idx = self
-            .band_index(row, col)
-            .expect("Element outside bandwidth");
+        let Some(idx) = self.band_index(row, col) else {
+            panic!("Element outside bandwidth");
+        };
+        // SAFETY: `idx` came from `band_index`, so `idx <= ldab * ncols - 1`
+        // (see `BandedRef::get`) is in bounds of the initialized, exclusively
+        // borrowed allocation (`BandedMut::new` contract); `&mut self` rules
+        // out other references through this view.
         unsafe {
             *self.ptr.add(idx) = value;
         }
@@ -1133,7 +1184,12 @@ impl<'a, T: Scalar> BandedMut<'a, T> {
     }
 }
 
+// SAFETY: `BandedMut` is an exclusive borrow (like `&'a mut [T]`), which is
+// `Send` when `T: Send`: moving it to another thread moves the only access.
 unsafe impl<'a, T: Scalar + Send> Send for BandedMut<'a, T> {}
+// SAFETY: a shared `&BandedMut` only reaches the `&self` methods (`get`, `rb`,
+// `band_index`, `in_band`, ...), which hand out shared `&T` / `BandedRef`; all
+// mutation needs `&mut self`. That matches `&'a mut [T]: Sync` for `T: Sync`.
 unsafe impl<'a, T: Scalar + Sync> Sync for BandedMut<'a, T> {}
 
 #[cfg(test)]
@@ -1580,5 +1636,75 @@ mod tests {
         assert_eq!(bref.shape(), (4, 4));
         assert_eq!(bref.ldab(), 3);
         assert_eq!(bref.get(0, 0), Some(&1.0));
+    }
+
+    // --- Regression: the `set` panic contract survives the removal of
+    // `.expect("Element outside bandwidth")` ----------------------------------
+
+    #[test]
+    #[should_panic(expected = "Element outside bandwidth")]
+    fn test_banded_set_outside_band_panics() {
+        let mut bm: BandedMat<f64> = BandedMat::zeros(4, 4, 1, 1);
+        bm.set(0, 2, 1.0); // two above the diagonal, ku = 1
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside bandwidth")]
+    fn test_banded_set_out_of_bounds_panics() {
+        let mut bm: BandedMat<f64> = BandedMat::zeros(4, 4, 1, 1);
+        bm.set(4, 4, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside bandwidth")]
+    fn test_symmetric_banded_set_outside_band_panics() {
+        let mut sb: SymmetricBandedMat<f64> =
+            SymmetricBandedMat::zeros(4, 1, super::super::packed::TriangularKind::Upper);
+        sb.set(3, 0, 1.0); // |row - col| = 3 > k = 1
+    }
+
+    #[test]
+    #[should_panic(expected = "Element outside bandwidth")]
+    fn test_banded_mut_set_outside_band_panics() {
+        let mut data = [0.0f64; 12]; // 4x4, kl = ku = 1
+        let mut bmut = BandedMut::from_slice(&mut data, 4, 4, 1, 1);
+        bmut.set(3, 0, 1.0);
+    }
+
+    #[test]
+    fn test_banded_set_in_band_writes_band_storage() {
+        // Every in-band index of each setter lands in the BLAS band slot
+        // `ku + row - col + col * ldab`, exactly as before.
+        let (n, kl, ku) = (5usize, 2usize, 1usize);
+        let ldab = kl + ku + 1;
+        let mut bm: BandedMat<f64> = BandedMat::zeros(n, n, kl, ku);
+        let mut raw = vec![0.0f64; ldab * n];
+        let mut bmut = BandedMut::from_slice(&mut raw, n, n, kl, ku);
+        for col in 0..n {
+            for row in col.saturating_sub(ku)..(col + kl + 1).min(n) {
+                let value = (10 * row + col) as f64 + 1.0;
+                bm.set(row, col, value);
+                bmut.set(row, col, value);
+            }
+        }
+        for col in 0..n {
+            for row in col.saturating_sub(ku)..(col + kl + 1).min(n) {
+                let value = (10 * row + col) as f64 + 1.0;
+                let slot = ku + row - col + col * ldab;
+                assert_eq!(bm.as_slice()[slot], value, "BandedMat ({row}, {col})");
+                assert_eq!(raw[slot], value, "BandedMut ({row}, {col})");
+            }
+        }
+
+        let k = 2usize;
+        for uplo in [
+            super::super::packed::TriangularKind::Upper,
+            super::super::packed::TriangularKind::Lower,
+        ] {
+            let mut sb: SymmetricBandedMat<f64> = SymmetricBandedMat::zeros(n, k, uplo);
+            sb.set(3, 1, 7.0); // mirrored half for Upper, stored half for Lower
+            assert_eq!(sb.get(1, 3), Some(&7.0));
+            assert_eq!(sb.get(3, 1), Some(&7.0));
+        }
     }
 }

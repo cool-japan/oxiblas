@@ -1,5 +1,6 @@
 //! Additive Schwarz domain decomposition preconditioner.
 
+use super::tolerance::{pivot_tolerance, raise_finite};
 use super::types::PreconditionerError;
 use crate::csr::CsrMatrix;
 use oxiblas_core::scalar::{Field, Real, Scalar};
@@ -129,7 +130,27 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
     ///
     /// # Errors
     ///
-    /// Returns error if matrix is not square or if local factorization fails.
+    /// Returns error if matrix is not square or if local factorization fails
+    /// ([`PreconditionerError::SingularBlock`] when an
+    /// [`LocalSolverType::ExactLU`] block is numerically singular).
+    ///
+    /// # Zero and negligible pivots
+    ///
+    /// Every test is scale-invariant, so `s·A` builds whenever `A` does and,
+    /// for a power-of-two `s`, gives exactly `1/s` times the preconditioner of
+    /// `A`, unless one of the fallbacks below applies (their replacement
+    /// values do not scale with `A`):
+    ///
+    /// * [`LocalSolverType::Jacobi`] inverts every nonzero local diagonal
+    ///   entry; a missing or exactly zero one is replaced by 1.
+    /// * [`LocalSolverType::ILU0`] and [`LocalSolverType::ExactLU`] treat a
+    ///   pivot of local column `k` as zero when it is at or below
+    ///   `eps · m · s_k`, where `m` is the local block size and `s_k` the
+    ///   largest finite magnitude of column `k` of the local block (the
+    ///   per-column rule of the crate's dense LU). ExactLU reports such a
+    ///   pivot as `SingularBlock(k)`; ILU(0) skips the elimination step with
+    ///   it and leaves the matching unknown undivided in the triangular solve,
+    ///   as it did before. The ILU(0) factors drop only exact zeros.
     pub fn new(
         a: &CsrMatrix<T>,
         config: AdditiveSchwarzConfig,
@@ -240,9 +261,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                         for ptr in start..end {
                             if local_col_indices[ptr] == local_row {
                                 let diag = local_values[ptr].clone();
-                                if Scalar::abs(diag.clone())
-                                    > T::from_f64(1e-14).unwrap_or(T::zero())
-                                {
+                                // Only an exact zero is skipped (scale-free).
+                                if diag != T::zero() {
                                     diag_inv[local_row] = T::one() / diag;
                                 }
                                 break;
@@ -325,6 +345,12 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
     }
 
     /// Compute ILU(0) factorization of a local matrix.
+    ///
+    /// A diagonal entry of U at or below `eps · n · s_i` (`s_i` the largest
+    /// finite magnitude of column `i` of the local matrix) is a numerically
+    /// zero pivot: it is not stored, so later rows skip the elimination step
+    /// with it and [`Self::solve_upper`] leaves that unknown undivided. All
+    /// other entries are stored unless exactly zero.
     fn compute_ilu0(
         values: &[T],
         col_indices: &[usize],
@@ -345,6 +371,20 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
         let mut u_values: Vec<T> = Vec::new();
         let mut u_col_indices: Vec<usize> = Vec::new();
         let mut u_row_ptrs: Vec<usize> = vec![0];
+
+        // Per-column pivot thresholds eps · n · max_i |a_ik| of the local
+        // matrix (finite entries only).
+        let mut col_scale = vec![T::zero(); n];
+        for ptr in 0..row_ptrs[n] {
+            raise_finite(
+                &mut col_scale[col_indices[ptr]],
+                Scalar::abs(values[ptr].clone()),
+            );
+        }
+        let col_tol: Vec<T> = col_scale
+            .into_iter()
+            .map(|scale| pivot_tolerance(n, scale))
+            .collect();
 
         // Dense working row
         let mut work = vec![T::zero(); n];
@@ -378,7 +418,8 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                     }
                 }
 
-                if Scalar::abs(u_kk.clone()) < T::from_f64(1e-14).unwrap_or(T::zero()) {
+                // A numerically zero pivot was not stored (see below).
+                if u_kk == T::zero() {
                     continue;
                 }
 
@@ -398,7 +439,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
             for j in 0..i {
                 if work_idx[j] {
                     let val = work[j].clone();
-                    if Scalar::abs(val.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    if val != T::zero() {
                         l_col_indices.push(j);
                         l_values.push(val);
                     }
@@ -409,11 +450,17 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
             l_values.push(T::one());
             l_row_ptrs.push(l_values.len());
 
-            // Store U (upper triangular, j >= i)
+            // Store U (upper triangular, j >= i). The diagonal is stored only
+            // when it is not a numerically zero pivot (relative to its column).
             for j in i..n {
                 if work_idx[j] {
                     let val = work[j].clone();
-                    if Scalar::abs(val.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+                    let keep = if j == i {
+                        Scalar::abs(val.clone()) > col_tol[i]
+                    } else {
+                        val != T::zero()
+                    };
+                    if keep {
                         u_col_indices.push(j);
                         u_values.push(val);
                     }
@@ -429,9 +476,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
             }
             // Also clear L entries
             for j in 0..i {
-                if work_idx[j]
-                    || Scalar::abs(work[j].clone()) > T::from_f64(1e-20).unwrap_or(T::zero())
-                {
+                if work_idx[j] || work[j] != T::zero() {
                     work[j] = T::zero();
                     work_idx[j] = false;
                 }
@@ -472,7 +517,9 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
     ///
     /// Returns [`PreconditionerError::SingularBlock`] if the local
     /// subdomain matrix is (numerically) singular, since an exact LU
-    /// solve is not well-defined in that case.
+    /// solve is not well-defined in that case: the largest remaining
+    /// magnitude of pivot column `k` is at or below `eps · n · s_k`, `s_k`
+    /// being the largest finite magnitude of column `k` of the local block.
     fn compute_exact_lu(
         values: &[T],
         col_indices: &[usize],
@@ -492,7 +539,18 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
         }
 
         let mut piv: Vec<usize> = (0..n).collect();
-        let zero_tol = T::from_f64(1e-14).unwrap_or(T::zero());
+        // Per-column singularity thresholds from the original block (rows are
+        // swapped, columns never move).
+        let mut col_scale = vec![T::zero(); n];
+        for row in 0..n {
+            for col in 0..n {
+                raise_finite(&mut col_scale[col], Scalar::abs(a[row * n + col].clone()));
+            }
+        }
+        let col_tol: Vec<T> = col_scale
+            .into_iter()
+            .map(|scale| pivot_tolerance(n, scale))
+            .collect();
 
         for k in 0..n {
             // Partial pivoting: pick the largest-magnitude entry in column k
@@ -507,7 +565,7 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                 }
             }
 
-            if max_val <= zero_tol {
+            if max_val <= col_tol[k] {
                 return Err(PreconditionerError::SingularBlock(k));
             }
 
@@ -606,7 +664,10 @@ impl<T: Scalar<Real = T> + Clone + Field + PartialOrd + Real> AdditiveSchwarz<T>
                 }
             }
 
-            if Scalar::abs(diag.clone()) > T::from_f64(1e-14).unwrap_or(T::zero()) {
+            // A numerically zero pivot is never stored (see `compute_ilu0`), so
+            // a missing diagonal (diag = 1) leaves the unknown undivided; the
+            // exact-zero test only guards the division.
+            if diag != T::zero() {
                 x[i] = sum / diag;
             } else {
                 x[i] = sum;

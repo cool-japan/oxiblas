@@ -214,12 +214,16 @@ fn main() {
     println!("==============================================");
     println!();
     println!("The 3M method uses 3 optimized real GEMM operations");
-    println!("with NEON SIMD, cache blocking, and prefetching.");
+    #[cfg(target_arch = "aarch64")]
+    println!("with NEON SIMD micro-kernels, cache blocking, and prefetching.");
+    #[cfg(not(target_arch = "aarch64"))]
+    println!("with the target's SIMD micro-kernels, cache blocking, and prefetching.");
 
     let sizes = [(256, "256"), (512, "512"), (1024, "1024")];
 
     bench_complex_gemm_c64(&sizes, 3, 5);
     bench_complex_gemm_c32(&sizes, 3, 5);
 
-    println!("\nNote: Complex GEMM counts 8 real flops per complex multiply-add.");
+    println!("\nNote: Complex GEMM counts the nominal 8 real flops per complex multiply-add;");
+    println!("      the 3M method executes about 6n³ of the nominal 8n³ (three real GEMMs).");
 }

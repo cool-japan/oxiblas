@@ -12,9 +12,12 @@
 //!
 //! # Thread Safety
 //!
-//! The tuning cache uses `std::sync::OnceLock` for lock-free, thread-safe
-//! initialization. Once a tuning result is computed for a given key, it is
-//! stored permanently and never recomputed.
+//! The tuning cache is a `Mutex<HashMap<..>>`; `std::sync::OnceLock` only holds
+//! the lazily initialized, process-wide [`RuntimeAutoTuner`] singleton. Once a
+//! tuning result is stored for a given key it is reused until
+//! [`RuntimeAutoTuner::clear`] is called. The lock is not held while
+//! benchmarking, so concurrent first requests for the same key may each run the
+//! benchmarks (the last result stored wins).
 //!
 //! # Usage
 //!
@@ -525,23 +528,22 @@ mod tests {
             candidates.len()
         );
 
-        // All MC values should be multiples of mr
+        // Every MC/NC is a multiple of MR/NR, or the full sample dimension
+        // (a dimension that fits its target is one unsplit block, issue #4).
+        let dim = SizeClass::Large.sample_dim();
         for c in &candidates {
-            assert_eq!(
-                c.mc % shape.mr,
-                0,
-                "MC={} not aligned to MR={}",
+            assert!(
+                c.mc % shape.mr == 0 || c.mc == dim,
+                "MC={} neither aligned to MR={} nor the dimension {dim}",
                 c.mc,
                 shape.mr
             );
         }
 
-        // All NC values should be multiples of nr
         for c in &candidates {
-            assert_eq!(
-                c.nc % shape.nr,
-                0,
-                "NC={} not aligned to NR={}",
+            assert!(
+                c.nc % shape.nr == 0 || c.nc == dim,
+                "NC={} neither aligned to NR={} nor the dimension {dim}",
                 c.nc,
                 shape.nr
             );
@@ -608,10 +610,14 @@ mod tests {
         let blocking = tuner.tune_gemm::<f64>(SizeClass::Small);
 
         let shape = f64::micro_kernel_shape();
+        let dim = SizeClass::Small.sample_dim();
         assert!(blocking.mc > 0, "MC must be > 0");
         assert!(blocking.kc > 0, "KC must be > 0");
         assert!(blocking.nc > 0, "NC must be > 0");
-        assert_eq!(blocking.mc % shape.mr, 0, "MC must be aligned to MR");
+        assert!(
+            blocking.mc.is_multiple_of(shape.mr) || blocking.mc == dim,
+            "MC must be aligned to MR or equal to the dimension"
+        );
     }
 
     #[test]
@@ -620,10 +626,14 @@ mod tests {
         let blocking = tuner.tune_gemm::<f32>(SizeClass::Small);
 
         let shape = f32::micro_kernel_shape();
+        let dim = SizeClass::Small.sample_dim();
         assert!(blocking.mc > 0, "MC must be > 0");
         assert!(blocking.kc > 0, "KC must be > 0");
         assert!(blocking.nc > 0, "NC must be > 0");
-        assert_eq!(blocking.mc % shape.mr, 0, "MC must be aligned to MR");
+        assert!(
+            blocking.mc.is_multiple_of(shape.mr) || blocking.mc == dim,
+            "MC must be aligned to MR or equal to the dimension"
+        );
     }
 
     #[test]

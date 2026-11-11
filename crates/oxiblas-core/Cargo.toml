@@ -24,7 +24,7 @@ libc = { workspace = true, optional = true }
 
 [features]
 default = ["std"]
-std = ["libc"]
+std = ["libc", "num-traits/std", "num-complex/std", "half?/std", "twofloat?/std"]
 parallel = ["rayon", "std"]
 f16 = ["half"]  # Half-precision (16-bit float) support
 f128 = ["dep:twofloat"]  # Quad-precision (double-double) support
@@ -42,6 +42,9 @@ max-simd-256 = []  # Limit SIMD to 256-bit (AVX2) maximum
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true, features = ["rayon"] }
 
 [[bench]]
 name = "simd"

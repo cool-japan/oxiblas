@@ -101,6 +101,7 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 // Loop index variables are common in matrix operations

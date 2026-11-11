@@ -348,9 +348,10 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> BlockLanczos<T>
 
         for idx in &selected_indices {
             // Approximate residual norm using the last block
-            let residual = if *idx < ritz_vectors.len() && !b_blocks.is_empty() {
+            let residual = if *idx < ritz_vectors.len()
+                && let Some(last_b) = b_blocks.last()
+            {
                 // Residual ~ ||B_m * s_last|| where s_last is the last p components
-                let last_b = b_blocks.last().expect("collection should be non-empty");
                 let y = &ritz_vectors[*idx];
                 let total_dim = actual_blocks * p;
 
@@ -483,7 +484,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> BlockLanczos<T>
         Ok(())
     }
 
-    /// Compute inner product of two blocks: result[i][j] = block1[i] . block2[j]
+    /// Compute inner product of two blocks: `result[i][j]` = `block1[i]` . `block2[j]`
     fn compute_block_inner_product(&self, block1: &[Vec<T>], block2: &[Vec<T>]) -> Vec<Vec<T>> {
         let p1 = block1.len();
         let p2 = block2.len();
@@ -1316,7 +1317,7 @@ impl<T: Scalar<Real = T> + Clone + Field + Real + FromPrimitive> BlockArnoldi<T>
         Ok(())
     }
 
-    /// Compute inner product of two blocks: result[i][j] = block1[i] . block2[j]
+    /// Compute inner product of two blocks: `result[i][j]` = `block1[i]` . `block2[j]`
     fn compute_block_inner_product(&self, block1: &[Vec<T>], block2: &[Vec<T>]) -> Vec<Vec<T>> {
         let p1 = block1.len();
         let p2 = block2.len();

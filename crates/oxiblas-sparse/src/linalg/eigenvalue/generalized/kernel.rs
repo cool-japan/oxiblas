@@ -1,7 +1,7 @@
 //! Dense eigenvalue kernels for the generalized eigenvalue solver.
 //!
 //! These are the small dense linear-algebra primitives used by
-//! [`GeneralizedEigen`](super::GeneralizedEigen): the Francis double-shift QR for real
+//! \[`GeneralizedEigen`\](super::GeneralizedEigen): the Francis double-shift QR for real
 //! upper Hessenberg matrices, the symmetric-tridiagonal QL eigenvalue solver with
 //! inverse-iteration eigenvectors, implicit-restart shift application, and the shifted
 //! Hessenberg/tridiagonal solves used by inverse iteration. They live in a dedicated

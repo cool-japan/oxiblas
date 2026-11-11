@@ -828,7 +828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Project Status
 
-**Version:** 0.2.3 (2026-11-12)
+**Version:** 0.2.4 (2026-11-12)
 
 - **Lines of Code:** ~283,000 lines of Rust, of which 228,258 are code (467 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
 - **Documentation:** 13 examples

@@ -541,7 +541,7 @@ Running 22 Iter1 subagents concurrently against the **same shared git working tr
 
 Production-grade pure Rust BLAS/LAPACK implementation.
 
-## Project Status (0.2.3, unreleased - Updated 2026-11-09)
+## Project Status (v0.2.3 Release - Updated 2026-11-12)
 
 - **Tests:** 4,437 tests passing, 4 skipped (release-only SVD comparisons; run them with `--release` or `--run-ignored all`) (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 358 doctests (`cargo test --doc --workspace --exclude oxiblas-benchmarks`)
 - **Code:** ~283,000 lines of Rust across 467 files, of which 228,258 are code (`tokei`, excluding the retired `oxiblas-ffi` crate)

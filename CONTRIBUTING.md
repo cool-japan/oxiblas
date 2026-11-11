@@ -101,7 +101,7 @@ loop.
 
 - Keep commits focused; describe the *why*, not just the *what*.
 - Update `CHANGELOG.md` for user-visible changes, under the section of the
-  next release (currently `## [0.2.3] - Unreleased`).
+  next release (the topmost `## [X.Y.Z] - Unreleased` heading).
 - Do not bump the crate version yourself; maintainers handle releases.
 - Security-relevant issues should go through `SECURITY.md`, not a public
   PR/issue, until a fix is ready.

@@ -37,7 +37,7 @@ use oxiblas_core::scalar::Field;
 use oxiblas_matrix::MatRef;
 
 #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
-mod neon;
+pub(crate) mod neon;
 
 /// Block size for the column dimension (K blocking) of the portable blocked
 /// kernels: the sequential `gemv_blocked` paths (including the `x86_64` AVX2

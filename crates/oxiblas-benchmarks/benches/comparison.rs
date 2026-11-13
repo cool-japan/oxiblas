@@ -47,6 +47,23 @@
 //! - DTRSM (f64 triangular solve with multiple RHS)
 //! - DSYRK (f64 symmetric rank-k update)
 //!
+//! ### GEMM shapes (single-threaded)
+//! - `sgemm_narrow_comparison`: f32 with 8, 12, 16 or 24 rows or columns of C
+//!   against 4096 x 4096
+//! - `gemm_small_comparison`, `sgemm_small_comparison`: cubes from 5 to 80 and
+//!   small rectangles, plain and with transposed operands
+//! - `gemm_thin_comparison`, `sgemm_thin_comparison`: one row or one column of
+//!   C with k from 256 to 16384, either operand plain or transposed
+//! - `gemm_short_wide_comparison`: the m x k x n shapes of issue #23,
+//!   (64, 512, 32768), (128, 256, 16384) and (32, 1024, 32768), f64 and f32
+//!
+//! These groups name their cases `<op(A)><op(B)>/<m>x<k>x<n>` (`N` plain,
+//! `T` transposed), and call OpenBLAS through `openblas::{dgemm_t, sgemm_t}`.
+//! Before the first of them is timed, each of the two wrappers is checked
+//! once against OxiBLAS on small integer-valued products in all four
+//! transposition pairs, so that a wrong argument order panics instead of
+//! being measured.
+//!
 //! ## Results Interpretation
 //!
 //! Criterion reports each library and size separately:
@@ -58,20 +75,27 @@
 //! OxiBLAS's speed as a percentage of OpenBLAS's, that is OpenBLAS time /
 //! OxiBLAS time × 100%, so above 100% means OxiBLAS is faster.
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 use std::hint::black_box;
 use std::num::NonZero;
+use std::sync::Once;
 use std::thread;
 
 // OxiBLAS imports
 use oxiblas_blas::level1::{axpy, dot, nrm2};
 use oxiblas_blas::level2::{GemvTrans, gemv};
+use oxiblas_blas::level3::gemm::gemm_transposed;
 use oxiblas_blas::level3::{Diag, Side, Trans, Uplo, gemm, gemm_with_par, syrk, trsm_in_place};
 use oxiblas_core::parallel::Par;
+use oxiblas_core::scalar::Scalar;
 use oxiblas_matrix::Mat;
 
 /// OpenBLAS routines resolved at run time from the loaded library.
 mod openblas {
+    use oxiblas_core::scalar::Scalar;
     use oxiblas_matrix::Mat;
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::process::Command;
@@ -80,6 +104,11 @@ mod openblas {
 
     const COL_MAJOR: c_int = 102;
     const NO_TRANS: c_int = 111;
+    const TRANS: c_int = 112;
+
+    /// Pauses of one second allowed for idle OpenBLAS workers to stop
+    /// spinning before the one-thread check gives up (see `OpenBlas::load`).
+    const IDLE_PAUSES: u32 = 30;
     const LOWER: c_int = 122;
     const NON_UNIT: c_int = 131;
     const LEFT: c_int = 141;
@@ -257,6 +286,61 @@ mod openblas {
         (!addr.is_null()).then(|| unsafe { std::mem::transmute_copy(&addr) })
     }
 
+    /// Rows and columns of `op(x)`.
+    fn op_dims<T: Scalar>(x: &Mat<T>, trans: bool) -> (usize, usize) {
+        if trans {
+            (x.ncols(), x.nrows())
+        } else {
+            (x.nrows(), x.ncols())
+        }
+    }
+
+    /// `C := alpha * op(A) * op(B) + beta * C` through a `cblas_?gemm`.
+    ///
+    /// M, N and K are the dimensions of the operations, as CBLAS defines them;
+    /// each leading dimension is that of the stored matrix.
+    ///
+    /// # Safety
+    /// `gemm` must be a `cblas_?gemm` for the element type `T`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm_t<T: Scalar>(
+        gemm: Gemm<T>,
+        trans_a: bool,
+        trans_b: bool,
+        alpha: T,
+        a: &Mat<T>,
+        b: &Mat<T>,
+        beta: T,
+        c: &mut Mat<T>,
+    ) {
+        let (m, k) = op_dims(a, trans_a);
+        let (k_b, n) = op_dims(b, trans_b);
+        assert_eq!(k, k_b, "op(A) and op(B) do not chain");
+        assert_eq!((m, n), (c.nrows(), c.ncols()), "C has the wrong shape");
+        let flag = |trans: bool| if trans { TRANS } else { NO_TRANS };
+        // SAFETY: all three are live column-major matrices with leading
+        // dimension `row_stride()`, which is at least their row count, and
+        // the shapes of the operations were checked above.
+        unsafe {
+            gemm(
+                COL_MAJOR,
+                flag(trans_a),
+                flag(trans_b),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                alpha,
+                a.as_ptr(),
+                a.row_stride() as c_int,
+                b.as_ptr(),
+                b.row_stride() as c_int,
+                beta,
+                c.as_mut_ptr(),
+                c.row_stride() as c_int,
+            );
+        }
+    }
+
     /// Returns the CPU time used so far by every thread of this process.
     fn process_cpu_time() -> Duration {
         let mut ts = libc::timespec {
@@ -288,10 +372,23 @@ mod openblas {
                 }
             };
             blas.set_num_threads(1);
-            let cores = blas.cores_used_by_gemm();
+            // The workers of a pthread build start with the library and
+            // busy-wait for a while before they sleep (2^28 time-stamp
+            // counter ticks by default: about 0.1 s on x86-64 hardware, much
+            // longer under emulation). That CPU time is not a threaded GEMM,
+            // so a high reading is taken again after a pause; a GEMM that
+            // really runs threaded stays high.
+            let mut cores = blas.cores_used_by_gemm();
+            let mut pauses = 0;
+            while cores >= 1.5 && pauses < IDLE_PAUSES {
+                std::thread::sleep(Duration::from_secs(1));
+                pauses += 1;
+                cores = blas.cores_used_by_gemm();
+            }
             assert!(
                 cores < 1.5,
-                "OpenBLAS used {cores:.1} cores with one thread requested"
+                "OpenBLAS used {cores:.1} cores with one thread requested \
+                 (measured after {pauses} pauses of 1 s)"
             );
 
             // SAFETY: these are the `openblas_config.h` prototypes.
@@ -312,7 +409,10 @@ mod openblas {
             };
             eprintln!("OpenBLAS under test: {path}");
             eprintln!("  config: {config}");
-            eprintln!("  kernel: {core}, sequential groups measured at {cores:.2} cores");
+            eprintln!(
+                "  kernel: {core}, sequential groups measured at {cores:.2} cores \
+                 (after {pauses} pauses of 1 s for idle workers)"
+            );
             blas
         }
 
@@ -430,6 +530,32 @@ mod openblas {
                     c.row_stride() as c_int,
                 );
             }
+        }
+
+        /// `C := op(A) * op(B)`, where `op(X)` is `X^T` when its flag is set.
+        pub fn dgemm_t(
+            &self,
+            trans_a: bool,
+            trans_b: bool,
+            a: &Mat<f64>,
+            b: &Mat<f64>,
+            c: &mut Mat<f64>,
+        ) {
+            // SAFETY: `dgemm` is `cblas_dgemm`, whose prototype is `Gemm<f64>`.
+            unsafe { gemm_t(self.dgemm, trans_a, trans_b, 1.0, a, b, 0.0, c) }
+        }
+
+        /// `C := op(A) * op(B)`, where `op(X)` is `X^T` when its flag is set.
+        pub fn sgemm_t(
+            &self,
+            trans_a: bool,
+            trans_b: bool,
+            a: &Mat<f32>,
+            b: &Mat<f32>,
+            c: &mut Mat<f32>,
+        ) {
+            // SAFETY: `sgemm` is `cblas_sgemm`, whose prototype is `Gemm<f32>`.
+            unsafe { gemm_t(self.sgemm, trans_a, trans_b, 1.0, a, b, 0.0, c) }
         }
 
         /// Solves `A * X = B` for lower triangular, non-unit `A`, overwriting `x`.
@@ -898,6 +1024,396 @@ fn bench_syrk_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// GEMM shapes of the 0.2.4 x86-64 work: narrow, small, thin and short-wide
+// products, plain and transposed, in f32 and f64.
+// ---------------------------------------------------------------------------
+
+/// Element types of the shape groups below.
+///
+/// The impls call the concrete routines (whose bounds the generic code would
+/// otherwise have to repeat); the group bodies are generic over this trait.
+trait GemmElem: Scalar {
+    /// `f32` or `f64`, for benchmark names and messages.
+    const NAME: &'static str;
+
+    fn from_value(value: f64) -> Self;
+
+    /// `C := op(A) * op(B)` through OxiBLAS.
+    fn oxiblas_gemm(
+        trans_a: Trans,
+        trans_b: Trans,
+        a: &Mat<Self>,
+        b: &Mat<Self>,
+        c: &mut Mat<Self>,
+    );
+
+    /// `C := op(A) * op(B)` through OpenBLAS.
+    fn openblas_gemm(
+        blas: &openblas::OpenBlas,
+        trans_a: Trans,
+        trans_b: Trans,
+        a: &Mat<Self>,
+        b: &Mat<Self>,
+        c: &mut Mat<Self>,
+    );
+
+    /// The once-per-process guard of the wrapper check of this type.
+    fn wrapper_checked() -> &'static Once;
+}
+
+impl GemmElem for f64 {
+    const NAME: &'static str = "f64";
+
+    fn from_value(value: f64) -> Self {
+        value
+    }
+
+    fn oxiblas_gemm(trans_a: Trans, trans_b: Trans, a: &Mat<f64>, b: &Mat<f64>, c: &mut Mat<f64>) {
+        gemm_transposed(
+            trans_a,
+            trans_b,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+        );
+    }
+
+    fn openblas_gemm(
+        blas: &openblas::OpenBlas,
+        trans_a: Trans,
+        trans_b: Trans,
+        a: &Mat<f64>,
+        b: &Mat<f64>,
+        c: &mut Mat<f64>,
+    ) {
+        blas.dgemm_t(is_trans(trans_a), is_trans(trans_b), a, b, c);
+    }
+
+    fn wrapper_checked() -> &'static Once {
+        static CHECKED: Once = Once::new();
+        &CHECKED
+    }
+}
+
+impl GemmElem for f32 {
+    const NAME: &'static str = "f32";
+
+    fn from_value(value: f64) -> Self {
+        value as f32
+    }
+
+    fn oxiblas_gemm(trans_a: Trans, trans_b: Trans, a: &Mat<f32>, b: &Mat<f32>, c: &mut Mat<f32>) {
+        gemm_transposed(
+            trans_a,
+            trans_b,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+        );
+    }
+
+    fn openblas_gemm(
+        blas: &openblas::OpenBlas,
+        trans_a: Trans,
+        trans_b: Trans,
+        a: &Mat<f32>,
+        b: &Mat<f32>,
+        c: &mut Mat<f32>,
+    ) {
+        blas.sgemm_t(is_trans(trans_a), is_trans(trans_b), a, b, c);
+    }
+
+    fn wrapper_checked() -> &'static Once {
+        static CHECKED: Once = Once::new();
+        &CHECKED
+    }
+}
+
+fn is_trans(trans: Trans) -> bool {
+    !matches!(trans, Trans::NoTrans)
+}
+
+/// `N` or `T`, as in the BLAS argument.
+fn trans_letter(trans: Trans) -> char {
+    if is_trans(trans) { 'T' } else { 'N' }
+}
+
+/// An `nrows x ncols` matrix whose entries come from `value(row, col)`.
+fn mat_from_fn<T: GemmElem>(
+    nrows: usize,
+    ncols: usize,
+    value: impl Fn(usize, usize) -> f64,
+) -> Mat<T> {
+    let mut mat = Mat::filled(nrows, ncols, T::from_value(0.0));
+    let ld = mat.row_stride();
+    let data = mat.raw_data_mut();
+    for j in 0..ncols {
+        for (i, entry) in data[j * ld..j * ld + nrows].iter_mut().enumerate() {
+            *entry = T::from_value(value(i, j));
+        }
+    }
+    mat
+}
+
+/// The stored `A` and `B` of `op(A) * op(B)` for an `m x k` by `k x n`
+/// product; `value(operand, row, col)` gives the entries (operand 0 is A).
+fn gemm_operands<T: GemmElem>(
+    (m, k, n): (usize, usize, usize),
+    trans_a: Trans,
+    trans_b: Trans,
+    value: impl Fn(usize, usize, usize) -> f64,
+) -> (Mat<T>, Mat<T>) {
+    let (a_rows, a_cols) = if is_trans(trans_a) { (k, m) } else { (m, k) };
+    let (b_rows, b_cols) = if is_trans(trans_b) { (n, k) } else { (k, n) };
+    let a = mat_from_fn(a_rows, a_cols, |i, j| value(0, i, j));
+    let b = mat_from_fn(b_rows, b_cols, |i, j| value(1, i, j));
+    (a, b)
+}
+
+/// Checks `openblas::{dgemm_t, sgemm_t}` against OxiBLAS once per type,
+/// before anything that uses it is timed: a wrong argument order would
+/// otherwise be measured as a speed.
+///
+/// m, k and n differ in every shape, and the row counts are not multiples of
+/// the padded leading dimension, so a swapped dimension, a wrong leading
+/// dimension or a swapped transposition flag changes the result. The entries
+/// are small integers, so both libraries are exact and must agree exactly.
+fn check_gemm_wrapper<T: GemmElem>(blas: &openblas::OpenBlas) {
+    T::wrapper_checked().call_once(|| {
+        let shapes = [(7, 5, 3), (19, 13, 11), (1, 9, 6), (6, 9, 1), (3, 37, 5)];
+        let flags = [Trans::NoTrans, Trans::Trans];
+        for (m, k, n) in shapes {
+            for trans_a in flags {
+                for trans_b in flags {
+                    let (a, b) = gemm_operands::<T>((m, k, n), trans_a, trans_b, |op, i, j| {
+                        ((i * 7 + j * 3 + op * 5) % 9) as f64 - 4.0
+                    });
+                    let mut expected = Mat::filled(m, n, T::from_value(0.0));
+                    let mut actual = Mat::filled(m, n, T::from_value(-99.0));
+                    T::oxiblas_gemm(trans_a, trans_b, &a, &b, &mut expected);
+                    T::openblas_gemm(blas, trans_a, trans_b, &a, &b, &mut actual);
+                    for j in 0..n {
+                        for i in 0..m {
+                            assert!(
+                                actual[(i, j)] == expected[(i, j)],
+                                "the OpenBLAS {} GEMM wrapper disagrees with OxiBLAS for \
+                                 {}{} {m}x{k}x{n} at ({i}, {j}): OpenBLAS {}, OxiBLAS {}",
+                                T::NAME,
+                                trans_letter(trans_a),
+                                trans_letter(trans_b),
+                                actual[(i, j)],
+                                expected[(i, j)],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "OpenBLAS {} GEMM wrapper agrees with OxiBLAS (NN, NT, TN, TT)",
+            T::NAME
+        );
+    });
+}
+
+/// One GEMM case of a shape group: OxiBLAS and OpenBLAS on the same operands.
+///
+/// The benchmark names are `oxiblas/<label>` and `openblas/<label>`, and the
+/// throughput counts `m * k * n` elements (GFLOPS = 2 x Gelem/s), as in the
+/// square groups. The entries are bounded, so no size overflows.
+fn bench_gemm_case<T: GemmElem>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    blas: &openblas::OpenBlas,
+    label: &str,
+    (m, k, n): (usize, usize, usize),
+    (trans_a, trans_b): (Trans, Trans),
+) {
+    group.throughput(Throughput::Elements((m * k * n) as u64));
+    let (a_mat, b_mat) = gemm_operands::<T>((m, k, n), trans_a, trans_b, |op, i, j| {
+        ((i * 13 + j * 7 + op * 3) % 23) as f64 * 0.03125 - 0.34375
+    });
+    let mut c_mat = Mat::filled(m, n, T::from_value(0.0));
+
+    // Benchmark OxiBLAS
+    group.bench_with_input(BenchmarkId::new("oxiblas", label), label, |bench, _| {
+        bench.iter(|| {
+            T::oxiblas_gemm(
+                black_box(trans_a),
+                black_box(trans_b),
+                black_box(&a_mat),
+                black_box(&b_mat),
+                black_box(&mut c_mat),
+            );
+        });
+    });
+
+    // Benchmark OpenBLAS
+    group.bench_with_input(BenchmarkId::new("openblas", label), label, |bench, _| {
+        bench.iter(|| {
+            T::openblas_gemm(
+                blas,
+                black_box(trans_a),
+                black_box(trans_b),
+                black_box(&a_mat),
+                black_box(&b_mat),
+                black_box(&mut c_mat),
+            );
+        });
+    });
+}
+
+const NN: (Trans, Trans) = (Trans::NoTrans, Trans::NoTrans);
+
+/// Benchmark SGEMM with a narrow C: 8, 12, 16 or 24 rows or columns against
+/// 4096 x 4096 (the f32 16x6 micro-kernel pads 8 and 12 rows to 16, and 8 and
+/// 16 columns to 12 and 18).
+fn bench_sgemm_narrow_comparison(c: &mut Criterion) {
+    let blas = openblas::get();
+    check_gemm_wrapper::<f32>(blas);
+    let mut group = c.benchmark_group("sgemm_narrow_comparison");
+    group.sample_size(20);
+
+    let long = 4096;
+    for width in [8, 12, 16, 24] {
+        let rows = format!("{width}x{long}x{long}");
+        bench_gemm_case::<f32>(&mut group, blas, &rows, (width, long, long), NN);
+        let cols = format!("{long}x{long}x{width}");
+        bench_gemm_case::<f32>(&mut group, blas, &cols, (long, long, width), NN);
+    }
+
+    group.finish();
+}
+
+/// Small products: cubes from 5 to 80 and rectangles, plain (NN), and cubes
+/// from 8 to 80 and one rectangle with transposed operands (TN, NT, TT).
+fn bench_small_shapes<T: GemmElem>(c: &mut Criterion, name: &str) {
+    let blas = openblas::get();
+    check_gemm_wrapper::<T>(blas);
+    let mut group = c.benchmark_group(name);
+
+    let cubes = [5, 8, 12, 16, 24, 32, 40, 48, 64, 80];
+    let rectangles = [
+        (4, 64, 64),
+        (64, 64, 4),
+        (16, 80, 8),
+        (80, 8, 80),
+        (33, 47, 29),
+    ];
+    for n in cubes {
+        bench_gemm_case::<T>(&mut group, blas, &format!("NN/{n}x{n}x{n}"), (n, n, n), NN);
+    }
+    for (m, k, n) in rectangles {
+        bench_gemm_case::<T>(&mut group, blas, &format!("NN/{m}x{k}x{n}"), (m, k, n), NN);
+    }
+
+    let transposed = [
+        (Trans::Trans, Trans::NoTrans),
+        (Trans::NoTrans, Trans::Trans),
+        (Trans::Trans, Trans::Trans),
+    ];
+    let trans_shapes = [
+        (8, 8, 8),
+        (16, 16, 16),
+        (32, 32, 32),
+        (64, 64, 64),
+        (80, 80, 80),
+        (33, 47, 29),
+    ];
+    for (trans_a, trans_b) in transposed {
+        for (m, k, n) in trans_shapes {
+            let label = format!(
+                "{}{}/{m}x{k}x{n}",
+                trans_letter(trans_a),
+                trans_letter(trans_b)
+            );
+            bench_gemm_case::<T>(&mut group, blas, &label, (m, k, n), (trans_a, trans_b));
+        }
+    }
+
+    group.finish();
+}
+
+/// Benchmark small DGEMM (see `bench_small_shapes`)
+fn bench_gemm_small_comparison(c: &mut Criterion) {
+    bench_small_shapes::<f64>(c, "gemm_small_comparison");
+}
+
+/// Benchmark small SGEMM (see `bench_small_shapes`)
+fn bench_sgemm_small_comparison(c: &mut Criterion) {
+    bench_small_shapes::<f32>(c, "sgemm_small_comparison");
+}
+
+/// Thin products with a long k: `1 x s x s` (one row of C; B plain or
+/// transposed) and `s x s x 1` (one column of C; A plain or transposed), for
+/// s in 256, 1024, 4096 and 16384. At 16384 the large operand takes 2 GiB in
+/// f64 and 1 GiB in f32.
+fn bench_thin_shapes<T: GemmElem>(c: &mut Criterion, name: &str) {
+    let blas = openblas::get();
+    check_gemm_wrapper::<T>(blas);
+    let mut group = c.benchmark_group(name);
+    group.sample_size(20);
+
+    for s in [256, 1024, 4096, 16384] {
+        for trans_b in [Trans::NoTrans, Trans::Trans] {
+            let label = format!("N{}/1x{s}x{s}", trans_letter(trans_b));
+            bench_gemm_case::<T>(
+                &mut group,
+                blas,
+                &label,
+                (1, s, s),
+                (Trans::NoTrans, trans_b),
+            );
+        }
+        for trans_a in [Trans::NoTrans, Trans::Trans] {
+            let label = format!("{}N/{s}x{s}x1", trans_letter(trans_a));
+            bench_gemm_case::<T>(
+                &mut group,
+                blas,
+                &label,
+                (s, s, 1),
+                (trans_a, Trans::NoTrans),
+            );
+        }
+    }
+
+    group.finish();
+}
+
+/// Benchmark thin DGEMM (see `bench_thin_shapes`)
+fn bench_gemm_thin_comparison(c: &mut Criterion) {
+    bench_thin_shapes::<f64>(c, "gemm_thin_comparison");
+}
+
+/// Benchmark thin SGEMM (see `bench_thin_shapes`)
+fn bench_sgemm_thin_comparison(c: &mut Criterion) {
+    bench_thin_shapes::<f32>(c, "sgemm_thin_comparison");
+}
+
+/// Benchmark the short, wide products of issue #23 (m x k x n), in f64 and
+/// f32: few rows of C against a long n, where the packed B block can outgrow
+/// the packing-buffer cache.
+fn bench_gemm_short_wide_comparison(c: &mut Criterion) {
+    let blas = openblas::get();
+    check_gemm_wrapper::<f64>(blas);
+    check_gemm_wrapper::<f32>(blas);
+    let mut group = c.benchmark_group("gemm_short_wide_comparison");
+    group.sample_size(20);
+
+    for (m, k, n) in [(64, 512, 32768), (128, 256, 16384), (32, 1024, 32768)] {
+        let label = format!("{}/{m}x{k}x{n}", f64::NAME);
+        bench_gemm_case::<f64>(&mut group, blas, &label, (m, k, n), NN);
+        let label = format!("{}/{m}x{k}x{n}", f32::NAME);
+        bench_gemm_case::<f32>(&mut group, blas, &label, (m, k, n), NN);
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     comparison_benches,
     bench_gemm_comparison,
@@ -911,6 +1427,12 @@ criterion_group!(
     bench_dot_comparison,
     bench_axpy_comparison,
     bench_nrm2_comparison,
+    bench_sgemm_narrow_comparison,
+    bench_gemm_small_comparison,
+    bench_sgemm_small_comparison,
+    bench_gemm_thin_comparison,
+    bench_sgemm_thin_comparison,
+    bench_gemm_short_wide_comparison,
 );
 
 criterion_main!(comparison_benches);

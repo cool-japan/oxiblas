@@ -38,6 +38,9 @@ serde = ["std", "oxiblas-matrix/serde"]
 mmap = ["std", "oxiblas-matrix/mmap"]
 nalgebra = ["oxiblas-matrix/nalgebra"]  # nalgebra type conversions
 full = ["parallel", "f16", "f128", "ndarray", "sparse", "serde", "mmap", "nalgebra"]
+# Opt-in SME2 backend (aarch64 only). Deliberately not part of `full` until it
+# has been validated on SME2 hardware; see `features::HAS_SME2`.
+sme2 = ["oxiblas-blas/sme2"]
 
 # SIMD control features (propagate to oxiblas-core, oxiblas-blas, oxiblas-lapack)
 force-scalar = ["oxiblas-core/force-scalar", "oxiblas-blas/force-scalar", "oxiblas-lapack/force-scalar"]  # Disable all SIMD

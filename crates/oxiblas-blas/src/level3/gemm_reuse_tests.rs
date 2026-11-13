@@ -7,6 +7,8 @@ use super::*;
 use crate::level3::gemm_packing::{
     PACK_CACHE_MAX_BYTES, PackSlot, pack_cache_bytes, pack_cache_capacity,
 };
+use crate::level3::gemm_plan::GemmPolicy;
+use crate::level3::gemm_small::SMALL_THRESHOLD;
 use num_complex::{Complex32, Complex64};
 use oxiblas_matrix::Mat;
 
@@ -162,7 +164,29 @@ fn assert_close<T: Elem>(got: &Mat<T>, expected: &Mat<T>, k: usize, ctx: &str) {
 /// Runs `C = alpha * op(A) * op(B) + beta * C` through the public entry point
 /// and checks it against the reference. With `beta == 0`, C starts as NaN so a
 /// read of C would show.
-fn check_case<T: Elem>(
+fn check_case<T: Elem>(ta: Trans, tb: Trans, dims: (usize, usize, usize), beta: T, seed: usize) {
+    check_case_on(None, ta, tb, dims, beta, seed);
+}
+
+/// [`check_case`] on the blocked route: the build's plan for the problem
+/// (`DEFAULT_POLICY`, its kernel and blocking) with [`GemmRoute::Blocked`]
+/// forced, so the packing buffers and the blocked driver are exercised under
+/// every policy (the x86 candidate sends products up to 80³ to its small
+/// kernels).
+fn check_case_blocked<T: Elem>(
+    ta: Trans,
+    tb: Trans,
+    dims: (usize, usize, usize),
+    beta: T,
+    seed: usize,
+) {
+    check_case_on(Some(GemmRoute::Blocked), ta, tb, dims, beta, seed);
+}
+
+/// [`check_case`] through the public entry point (`route == None`) or
+/// through [`gemm_planned`] with `route` forced.
+fn check_case_on<T: Elem>(
+    route: Option<GemmRoute>,
     ta: Trans,
     tb: Trans,
     (m, k, n): (usize, usize, usize),
@@ -179,7 +203,24 @@ fn check_case<T: Elem>(
     };
     let expected = reference(ta, tb, alpha, &a, &b, beta, &c0, (m, k, n));
     let mut c = c0.clone();
-    gemm_transposed(ta, tb, alpha, a.as_ref(), b.as_ref(), beta, c.as_mut());
+    match route {
+        None => gemm_transposed(ta, tb, alpha, a.as_ref(), b.as_ref(), beta, c.as_mut()),
+        Some(route) => {
+            let plan = GemmPlan::<T>::for_problem(DEFAULT_POLICY, m, n, k).with_forced_route(route);
+            gemm_planned(
+                ta,
+                tb,
+                alpha,
+                a.as_ref(),
+                b.as_ref(),
+                beta,
+                c.as_mut(),
+                Par::Seq,
+                BlockingSource::Default,
+                &plan,
+            );
+        }
+    }
     assert_close(
         &c,
         &expected,
@@ -220,8 +261,8 @@ fn check_no_stale_data<T: Elem>() {
     let all = [Trans::NoTrans, Trans::Trans, Trans::ConjTrans];
     for &ta in &all {
         for &tb in &all {
-            check_case::<T>(ta, tb, (m, 61, n), T::zero(), 11);
-            check_case::<T>(ta, tb, (m, 61, n), T::sample(5), 12);
+            check_case_blocked::<T>(ta, tb, (m, 61, n), T::zero(), 11);
+            check_case_blocked::<T>(ta, tb, (m, 61, n), T::sample(5), 12);
         }
     }
 }
@@ -316,43 +357,50 @@ fn test_alternating_element_types_on_one_thread() {
         .iter()
         .enumerate()
     {
-        check_case::<f32>(Trans::NoTrans, Trans::NoTrans, (m, k, n), 0.0, round);
-        check_case::<f64>(Trans::NoTrans, Trans::Trans, (m, k, n), 0.0, round);
-        check_case::<Complex64>(
+        check_case_blocked::<f32>(Trans::NoTrans, Trans::NoTrans, (m, k, n), 0.0, round);
+        check_case_blocked::<f64>(Trans::NoTrans, Trans::Trans, (m, k, n), 0.0, round);
+        check_case_blocked::<Complex64>(
             Trans::ConjTrans,
             Trans::NoTrans,
             (m, k, n),
             Complex64::new(0.0, 0.0),
             round,
         );
-        check_case::<Complex32>(
+        check_case_blocked::<Complex32>(
             Trans::NoTrans,
             Trans::NoTrans,
             (m, k, n),
             Complex32::new(0.5, -0.25),
             round,
         );
-        check_case::<f64>(Trans::NoTrans, Trans::NoTrans, (m, k, n), 1.0, round);
+        check_case_blocked::<f64>(Trans::NoTrans, Trans::NoTrans, (m, k, n), 1.0, round);
     }
     assert!(pack_cache_bytes() <= PACK_CACHE_MAX_BYTES);
 }
 
 #[test]
 fn test_edge_tiles_every_remainder() {
-    // m and n run through every remainder modulo MR and NR (blocked path:
-    // m * n * k > SMALL_THRESHOLD), with beta = 0 (NaN C), 1 and -0.5.
+    // m and n run through every remainder modulo MR and NR on the blocked
+    // route (forced: the x86 candidate's small route reaches 80³), with
+    // beta = 0 (NaN C), 1 and -0.5. The plan's kernel may differ from the
+    // canonical one, so the remainders run up to the larger MR and NR of the
+    // two (every MR and NR of this crate's kernels divides the larger one,
+    // or is at most it: 8 | 16, 6 <= 8).
     fn sweep<T: Elem>(betas: &[T]) {
-        let shape = T::micro_kernel_shape();
         let k = 40;
-        // Whole micro-panels plus a remainder, large enough for the blocked
-        // path with every kernel shape.
-        let (m0, n0) = (64 / shape.mr * shape.mr, 48 / shape.nr * shape.nr);
-        for dm in 0..shape.mr {
-            for dn in 0..shape.nr {
+        // 64 and 48 are whole micro-panels of every kernel shape (MR in
+        // {2, 4, 8, 16}, NR in {2, 4, 6, 8, 16}).
+        let (m0, n0) = (64, 48);
+        let canonical = T::micro_kernel_shape();
+        let planned = GemmPlan::<T>::for_problem(DEFAULT_POLICY, m0, n0, k)
+            .kernel
+            .shape;
+        for dm in 0..canonical.mr.max(planned.mr) {
+            for dn in 0..canonical.nr.max(planned.nr) {
                 let (m, n) = (m0 + dm, n0 + dn);
                 assert!(m * n * k > SMALL_THRESHOLD);
                 for &beta in betas {
-                    check_case::<T>(
+                    check_case_blocked::<T>(
                         Trans::NoTrans,
                         Trans::NoTrans,
                         (m, k, n),
@@ -373,7 +421,15 @@ fn test_edge_tiles_every_remainder() {
 /// of the same data still goes element-wise through `read_op`. Both must
 /// produce the same packed panels as an explicitly transposed copy, so all
 /// three results agree bitwise.
+///
+/// Every product must take the blocked route under every policy (above the
+/// largest small-route ceiling, the x86 candidate's 80³), or the
+/// column-major `NoTrans` reference would run on the small kernels.
 fn check_transposed_paths_bitwise<T: Elem>((m, k, n): (usize, usize, usize)) {
+    assert!(
+        m * n * k > crate::level3::gemm_plan::CANDIDATE_X86.small_simd_max_work,
+        "{m}x{k}x{n} must take the blocked route"
+    );
     let real = T::is_real();
     let a_nt = fill::<T>(m, k, 21);
     let b_nt = fill::<T>(k, n, 22);
@@ -464,14 +520,14 @@ fn check_transposed_paths_bitwise<T: Elem>((m, k, n): (usize, usize, usize)) {
 
 #[test]
 fn test_transposed_fast_packers_bitwise_f64() {
-    check_transposed_paths_bitwise::<f64>((67, 45, 53));
+    check_transposed_paths_bitwise::<f64>((83, 75, 89));
     // k > 512 takes the auto-tuned blocking with several KC blocks.
     check_transposed_paths_bitwise::<f64>((37, 700, 29));
 }
 
 #[test]
 fn test_transposed_fast_packers_bitwise_f32() {
-    check_transposed_paths_bitwise::<f32>((67, 45, 53));
+    check_transposed_paths_bitwise::<f32>((83, 75, 89));
     check_transposed_paths_bitwise::<f32>((70, 1100, 9));
 }
 
@@ -479,8 +535,8 @@ fn test_transposed_fast_packers_bitwise_f32() {
 fn test_transposed_fast_packers_bitwise_complex() {
     // Complex `Trans` uses the fast packers too; `ConjTrans` stays element-wise
     // (checked against the reference in `check_no_stale_data`).
-    check_transposed_paths_bitwise::<Complex64>((45, 33, 37));
-    check_transposed_paths_bitwise::<Complex32>((45, 33, 37));
+    check_transposed_paths_bitwise::<Complex64>((83, 75, 89));
+    check_transposed_paths_bitwise::<Complex32>((83, 75, 89));
 }
 
 #[test]
@@ -539,15 +595,37 @@ fn test_strided_c_view_and_border_untouched() {
 
 #[test]
 fn test_pack_cache_stays_bounded_after_oversized_gemm() {
-    // 8 x 416 x 4096 (short-wide): the packed B panel is 416 x 4098 f64,
-    // about 13.6 MB, above the cache limit, so it must be freed on return.
+    // 8 x 416 x 4096 (short-wide) with the auto-tuned blocking passed
+    // explicitly, so no B-block cap can shrink it (a capping policy would
+    // make this test vacuous): the packed B panel is about 416 x 4098 f64,
+    // some 13.6 MB, above the cache limit, so it must be freed on return.
     let (m, k, n) = (8usize, 416usize, 4096usize);
+    let shape = f64::micro_kernel_shape();
+    let targets = GemmBlocking::auto_tuned::<f64>(m, k, n, &shape);
+    let fitted = targets.fit_to_dims(m, k, n, &shape);
+    let b_bytes = fitted.kc * fitted.nc.div_ceil(shape.nr) * shape.nr * 8;
+    assert!(
+        b_bytes > PACK_CACHE_MAX_BYTES,
+        "{fitted:?}: the packed B block ({b_bytes} bytes) must exceed the cache limit"
+    );
     let a = fill::<f64>(m, k, 41);
     let b = fill::<f64>(k, n, 42);
     let mut c: Mat<f64> = Mat::zeros(m, n);
-    gemm(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut());
+    gemm_with_blocking(
+        1.0,
+        a.as_ref(),
+        b.as_ref(),
+        0.0,
+        c.as_mut(),
+        Par::Seq,
+        &targets,
+    );
     assert!(pack_cache_bytes() <= PACK_CACHE_MAX_BYTES);
-    assert!(pack_cache_capacity::<f64>(PackSlot::B) * 8 <= PACK_CACHE_MAX_BYTES);
+    assert_eq!(
+        pack_cache_capacity::<f64>(PackSlot::B),
+        0,
+        "the oversized B buffer must be freed"
+    );
     // Spot-check the last 96 columns.
     let mut b_tail: Mat<f64> = Mat::zeros(k, 96);
     b_tail.copy_from(&b.as_ref().submatrix(0, 4000, k, 96));
@@ -567,8 +645,8 @@ fn test_pack_cache_stays_bounded_after_oversized_gemm() {
             assert!((g - e).abs() <= f64::tol(k), "({i},{j}): {g} vs {e}");
         }
     }
-    // The next, small call still works and caches normally.
-    check_case::<f64>(Trans::NoTrans, Trans::NoTrans, (70, 60, 50), 0.0, 43);
+    // The next, small blocked call still works and caches normally.
+    check_case_blocked::<f64>(Trans::NoTrans, Trans::NoTrans, (70, 60, 50), 0.0, 43);
     assert!(pack_cache_capacity::<f64>(PackSlot::B) > 0);
 }
 
@@ -611,8 +689,6 @@ fn test_dispatch_resolved_once_matches_per_tile_dispatch() {
 #[cfg(feature = "parallel")]
 #[test]
 fn test_nested_gemms_inside_parallel_gemm() {
-    use rayon::prelude::*;
-
     // An outer parallel GEMM runs while sequential and parallel GEMMs run in
     // other tasks of the same pool: work stealing makes a worker that is
     // waiting inside one GEMM run tile tasks or whole GEMMs of another, so
@@ -653,18 +729,59 @@ fn test_nested_gemms_inside_parallel_gemm() {
         })
         .collect();
 
-    pool.install(|| {
+    // The outer GEMM runs through the public entry point, then with each pack
+    // scope forced (the per-tile scope moves both packing buffers onto the
+    // workers, which are the threads that also run the nested GEMMs).
+    let outer_scopes = [
+        None,
+        Some(crate::level3::gemm_plan::PackScope::Shared),
+        Some(crate::level3::gemm_plan::PackScope::PerTile),
+    ];
+    for outer_scope in outer_scopes {
+        pool.install(|| run_nested_round(outer_scope, (&big_a, &big_b, &big_ref), &small));
+    }
+}
+
+/// One round of [`test_nested_gemms_inside_parallel_gemm`]: the outer GEMM
+/// (`scope`: through the public entry point when `None`, else through the
+/// blocked route with that pack scope forced) joined with the nested ones.
+#[cfg(feature = "parallel")]
+fn run_nested_round(
+    scope: Option<crate::level3::gemm_plan::PackScope>,
+    (big_a, big_b, big_ref): (&Mat<f64>, &Mat<f64>, &Mat<f64>),
+    small: &[(Mat<f64>, Mat<f64>, Mat<f64>)],
+) {
+    use rayon::prelude::*;
+
+    let (bm, bk, bn) = (big_a.nrows(), big_a.ncols(), big_b.ncols());
+    {
         let (big_c, smalls) = rayon::join(
             || {
                 let mut c = Mat::filled(bm, bn, f64::NAN);
-                gemm_with_par(
-                    1.0,
-                    big_a.as_ref(),
-                    big_b.as_ref(),
-                    0.0,
-                    c.as_mut(),
-                    Par::Rayon,
-                );
+                match scope {
+                    None => gemm_with_par(
+                        1.0,
+                        big_a.as_ref(),
+                        big_b.as_ref(),
+                        0.0,
+                        c.as_mut(),
+                        Par::Rayon,
+                    ),
+                    Some(scope) => gemm_planned(
+                        Trans::NoTrans,
+                        Trans::NoTrans,
+                        1.0,
+                        big_a.as_ref(),
+                        big_b.as_ref(),
+                        0.0,
+                        c.as_mut(),
+                        Par::Rayon,
+                        BlockingSource::Default,
+                        &GemmPlan::<f64>::for_problem(DEFAULT_POLICY, bm, bn, bk)
+                            .with_forced_route(GemmRoute::Blocked)
+                            .with_forced_scope(scope),
+                    ),
+                }
                 c
             },
             || {
@@ -680,9 +797,315 @@ fn test_nested_gemms_inside_parallel_gemm() {
                     .collect::<Vec<_>>()
             },
         );
-        assert_close(&big_c, &big_ref, bk, "outer parallel GEMM");
-        for (i, (c, (_, b, r))) in smalls.iter().zip(&small).enumerate() {
-            assert_close(c, r, b.nrows(), &format!("nested GEMM {i}"));
+        assert_close(
+            &big_c,
+            big_ref,
+            bk,
+            &format!("outer parallel GEMM {scope:?}"),
+        );
+        for (i, (c, (_, b, r))) in smalls.iter().zip(small).enumerate() {
+            assert_close(c, r, b.nrows(), &format!("nested GEMM {i} ({scope:?})"));
         }
-    });
+    }
+}
+
+// ------------------------------------------------------------------
+// Issue #23: the B-block cap changes NC only (never a result bit), and the
+// packed B block of a thin-M product then stays in the per-thread cache.
+// ------------------------------------------------------------------
+
+/// Plans forcing the blocked route, without the B-block cap and with it in
+/// `scope`.
+fn b_cap_plans_in<T: Elem>(scope: BCapScope) -> (GemmPlan<T>, GemmPlan<T>) {
+    use crate::level3::gemm_plan::LEGACY_POLICY;
+    let uncapped = GemmPlan::<T>::new(LEGACY_POLICY).with_forced_route(GemmRoute::Blocked);
+    let capped = GemmPlan::<T>::new(GemmPolicy {
+        b_cap: scope,
+        ..LEGACY_POLICY
+    })
+    .with_forced_route(GemmRoute::Blocked);
+    (uncapped, capped)
+}
+
+/// [`b_cap_plans_in`] with the cap in the sequential driver.
+fn b_cap_plans<T: Elem>() -> (GemmPlan<T>, GemmPlan<T>) {
+    b_cap_plans_in(BCapScope::Sequential)
+}
+
+/// Exact bit patterns of the real element types.
+trait Bits: Elem {
+    fn bits(self) -> u64;
+}
+
+impl Bits for f64 {
+    fn bits(self) -> u64 {
+        self.to_bits()
+    }
+}
+
+impl Bits for f32 {
+    fn bits(self) -> u64 {
+        u64::from(self.to_bits())
+    }
+}
+
+fn bits_eq<T: Bits>(got: &Mat<T>, expected: &Mat<T>) -> bool {
+    (0..got.ncols())
+        .all(|j| (0..got.nrows()).all(|i| got[(i, j)].bits() == expected[(i, j)].bits()))
+}
+
+#[test]
+fn test_issue_23_b_cap_result_bitwise_unchanged() {
+    fn check<T: Bits>() {
+        let shape = T::micro_kernel_shape();
+        let elem = core::mem::size_of::<T>();
+        // Single pass (all rows in one MC block) with two KC blocks and
+        // more than 4 MiB of packed B; then two MC blocks (one of MR rows,
+        // one of a single row), one KC block and more than 8 MiB of packed
+        // B. The byte thresholds fix kc·n, so the work scales with m only:
+        // both shapes use the fewest rows that keep their case.
+        let kc = 256;
+        let single = (
+            (shape.mr, 2 * kc, (4 << 20) / (kc * elem) + 452),
+            GemmBlocking {
+                mc: 64,
+                kc,
+                nc: 1 << 20,
+            },
+        );
+        let shallow = (
+            (shape.mr + 1, 2 * kc, (8 << 20) / (2 * kc * elem) + 200),
+            GemmBlocking {
+                mc: shape.mr,
+                kc: 2 * kc,
+                nc: 1 << 20,
+            },
+        );
+        for ((m, k, n), targets) in [single, shallow] {
+            let ctx = format!("{} {m}x{k}x{n}", core::any::type_name::<T>());
+            let fitted = targets.fit_to_dims(m, k, n, &shape);
+            let a = fill::<T>(m, k, 71);
+            let b = fill::<T>(k, n, 72);
+            for beta in [T::zero(), T::sample(73)] {
+                let c0 = if beta == T::zero() {
+                    Mat::filled(m, n, T::nan())
+                } else {
+                    fill::<T>(m, n, 74)
+                };
+                let run = |plan: &GemmPlan<T>, par: Par| {
+                    let mut c = c0.clone();
+                    gemm_planned(
+                        Trans::NoTrans,
+                        Trans::NoTrans,
+                        T::sample(75),
+                        a.as_ref(),
+                        b.as_ref(),
+                        beta,
+                        c.as_mut(),
+                        par,
+                        BlockingSource::Heuristic(targets),
+                        plan,
+                    );
+                    c
+                };
+                // The uncapped sequential result, the same for every cap
+                // scope.
+                let (uncapped, _) = b_cap_plans_in::<T>(BCapScope::Sequential);
+                let c_ref = run(&uncapped, Par::Seq);
+                // `All` also hands the capped NC to the 2D parallel driver.
+                for scope in [BCapScope::Sequential, BCapScope::All] {
+                    let ctx = format!("{ctx} {scope:?} beta={beta}");
+                    let (_, capped) = b_cap_plans_in::<T>(scope);
+                    let blocks =
+                        call_blocking(BlockingSource::Heuristic(targets), &capped, m, k, n);
+                    let capped_blocks = *blocks.sequential();
+                    assert!(capped_blocks.nc < fitted.nc, "{ctx}: the cap must engage");
+                    assert_eq!((capped_blocks.mc, capped_blocks.kc), (fitted.mc, fitted.kc));
+                    let c = run(&capped, Par::Seq);
+                    assert!(bits_eq(&c, &c_ref), "{ctx} Seq: bits moved");
+                    #[cfg(feature = "parallel")]
+                    {
+                        use crate::level3::gemm_parallel::scope_runs;
+                        use crate::level3::gemm_plan::PackScope;
+                        // The parallel NC is capped exactly under `All`.
+                        let parallel_nc = blocks.parallel().nc;
+                        if scope == BCapScope::All {
+                            assert_eq!(parallel_nc, capped_blocks.nc, "{ctx}");
+                        } else {
+                            assert_eq!(parallel_nc, fitted.nc, "{ctx}");
+                        }
+                        // Both pack scopes of the 2D driver, which must run
+                        // (counted per scope on this thread).
+                        for pack in [PackScope::Shared, PackScope::PerTile] {
+                            let plan = capped.with_forced_scope(pack);
+                            let before = scope_runs();
+                            let c = run(&plan, Par::RayonWith(4));
+                            let after = scope_runs();
+                            let ran = match pack {
+                                PackScope::Shared => (after.0 - before.0, after.1 - before.1),
+                                PackScope::PerTile => (after.1 - before.1, after.0 - before.0),
+                            };
+                            assert_eq!(ran, (1, 0), "{ctx} {pack:?}: 2D driver (this, other)");
+                            assert!(bits_eq(&c, &c_ref), "{ctx} {pack:?}: bits moved");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    check::<f64>();
+    check::<f32>();
+}
+
+#[test]
+fn test_issue_23_thin_m_b_buffer_stays_cached() {
+    // Thin-M (all rows in one MC block): the uncapped packed B block is
+    // larger than the per-thread cache limit, so it was freed after every
+    // call (0.2.3); with the cap NC shrinks to at most 2 MiB of packed B and
+    // the buffer stays cached.
+    let shape = f64::micro_kernel_shape();
+    let kc = 256usize;
+    let (m, k) = (16usize, kc);
+    let n = PACK_CACHE_MAX_BYTES / (kc * 8) + 2 * shape.nr;
+    let targets = GemmBlocking {
+        mc: 64,
+        kc,
+        nc: 1 << 20,
+    };
+    let (uncapped, capped) = b_cap_plans::<f64>();
+    let a = fill::<f64>(m, k, 81);
+    let b = fill::<f64>(k, n, 82);
+    let run_with = |plan: &GemmPlan<f64>, source: BlockingSource| {
+        let mut c: Mat<f64> = Mat::filled(m, n, f64::NAN);
+        gemm_planned(
+            Trans::NoTrans,
+            Trans::NoTrans,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+            Par::Seq,
+            source,
+            plan,
+        );
+        c
+    };
+    let run = |plan: &GemmPlan<f64>| run_with(plan, BlockingSource::Heuristic(targets));
+
+    let c_uncapped = run(&uncapped);
+    assert_eq!(
+        pack_cache_capacity::<f64>(PackSlot::B),
+        0,
+        "the uncapped B block must exceed the cache limit (0.2.3 frees it)"
+    );
+
+    let c_capped = run(&capped);
+    let cached = pack_cache_capacity::<f64>(PackSlot::B);
+    assert!(cached > 0, "the capped B block must stay cached");
+    assert!(cached * 8 <= 2 << 20, "capped B block of {cached} elements");
+    assert!(pack_cache_bytes() <= PACK_CACHE_MAX_BYTES);
+    assert!(bits_eq(&c_capped, &c_uncapped), "the cap moved result bits");
+
+    // The next call reuses the cached buffer.
+    let c_again = run(&capped);
+    assert_eq!(pack_cache_capacity::<f64>(PackSlot::B), cached);
+    assert!(bits_eq(&c_again, &c_uncapped));
+
+    // Explicit (caller-chosen) blocking is never capped, even under a
+    // capping plan: its packed B block exceeds the cache limit again.
+    let c_explicit = run_with(&capped, BlockingSource::Explicit(targets));
+    assert_eq!(
+        pack_cache_capacity::<f64>(PackSlot::B),
+        0,
+        "explicit blocking must keep the caller's NC"
+    );
+    assert!(bits_eq(&c_explicit, &c_uncapped));
+}
+
+#[test]
+fn test_issue_23_b_cap_shallow_leaves_room_for_a() {
+    // Shallow case (several MC blocks, two KC blocks): the sequential driver
+    // returns its B buffer to the cache before its A buffer, so a B block
+    // capped at the whole cache limit (issue #23's 8 MiB against the 8 MiB
+    // cache) makes the cache free A after every call. The rule caps B at the
+    // room left beside A instead. Scaled down by 16 so the test stays cheap:
+    // a 512 KiB cache, a 512 KiB shallow cap and a 64 KiB A block.
+    use crate::level3::autotune::{BBlockCaps, ISSUE_23_B_CAPS, capped_nc_with};
+    use crate::level3::gemm_packing::set_pack_cache_limit;
+    let limit = 512usize << 10;
+    let caps = BBlockCaps {
+        shallow_cap: limit,
+        ..ISSUE_23_B_CAPS
+    };
+    let policy = GemmPolicy {
+        b_cap: BCapScope::Sequential,
+        b_caps: caps,
+        ..crate::level3::gemm_plan::LEGACY_POLICY
+    };
+    let capped = GemmPlan::<f64>::new(policy).with_forced_route(GemmRoute::Blocked);
+    let (uncapped, _) = b_cap_plans::<f64>();
+    let shape = capped.kernel.shape;
+    let (mc, kc) = (64usize, 128usize);
+    assert_eq!(mc % shape.mr, 0);
+    // n is two blocks of the plain cap's NC, so that cap would give a B block
+    // of (almost) the whole cache.
+    let plain_nc = limit / (kc * 8) / shape.nr * shape.nr;
+    let (m, k, n) = (2 * mc, 2 * kc, 2 * plain_nc);
+    let targets = GemmBlocking {
+        mc,
+        kc,
+        nc: 1 << 20,
+    };
+    let a_bytes = mc * kc * 8;
+
+    let _guard = set_pack_cache_limit(limit);
+    let fitted = targets.fit_to_dims(m, k, n, &shape);
+    assert_eq!((fitted.mc, fitted.kc, fitted.nc), (mc, kc, n));
+    let blocks = *call_blocking(BlockingSource::Heuristic(targets), &capped, m, k, n).sequential();
+    let rule = |cache_limit| capped_nc_with(m, k, n, mc, kc, n, shape.nr, 8, &caps, cache_limit);
+    assert_eq!(
+        blocks.nc,
+        rule(limit),
+        "call_blocking uses this thread's limit"
+    );
+    // The plain cap (room ignored, as with a twice larger cache) leaves no
+    // room for A; the rule does.
+    assert_eq!(rule(2 * limit), plain_nc);
+    assert!(kc * plain_nc * 8 + a_bytes > limit);
+    assert!(blocks.nc < plain_nc);
+    assert!(kc * blocks.nc.div_ceil(shape.nr) * shape.nr * 8 + a_bytes <= limit);
+
+    let a = fill::<f64>(m, k, 91);
+    let b = fill::<f64>(k, n, 92);
+    let run = |plan: &GemmPlan<f64>| {
+        let mut c: Mat<f64> = Mat::filled(m, n, f64::NAN);
+        gemm_planned(
+            Trans::NoTrans,
+            Trans::NoTrans,
+            1.0,
+            a.as_ref(),
+            b.as_ref(),
+            0.0,
+            c.as_mut(),
+            Par::Seq,
+            BlockingSource::Heuristic(targets),
+            plan,
+        );
+        c
+    };
+    let c_uncapped = run(&uncapped);
+    let c_capped = run(&capped);
+    assert!(bits_eq(&c_capped, &c_uncapped), "the cap moved result bits");
+    // Both buffers stay cached, within the limit.
+    let cached_a = pack_cache_capacity::<f64>(PackSlot::A);
+    let cached_b = pack_cache_capacity::<f64>(PackSlot::B);
+    assert_eq!(cached_a, mc * kc, "the A buffer was freed");
+    assert!(cached_b > 0, "the B buffer was freed");
+    assert!(pack_cache_bytes() <= limit);
+    // And the next call reuses both.
+    let c_again = run(&capped);
+    assert_eq!(pack_cache_capacity::<f64>(PackSlot::A), cached_a);
+    assert_eq!(pack_cache_capacity::<f64>(PackSlot::B), cached_b);
+    assert!(bits_eq(&c_again, &c_uncapped));
 }

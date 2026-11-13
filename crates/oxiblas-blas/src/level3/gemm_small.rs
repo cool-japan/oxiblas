@@ -1,22 +1,54 @@
 //! Small matrix GEMM specializations.
 //!
 //! This module provides optimized GEMM implementations for small problems
-//! (`m * n * k <= SMALL_THRESHOLD`, i.e. at most 32³ multiply-adds however the
-//! dimensions are split) where the overhead of packing and blocked algorithms
-//! outweighs their benefits.
+//! (by default `m * n * k <= SMALL_THRESHOLD`, i.e. at most 32³ multiply-adds
+//! however the dimensions are split; a routing policy may raise the ceiling
+//! for problems its tier's SIMD small kernels take, see
+//! `GemmPolicy::small_simd_max_work`) where the overhead of packing and
+//! blocked algorithms outweighs their benefits.
 //!
 //! For small matrices, we use:
 //! - Unrolled loops to reduce loop overhead
 //! - Register blocking to maximize register utilization
 //! - SIMD when available and beneficial
 //! - Direct memory access (no packing)
+//!
+//! SIMD small kernels per tier (`f64`/`f32`, column-major operands):
+//! - NEON (aarch64): 4×4 tiles from `m, n >= 4` (`gemm_small_f64_simd` /
+//!   `gemm_small_f32_simd`), under every policy.
+//! - AVX2 + FMA (x86-64): f64 8×4 and f32 16×4 register tiles with masked row
+//!   tails, from `m >= 5`, `n >= 4`, only under a policy with
+//!   `small_simd_x86` (the x86 candidate policy; the default policy of a
+//!   normal build keeps the portable loops there, exactly as 0.2.3). Every
+//!   element is computed by the same fused sequence wherever it sits, so the
+//!   results are position independent (see `gemm_small_avx2.rs`).
+//! - SSE4.2 and portable builds: the portable loops.
 
-use oxiblas_core::scalar::Field;
+use super::gemm::{op_dims, read_op};
+use super::gemm_kernel::GemmKernel;
+use super::gemm_packing::{PackBuffer, PackSlot};
+use super::gemm_plan::{DEFAULT_POLICY, GemmContext, GemmPolicy, SimdTier};
+use super::trsm::Trans;
+use crate::level1::typed::{same_matmut, same_matref, same_value};
+use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{MatMut, MatRef};
+
+#[cfg(target_arch = "x86_64")]
+#[path = "gemm_small_avx2.rs"]
+mod avx2;
 
 /// Threshold for using small matrix specialization.
 ///
-/// When m * n * k is at most this threshold, small matrix kernels are used.
+/// Under the default policy, GEMM sends a `NoTrans`/`NoTrans` problem with
+/// `m * n * k` at most this threshold (32³) to the small path, on every SIMD
+/// tier. (The candidate policies first send thin problems, `m == 1` or
+/// `n == 1`, to the thin route, and, on a tier whose SIMD small kernels take
+/// the shape, a problem with operands that are not column-major between 8³
+/// and 32³ to the copy-to-column-major small path.) A routing policy
+/// may raise the ceiling for column-major `f64`/`f32` problems that a tier's
+/// SIMD small kernels take (`small_simd_max_work`): the x86-64 candidate
+/// policy (`--cfg oxiblas_gemm_candidate`) uses 80³ for the AVX2 + FMA small
+/// kernels; the default policy keeps 32³ everywhere.
 pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 
 /// Performs small matrix GEMM with unrolled loops.
@@ -27,10 +59,43 @@ pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 /// `m * n * k <= SMALL_THRESHOLD`). As in reference BLAS, C is not read when
 /// `beta == 0` and A/B are not read when `alpha == 0`.
 ///
-/// On aarch64, `f64`/`f32` problems with `m, n >= 4` and column-major operands
-/// (`col_stride() == 1`) run on the NEON kernels (`gemm_small_f64_simd` /
-/// `gemm_small_f32_simd`); all other cases use the portable loops.
+/// It runs with this build's default routing policy. On aarch64, `f64`/`f32`
+/// problems with `m, n >= 4` and column-major operands (`col_stride() == 1`)
+/// run on the NEON kernels (`gemm_small_f64_simd` / `gemm_small_f32_simd`).
+/// On x86-64 with AVX2 and FMA, the same problems with `m >= 5`, `n >= 4` run
+/// on the AVX2 + FMA small kernels only when the crate is built with the
+/// candidate policy (`--cfg oxiblas_gemm_candidate`); the default policy
+/// keeps the portable loops there, bit for bit as in 0.2.3. All other cases
+/// (other element types, strided or transposed views, SSE4.2, `force-scalar`
+/// builds, and x86 builds capped by `max-simd-128`) use the portable loops.
 pub fn gemm_small<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+) {
+    gemm_small_with(GemmContext::detect(DEFAULT_POLICY), alpha, a, b, beta, c);
+}
+
+/// [`gemm_small`] for the SIMD tier and policy of a GEMM plan.
+///
+/// `C = alpha * A * B + beta * C` with C not read when `beta == 0` and A/B
+/// not read when `alpha == 0`. Beta is applied first (C is zero-filled
+/// without being read when `beta == 0`); then the SIMD small kernels of
+/// `ctx`'s tier accumulate `alpha * A * B` when they apply (`f64`/`f32` with
+/// column-major operands and consistent shapes):
+/// - NEON: from `m, n >= 4`;
+/// - AVX2 + FMA: from `m >= 5`, `n >= 4`, when `ctx.policy.small_simd_x86`
+///   (the same rule as the router's `RouteInputs::simd_small`); per element
+///   `acc = fma(A[i, p], B[p, j], acc)` for `p` ascending from `+0`, then
+///   `C[i, j] = fma(acc, alpha, C[i, j])`.
+///
+/// Everything else (SSE4.2 and portable tiers, the AVX2 tier under a policy
+/// without `small_simd_x86`, other element types, strided operands) takes
+/// the portable loops.
+pub(crate) fn gemm_small_with<T: Field>(
+    ctx: GemmContext,
     alpha: T,
     a: &MatRef<'_, T>,
     b: &MatRef<'_, T>,
@@ -48,39 +113,155 @@ pub fn gemm_small<T: Field>(
         return;
     }
 
-    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
-    {
-        if gemm_small_simd_dispatch(alpha, a, b, c) {
-            return;
-        }
+    if !small_simd(ctx, alpha, a, b, c) {
+        gemm_small_acc(alpha, a, b, c);
     }
-
-    gemm_small_acc(alpha, a, b, c);
 }
 
-/// Routes `C += alpha * A * B` to the NEON kernels when `T` is `f64`/`f32` and
-/// the operands qualify; returns `false` (having done nothing) otherwise.
-#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+/// `C = alpha * op(A) * op(B) + beta * C` for a transposed or strided small
+/// problem on the column-major small kernels.
+///
+/// `op(A)` (`m × k`) and `op(B)` (`k × n`) are copied to column-major scratch
+/// (leading dimensions `m` and `k`) in this thread's A and B packing buffers;
+/// an operand that is already `NoTrans` with `col_stride() == 1` is used in
+/// place. Then [`gemm_small_with`] runs on the copies, so alpha, beta and C
+/// behave exactly as for `NoTrans`/`NoTrans`, and the result is bit for bit
+/// that of `gemm_small_with` on column-major operands holding the same values.
+///
+/// Returns `false` without touching C when the shapes are inconsistent or a
+/// scratch view cannot be formed; the caller then uses the transpose-aware
+/// loops.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_small_trans_copy<T: Field + GemmKernel + bytemuck::Zeroable>(
+    ctx: GemmContext,
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+) -> bool {
+    let (m, k) = op_dims(a, trans_a);
+    let (kb, n) = op_dims(b, trans_b);
+    if kb != k || c.nrows() != m || c.ncols() != n {
+        return false;
+    }
+    let a_buf = (!is_plain_column_major(a, trans_a))
+        .then(|| copy_to_column_major(a, trans_a, m, k, PackSlot::A));
+    let b_buf = (!is_plain_column_major(b, trans_b))
+        .then(|| copy_to_column_major(b, trans_b, k, n, PackSlot::B));
+    let a_view = match &a_buf {
+        Some(buf) => match MatRef::from_column_major(buf.as_slice(), m, k) {
+            Some(view) => view,
+            None => return false,
+        },
+        None => *a,
+    };
+    let b_view = match &b_buf {
+        Some(buf) => match MatRef::from_column_major(buf.as_slice(), k, n) {
+            Some(view) => view,
+            None => return false,
+        },
+        None => *b,
+    };
+    gemm_small_with(ctx, alpha, &a_view, &b_view, beta, c);
+    true
+}
+
+/// `op(x)` is `x` itself in plain column-major storage.
 #[inline]
-fn gemm_small_simd_dispatch<T: Field>(
+fn is_plain_column_major<T: Scalar>(x: &MatRef<'_, T>, trans: Trans) -> bool {
+    trans == Trans::NoTrans && x.col_stride() == 1
+}
+
+/// `op(src)` (`rows × cols`) copied into this thread's packing buffer of
+/// `slot` as a column-major matrix with leading dimension `rows` (every
+/// element of the first `rows · cols` is written).
+fn copy_to_column_major<T: Field + GemmKernel + bytemuck::Zeroable>(
+    src: &MatRef<'_, T>,
+    trans: Trans,
+    rows: usize,
+    cols: usize,
+    slot: PackSlot,
+) -> PackBuffer<T> {
+    let mut buf = PackBuffer::<T>::take(slot, rows * cols);
+    copy_op_column_major(
+        src,
+        trans,
+        &mut buf.as_mut_slice()[..rows * cols],
+        rows,
+        cols,
+    );
+    buf
+}
+
+/// `dst[i + j·rows] = op(src)[i, j]` for every `i < rows`, `j < cols`.
+///
+/// The loops follow the contiguous direction of the source: column by column
+/// when the columns of `op(src)` are contiguous, otherwise in 4 × 4 blocks
+/// that read along the rows of `op(src)` (the stored columns of a transposed
+/// operand) and write four destination columns.
+fn copy_op_column_major<T: Field>(
+    src: &MatRef<'_, T>,
+    trans: Trans,
+    dst: &mut [T],
+    rows: usize,
+    cols: usize,
+) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // Distance in `src` between op(src)[i, j] and op(src)[i + 1, j].
+    let down = if trans == Trans::NoTrans {
+        src.col_stride()
+    } else {
+        src.row_stride()
+    };
+    if down == 1 || rows == 1 {
+        for (j, column) in dst.chunks_exact_mut(rows).take(cols).enumerate() {
+            for (i, d) in column.iter_mut().enumerate() {
+                *d = read_op(src, trans, i, j);
+            }
+        }
+        return;
+    }
+    const BLOCK: usize = 4;
+    for j0 in (0..cols).step_by(BLOCK) {
+        let j1 = (j0 + BLOCK).min(cols);
+        for i0 in (0..rows).step_by(BLOCK) {
+            for i in i0..(i0 + BLOCK).min(rows) {
+                for j in j0..j1 {
+                    dst[i + j * rows] = read_op(src, trans, i, j);
+                }
+            }
+        }
+    }
+}
+
+/// `C += alpha * A * B` on the SIMD small kernels of `ctx`'s tier when `T`
+/// is `f64` or `f32`, the operands are column-major with consistent shapes,
+/// and the tier's kernels take the shape; `false` (nothing done) otherwise.
+///
+/// The typed views are formed here, on every target, with the
+/// `level1::typed` hand-off; the per-type functions below choose the kernel
+/// by tier.
+#[inline]
+fn small_simd<T: Field>(
+    ctx: GemmContext,
     alpha: T,
     a: &MatRef<'_, T>,
     b: &MatRef<'_, T>,
     c: &mut MatMut<'_, T>,
 ) -> bool {
-    use core::any::TypeId;
-
     let m = a.nrows();
     let k = a.ncols();
     let n = b.ncols();
 
-    // The NEON kernels need at least one full 4x4 tile, unit row-to-row
-    // strides (plain column-major A and B; `MatMut` always has them) and
-    // consistent shapes, because they address the operands through raw
-    // pointers.
-    let eligible = m >= 4
-        && n >= 4
-        && a.col_stride() == 1
+    // The SIMD kernels address the operands through raw pointers with unit
+    // row-to-row strides (plain column-major A and B; `MatMut` always has
+    // them), so they need those strides and consistent shapes.
+    let eligible = a.col_stride() == 1
         && b.col_stride() == 1
         && b.nrows() == k
         && c.nrows() == m
@@ -89,36 +270,211 @@ fn gemm_small_simd_dispatch<T: Field>(
         return false;
     }
 
-    if TypeId::of::<T>() == TypeId::of::<f64>() {
-        // SAFETY: `T` is `f64` (identical `TypeId`s), so every cast below
-        // reinterprets a value as its own type. The rebuilt views keep the
-        // original pointers, shapes and leading dimensions; the unit
-        // row-to-row stride implied by `MatRef::new`/`MatMut::new` is exact
-        // because `col_stride() == 1` was checked above. Exclusive access to C
-        // is inherited from `c: &mut MatMut`, and no view outlives this block.
-        unsafe {
-            let a64 = MatRef::<f64>::new(a.as_ptr().cast::<f64>(), m, k, a.row_stride());
-            let b64 = MatRef::<f64>::new(b.as_ptr().cast::<f64>(), k, n, b.row_stride());
-            let mut c64 = MatMut::<f64>::new(c.as_mut_ptr().cast::<f64>(), m, n, c.row_stride());
-            let alpha64 = *(&raw const alpha).cast::<f64>();
-            gemm_small_f64_simd(alpha64, &a64, &b64, &mut c64);
-        }
-        return true;
+    if let (Some(a64), Some(b64), Some(alpha64)) = (
+        same_matref::<T, f64>(*a),
+        same_matref::<T, f64>(*b),
+        same_value::<T, f64>(alpha),
+    ) && let Some(mut c64) = same_matmut::<T, f64>(c.rb_mut())
+    {
+        return small_simd_f64(ctx, alpha64, &a64, &b64, &mut c64);
     }
-
-    if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: as above, with `T` being `f32`.
-        unsafe {
-            let a32 = MatRef::<f32>::new(a.as_ptr().cast::<f32>(), m, k, a.row_stride());
-            let b32 = MatRef::<f32>::new(b.as_ptr().cast::<f32>(), k, n, b.row_stride());
-            let mut c32 = MatMut::<f32>::new(c.as_mut_ptr().cast::<f32>(), m, n, c.row_stride());
-            let alpha32 = *(&raw const alpha).cast::<f32>();
-            gemm_small_f32_simd(alpha32, &a32, &b32, &mut c32);
-        }
-        return true;
+    if let (Some(a32), Some(b32), Some(alpha32)) = (
+        same_matref::<T, f32>(*a),
+        same_matref::<T, f32>(*b),
+        same_value::<T, f32>(alpha),
+    ) && let Some(mut c32) = same_matmut::<T, f32>(c.rb_mut())
+    {
+        return small_simd_f32(ctx, alpha32, &a32, &b32, &mut c32);
     }
-
     false
+}
+
+/// [`small_simd`] for `f64` (column-major operands, consistent shapes):
+/// the kernels of `ctx`'s tier, or `false` (nothing done).
+#[inline]
+fn small_simd_f64(
+    ctx: GemmContext,
+    alpha: f64,
+    a: &MatRef<'_, f64>,
+    b: &MatRef<'_, f64>,
+    c: &mut MatMut<'_, f64>,
+) -> bool {
+    match ctx.tier() {
+        SimdTier::Neon => neon_small_f64(alpha, a, b, c),
+        SimdTier::Avx2Fma => {
+            avx2_small_applies(&ctx.policy, a.nrows(), b.ncols())
+                && avx2_small_f64(ctx, alpha, a, b, c)
+        }
+        SimdTier::Sse42 | SimdTier::Portable => false,
+    }
+}
+
+/// [`small_simd`] for `f32` (column-major operands, consistent shapes):
+/// the kernels of `ctx`'s tier, or `false` (nothing done).
+#[inline]
+fn small_simd_f32(
+    ctx: GemmContext,
+    alpha: f32,
+    a: &MatRef<'_, f32>,
+    b: &MatRef<'_, f32>,
+    c: &mut MatMut<'_, f32>,
+) -> bool {
+    match ctx.tier() {
+        SimdTier::Neon => neon_small_f32(alpha, a, b, c),
+        SimdTier::Avx2Fma => {
+            avx2_small_applies(&ctx.policy, a.nrows(), b.ncols())
+                && avx2_small_f32(ctx, alpha, a, b, c)
+        }
+        SimdTier::Sse42 | SimdTier::Portable => false,
+    }
+}
+
+/// Whether the AVX2 + FMA small kernels take an `m × n` product under
+/// `policy`: only with `policy.small_simd_x86` (off in the legacy policy, so
+/// the default build keeps the 0.2.3 portable loops), and from `m >= 5`,
+/// `n >= 4`. The router's `RouteInputs::simd_small` applies the same rule to
+/// the AVX2 + FMA tier.
+#[inline]
+const fn avx2_small_applies(policy: &GemmPolicy, m: usize, n: usize) -> bool {
+    policy.small_simd_x86 && m >= 5 && n >= 4
+}
+
+/// The AVX2 + FMA `f64` small kernel on column-major operands with
+/// consistent shapes, when `ctx` is on that tier; `false` otherwise, and
+/// always in builds for other architectures (where the tier never occurs).
+#[inline]
+fn avx2_small_f64(
+    ctx: GemmContext,
+    alpha: f64,
+    a: &MatRef<'_, f64>,
+    b: &MatRef<'_, f64>,
+    c: &mut MatMut<'_, f64>,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
+        if ctx.tier() != SimdTier::Avx2Fma
+            || a.col_stride() != 1
+            || b.col_stride() != 1
+            || b.nrows() != k
+            || c.nrows() != m
+            || c.ncols() != n
+        {
+            return false;
+        }
+        let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
+        let c_ptr = c.as_mut_ptr();
+        // SAFETY: `GemmContext::tier()` is `Avx2Fma` only when AVX2 and FMA
+        // were detected at run time and the build allows 256-bit vectors
+        // (`SimdTier::from_kind` on the capped kernel kind), so both target
+        // features of the kernel are present. A is `m × k` and B `k × n` with
+        // unit row-to-row stride (checked above), so `A[i, p]` is the view's
+        // element at `as_ptr() + i + p·lda` and `B[p, j]` at
+        // `as_ptr() + p + j·ldb`; C is `m × n` (checked) and a `MatMut`
+        // always has unit row-to-row stride, so `C[i, j]` is at
+        // `c_ptr + i + j·ldc`. The kernel touches only those elements (masked
+        // tails, no access outside the three areas), C is borrowed exclusively
+        // through `c`, and the borrows of `a` / `b` keep A and B readable and
+        // disjoint from C for the call.
+        unsafe {
+            avx2::small_f64_avx2(m, n, k, alpha, a.as_ptr(), lda, b.as_ptr(), ldb, c_ptr, ldc);
+        }
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ctx, alpha, a, b, c);
+        false
+    }
+}
+
+/// The AVX2 + FMA `f32` small kernel (see [`avx2_small_f64`]).
+#[inline]
+fn avx2_small_f32(
+    ctx: GemmContext,
+    alpha: f32,
+    a: &MatRef<'_, f32>,
+    b: &MatRef<'_, f32>,
+    c: &mut MatMut<'_, f32>,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
+        if ctx.tier() != SimdTier::Avx2Fma
+            || a.col_stride() != 1
+            || b.col_stride() != 1
+            || b.nrows() != k
+            || c.nrows() != m
+            || c.ncols() != n
+        {
+            return false;
+        }
+        let (lda, ldb, ldc) = (a.row_stride(), b.row_stride(), c.row_stride());
+        let c_ptr = c.as_mut_ptr();
+        // SAFETY: as in `avx2_small_f64`: the `Avx2Fma` tier guarantees AVX2
+        // and FMA at run time under a build that allows 256 bits, and the
+        // checked shapes and unit row-to-row strides put every element the
+        // kernel accesses (`A[i, p]`, `B[p, j]`, `C[i, j]` for `i < m`,
+        // `p < k`, `j < n`) inside the views; C is borrowed exclusively.
+        unsafe {
+            avx2::small_f32_avx2(m, n, k, alpha, a.as_ptr(), lda, b.as_ptr(), ldb, c_ptr, ldc);
+        }
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ctx, alpha, a, b, c);
+        false
+    }
+}
+
+/// The NEON `f64` small kernel when the problem has a full 4×4 tile;
+/// `false` otherwise, and always in builds without it (other architectures,
+/// `force-scalar`, where the NEON tier never occurs).
+#[inline]
+fn neon_small_f64(
+    alpha: f64,
+    a: &MatRef<'_, f64>,
+    b: &MatRef<'_, f64>,
+    c: &mut MatMut<'_, f64>,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if a.nrows() >= 4 && b.ncols() >= 4 {
+            gemm_small_f64_simd(alpha, a, b, c);
+            return true;
+        }
+        false
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(feature = "force-scalar"))))]
+    {
+        let _ = (alpha, a, b, c);
+        false
+    }
+}
+
+/// The NEON `f32` small kernel when the problem has a full 4×4 tile;
+/// `false` otherwise, and always in builds without it.
+#[inline]
+fn neon_small_f32(
+    alpha: f32,
+    a: &MatRef<'_, f32>,
+    b: &MatRef<'_, f32>,
+    c: &mut MatMut<'_, f32>,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+    {
+        if a.nrows() >= 4 && b.ncols() >= 4 {
+            gemm_small_f32_simd(alpha, a, b, c);
+            return true;
+        }
+        false
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(feature = "force-scalar"))))]
+    {
+        let _ = (alpha, a, b, c);
+        false
+    }
 }
 
 /// Portable small GEMM accumulation: `C += alpha * A * B` (no beta).
@@ -818,351 +1174,5 @@ unsafe fn gemm_4x4_neon_f32(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use num_traits::ToPrimitive;
-    use oxiblas_core::scalar::Scalar;
-    use oxiblas_matrix::Mat;
-
-    #[test]
-    fn test_gemm_2x2() {
-        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
-        let b: Mat<f64> = Mat::from_rows(&[&[5.0, 6.0], &[7.0, 8.0]]);
-        let mut c: Mat<f64> = Mat::zeros(2, 2);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        // A*B = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
-        assert!((c[(0, 0)] - 19.0).abs() < 1e-10);
-        assert!((c[(0, 1)] - 22.0).abs() < 1e-10);
-        assert!((c[(1, 0)] - 43.0).abs() < 1e-10);
-        assert!((c[(1, 1)] - 50.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_gemm_3x3() {
-        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], &[7.0, 8.0, 9.0]]);
-        let b: Mat<f64> = Mat::eye(3);
-        let mut c: Mat<f64> = Mat::zeros(3, 3);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        // A*I = A
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!((c[(i, j)] - a[(i, j)]).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[test]
-    fn test_gemm_4x4() {
-        let a: Mat<f64> = Mat::filled(4, 4, 2.0);
-        let b: Mat<f64> = Mat::filled(4, 4, 3.0);
-        let mut c: Mat<f64> = Mat::zeros(4, 4);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        // Each element = 4 * (2*3) = 24
-        for i in 0..4 {
-            for j in 0..4 {
-                assert!((c[(i, j)] - 24.0).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[test]
-    fn test_gemm_small_8x8() {
-        let n = 8;
-        let a: Mat<f64> = Mat::filled(n, n, 1.0);
-        let b: Mat<f64> = Mat::filled(n, n, 1.0);
-        let mut c: Mat<f64> = Mat::zeros(n, n);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        // Each element = n * (1*1) = n
-        for i in 0..n {
-            for j in 0..n {
-                assert!((c[(i, j)] - n as f64).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[test]
-    fn test_gemm_small_16x16() {
-        let n = 16;
-        let a: Mat<f64> = Mat::filled(n, n, 1.0);
-        let b: Mat<f64> = Mat::filled(n, n, 1.0);
-        let mut c: Mat<f64> = Mat::zeros(n, n);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        for i in 0..n {
-            for j in 0..n {
-                assert!((c[(i, j)] - n as f64).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[test]
-    fn test_gemm_small_general() {
-        let m = 20;
-        let k = 15;
-        let n = 25;
-        let a: Mat<f64> = Mat::filled(m, k, 1.0);
-        let b: Mat<f64> = Mat::filled(k, n, 1.0);
-        let mut c: Mat<f64> = Mat::zeros(m, n);
-
-        gemm_small(1.0, &a.as_ref(), &b.as_ref(), 0.0, &mut c.as_mut());
-
-        for i in 0..m {
-            for j in 0..n {
-                assert!((c[(i, j)] - k as f64).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[test]
-    fn test_gemm_with_alpha_beta() {
-        let a: Mat<f64> = Mat::from_rows(&[&[1.0, 2.0], &[3.0, 4.0]]);
-        let b: Mat<f64> = Mat::from_rows(&[&[1.0, 0.0], &[0.0, 1.0]]);
-        let mut c: Mat<f64> = Mat::from_rows(&[&[10.0, 20.0], &[30.0, 40.0]]);
-
-        // C = 2*A*B + 0.5*C = 2*A + 0.5*C
-        gemm_small(2.0, &a.as_ref(), &b.as_ref(), 0.5, &mut c.as_mut());
-
-        // Expected: 2*[[1,2],[3,4]] + 0.5*[[10,20],[30,40]]
-        //         = [[2,4],[6,8]] + [[5,10],[15,20]]
-        //         = [[7,14],[21,28]]
-        assert!((c[(0, 0)] - 7.0).abs() < 1e-10);
-        assert!((c[(0, 1)] - 14.0).abs() < 1e-10);
-        assert!((c[(1, 0)] - 21.0).abs() < 1e-10);
-        assert!((c[(1, 1)] - 28.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_gemm_f32() {
-        let a: Mat<f32> = Mat::from_rows(&[&[1.0f32, 2.0], &[3.0, 4.0]]);
-        let b: Mat<f32> = Mat::from_rows(&[&[5.0f32, 6.0], &[7.0, 8.0]]);
-        let mut c: Mat<f32> = Mat::zeros(2, 2);
-
-        gemm_small(1.0f32, &a.as_ref(), &b.as_ref(), 0.0f32, &mut c.as_mut());
-
-        assert!((c[(0, 0)] - 19.0).abs() < 1e-5);
-        assert!((c[(0, 1)] - 22.0).abs() < 1e-5);
-        assert!((c[(1, 0)] - 43.0).abs() < 1e-5);
-        assert!((c[(1, 1)] - 50.0).abs() < 1e-5);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn test_gemm_small_f64_simd() {
-        let n = 8;
-        let a: Mat<f64> = Mat::filled(n, n, 1.0);
-        let b: Mat<f64> = Mat::filled(n, n, 1.0);
-        let mut c: Mat<f64> = Mat::zeros(n, n);
-
-        gemm_small_f64_simd(1.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
-
-        for i in 0..n {
-            for j in 0..n {
-                assert!((c[(i, j)] - n as f64).abs() < 1e-10);
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn test_gemm_small_f32_simd() {
-        let n = 8;
-        let a: Mat<f32> = Mat::filled(n, n, 1.0);
-        let b: Mat<f32> = Mat::filled(n, n, 1.0);
-        let mut c: Mat<f32> = Mat::zeros(n, n);
-
-        gemm_small_f32_simd(1.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
-
-        for i in 0..n {
-            for j in 0..n {
-                assert!((c[(i, j)] - n as f32).abs() < 1e-5);
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Issue #16 (cause 3): `gemm_small` dispatches to the SIMD kernels.
-    // These tests pin down the full alpha/beta contract of `gemm_small`
-    // (including the reference-BLAS rule that A/B are not read when
-    // alpha == 0 and C is not read when beta == 0) against an independent
-    // naive reference, for sizes on both sides of the 4x4 SIMD tile and
-    // for strided (transposed-view) operands that must take the generic path.
-    // ------------------------------------------------------------------
-
-    /// Deterministic, non-symmetric fill in roughly [-1, 1].
-    fn pattern<T: Field + bytemuck::Zeroable>(rows: usize, cols: usize, seed: usize) -> Mat<T> {
-        let mut m: Mat<T> = Mat::zeros(rows, cols);
-        for j in 0..cols {
-            for i in 0..rows {
-                let v = ((i * 7 + j * 13 + seed * 5) % 23) as f64 / 11.0 - 1.0;
-                m[(i, j)] = T::from_f64(v).unwrap_or_else(T::zero);
-            }
-        }
-        m
-    }
-
-    /// Naive `alpha * A * B + beta * C` honouring the BLAS zero rules.
-    fn reference<T: Field + bytemuck::Zeroable>(
-        alpha: T,
-        a: &MatRef<'_, T>,
-        b: &MatRef<'_, T>,
-        beta: T,
-        c: &Mat<T>,
-    ) -> Mat<T> {
-        let (m, k, n) = (a.nrows(), a.ncols(), b.ncols());
-        let mut out: Mat<T> = Mat::zeros(m, n);
-        for j in 0..n {
-            for i in 0..m {
-                let mut acc = T::zero();
-                if alpha != T::zero() {
-                    for p in 0..k {
-                        acc += a[(i, p)] * b[(p, j)];
-                    }
-                }
-                let scaled = if alpha == T::zero() {
-                    T::zero()
-                } else {
-                    alpha * acc
-                };
-                out[(i, j)] = if beta == T::zero() {
-                    scaled
-                } else {
-                    scaled + beta * c[(i, j)]
-                };
-            }
-        }
-        out
-    }
-
-    fn check_gemm_small_contract<T: Field + bytemuck::Zeroable>(tol: f64) {
-        let nan = T::from_f64(f64::NAN).unwrap_or_else(T::zero);
-        let sizes = [
-            (2usize, 2usize, 3usize),
-            (3, 5, 4),
-            (4, 4, 1),
-            (4, 4, 2),
-            (4, 4, 4),
-            (5, 7, 3),
-            (8, 8, 8),
-            (13, 6, 11),
-            (16, 16, 16),
-            (17, 9, 20),
-            (32, 32, 32),
-        ];
-        let minus_two = T::from_f64(-2.0).unwrap_or_else(T::zero);
-        let half = T::from_f64(0.5).unwrap_or_else(T::zero);
-        for &(m, k, n) in &sizes {
-            for &alpha in &[T::zero(), T::one(), minus_two] {
-                for &beta in &[T::zero(), T::one(), half] {
-                    // alpha == 0 poisons A/B, beta == 0 poisons C: neither may
-                    // reach the result.
-                    let (a, b) = if alpha == T::zero() {
-                        (Mat::filled(m, k, nan), Mat::filled(k, n, nan))
-                    } else {
-                        (pattern::<T>(m, k, 1), pattern::<T>(k, n, 2))
-                    };
-                    let c_init = if beta == T::zero() {
-                        Mat::filled(m, n, nan)
-                    } else {
-                        pattern::<T>(m, n, 3)
-                    };
-                    let expected = reference(alpha, &a.as_ref(), &b.as_ref(), beta, &c_init);
-
-                    // Contiguous operands (SIMD-eligible when m, n >= 4).
-                    let mut c = c_init.clone();
-                    gemm_small(alpha, &a.as_ref(), &b.as_ref(), beta, &mut c.as_mut());
-                    assert_close(&c, &expected, tol, m, k, n);
-
-                    // Strided transposed views (col_stride != 1): generic path.
-                    let mut a_store: Mat<T> = Mat::zeros(k, m);
-                    let mut b_store: Mat<T> = Mat::zeros(n, k);
-                    for j in 0..k {
-                        for i in 0..m {
-                            a_store[(j, i)] = a[(i, j)];
-                        }
-                    }
-                    for j in 0..n {
-                        for i in 0..k {
-                            b_store[(j, i)] = b[(i, j)];
-                        }
-                    }
-                    let a_view = a_store.as_ref().transpose();
-                    let b_view = b_store.as_ref().transpose();
-                    let mut c = c_init.clone();
-                    gemm_small(alpha, &a_view, &b_view, beta, &mut c.as_mut());
-                    assert_close(&c, &expected, tol, m, k, n);
-                }
-            }
-        }
-    }
-
-    fn assert_close<T: Field>(
-        got: &Mat<T>,
-        expected: &Mat<T>,
-        tol: f64,
-        m: usize,
-        k: usize,
-        n: usize,
-    ) {
-        for j in 0..n {
-            for i in 0..m {
-                let (g, e) = (got[(i, j)], expected[(i, j)]);
-                let err = Scalar::abs(g - e).to_f64().unwrap_or(f64::NAN);
-                let scale = Scalar::abs(e).to_f64().unwrap_or(f64::NAN).max(1.0);
-                assert!(
-                    err <= tol * scale,
-                    "{m}x{k}x{n} ({i},{j}): got {g} expected {e}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_issue_16_gemm_small_matches_reference_f64() {
-        check_gemm_small_contract::<f64>(1e-12);
-    }
-
-    #[test]
-    fn test_issue_16_gemm_small_matches_reference_f32() {
-        check_gemm_small_contract::<f32>(1e-5);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn test_issue_16_simd_small_kernels_accumulate_into_c() {
-        // The SIMD kernels compute C += alpha * A * B ("beta handled by the
-        // caller"). Their tiny path (m*n*k < 64) used to call
-        // gemm_small(.., beta = 0, ..), zero-filling C instead.
-        for &(m, k, n) in &[(4usize, 2usize, 4usize), (4, 3, 5), (8, 8, 8), (6, 5, 7)] {
-            let a: Mat<f64> = Mat::filled(m, k, 1.0);
-            let b: Mat<f64> = Mat::filled(k, n, 1.0);
-            let mut c: Mat<f64> = Mat::filled(m, n, 1.0);
-            gemm_small_f64_simd(2.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
-            let expected = 1.0 + 2.0 * k as f64;
-            for j in 0..n {
-                for i in 0..m {
-                    assert_eq!(c[(i, j)], expected, "f64 {m}x{k}x{n} ({i},{j})");
-                }
-            }
-
-            let a: Mat<f32> = Mat::filled(m, k, 1.0);
-            let b: Mat<f32> = Mat::filled(k, n, 1.0);
-            let mut c: Mat<f32> = Mat::filled(m, n, 1.0);
-            gemm_small_f32_simd(2.0, &a.as_ref(), &b.as_ref(), &mut c.as_mut());
-            let expected = 1.0 + 2.0 * k as f32;
-            for j in 0..n {
-                for i in 0..m {
-                    assert_eq!(c[(i, j)], expected, "f32 {m}x{k}x{n} ({i},{j})");
-                }
-            }
-        }
-    }
-}
+#[path = "gemm_small_tests.rs"]
+mod tests;

@@ -874,7 +874,7 @@ OxiBLAS is part of the SciRS2 scientific computing ecosystem:
 
 ## Sponsorship
 
-OxiBLAS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+OxiBLAS is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find OxiBLAS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
 

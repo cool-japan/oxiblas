@@ -29,6 +29,12 @@ force-scalar = ["oxiblas-core/force-scalar"]  # Disable all SIMD
 max-simd-128 = ["oxiblas-core/max-simd-128"]  # Limit to 128-bit SIMD
 max-simd-256 = ["oxiblas-core/max-simd-256"]  # Limit to 256-bit SIMD
 
+# Opt-in SME2 backend for Arm CPUs with SME2 and a 512-bit streaming vector
+# length (Apple M4 and later). Off by default until it has been validated on
+# SME2 hardware; compiles to nothing on targets other than aarch64, and stays
+# off at run time under force-scalar / max-simd-128 / max-simd-256.
+sme2 = []
+
 [lints]
 workspace = true
 

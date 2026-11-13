@@ -4,6 +4,7 @@
 //! based on CPU cache hierarchy and matrix dimensions.
 
 use crate::level3::gemm_kernel::MicroKernelShape;
+use crate::level3::gemm_packing::pack_cache_limit;
 use std::sync::OnceLock;
 
 /// CPU cache information.
@@ -98,7 +99,7 @@ fn detect_cache_macos() -> Option<CacheInfo> {
     macos_cache_info(sysctl_usize)
 }
 
-/// Reads a positive integer sysctl value with `sysctl -n <key>`.
+/// Reads a positive integer sysctl value with `/usr/sbin/sysctl -n <key>`.
 ///
 /// A key the kernel does not know makes `sysctl` exit with status 1 and print
 /// nothing; some known keys (`hw.l3cachesize` on an Apple M3) exit with
@@ -106,7 +107,8 @@ fn detect_cache_macos() -> Option<CacheInfo> {
 /// read as `None`.
 #[cfg(target_os = "macos")]
 fn sysctl_usize(key: &str) -> Option<usize> {
-    let output = std::process::Command::new("sysctl")
+    // By absolute path: a `sysctl` found through `PATH` could be any program.
+    let output = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", key])
         .output()
         .ok()?;
@@ -416,6 +418,45 @@ fn cache_targets_for(
     elem_size: usize,
     shape: &MicroKernelShape,
 ) -> AutoTunedBlocking {
+    cache_targets_with_kc_shape(cache, elem_size, shape, shape)
+}
+
+/// [`cache_targets_for`] with KC taken from the shape `kc_shape` and MC / NC
+/// derived from that KC for `shape`.
+///
+/// With `kc_shape == shape` this is exactly [`cache_targets_for`]. The GEMM
+/// default blocking passes the canonical micro-kernel shape of the element
+/// type as `kc_shape`, so a plan whose kernel has another shape keeps the KC
+/// partition, and with it the result bits, of the canonical kernel.
+pub(crate) fn cache_targets_with_kc_shape(
+    cache: &CacheInfo,
+    elem_size: usize,
+    shape: &MicroKernelShape,
+    kc_shape: &MicroKernelShape,
+) -> AutoTunedBlocking {
+    let kc = cache_kc(cache, elem_size, kc_shape);
+    let (mc, nc) = cache_mc_nc_for_kc(cache, elem_size, shape, kc);
+    AutoTunedBlocking { mc, kc, nc }
+}
+
+/// The L2 share of the cache model (packed A, `MC × KC`).
+fn l2_target(cache: &CacheInfo) -> usize {
+    // L2 target: Use higher percentage for smaller caches to maximize utilization
+    // For 256KB L2, we want to use 75% to ensure packed A fits well
+    if cache.l2 <= 256 * 1024 {
+        cache.l2 * 3 / 4 // 75% for small L2 (256KB or less)
+    } else if cache.l2 <= 512 * 1024 {
+        cache.l2 * 7 / 10 // 70% for medium-small L2
+    } else {
+        cache.l2 * 7 / 10 // 70% for larger L2
+    }
+}
+
+/// The KC target of the cache model for a micro-kernel shape.
+///
+/// It depends on the shape: the L1 bound uses NR (`KC × NR` of B in L1) and
+/// the L2 refinement uses MR (through the MR-aligned intermediate MC).
+fn cache_kc(cache: &CacheInfo, elem_size: usize, shape: &MicroKernelShape) -> usize {
     let mr = shape.mr;
     let nr = shape.nr;
     let line_size = cache.line_size;
@@ -423,20 +464,8 @@ fn cache_targets_for(
     // Improved cache utilization targets based on empirical testing:
     // - L1: 80% for B micro-panel (critical path, keep hot)
     // - L2: Variable based on size (smaller caches need higher utilization)
-    // - L3: 60% for B macro-panel (largest, less pressure)
     let l1_target = cache.l1d * 4 / 5; // 80%
-
-    // L2 target: Use higher percentage for smaller caches to maximize utilization
-    // For 256KB L2, we want to use 75% to ensure packed A fits well
-    let l2_target = if cache.l2 <= 256 * 1024 {
-        cache.l2 * 3 / 4 // 75% for small L2 (256KB or less)
-    } else if cache.l2 <= 512 * 1024 {
-        cache.l2 * 7 / 10 // 70% for medium-small L2
-    } else {
-        cache.l2 * 7 / 10 // 70% for larger L2
-    };
-
-    let l3_target = cache.l3 * 6 / 10; // 60%
+    let l2_target = l2_target(cache);
 
     // Compute KC: B micro-panel (KC × NR) should fit in L1
     // KC × NR × elem_size ≤ L1_target
@@ -499,20 +528,34 @@ fn cache_targets_for(
 
     // Final KC: balance L1 micro-panel and L2 macro-panel constraints
     // Prefer larger KC (reduces packing overhead) but respect L1 constraint
-    let kc = kc_from_l1.min(kc_from_l2).min(kc_target).max(64);
+    kc_from_l1.min(kc_from_l2).min(kc_target).max(64)
+}
+
+/// The MC and NC targets of the cache model for a given KC and micro-kernel
+/// shape: MC is a multiple of `max(MR, elements per cache line)`, NC of
+/// `max(NR, elements per cache line)`.
+fn cache_mc_nc_for_kc(
+    cache: &CacheInfo,
+    elem_size: usize,
+    shape: &MicroKernelShape,
+    kc: usize,
+) -> (usize, usize) {
+    let elems_per_line = cache.line_size / elem_size;
+    // - L3: 60% for B macro-panel (largest, less pressure)
+    let l3_target = cache.l3 * 6 / 10; // 60%
 
     // Re-compute MC with final KC, aiming for maximum utilization
-    let mc_raw = l2_target / (kc * elem_size);
-    let mc = round_up_to_multiple(mc_raw, mr.max(elems_per_line));
+    let mc_raw = l2_target(cache) / (kc * elem_size);
+    let mc = round_up_to_multiple(mc_raw, shape.mr.max(elems_per_line));
 
     // Compute NC: pack_b (KC × NC) should fit in L3
     // NC ≤ L3_target / (KC × elem_size)
     let nc_from_l3 = l3_target / (kc * elem_size);
 
     // NC should be a multiple of NR and cache-line aligned
-    let nc = round_up_to_multiple(nc_from_l3, nr.max(elems_per_line));
+    let nc = round_up_to_multiple(nc_from_l3, shape.nr.max(elems_per_line));
 
-    AutoTunedBlocking { mc, kc, nc }
+    (mc, nc)
 }
 
 /// Fits dimension-free block targets to the actual GEMM dimensions with
@@ -612,6 +655,26 @@ pub fn compute_blocking_adaptive(
     elem_size: usize,
     shape: &MicroKernelShape,
 ) -> AutoTunedBlocking {
+    compute_blocking_adaptive_with(get_cache_info, m, k, n, elem_size, shape, shape)
+}
+
+/// [`compute_blocking_adaptive`] for the cache description `cache` returns
+/// (called only when the cache model is needed), with KC taken from
+/// `kc_shape` and MC / NC derived for `shape`
+/// ([`cache_targets_with_kc_shape`]).
+///
+/// The size and aspect-ratio rules use only the dimensions and the KC target,
+/// so for one element type and one set of dimensions the KC of the result
+/// does not depend on `shape`.
+pub(crate) fn compute_blocking_adaptive_with(
+    cache: impl FnOnce() -> CacheInfo,
+    m: usize,
+    k: usize,
+    n: usize,
+    elem_size: usize,
+    shape: &MicroKernelShape,
+    kc_shape: &MicroKernelShape,
+) -> AutoTunedBlocking {
     // For small matrices, use minimal blocking to reduce packing overhead
     let total_flops = 2 * m * n * k;
     if total_flops < 100_000 {
@@ -625,7 +688,7 @@ pub fn compute_blocking_adaptive(
     }
 
     // Start with the general cache targets
-    let base = cache_targets(elem_size, shape);
+    let base = cache_targets_with_kc_shape(&cache(), elem_size, shape, kc_shape);
 
     // Compute aspect ratios
     let m_f = m as f64;
@@ -669,6 +732,158 @@ pub fn compute_blocking_adaptive(
     };
 
     fit_to_dims(targets, m, k, n, shape)
+}
+
+/// The issue #23 rule that caps the packed `op(B)` block of the blocked GEMM.
+///
+/// Only NC changes: the micro-tile grid, the KC partition and with them every
+/// result bit stay the same. Two cases cap a block:
+///
+/// - **single pass**: all of `m` is one MC block, so each packed B block is
+///   used once. A block above `single_pass_split_above` bytes is split into
+///   blocks of at most `single_pass_target` bytes (thin-M shapes, e.g.
+///   `64 × 32768 × 512`), when `k` has at most `single_pass_max_kc_blocks`
+///   KC blocks (`usize::MAX`: any depth).
+/// - **shallow**: several MC blocks and at most `shallow_kc_blocks` KC
+///   blocks; a packed B block is capped at `shallow_cap` bytes, or at the
+///   room the calling thread's packing cache has left beside the packed A
+///   block when that is less (see [`capped_nc_with`]).
+///
+/// `single_pass_max_kc_blocks` exists because the rule can be read two ways
+/// ("one MC block" alone, or "one MC block and a shallow depth"); both
+/// readings are expressible ([`ISSUE_23_B_CAPS`] and, for the A/B runs,
+/// `ISSUE_23_B_CAPS_SHALLOW_SINGLE_PASS`) and measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BBlockCaps {
+    /// Single pass: blocks above this many bytes are split.
+    pub(crate) single_pass_split_above: usize,
+    /// Single pass: the most bytes of a split block.
+    pub(crate) single_pass_target: usize,
+    /// Single pass: the deepest `k` (in KC blocks) the rule applies to.
+    pub(crate) single_pass_max_kc_blocks: usize,
+    /// Shallow: the deepest `k` (in KC blocks) the rule applies to.
+    pub(crate) shallow_kc_blocks: usize,
+    /// Shallow: the most bytes of a packed B block.
+    pub(crate) shallow_cap: usize,
+}
+
+/// The caps of issue #23: split single-pass blocks above 4 MiB into blocks of
+/// at most 2 MiB (any depth); cap blocks at 8 MiB when there are several MC
+/// blocks and at most two KC blocks.
+pub(crate) const ISSUE_23_B_CAPS: BBlockCaps = BBlockCaps {
+    single_pass_split_above: 4 << 20,
+    single_pass_target: 2 << 20,
+    single_pass_max_kc_blocks: usize::MAX,
+    shallow_kc_blocks: 2,
+    shallow_cap: 8 << 20,
+};
+
+/// The other reading of the issue #23 rule, for the A/B runs: the
+/// single-pass split applies only when `k` has at most two KC blocks (the
+/// depth of the shallow case); everything else is [`ISSUE_23_B_CAPS`].
+#[cfg(test)]
+pub(crate) const ISSUE_23_B_CAPS_SHALLOW_SINGLE_PASS: BBlockCaps = BBlockCaps {
+    single_pass_max_kc_blocks: ISSUE_23_B_CAPS.shallow_kc_blocks,
+    ..ISSUE_23_B_CAPS
+};
+
+/// NC for an `m × k` by `k × n` product whose fitted blocks are `mc`, `kc`
+/// and `nc` (micro-panel width `nr`, `elem` bytes per element), capped by
+/// `caps`, for the packing cache of the calling thread.
+///
+/// [`capped_nc_with`] with the calling thread's packing-cache limit
+/// (`gemm_packing::pack_cache_limit`, [`PACK_CACHE_MAX_BYTES`] by default):
+/// the blocked drivers park their packed A and B blocks in the cache of the
+/// thread that calls them, which is the thread that calls this.
+///
+/// [`PACK_CACHE_MAX_BYTES`]: crate::level3::gemm_packing::PACK_CACHE_MAX_BYTES
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(crate) fn capped_nc(
+    m: usize,
+    k: usize,
+    n: usize,
+    mc: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+    elem: usize,
+    caps: &BBlockCaps,
+) -> usize {
+    capped_nc_with(m, k, n, mc, kc, nc, nr, elem, caps, pack_cache_limit())
+}
+
+/// [`capped_nc`] for a packing cache that keeps at most `cache_limit` bytes
+/// per thread.
+///
+/// Returns `nc` unchanged when no cap applies (or NC is a single micro-panel
+/// already); otherwise the [`balanced_block`] split of `n` into blocks of at
+/// most the capped size (and at least one micro-panel), a multiple of `nr`.
+///
+/// **Room beside A (shallow case).** The sequential driver returns its packed
+/// B block to the cache before its packed A block, so a B block that fills
+/// the cache on its own (the 8 MiB `shallow_cap` against the 8 MiB default
+/// limit) makes the cache free the A block after every call. The shallow cap
+/// is therefore `min(shallow_cap, cache_limit − A)`, with `A = mc · kc · elem`
+/// the bytes of the packed A block. That is exact: the shallow case has
+/// `m > mc`, so `mc` was split by [`balanced_block`] into a multiple of MR
+/// and the A buffer (`round_up(mc, MR) · kc` elements) has no padding. When
+/// the room cannot hold even one `kc × nr` micro-panel (the A block alone
+/// fills the cache), no NC can keep both blocks cached and the plain
+/// `shallow_cap` applies. The single-pass case is left as the rule states it:
+/// its target (2 MiB) leaves the default cache 6 MiB for an A block of at
+/// most one MC block of rows.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub(crate) fn capped_nc_with(
+    m: usize,
+    k: usize,
+    n: usize,
+    mc: usize,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+    elem: usize,
+    caps: &BBlockCaps,
+    cache_limit: usize,
+) -> usize {
+    if kc == 0 || nr == 0 || elem == 0 || nc <= nr {
+        return nc;
+    }
+    let bytes = kc
+        .saturating_mul(nc.div_ceil(nr))
+        .saturating_mul(nr)
+        .saturating_mul(elem);
+    let kc_blocks = k.div_ceil(kc);
+    let limit = if m <= mc {
+        (kc_blocks <= caps.single_pass_max_kc_blocks && bytes > caps.single_pass_split_above)
+            .then_some(caps.single_pass_target)
+    } else if kc_blocks <= caps.shallow_kc_blocks {
+        let a_bytes = mc.saturating_mul(kc).saturating_mul(elem);
+        let room = cache_limit.saturating_sub(a_bytes);
+        let panel = kc.saturating_mul(nr).saturating_mul(elem);
+        let cap = if room >= panel {
+            caps.shallow_cap.min(room)
+        } else {
+            caps.shallow_cap
+        };
+        (bytes > cap).then_some(cap)
+    } else {
+        None
+    };
+    match limit {
+        None => nc,
+        Some(limit) => {
+            // A multiple of NR, so that a block that fits it unsplit (`n` at
+            // most this) is not padded past the limit either.
+            let fitting = round_down_to_multiple(limit / kc.saturating_mul(elem), nr);
+            // Defensive: a cap applies only when the padded block exceeds
+            // `limit`, so `fitting < nc` already, and `nr < nc` by the early
+            // return, so `.min(nc)` never binds.
+            let target = fitting.max(nr).min(nc);
+            balanced_block(n, target, nr)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -985,5 +1200,203 @@ mod tests {
             let plain = compute_blocking(m, k, n, 8, &shape);
             assert_eq!(plain.nc, n, "({m},{k},{n}) plain: {plain:?}");
         }
+    }
+
+    /// The 8 and 16 MiB per-thread cache limits the A/B compares.
+    const LIMIT_8: usize = 8 << 20;
+    const LIMIT_16: usize = 16 << 20;
+
+    /// The shallow-case cap the rule documents, computed independently:
+    /// `min(shallow_cap, limit − A)` unless the room is below one panel.
+    fn shallow_cap_for(mc: usize, kc: usize, nr: usize, elem: usize, limit: usize) -> usize {
+        let room = limit.saturating_sub(mc * kc * elem);
+        if room >= kc * nr * elem {
+            ISSUE_23_B_CAPS.shallow_cap.min(room)
+        } else {
+            ISSUE_23_B_CAPS.shallow_cap
+        }
+    }
+
+    #[test]
+    fn test_issue_23_b_cap_rule_table() {
+        let caps = ISSUE_23_B_CAPS;
+        // The alternative reading: the single-pass split only for k of at
+        // most two KC blocks.
+        let alt = ISSUE_23_B_CAPS_SHALLOW_SINGLE_PASS;
+        assert_eq!(alt.single_pass_max_kc_blocks, 2);
+        assert_eq!(
+            BBlockCaps {
+                single_pass_max_kc_blocks: usize::MAX,
+                ..alt
+            },
+            caps
+        );
+        // (m, k, n, mc, kc, nc, nr, elem) -> capped NC with an 8 MiB cache,
+        // the same under the alternative reading, and with a 16 MiB cache.
+        type Dims = (usize, usize, usize, usize, usize, usize, usize, usize);
+        let table: [(Dims, usize, usize, usize); 17] = [
+            // M3 f64 thin-M (issue #23): 16.8 MB of packed B -> 1.95 MiB.
+            ((64, 512, 32_768, 64, 256, 8_196, 6, 8), 996, 996, 996),
+            // The same with f32 (8 x 8 kernel): 16 MiB -> 2 MiB.
+            ((64, 512, 32_768, 64, 512, 8_192, 8, 4), 1_024, 1_024, 1_024),
+            // Just below 4 MiB: unchanged; just above: split.
+            ((64, 256, 2_046, 64, 256, 2_046, 6, 8), 2_046, 2_046, 2_046),
+            ((64, 256, 2_052, 64, 256, 2_052, 6, 8), 684, 684, 684),
+            // Single pass but deep (64 KC blocks): only the first reading
+            // splits.
+            ((64, 16_384, 32_768, 64, 256, 8_196, 6, 8), 996, 8_196, 996),
+            ((64, 768, 32_768, 64, 256, 8_196, 6, 8), 996, 8_196, 996),
+            // Several MC blocks, one KC block, 16 MiB of f32. The A block is
+            // 576 x 512 x 4 = 1.125 MiB: an 8 MiB cache has 6.875 MiB left
+            // beside it (NC 3520 -> balanced 3280); a 16 MiB cache leaves
+            // the 8 MiB cap binding (NC 4096).
+            (
+                (4_096, 512, 32_768, 576, 512, 8_192, 8, 4),
+                3_280,
+                3_280,
+                4_096,
+            ),
+            // 8 MiB of packed B: not above the 8 MiB cap, but above the room
+            // beside A in an 8 MiB cache.
+            (
+                (4_096, 512, 32_768, 576, 512, 4_096, 8, 4),
+                3_280,
+                3_280,
+                4_096,
+            ),
+            // Several MC blocks, three KC blocks: never capped.
+            (
+                (4_096, 1_536, 32_768, 576, 512, 8_192, 8, 4),
+                8_192,
+                8_192,
+                8_192,
+            ),
+            // The A block alone fills an 8 MiB cache (2048 x 1024 x 4): no
+            // NC keeps both, so the plain 8 MiB cap applies (and not one
+            // micro-panel); a 16 MiB cache has exactly 8 MiB left.
+            (
+                (4_096, 1_024, 32_768, 2_048, 1_024, 8_192, 8, 4),
+                2_048,
+                2_048,
+                2_048,
+            ),
+            // Room for one and a third micro-panels beside A (f64, 8 x 6): the
+            // cap shrinks NC to that one panel.
+            ((4_096, 256, 32_768, 4_088, 256, 8_196, 6, 8), 6, 6, 3_642),
+            // Room beside A (8 MiB - 3968 x 264 x 8 = 8192 bytes) is more
+            // than zero but below one 264 x 6 micro-panel (12672 bytes): no
+            // NC keeps both blocks cached, so the plain 8 MiB cap applies
+            // (3966 columns -> balanced 3642), not the room (one panel, 6).
+            (
+                (8_192, 528, 32_768, 3_968, 264, 8_196, 6, 8),
+                3_642,
+                3_642,
+                3_642,
+            ),
+            // The byte target rounded down to a multiple of NR: the room
+            // beside A (8 MiB - 3096 x 256 x 8 = 2048000 bytes) holds exactly
+            // 1000 columns of depth 256, but one block of n = 1000 is padded
+            // to 1002 columns (2052096 bytes), more than the room. Rounded
+            // down, the target is 996 and n splits into two blocks of 504,
+            // which fit beside A; unrounded, the target 1000 would keep the
+            // padded 1002 columns. A 16 MiB cache leaves the 8 MiB cap, which
+            // the 2 MB block does not exceed.
+            (
+                (8_192, 512, 1_000, 3_096, 256, 1_000, 6, 8),
+                504,
+                504,
+                1_000,
+            ),
+            // Small blocks: unchanged.
+            ((64, 512, 512, 64, 256, 512, 6, 8), 512, 512, 512),
+            // NC of one micro-panel or less: unchanged (no panic).
+            ((64, 1 << 20, 3, 64, 1 << 20, 3, 6, 8), 3, 3, 3),
+            ((64, 1 << 20, 6, 64, 1 << 20, 6, 6, 8), 6, 6, 6),
+            // Degenerate KC: unchanged.
+            ((64, 512, 32_768, 64, 0, 8_196, 6, 8), 8_196, 8_196, 8_196),
+        ];
+        for ((m, k, n, mc, kc, nc, nr, elem), want, want_alt, want_16) in table {
+            let ctx = format!("m={m} k={k} n={n} mc={mc} kc={kc} nc={nc} nr={nr} elem={elem}");
+            let rule = |caps: &BBlockCaps, limit: usize| {
+                capped_nc_with(m, k, n, mc, kc, nc, nr, elem, caps, limit)
+            };
+            assert_eq!(rule(&caps, LIMIT_8), want, "{ctx}");
+            assert_eq!(rule(&alt, LIMIT_8), want_alt, "{ctx} (alternative reading)");
+            assert_eq!(rule(&caps, LIMIT_16), want_16, "{ctx} (16 MiB cache)");
+            // The default limit is the 8 MiB one.
+            assert_eq!(
+                capped_nc(m, k, n, mc, kc, nc, nr, elem, &caps),
+                want,
+                "{ctx}"
+            );
+        }
+        // Properties over a sweep of fitted blockings and both cache limits:
+        // the result never grows NC, is a multiple of NR (or NC itself), its
+        // padded block fits the limit unless the limit is below one
+        // micro-panel, a shallow block that is capped leaves the A block room
+        // in the cache, and the rule is idempotent.
+        for &(nr, elem) in &[(6usize, 8usize), (8, 8), (4, 8), (2, 8), (8, 4), (16, 4)] {
+            for &m in &[1usize, 64, 577, 4_096] {
+                for &k in &[8usize, 300, 512, 2_049, 20_000] {
+                    for &n in &[1usize, 7, 500, 4_097, 32_768, 100_000] {
+                        for limit in [LIMIT_8, LIMIT_16, 3 << 20] {
+                            let mc = balanced_block(m, 576, nr.max(4));
+                            let kc = balanced_block(k, 512, KC_BLOCK_UNIT);
+                            let nc = balanced_block(n, 1 << 14, nr);
+                            let capped =
+                                capped_nc_with(m, k, n, mc, kc, nc, nr, elem, &caps, limit);
+                            let ctx = format!(
+                                "m={m} k={k} n={n} mc={mc} kc={kc} nc={nc} nr={nr} limit={limit}"
+                            );
+                            assert!(capped <= nc && capped > 0, "{ctx}: {capped}");
+                            if capped != nc {
+                                assert_eq!(capped % nr, 0, "{ctx}: {capped}");
+                                let bytes = kc * capped.div_ceil(nr) * nr * elem;
+                                let cap = if m <= mc {
+                                    caps.single_pass_target
+                                } else {
+                                    shallow_cap_for(mc, kc, nr, elem, limit)
+                                };
+                                assert!(bytes <= cap || capped == nr, "{ctx}: {bytes} bytes");
+                                if m > mc && cap < caps.shallow_cap {
+                                    assert!(
+                                        bytes + mc * kc * elem <= limit,
+                                        "{ctx}: A and B do not fit together"
+                                    );
+                                }
+                            }
+                            assert_eq!(
+                                capped_nc_with(m, k, n, mc, kc, capped, nr, elem, &caps, limit),
+                                capped,
+                                "{ctx}: not idempotent"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_issue_23_b_cap_follows_the_thread_cache_limit() {
+        // `capped_nc` (what `gemm::call_blocking` calls) uses the calling
+        // thread's packing-cache limit, so the room it leaves for A always
+        // matches the limit the cache enforces.
+        use crate::level3::gemm_packing::set_pack_cache_limit;
+        let dims = (4_096, 512, 32_768, 576, 512, 8_192, 8, 4);
+        let (m, k, n, mc, kc, nc, nr, elem) = dims;
+        let caps = ISSUE_23_B_CAPS;
+        let rule = || capped_nc(m, k, n, mc, kc, nc, nr, elem, &caps);
+        assert_eq!(pack_cache_limit(), LIMIT_8);
+        assert_eq!(rule(), 3_280);
+        {
+            let _guard = set_pack_cache_limit(LIMIT_16);
+            assert_eq!(rule(), 4_096);
+            assert_eq!(
+                rule(),
+                capped_nc_with(m, k, n, mc, kc, nc, nr, elem, &caps, LIMIT_16)
+            );
+        }
+        assert_eq!(rule(), 3_280);
     }
 }

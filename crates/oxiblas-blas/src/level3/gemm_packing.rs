@@ -67,11 +67,80 @@ pub enum PackSlot {
 ///   this limit, the buffer is freed instead. A single large GEMM therefore
 ///   never pins more than this much memory per thread after it returns (at
 ///   most 8 MiB × the number of threads that ran GEMMs).
+///
+/// This is the default of each thread's limit. The drivers read the limit in
+/// force through `pack_cache_limit`. Only in-crate tests (including the A/B
+/// harness) set other values per thread, with a setter that exists only in
+/// test builds; nothing else changes it.
 pub const PACK_CACHE_MAX_BYTES: usize = 8 << 20;
 
 thread_local! {
     /// Bytes currently parked in this thread's packing-buffer slots.
     static PACK_CACHE_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// This thread's cache limit in bytes: [`PACK_CACHE_MAX_BYTES`] unless a
+    /// test set another one.
+    static PACK_CACHE_LIMIT: Cell<usize> = const { Cell::new(PACK_CACHE_MAX_BYTES) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of buffers [`PackBuffer::take`] allocated on this thread (test
+    /// hook; a loan served from the cache does not count).
+    static PACK_CACHE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The most packing-buffer bytes this thread keeps cached between GEMM calls:
+/// [`PACK_CACHE_MAX_BYTES`] unless a test changed it for this thread.
+///
+/// The issue #23 B-block cap (`autotune::capped_nc`) reads the same value, so
+/// the room it leaves beside the A buffer always matches the limit the cache
+/// enforces.
+#[inline]
+pub(crate) fn pack_cache_limit() -> usize {
+    PACK_CACHE_LIMIT
+        .try_with(Cell::get)
+        .unwrap_or(PACK_CACHE_MAX_BYTES)
+}
+
+/// Restores a thread's previous packing-cache limit when dropped (see
+/// [`set_pack_cache_limit`]).
+///
+/// The guard is neither `Send` nor `Sync`: it restores the limit of the
+/// thread that drops it, so it must be dropped on the thread that created it.
+#[cfg(test)]
+#[must_use = "the previous limit is restored when the guard drops"]
+pub(crate) struct PackCacheLimitGuard {
+    previous: usize,
+    /// Keeps the guard on its thread (`*const ()` is neither `Send` nor
+    /// `Sync`).
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl Drop for PackCacheLimitGuard {
+    fn drop(&mut self) {
+        let _ = PACK_CACHE_LIMIT.try_with(|limit| limit.set(self.previous));
+    }
+}
+
+/// Sets the calling thread's packing-cache limit to `bytes` until the
+/// returned guard drops (test and A/B hook).
+///
+/// The limit is per thread: to change it for the workers of a rayon pool,
+/// call this on every worker (for example with `ThreadPool::broadcast`) and
+/// drop the guards on those same workers when the run is over (the guard is
+/// not `Send`, so it cannot be handed back to the caller). Lowering the
+/// limit evicts nothing at once; a buffer parked above the new limit is freed
+/// the next time it is put back.
+#[cfg(test)]
+pub(crate) fn set_pack_cache_limit(bytes: usize) -> PackCacheLimitGuard {
+    let previous = PACK_CACHE_LIMIT
+        .try_with(|limit| limit.replace(bytes))
+        .unwrap_or(PACK_CACHE_MAX_BYTES);
+    PackCacheLimitGuard {
+        previous,
+        _not_send: core::marker::PhantomData,
+    }
 }
 
 /// Heap bytes owned by `buf`.
@@ -92,7 +161,8 @@ fn take_cached<T: GemmKernel>(slot: PackSlot) -> AlignedVec<T> {
 }
 
 /// Returns `buf` to this thread's cache slot, or frees it when the type keeps
-/// no cache or the size policy of [`PACK_CACHE_MAX_BYTES`] does not allow it.
+/// no cache or the size policy of [`PACK_CACHE_MAX_BYTES`] (with this
+/// thread's [`pack_cache_limit`]) does not allow it.
 fn put_cached<T: GemmKernel>(slot: PackSlot, buf: AlignedVec<T>) {
     let bytes = pack_bytes(&buf);
     if bytes == 0 {
@@ -101,7 +171,7 @@ fn put_cached<T: GemmKernel>(slot: PackSlot, buf: AlignedVec<T>) {
     let Ok(parked) = PACK_CACHE_BYTES.try_with(Cell::get) else {
         return;
     };
-    if parked.saturating_add(bytes) > PACK_CACHE_MAX_BYTES {
+    if parked.saturating_add(bytes) > pack_cache_limit() {
         return;
     }
     let mut stored = false;
@@ -140,6 +210,8 @@ impl<T: GemmKernel + bytemuck::Zeroable> PackBuffer<T> {
             // grow never holds both.
             drop(core::mem::take(&mut buf));
             buf = AlignedVec::zeros(len);
+            #[cfg(test)]
+            let _ = PACK_CACHE_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
         }
         Self { buf, slot }
     }
@@ -170,6 +242,13 @@ impl<T: GemmKernel> Drop for PackBuffer<T> {
 #[cfg(test)]
 pub(crate) fn pack_cache_bytes() -> usize {
     PACK_CACHE_BYTES.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Number of packing buffers this thread has allocated so far (test hook; a
+/// loan served from the cache allocates nothing).
+#[cfg(test)]
+pub(crate) fn pack_cache_allocations() -> usize {
+    PACK_CACHE_ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
 }
 
 /// Capacity, in elements, of this thread's cached `T` buffer for `slot`

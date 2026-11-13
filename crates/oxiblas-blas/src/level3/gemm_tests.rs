@@ -2,6 +2,7 @@
 //! transpose-aware entry points.
 
 use super::*;
+use crate::level3::gemm_small::SMALL_THRESHOLD;
 use oxiblas_matrix::Mat;
 
 #[test]
@@ -979,8 +980,15 @@ fn copy_view_f64(view: MatRef<'_, f64>) -> Mat<f64> {
 
 #[test]
 fn test_gemm_blocked_transposed_view_operands() {
-    for &(m, k, n) in &[(64usize, 64usize, 64usize), (80, 72, 96), (37, 129, 50)] {
+    // Above the largest small-route ceiling of any policy (the x86
+    // candidate's 80³), so the column-major copies take the blocked path
+    // too.
+    for &(m, k, n) in &[(96usize, 64usize, 96usize), (80, 72, 96), (37, 329, 50)] {
         assert!(m * n * k > SMALL_THRESHOLD, "must take the blocked path");
+        assert!(
+            m * n * k > crate::level3::gemm_plan::CANDIDATE_X86.small_simd_max_work,
+            "must take the blocked path under every policy"
+        );
         let a_store = pattern_f64(k, m, 1); // A = a_store^T is m x k
         let b_store = pattern_f64(n, k, 2); // B = b_store^T is k x n
         let a_view = a_store.as_ref().transpose();

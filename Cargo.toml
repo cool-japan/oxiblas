@@ -72,6 +72,11 @@ faer = "0.24"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"  # Rust 2024 defaults to requiring unsafe blocks; we allow for now
+# `--cfg oxiblas_gemm_candidate` selects the candidate GEMM policies of
+# oxiblas-blas (same-source A/B runs), and `--cfg oxiblas_gemm_bcap_all` makes
+# those candidates cap the B block in both blocked drivers (A/B of the
+# `BCapScope::All` variant); declared so the cfgs are checked.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(oxiblas_gemm_candidate)', 'cfg(oxiblas_gemm_bcap_all)'] }
 
 [workspace.lints.clippy]
 all = "warn"

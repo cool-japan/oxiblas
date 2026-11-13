@@ -475,6 +475,20 @@ pub mod features {
     pub const HAS_F128: bool = cfg!(feature = "f128");
     /// `true` when the `ndarray` feature (ndarray interop) is compiled in.
     pub const HAS_NDARRAY: bool = cfg!(feature = "ndarray");
+    /// `true` when the opt-in `sme2` feature (the SME2 matrix backend for Arm
+    /// CPUs such as the Apple M4) is compiled in.
+    ///
+    /// The backend exists only on `aarch64`, so this is `false` on every other
+    /// architecture even when the feature is enabled. Like the other flags it
+    /// describes the build, not the machine: at run time the backend is also
+    /// skipped when the crate is built with `force-scalar`, `max-simd-128` or
+    /// `max-simd-256`, when the `OXIBLAS_DISABLE_SME2` environment variable is
+    /// set to anything other than an empty string or `0`, and when the
+    /// operating system does not report SME2 with a 512-bit streaming vector
+    /// length. `oxiblas::blas::level3::sme2_active()` gives the run-time
+    /// answer; it exists in every build and always returns `false` when this
+    /// flag is `false`.
+    pub const HAS_SME2: bool = cfg!(all(feature = "sme2", target_arch = "aarch64"));
     /// `true` when this crate is actually built without the standard library
     /// support that it forwards to the `oxiblas-core`/`oxiblas-matrix` layers
     /// (no-std mode for the core layer).

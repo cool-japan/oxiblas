@@ -25,11 +25,30 @@
 //! are bitwise identical for any thread count. Each tile is a disjoint
 //! [`MatMut`] split off C with the consuming `split_cols` / `split_rows`, so C
 //! needs neither raw pointers nor synchronization.
+//!
+//! That is the [`PackScope::Shared`] scope. With [`PackScope::PerTile`] every
+//! tile packs its own part of B as well, and the KC loop moves inside the
+//! tile task (one fork/join per NC block instead of two per KC step):
+//!
+//! ```text
+//! for jc in NC blocks of n                      (sequential)
+//!     split C[:, jc..jc+w] into rows × cols tiles   (about 4 per thread)
+//!     every tile, in parallel                   (one task per tile)
+//!         for pc in KC blocks of k              (sequential, in order)
+//!             pack B~ = op(B)[pc.., tile columns]   into the worker's buffer
+//!             for ic in MC blocks of the tile
+//!                 pack A~ into the worker's buffer
+//!                 C_tile = alpha * A~ * B~ + beta_eff * C_tile
+//! ```
 
 use super::autotune::balanced_block;
-use super::gemm::{GemmBlocking, macro_panel_multiply, op_dims, pack_a_trans_dispatch, read_op};
-use super::gemm_kernel::{GemmKernel, MicroKernelShape};
+use super::gemm::{
+    GemmBlocking, macro_panel_multiply_with, op_dims, pack_a_trans_dispatch, pack_b_trans_dispatch,
+    read_op,
+};
+use super::gemm_kernel::{GemmKernel, MicroKernel, MicroKernelShape};
 use super::gemm_packing::{PackBuffer, PackSlot};
+use super::gemm_plan::PackScope;
 use super::trsm::Trans;
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
@@ -44,6 +63,14 @@ const TILES_PER_THREAD: usize = 3;
 
 /// Target number of packed-B chunks per worker thread in phase 1.
 const B_CHUNKS_PER_THREAD: usize = 2;
+
+/// Target number of C tiles per worker thread under [`PackScope::PerTile`].
+///
+/// A per-tile task runs the whole KC loop of its tile, so a task is longer
+/// than a shared-scope task and there is one fork/join per NC block instead
+/// of two per KC step; one more tile per thread than the shared scope keeps
+/// the work stealing able to balance the tail.
+const PER_TILE_TILES_PER_THREAD: usize = 4;
 
 /// Number of tile rows and tile columns for one NC block of C.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +104,69 @@ impl TileGrid {
         best
     }
 
+    /// Chooses the tile grid of [`PackScope::PerTile`] for an `m × w` block
+    /// of C on `threads` threads.
+    ///
+    /// With `mu = ⌈m / MR⌉`, `nu = ⌈w / NR⌉` and
+    /// `G = max(1, min(4 · threads, mu · nu / 4))` target tiles, the
+    /// candidates are `rows ∈ 1..=min(G, mu)` with `cols = min(⌈G / rows⌉,
+    /// nu)`. Each has an estimated span: `⌈rows · cols / threads⌉` rounds of
+    /// its largest tile (in micro-tiles). Among the candidates whose span is
+    /// within 1/8 of the shortest, it picks, in this order:
+    /// 1. the most nearly square tile (largest tile height over width, or
+    ///    width over height, in elements);
+    /// 2. the fewest elements packed per KC row, `rows · w + cols · m` (each
+    ///    tile row packs all `w` columns of B, each tile column all `m` rows
+    ///    of A);
+    /// 3. the fewest tile columns.
+    ///
+    /// Ranking by the largest tile alone (as the shared grid does) prefers
+    /// thin, over-decomposed grids, because `cols` rounds `G / rows` up: for
+    /// f64 2048² on 8 threads (8 × 6 kernel) it picks 29 × 2 tiles of
+    /// 72 × 1026; this rule picks 6 × 6 tiles of 344 × 342.
+    fn choose_per_tile(m: usize, w: usize, shape: &MicroKernelShape, threads: usize) -> Self {
+        let threads = threads.max(1);
+        let mu = m.div_ceil(shape.mr);
+        let nu = w.div_ceil(shape.nr);
+        let target = (PER_TILE_TILES_PER_THREAD * threads)
+            .min(mu * nu / 4)
+            .max(1);
+        let candidates = (1..=target.min(mu)).map(|rows| {
+            let cols = target.div_ceil(rows).min(nu);
+            let (tile_mu, tile_nu) = (mu.div_ceil(rows), nu.div_ceil(cols));
+            let span = (rows * cols).div_ceil(threads) * tile_mu * tile_nu;
+            (
+                Self { rows, cols },
+                span,
+                tile_mu * shape.mr,
+                tile_nu * shape.nr,
+            )
+        });
+        let shortest = candidates
+            .clone()
+            .map(|(_, span, _, _)| span)
+            .min()
+            .unwrap_or(0);
+        let mut best = Self { rows: 1, cols: 1 };
+        let mut best_key = (usize::MAX, usize::MAX, usize::MAX);
+        for (grid, span, height, width) in candidates {
+            if span.saturating_mul(8) > shortest.saturating_mul(9) {
+                continue;
+            }
+            let aspect = height.max(width).saturating_mul(1000) / height.min(width).max(1);
+            let packed = grid
+                .rows
+                .saturating_mul(w)
+                .saturating_add(grid.cols.saturating_mul(m));
+            let key = (aspect, packed, grid.cols);
+            if key < best_key {
+                best_key = key;
+                best = grid;
+            }
+        }
+        best
+    }
+
     /// Total number of tiles.
     fn count(self) -> usize {
         self.rows * self.cols
@@ -85,6 +175,11 @@ impl TileGrid {
     /// Height of the tallest tile row of an `m`-row block.
     fn tallest_rows(self, m: usize, mr: usize) -> usize {
         (m.div_ceil(mr).div_ceil(self.rows) * mr).min(m)
+    }
+
+    /// Width of the widest tile column of a `w`-column block.
+    fn widest_cols(self, w: usize, nr: usize) -> usize {
+        (w.div_ceil(nr).div_ceil(self.cols) * nr).min(w)
     }
 }
 
@@ -236,9 +331,13 @@ fn pack_b_panel<T: Field>(
 /// grid described in the module docs.
 ///
 /// `blocking` must already be fitted to the problem (the GEMM funnel does
-/// that), and `alpha == 0` must have been handled by the caller. Returns
-/// `false` without touching C when the widest NC block cannot be split into
-/// at least two tiles; the caller then runs the sequential driver.
+/// that), and `alpha == 0` must have been handled by the caller. `kernel` is
+/// the micro-kernel of the call's plan: A and B are packed with its shape and
+/// every tile runs it (never a re-dispatched one). `scope` is the plan's pack
+/// scope: [`run_shared`] or [`run_per_tile`]; both give the bits of the
+/// sequential driver. Returns `false` without touching C when the widest NC
+/// block cannot be split into at least two tiles; the caller then runs the
+/// sequential driver.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroable>(
     trans_a: Trans,
@@ -249,7 +348,60 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
     beta: T,
     c: &mut MatMut<'_, T>,
     blocking: &GemmBlocking,
-    shape: &MicroKernelShape,
+    kernel: &MicroKernel<T>,
+    scope: PackScope,
+    par: Par,
+) -> bool {
+    match scope {
+        PackScope::Shared => run_shared(
+            trans_a, trans_b, alpha, a, b, beta, c, blocking, kernel, par,
+        ),
+        PackScope::PerTile => run_per_tile(
+            trans_a, trans_b, alpha, a, b, beta, c, blocking, kernel, par,
+        ),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls the 2D driver ran on this thread, per runner: `(Shared,
+    /// PerTile)` (test hook; each runner counts itself once it has run, on
+    /// the calling thread).
+    static SCOPE_RUNS: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
+}
+
+/// Counts one engaged run of `scope` on this thread.
+#[cfg(test)]
+fn count_scope_run(scope: PackScope) {
+    let _ = SCOPE_RUNS.try_with(|runs| {
+        let (shared, per_tile) = runs.get();
+        runs.set(match scope {
+            PackScope::Shared => (shared + 1, per_tile),
+            PackScope::PerTile => (shared, per_tile + 1),
+        });
+    });
+}
+
+/// `(Shared, PerTile)`: how many calls the 2D driver ran on this thread with
+/// each scope (test hook).
+#[cfg(test)]
+pub(crate) fn scope_runs() -> (usize, usize) {
+    SCOPE_RUNS.try_with(core::cell::Cell::get).unwrap_or((0, 0))
+}
+
+/// [`try_gemm_blocked_parallel`] with [`PackScope::Shared`]: one packed B~
+/// per `(jc, pc)` step, packed in parallel and shared by every tile.
+#[allow(clippy::too_many_arguments)]
+fn run_shared<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    kernel: &MicroKernel<T>,
     par: Par,
 ) -> bool {
     // Logical (post-transpose) dimensions.
@@ -259,6 +411,7 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
         return false;
     }
 
+    let shape = &kernel.shape;
     let mr = shape.mr;
     let nr = shape.nr;
     let mc = blocking.mc.min(m);
@@ -313,484 +466,144 @@ pub(super) fn try_gemm_blocked_parallel<T: Field + GemmKernel + bytemuck::Zeroab
                 for ic in (0..rows).step_by(mc_tile) {
                     let ib = mc_tile.min(rows - ic);
                     pack_a_trans_dispatch(a, trans_a, tile.row0 + ic, pc, ib, pb, &mut a_buf, mr);
-                    macro_panel_multiply(
+                    macro_panel_multiply_with(
                         alpha,
                         &a_buf,
                         ib,
                         pb,
                         b_panels,
-                        pb,
                         cols,
                         beta_eff,
                         tile.view.rb_mut().submatrix(ic, 0, ib, cols),
-                        shape,
+                        kernel,
                     );
                 }
             });
         }
     }
+    #[cfg(test)]
+    count_scope_run(PackScope::Shared);
+    true
+}
+
+/// [`try_gemm_blocked_parallel`] with [`PackScope::PerTile`]: every tile
+/// packs its own A~ and B~ into its worker's buffers and runs the whole KC
+/// loop of the tile, with one fork/join per NC block.
+///
+/// # Why the result is bitwise the sequential driver's
+///
+/// An element of C is computed by one MR × NR micro-tile per KC block, and
+/// its bits depend only on the values the micro-kernel reads (the packed A
+/// row panel and B column panel of that KC block), the kernel and its
+/// `beta_eff`, and the order of the KC blocks:
+/// - Tile origins are multiples of MR and NR ([`split_point`] over the
+///   micro-grid), and the MC sub-blocks inside a tile
+///   (`balanced_block(rows, mc, mr)`) are multiples of MR or the whole tile,
+///   so every micro-tile starts at the same `(row, column)` as in the
+///   sequential driver and is padded only where C ends, as there. The
+///   packers copy values (`ConjTrans` conjugates, as in the sequential
+///   driver, which uses the same [`pack_a_trans_dispatch`] /
+///   [`pack_b_trans_dispatch`]), so the panels hold the same values.
+/// - The KC partition is the sequential one (`(0..k).step_by(kc)` with the
+///   same `kc`), walked in order inside each tile.
+/// - `beta` is applied exactly once, at the first KC block (`pc == 0`); every
+///   later block accumulates with `beta_eff = 1`, as in the sequential
+///   driver. Each tile writes only its own disjoint view of C, so no element
+///   is touched by two tasks.
+///
+/// Neither MC nor NC changes a result bit (they only regroup micro-tiles),
+/// so the tile grid and the thread count do not either.
+#[allow(clippy::too_many_arguments)]
+fn run_per_tile<T: Field + GemmKernel + bytemuck::Zeroable>(
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: &MatRef<'_, T>,
+    b: &MatRef<'_, T>,
+    beta: T,
+    c: &mut MatMut<'_, T>,
+    blocking: &GemmBlocking,
+    kernel: &MicroKernel<T>,
+    par: Par,
+) -> bool {
+    // Logical (post-transpose) dimensions.
+    let (m, k) = op_dims(a, trans_a);
+    let (_, n) = op_dims(b, trans_b);
+    if m == 0 || n == 0 || k == 0 {
+        return false;
+    }
+
+    let shape = &kernel.shape;
+    let mr = shape.mr;
+    let nr = shape.nr;
+    let mc = blocking.mc.min(m);
+    let kc = blocking.kc.min(k);
+    let nc = blocking.nc.min(n);
+    let threads = par.num_threads();
+
+    // Grids of the full-width NC blocks and of the (possibly narrower) last.
+    let full_grid = TileGrid::choose_per_tile(m, nc, shape, threads);
+    if full_grid.count() < 2 {
+        return false;
+    }
+    let last_w = n - (n - 1) / nc * nc;
+    let last_grid = TileGrid::choose_per_tile(m, last_w, shape, threads);
+
+    // Each tile packs at most `round_up(min(mc, tallest tile), MR) x KC` of A
+    // and `round_up(widest tile, NR) x KC` of B.
+    let max_tile_rows = full_grid
+        .tallest_rows(m, mr)
+        .max(last_grid.tallest_rows(m, mr));
+    let max_tile_cols = full_grid
+        .widest_cols(nc, nr)
+        .max(last_grid.widest_cols(last_w, nr));
+    let a_len = mc.min(max_tile_rows).div_ceil(mr) * mr * kc;
+    let b_len = max_tile_cols.div_ceil(nr) * nr * kc;
+
+    for jc in (0..n).step_by(nc) {
+        let w = nc.min(n - jc);
+        let grid = if w == nc { full_grid } else { last_grid };
+        let mut tiles = split_tiles(c.rb_mut().submatrix(0, jc, m, w), grid, shape);
+
+        tiles.par_iter_mut().with_max_len(1).for_each(|tile| {
+            // Both buffers come from the cache of the worker that runs the
+            // task (moved out of its thread-local slots for the task, so a
+            // task stolen by a worker that waits inside another GEMM finds the
+            // slots empty and allocates). Workers keep them between tasks and
+            // calls (policy: `PACK_CACHE_MAX_BYTES`).
+            let mut a_buf = PackBuffer::<T>::take(PackSlot::A, a_len);
+            let mut b_buf = PackBuffer::<T>::take(PackSlot::B, b_len);
+            let rows = tile.view.nrows();
+            let cols = tile.view.ncols();
+            let mc_tile = balanced_block(rows, mc, mr);
+            for pc in (0..k).step_by(kc) {
+                let pb = kc.min(k - pc);
+                // beta applies on the first KC step only; later steps accumulate.
+                let beta_eff = if pc == 0 { beta } else { T::one() };
+                pack_b_trans_dispatch(b, trans_b, pc, jc + tile.col0, pb, cols, &mut b_buf, nr);
+                for ic in (0..rows).step_by(mc_tile) {
+                    let ib = mc_tile.min(rows - ic);
+                    pack_a_trans_dispatch(a, trans_a, tile.row0 + ic, pc, ib, pb, &mut a_buf, mr);
+                    macro_panel_multiply_with(
+                        alpha,
+                        &a_buf,
+                        ib,
+                        pb,
+                        &b_buf,
+                        cols,
+                        beta_eff,
+                        tile.view.rb_mut().submatrix(ic, 0, ib, cols),
+                        kernel,
+                    );
+                }
+            }
+        });
+    }
+    #[cfg(test)]
+    count_scope_run(PackScope::PerTile);
     true
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::level3::autotune::KC_BLOCK_UNIT;
-    use crate::level3::gemm::{
-        PARALLEL_GATE, gemm_transposed_with_blocking, gemm_transposed_with_par,
-    };
-    use num_complex::Complex64;
-    use oxiblas_matrix::Mat;
-
-    /// Element helpers for the bitwise comparisons.
-    trait Probe: Field + GemmKernel + bytemuck::Zeroable {
-        /// Exact bit patterns (real, imaginary).
-        fn bits(self) -> (u64, u64);
-        /// True when every component is finite.
-        fn finite(self) -> bool;
-        /// Deterministic, non-symmetric sample value.
-        fn sample(seed: usize) -> Self;
-        /// A NaN (NaN in every component).
-        fn nan() -> Self;
-    }
-
-    fn unit_sample(seed: usize) -> f64 {
-        ((seed.wrapping_mul(2_654_435_761) >> 7) % 1009) as f64 / 504.5 - 1.0
-    }
-
-    impl Probe for f64 {
-        fn bits(self) -> (u64, u64) {
-            (self.to_bits(), 0)
-        }
-        fn finite(self) -> bool {
-            self.is_finite()
-        }
-        fn sample(seed: usize) -> Self {
-            unit_sample(seed)
-        }
-        fn nan() -> Self {
-            f64::NAN
-        }
-    }
-
-    impl Probe for f32 {
-        fn bits(self) -> (u64, u64) {
-            (u64::from(self.to_bits()), 0)
-        }
-        fn finite(self) -> bool {
-            self.is_finite()
-        }
-        fn sample(seed: usize) -> Self {
-            unit_sample(seed) as f32
-        }
-        fn nan() -> Self {
-            f32::NAN
-        }
-    }
-
-    impl Probe for Complex64 {
-        fn bits(self) -> (u64, u64) {
-            (self.re.to_bits(), self.im.to_bits())
-        }
-        fn finite(self) -> bool {
-            self.re.is_finite() && self.im.is_finite()
-        }
-        fn sample(seed: usize) -> Self {
-            Complex64::new(unit_sample(seed), unit_sample(seed.wrapping_add(7_919)))
-        }
-        fn nan() -> Self {
-            Complex64::new(f64::NAN, f64::NAN)
-        }
-    }
-
-    fn fill<T: Probe>(rows: usize, cols: usize, seed: usize) -> Mat<T> {
-        let mut out: Mat<T> = Mat::zeros(rows, cols);
-        for j in 0..cols {
-            for i in 0..rows {
-                out[(i, j)] = T::sample(i * 7_919 + j * 104_729 + seed * 1_299_709);
-            }
-        }
-        out
-    }
-
-    fn assert_bits_eq<T: Probe>(got: &Mat<T>, expected: &Mat<T>, ctx: &str) {
-        for j in 0..got.ncols() {
-            for i in 0..got.nrows() {
-                assert_eq!(
-                    got[(i, j)].bits(),
-                    expected[(i, j)].bits(),
-                    "{ctx} at ({i},{j}): {} vs {}",
-                    got[(i, j)],
-                    expected[(i, j)]
-                );
-            }
-        }
-    }
-
-    /// The blocking `gemm_transposed_with_par` selects, fitted to the problem.
-    fn fitted_blocking<T: Probe>(m: usize, k: usize, n: usize) -> GemmBlocking {
-        let shape = T::micro_kernel_shape();
-        let blk = if m >= 512 || k >= 512 || n >= 512 {
-            GemmBlocking::auto_tuned::<T>(m, k, n, &shape)
-        } else {
-            GemmBlocking::for_kernel::<T>(&shape)
-        };
-        fit(&blk, m, k, n, &shape)
-    }
-
-    fn fit(
-        blk: &GemmBlocking,
-        m: usize,
-        k: usize,
-        n: usize,
-        shape: &MicroKernelShape,
-    ) -> GemmBlocking {
-        GemmBlocking {
-            mc: balanced_block(m, blk.mc, shape.mr),
-            kc: balanced_block(k, blk.kc, KC_BLOCK_UNIT),
-            nc: balanced_block(n, blk.nc, shape.nr),
-        }
-    }
-
-    /// Runs `C = alpha * op(A) * op(B) + beta * C` sequentially, then on the 2D
-    /// driver (directly and through the public entry point) for every thread
-    /// count, asserting bitwise-identical results. With `poison_c`, C starts
-    /// as NaN and `beta == 0`, so C must not be read.
-    fn check<T: Probe>(
-        (m, k, n): (usize, usize, usize),
-        (ta, tb): (Trans, Trans),
-        blocking: Option<GemmBlocking>,
-        threads: &[usize],
-        poison_c: bool,
-    ) {
-        let shape = T::micro_kernel_shape();
-        let a = if ta == Trans::NoTrans {
-            fill::<T>(m, k, 1)
-        } else {
-            fill::<T>(k, m, 1)
-        };
-        let b = if tb == Trans::NoTrans {
-            fill::<T>(k, n, 2)
-        } else {
-            fill::<T>(n, k, 2)
-        };
-        let alpha = T::sample(5);
-        let (beta, c_init) = if poison_c {
-            (T::zero(), Mat::filled(m, n, T::nan()))
-        } else {
-            (T::sample(9), fill::<T>(m, n, 3))
-        };
-        let fitted = match blocking {
-            Some(blk) => fit(&blk, m, k, n, &shape),
-            None => fitted_blocking::<T>(m, k, n),
-        };
-        let ctx = format!("{m}x{k}x{n} {ta:?}/{tb:?} {fitted:?}");
-
-        let mut c_seq = c_init.clone();
-        gemm_transposed_with_blocking(
-            ta,
-            tb,
-            alpha,
-            a.as_ref(),
-            b.as_ref(),
-            beta,
-            c_seq.as_mut(),
-            Par::Seq,
-            &fitted,
-        );
-        if poison_c {
-            for j in 0..n {
-                for i in 0..m {
-                    assert!(c_seq[(i, j)].finite(), "{ctx}: beta = 0 read C");
-                }
-            }
-        }
-
-        for &t in threads {
-            let par = Par::RayonWith(t);
-            assert!(
-                PARALLEL_GATE.should_parallelize(m * n * k, par),
-                "{ctx}: gate, t={t}"
-            );
-
-            let mut c_par = c_init.clone();
-            let engaged = try_gemm_blocked_parallel(
-                ta,
-                tb,
-                alpha,
-                &a.as_ref(),
-                &b.as_ref(),
-                beta,
-                &mut c_par.as_mut(),
-                &fitted,
-                &shape,
-                par,
-            );
-            assert!(engaged, "{ctx}: 2D driver declined, t={t}");
-            assert_bits_eq(&c_par, &c_seq, &format!("{ctx} direct t={t}"));
-
-            let mut c_api = c_init.clone();
-            gemm_transposed_with_blocking(
-                ta,
-                tb,
-                alpha,
-                a.as_ref(),
-                b.as_ref(),
-                beta,
-                c_api.as_mut(),
-                par,
-                &fitted,
-            );
-            assert_bits_eq(&c_api, &c_seq, &format!("{ctx} api t={t}"));
-        }
-    }
-
-    /// Shapes (m, k, n): square-ish with two KC blocks, tall, wide, and a deep
-    /// k with five KC blocks.
-    const SHAPES: [(usize, usize, usize); 4] = [
-        (513, 517, 300),
-        (2048, 64, 64),
-        (64, 64, 4096),
-        (37, 4099, 129),
-    ];
-
-    #[test]
-    fn test_issue_16_parallel_matches_sequential_bitwise_f64() {
-        let combos = [
-            (Trans::NoTrans, Trans::NoTrans),
-            (Trans::Trans, Trans::NoTrans),
-            (Trans::NoTrans, Trans::ConjTrans),
-            (Trans::Trans, Trans::Trans),
-        ];
-        for &shape in &SHAPES {
-            for &combo in &combos {
-                check::<f64>(shape, combo, None, &[2, 3, 8], false);
-            }
-            check::<f64>(shape, (Trans::NoTrans, Trans::NoTrans), None, &[5], true);
-        }
-    }
-
-    #[test]
-    fn test_issue_16_parallel_matches_sequential_bitwise_f32() {
-        for &shape in &SHAPES {
-            check::<f32>(
-                shape,
-                (Trans::NoTrans, Trans::NoTrans),
-                None,
-                &[2, 8],
-                false,
-            );
-            check::<f32>(shape, (Trans::Trans, Trans::ConjTrans), None, &[3], false);
-            check::<f32>(shape, (Trans::NoTrans, Trans::Trans), None, &[4], true);
-        }
-    }
-
-    #[test]
-    fn test_issue_16_parallel_matches_sequential_bitwise_c64() {
-        // 213 * 157 * 137 = 4.58M multiply-adds clears the 8-thread gate
-        // (PARALLEL_GATE: 80^3 per thread, i.e. 160^3 on 8 threads).
-        let all = [Trans::NoTrans, Trans::Trans, Trans::ConjTrans];
-        for &ta in &all {
-            for &tb in &all {
-                check::<Complex64>((213, 157, 137), (ta, tb), None, &[2, 3, 8], false);
-            }
-        }
-        for &shape in &[(2048usize, 64usize, 64usize), (64, 64, 4096)] {
-            check::<Complex64>(
-                shape,
-                (Trans::ConjTrans, Trans::ConjTrans),
-                None,
-                &[3],
-                false,
-            );
-            check::<Complex64>(shape, (Trans::NoTrans, Trans::NoTrans), None, &[5], true);
-        }
-    }
-
-    #[test]
-    fn test_issue_16_parallel_bitwise_with_many_blocks() {
-        // Small explicit targets: four NC blocks, four KC blocks and several
-        // MC sub-blocks per tile exercise every loop of the 2D driver.
-        let blocking = GemmBlocking {
-            mc: 64,
-            kc: 48,
-            nc: 96,
-        };
-        let combos = [
-            (Trans::NoTrans, Trans::NoTrans),
-            (Trans::Trans, Trans::NoTrans),
-            (Trans::NoTrans, Trans::Trans),
-            (Trans::ConjTrans, Trans::ConjTrans),
-        ];
-        for &combo in &combos {
-            check::<f64>((200, 150, 300), combo, Some(blocking), &[2, 3, 5, 8], false);
-        }
-        check::<f64>((200, 150, 300), combos[0], Some(blocking), &[4], true);
-        check::<f32>((200, 150, 300), combos[1], Some(blocking), &[3], false);
-        check::<Complex64>((200, 150, 300), combos[3], Some(blocking), &[3], false);
-    }
-
-    #[test]
-    fn test_issue_16_parallel_bitwise_strided_views() {
-        // Transposed views (col_stride != 1) for A and B, and a C view with a
-        // leading dimension larger than its row count.
-        let (m, k, n) = (160usize, 150usize, 120usize);
-        let a_store = fill::<f64>(k, m, 1);
-        let b_store = fill::<f64>(n, k, 2);
-        let a_view = a_store.as_ref().transpose();
-        let b_view = b_store.as_ref().transpose();
-        assert_ne!(a_view.col_stride(), 1);
-        let shape = f64::micro_kernel_shape();
-        let fitted = fitted_blocking::<f64>(m, k, n);
-
-        let mut c_seq_big = fill::<f64>(m + 5, n + 3, 3);
-        let mut c_par_big = c_seq_big.clone();
-        gemm_transposed_with_blocking(
-            Trans::NoTrans,
-            Trans::NoTrans,
-            0.75,
-            a_view,
-            b_view,
-            -1.25,
-            c_seq_big.as_mut().submatrix(2, 1, m, n),
-            Par::Seq,
-            &fitted,
-        );
-        let engaged = try_gemm_blocked_parallel(
-            Trans::NoTrans,
-            Trans::NoTrans,
-            0.75,
-            &a_view,
-            &b_view,
-            -1.25,
-            &mut c_par_big.as_mut().submatrix(2, 1, m, n),
-            &fitted,
-            &shape,
-            Par::RayonWith(4),
-        );
-        assert!(engaged);
-        // The whole backing store must agree, including the untouched border.
-        assert_bits_eq(&c_par_big, &c_seq_big, "strided views");
-    }
-
-    #[test]
-    fn test_issue_16_tile_grid_valid_and_balanced() {
-        for &(mr, nr) in &[(8usize, 6usize), (8, 8), (16, 6), (4, 4), (2, 2)] {
-            let shape = MicroKernelShape { mr, nr };
-            for &m in &[1usize, 7, 64, 100, 513, 2048, 4096] {
-                for &w in &[1usize, 6, 64, 517, 2048, 5712] {
-                    for &threads in &[2usize, 3, 4, 8, 12, 64] {
-                        let grid = TileGrid::choose(m, w, &shape, threads);
-                        let (mu, nu) = (m.div_ceil(mr), w.div_ceil(nr));
-                        let ctx = format!("{mr}x{nr} m={m} w={w} t={threads}: {grid:?}");
-                        assert!((1..=mu).contains(&grid.rows), "{ctx}");
-                        assert!((1..=nu).contains(&grid.cols), "{ctx}");
-                        assert!(grid.count() < 2 * TILES_PER_THREAD * threads, "{ctx}");
-                        if mu * nu >= 8 {
-                            assert!(grid.count() >= 2, "{ctx}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_issue_16_split_tiles_cover_c_exactly_once() {
-        let shape = MicroKernelShape { mr: 8, nr: 6 };
-        for &(m, w, threads) in &[
-            (37usize, 50usize, 3usize),
-            (513, 300, 8),
-            (8, 6, 2),
-            (64, 4096, 12),
-        ] {
-            let grid = TileGrid::choose(m, w, &shape, threads);
-            let mut c: Mat<f64> = Mat::zeros(m, w);
-            let tiles = split_tiles(c.as_mut(), grid, &shape);
-            assert_eq!(tiles.len(), grid.count());
-            let mut covered_rows = 0;
-            for mut tile in tiles {
-                let (rows, cols) = (tile.view.nrows(), tile.view.ncols());
-                assert!(rows > 0 && cols > 0, "empty tile");
-                assert_eq!(tile.row0 % shape.mr, 0, "row start off the micro grid");
-                assert_eq!(tile.col0 % shape.nr, 0, "column start off the micro grid");
-                assert!(tile.row0 + rows <= m && tile.col0 + cols <= w);
-                // Tag each element with its global row so a misplaced view is
-                // caught, not just a double-counted one.
-                for j in 0..cols {
-                    for i in 0..rows {
-                        tile.view[(i, j)] += 1.0 + (tile.row0 + i) as f64 * 1e3;
-                    }
-                }
-                covered_rows += rows * cols;
-            }
-            assert_eq!(covered_rows, m * w);
-            for j in 0..w {
-                for i in 0..m {
-                    let expected = 1.0 + i as f64 * 1e3;
-                    assert_eq!(c[(i, j)], expected, "({i},{j}) misplaced or double-covered");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_issue_16_square_problems_split_across_threads() {
-        // With the NC-only split, a square problem with n <= NC was a single
-        // work item. Every NC block must now offer at least one tile per
-        // thread.
-        let threads = 12;
-        for &n in &[512usize, 1024, 2048, 4096] {
-            for (label, shape, blk) in [
-                (
-                    "f64",
-                    f64::micro_kernel_shape(),
-                    GemmBlocking::auto_tuned::<f64>(n, n, n, &f64::micro_kernel_shape()),
-                ),
-                (
-                    "f32",
-                    f32::micro_kernel_shape(),
-                    GemmBlocking::auto_tuned::<f32>(n, n, n, &f32::micro_kernel_shape()),
-                ),
-            ] {
-                let nc = balanced_block(n, blk.nc, shape.nr);
-                let last_w = n - (n - 1) / nc * nc;
-                for w in [nc, last_w] {
-                    let grid = TileGrid::choose(n, w, &shape, threads);
-                    assert!(
-                        grid.count() >= threads,
-                        "{label} n={n} w={w}: only {} tiles ({grid:?})",
-                        grid.count()
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_issue_16_parallel_alpha_zero_and_api_paths() {
-        // The funnel handles alpha == 0 before the 2D driver: NaN operands
-        // must not leak, whatever the thread count.
-        let n = 200;
-        let a: Mat<f64> = Mat::filled(n, n, f64::NAN);
-        let b: Mat<f64> = Mat::filled(n, n, f64::INFINITY);
-        for &t in &[2usize, 7] {
-            let mut c: Mat<f64> = Mat::filled(n, n, 2.0);
-            gemm_transposed_with_par(
-                Trans::Trans,
-                Trans::NoTrans,
-                0.0,
-                a.as_ref(),
-                b.as_ref(),
-                0.5,
-                c.as_mut(),
-                Par::RayonWith(t),
-            );
-            for j in 0..n {
-                for i in 0..n {
-                    assert_eq!(c[(i, j)].to_bits(), 1.0f64.to_bits(), "t={t} ({i},{j})");
-                }
-            }
-        }
-    }
-}
+#[path = "gemm_parallel_tests.rs"]
+mod tests;

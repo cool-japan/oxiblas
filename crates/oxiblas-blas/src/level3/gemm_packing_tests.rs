@@ -752,6 +752,90 @@ fn test_pack_buffer_policy_frees_oversized_buffers() {
 }
 
 #[test]
+fn test_pack_cache_limit_is_per_thread_and_restored() {
+    assert_eq!(pack_cache_limit(), PACK_CACHE_MAX_BYTES);
+    // Start from empty f64 slots so only this test's buffers are parked.
+    drop(PackBuffer::<f64>::take(
+        PackSlot::A,
+        PACK_CACHE_MAX_BYTES / 8 + 1,
+    ));
+    drop(PackBuffer::<f64>::take(
+        PackSlot::B,
+        PACK_CACHE_MAX_BYTES / 8 + 1,
+    ));
+    assert_eq!(pack_cache_capacity::<f64>(PackSlot::A), 0);
+    assert_eq!(pack_cache_capacity::<f64>(PackSlot::B), 0);
+    {
+        // A lower limit: 4 KiB.
+        let _guard = set_pack_cache_limit(4096);
+        assert_eq!(pack_cache_limit(), 4096);
+        drop(PackBuffer::<f64>::take(PackSlot::A, 513));
+        assert_eq!(
+            pack_cache_capacity::<f64>(PackSlot::A),
+            0,
+            "4104 bytes kept"
+        );
+        drop(PackBuffer::<f64>::take(PackSlot::A, 512));
+        assert_eq!(pack_cache_capacity::<f64>(PackSlot::A), 512);
+        // The limit is per thread: another thread keeps the default.
+        let other = std::thread::spawn(pack_cache_limit).join();
+        assert_eq!(other.ok(), Some(PACK_CACHE_MAX_BYTES));
+    }
+    assert_eq!(pack_cache_limit(), PACK_CACHE_MAX_BYTES, "guard restores");
+    {
+        // A higher limit keeps a buffer the default frees: 12 MiB of f64.
+        let big = (12 << 20) / 8;
+        let _guard = set_pack_cache_limit(16 << 20);
+        drop(PackBuffer::<f64>::take(PackSlot::B, big));
+        assert_eq!(pack_cache_capacity::<f64>(PackSlot::B), big);
+        assert!(pack_cache_bytes() <= 16 << 20);
+        // Back under the default: the parked buffer is freed when it is
+        // next put back.
+        drop(_guard);
+        drop(PackBuffer::<f64>::take(PackSlot::B, 1));
+        assert_eq!(pack_cache_capacity::<f64>(PackSlot::B), 0);
+    }
+    assert!(pack_cache_bytes() <= PACK_CACHE_MAX_BYTES);
+    assert_eq!(pack_cache_bytes(), parked_bytes());
+}
+
+#[test]
+fn test_pack_cache_limit_nested_guards_restore_the_previous_limit() {
+    // Each guard restores the limit that was in force when it was created,
+    // not the default: dropping the inner guard brings back the outer
+    // guard's limit, dropping the outer one the default.
+    assert_eq!(pack_cache_limit(), PACK_CACHE_MAX_BYTES);
+    let outer = set_pack_cache_limit(4 << 10);
+    assert_eq!(pack_cache_limit(), 4 << 10);
+    let inner = set_pack_cache_limit(16 << 10);
+    assert_eq!(pack_cache_limit(), 16 << 10);
+    drop(inner);
+    assert_eq!(pack_cache_limit(), 4 << 10, "inner guard restores 4 KiB");
+    drop(outer);
+    assert_eq!(
+        pack_cache_limit(),
+        PACK_CACHE_MAX_BYTES,
+        "outer guard restores the default"
+    );
+}
+
+#[test]
+fn test_pack_buffer_allocations_count_growth_only() {
+    let before = pack_cache_allocations();
+    drop(PackBuffer::<f32>::take(PackSlot::A, 4096));
+    let grown = pack_cache_allocations();
+    assert!(grown <= before + 1);
+    // Reusing the parked buffer (same or smaller length) allocates nothing.
+    for len in [4096usize, 100, 1] {
+        drop(PackBuffer::<f32>::take(PackSlot::A, len));
+        assert_eq!(pack_cache_allocations(), grown, "len {len}");
+    }
+    // Growing allocates exactly once.
+    drop(PackBuffer::<f32>::take(PackSlot::A, 8193));
+    assert_eq!(pack_cache_allocations(), grown + 1);
+}
+
+#[test]
 fn test_pack_buffer_fresh_elements_are_zero() {
     let buf = PackBuffer::<Complex32>::take(PackSlot::A, 77);
     assert!(buf.iter().all(|v| v.re == 0.0 && v.im == 0.0));

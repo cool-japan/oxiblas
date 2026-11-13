@@ -8,8 +8,14 @@
 //! using SIMD intrinsics.
 
 #[cfg(target_arch = "x86_64")]
+mod avx2_f32;
+
+#[cfg(target_arch = "x86_64")]
 use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
 use super::gemm_packing::PackSlot;
+use super::gemm_plan::{F32Avx2Policy, SimdTier};
+use crate::level1::typed::same_value;
+use core::any::TypeId;
 use core::cell::Cell;
 use num_complex::{Complex32, Complex64};
 use oxiblas_core::memory::AlignedVec;
@@ -30,11 +36,11 @@ pub type MicroKernelFn<T> = unsafe fn(usize, T, *const T, *const T, T, *mut T, u
 
 /// A micro-kernel and its shape, taken from one dispatch decision.
 ///
-/// The GEMM drivers resolve this once per call (or per macro panel) and then
-/// call `kernel` for every micro-tile, instead of re-running the CPU dispatch
-/// inside [`GemmKernel::micro_kernel`] for each tile. Because `shape` and
-/// `kernel` come from the same decision, the packed layout always matches the
-/// kernel that consumes it.
+/// The GEMM drivers resolve this once per call and then call `kernel` for
+/// every micro-tile (the sequential and the parallel driver alike), instead of
+/// re-running the CPU dispatch inside [`GemmKernel::micro_kernel`] for each
+/// tile. Because `shape` and `kernel` come from the same decision, the packed
+/// layout always matches the kernel that consumes it.
 #[derive(Debug, Clone, Copy)]
 pub struct MicroKernel<T> {
     /// Register-block shape (`MR × NR`) the packed panels must use.
@@ -61,7 +67,7 @@ pub struct MicroKernel<T> {
 /// clamp the SIMD width (see `cap_kernel_kind`, which `force-scalar` builds
 /// leave out).
 #[inline]
-fn selected_kernel_kind() -> GemmKernelKind {
+pub(crate) fn selected_kernel_kind() -> GemmKernelKind {
     #[cfg(feature = "force-scalar")]
     {
         GemmKernelKind::Scalar
@@ -72,6 +78,151 @@ fn selected_kernel_kind() -> GemmKernelKind {
         cap_kernel_kind(detected)
     }
 }
+/// The micro-kernel of one GEMM call's plan for an `m × k` by `k × n`
+/// product on `tier`.
+///
+/// The plan's kernel only decides the register-tile shape the panels are
+/// packed with; the default blocking takes KC from the canonical kernel
+/// (`T::micro_kernel_dispatch()`), so for the same KC partition the f32
+/// 16×6 kernel gives the bits of the canonical 8×8 kernel except the
+/// payloads of NaN results. NaN results sit at the same positions; their
+/// payloads may differ because the compiler may commute the first two
+/// operands of an FMA, which decides the payload x86 propagates. Under
+/// [`F32Avx2Policy::Legacy8x8`] it is always the canonical kernel.
+///
+/// The one per-problem kernel is the f32 16×6 AVX2 + FMA kernel (module
+/// `avx2_f32`, x86-64 only). [`f32_avx2_picks_16x6`] decides when it
+/// replaces the canonical f32 kernel: on [`SimdTier::Avx2Fma`] under
+/// [`F32Avx2Policy::Adaptive`], only when the canonical f32 kernel is the
+/// 8×8 AVX2 kernel (the tier is `Avx2Fma` on AVX-512 hosts as well, where
+/// the canonical f32 kernel is 16×16 and stays; an AVX-512 host capped by
+/// `max-simd-256` has the 8×8 kernel and may switch), and only when the
+/// padding model [`f32_avx2_prefers_8x8`] does not keep 8×8. Every other
+/// type, tier and policy gets the canonical kernel. Off x86-64 the tier is
+/// never `Avx2Fma` and no 16×6 kernel is compiled, so the canonical kernel is
+/// returned whatever the inputs say.
+#[inline]
+pub(crate) fn kernel_for_problem<T: GemmKernel>(
+    tier: SimdTier,
+    f32_avx2: F32Avx2Policy,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> MicroKernel<T> {
+    // The type test first: other types never look at the f32 canonical shape.
+    let per_problem = if TypeId::of::<T>() == TypeId::of::<f32>()
+        && f32_avx2_picks_16x6(tier, f32_avx2, f32::micro_kernel_shape(), m, n, k)
+    {
+        f32_16x6_kernel().and_then(same_value::<MicroKernel<f32>, MicroKernel<T>>)
+    } else {
+        None
+    };
+    per_problem.unwrap_or_else(T::micro_kernel_dispatch)
+}
+
+/// The f32 16×6 AVX2 + FMA kernel, where it is compiled (x86-64).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn f32_16x6_kernel() -> Option<MicroKernel<f32>> {
+    Some(avx2_f32::micro_kernel_16x6())
+}
+
+/// The f32 16×6 AVX2 + FMA kernel exists only on x86-64.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn f32_16x6_kernel() -> Option<MicroKernel<f32>> {
+    None
+}
+
+/// Whether one GEMM call's plan carries the f32 16×6 kernel instead of the
+/// canonical f32 kernel whose shape is `canonical`.
+///
+/// True exactly when `tier` is [`SimdTier::Avx2Fma`], `f32_avx2` is
+/// [`F32Avx2Policy::Adaptive`], `canonical` is 8×8 (the AVX2 kernel; never
+/// the AVX-512 16×16 kernel) and [`f32_avx2_prefers_8x8`] is false for the
+/// problem. A pure rule, compiled and tested on every target.
+#[inline]
+pub(crate) fn f32_avx2_picks_16x6(
+    tier: SimdTier,
+    f32_avx2: F32Avx2Policy,
+    canonical: MicroKernelShape,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    match f32_avx2 {
+        F32Avx2Policy::Legacy8x8 => false,
+        F32Avx2Policy::Adaptive => {
+            tier == SimdTier::Avx2Fma
+                && canonical == (MicroKernelShape { mr: 8, nr: 8 })
+                && !f32_avx2_prefers_8x8(m, n, k)
+        }
+    }
+}
+
+/// Relative peak of the f32 8×8 AVX2 kernel against the 16×6 kernel, in
+/// permille, used by [`f32_avx2_prefers_8x8`].
+///
+/// First estimate, to be calibrated on real AVX2 hardware (the A/B runs).
+pub(crate) const F32_AVX2_8X8_REL_PEAK_PERMILLE: u128 = 800;
+
+/// Work (`m · n · k`) below which [`f32_avx2_prefers_8x8`] keeps the 8×8
+/// kernel whatever the padding (0: no such floor).
+///
+/// First estimate, to be calibrated on real AVX2 hardware (the A/B runs).
+pub(crate) const F32_AVX2_16X6_MIN_WORK: usize = 0;
+
+/// The padding model of the f32 AVX2 kernel choice: whether an `m × k` by
+/// `k × n` product keeps the 8×8 kernel rather than the 16×6 kernel.
+///
+/// Each kernel computes whole tiles, so its cost is proportional to the
+/// padded tile area divided by its speed. With the 8×8 kernel running at
+/// `R` = [`F32_AVX2_8X8_REL_PEAK_PERMILLE`] / 1000 of the 16×6 kernel's
+/// speed, 8×8 is kept when
+/// `R · ⌈m⌉₁₆ · ⌈n⌉₆ > ⌈m⌉₈ · ⌈n⌉₈` (`⌈x⌉ᵤ`: `x` rounded up to a multiple of
+/// `u`), i.e. when the 16×6 tiles waste so much on a narrow C that the
+/// faster kernel loses, or when the work is below
+/// [`F32_AVX2_16X6_MIN_WORK`].
+#[inline]
+pub(crate) fn f32_avx2_prefers_8x8(m: usize, n: usize, k: usize) -> bool {
+    f32_avx2_prefers_8x8_with(
+        F32_AVX2_8X8_REL_PEAK_PERMILLE,
+        F32_AVX2_16X6_MIN_WORK,
+        m,
+        n,
+        k,
+    )
+}
+
+/// [`f32_avx2_prefers_8x8`] with the model parameters given explicitly
+/// (`rel_peak_permille` = `R · 1000`, `min_work` the work floor).
+#[inline]
+fn f32_avx2_prefers_8x8_with(
+    rel_peak_permille: u128,
+    min_work: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let work = m.saturating_mul(n).saturating_mul(k);
+    if work < min_work {
+        return true;
+    }
+    // For a real matrix 1 <= m·n <= isize::MAX < 2^63, and ⌈m⌉₁₆ <= 16·m,
+    // ⌈n⌉₆ <= 6·n, so the 16×6 cost (permille <= 1000 < 2^10) is below
+    // 2^10 · 96 · 2^63 < 2^80, and the 8×8 cost likewise: both fit in u128.
+    // The saturation only keeps absurd inputs (such as usize::MAX
+    // dimensions) from panicking; the answer for them is arbitrary.
+    let pad = |x: usize, unit: u128| (x as u128).div_ceil(unit) * unit;
+    let cost_16x6 = rel_peak_permille
+        .saturating_mul(pad(m, 16))
+        .saturating_mul(pad(n, 6));
+    let cost_8x8 = 1000_u128
+        .saturating_mul(pad(m, 8))
+        .saturating_mul(pad(n, 8));
+    cost_16x6 > cost_8x8
+}
+
 /// Clamp a runtime-detected kernel kind to the compile-time SIMD width ceiling.
 ///
 /// WHY: the `max-simd-128` / `max-simd-256` features must actually constrain the
@@ -197,7 +348,7 @@ thread_local! {
 /// [`GemmKernel::micro_kernel_shape`], [`GemmKernel::micro_kernel`] and
 /// [`GemmKernel::micro_kernel_dispatch`] cannot disagree.
 #[inline]
-fn f64_kernel_for(kind: GemmKernelKind) -> MicroKernel<f64> {
+pub(crate) fn f64_kernel_for(kind: GemmKernelKind) -> MicroKernel<f64> {
     let (mr, nr, kernel): (usize, usize, MicroKernelFn<f64>) = match kind {
         #[cfg(target_arch = "x86_64")]
         GemmKernelKind::Avx512 => (16, 6, micro_kernel_f64_avx512),

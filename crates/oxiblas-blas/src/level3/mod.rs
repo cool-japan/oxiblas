@@ -14,18 +14,26 @@
 //! - [`her2k::her2k`]: Hermitian rank-2k update
 //! - [`strassen`]: Strassen's algorithm for very large matrices
 //! - [`batched`]: Batched operations for ML workloads (batch GEMM, GEMV, AXPY)
+//!
+//! [`sme2_active()`] reports whether the SME2 backend (the opt-in `sme2`
+//! Cargo feature on `aarch64`) is active for calls made from the current
+//! thread; in every other build it returns `false`.
 
 pub mod autotune;
 pub mod batched;
 pub mod complex_gemm;
 pub mod gemm;
+#[cfg(test)]
+mod gemm_ab_tests;
 pub mod gemm_cache_oblivious;
 pub mod gemm_kernel;
 pub mod gemm_kernel_sse42;
 pub mod gemm_packing;
 #[cfg(feature = "parallel")]
 mod gemm_parallel;
+mod gemm_plan;
 pub mod gemm_small;
+mod gemm_thin;
 pub mod gemm_winograd;
 pub mod gemmt;
 pub mod hemm;
@@ -33,6 +41,8 @@ pub mod her2k;
 pub mod herk;
 #[cfg(feature = "runtime-tuning")]
 pub mod runtime_autotune;
+#[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+pub(crate) mod sme2;
 pub mod strassen;
 pub mod symm;
 pub mod syr2k;
@@ -82,3 +92,49 @@ pub use trsm::{
     Diag, Side, Trans, Uplo, trsm, trsm_c32, trsm_c32_in_place, trsm_c64, trsm_c64_in_place,
     trsm_in_place, trsm_in_place_with_par, trsm_with_par,
 };
+
+/// Returns `true` when the SME2 backend is active for calls made from the
+/// current thread.
+///
+/// The function exists in every build. Without the opt-in `sme2` Cargo
+/// feature, or on any architecture other than `aarch64`, it always returns
+/// `false`. With the feature on `aarch64` it is `true` only when the build
+/// does not cap SIMD (`force-scalar`, `max-simd-128` and `max-simd-256` keep
+/// the backend off), the `OXIBLAS_DISABLE_SME2` environment variable is unset,
+/// empty or `0` (read once, at the first call), the operating system reports
+/// SME2 with a 512-bit streaming vector length, and the calling thread is
+/// not in streaming mode, holds no live ZA state and has no pending lazy ZA
+/// save. A host where the detection cannot run (for example a sandbox that
+/// forbids spawning `sysctl` on macOS) leaves the backend off.
+///
+/// A `true` result covers `f32`; `f64` additionally needs FEAT_SME_F64F64.
+pub fn sme2_active() -> bool {
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    {
+        sme2::sme2_active()
+    }
+    #[cfg(not(all(feature = "sme2", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_sme2_active_exists_in_every_build() {
+        let active = super::sme2_active();
+        // A build that caps SIMD keeps the backend off even with the feature.
+        if cfg!(any(
+            feature = "force-scalar",
+            feature = "max-simd-128",
+            feature = "max-simd-256"
+        )) {
+            assert!(!active, "a SIMD-capped build never runs SME2");
+        }
+        #[cfg(not(all(feature = "sme2", target_arch = "aarch64")))]
+        assert!(!active, "no SME2 backend in this build");
+        // Asking again from the same thread gives the same answer.
+        assert_eq!(super::sme2_active(), active);
+    }
+}

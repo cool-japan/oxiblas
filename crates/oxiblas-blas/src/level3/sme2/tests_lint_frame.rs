@@ -4,7 +4,7 @@
 
 use super::tests_rules::{GOOD_STREAMING, assert_violates, violations, with_body_line};
 use super::*;
-use crate::level3::sme2::test_support::FPSR_TEMPLATES;
+use crate::level3::sme2::fpstate::FPSR_TEMPLATES;
 
 /// A registry entry for a template, with the given `const` operands.
 fn entry(template: &str, consts: &'static [&'static str], f64f64: bool) -> KernelEntry {

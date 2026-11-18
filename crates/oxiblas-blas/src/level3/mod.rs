@@ -32,6 +32,7 @@ pub mod gemm_packing;
 #[cfg(feature = "parallel")]
 mod gemm_parallel;
 mod gemm_plan;
+mod gemm_policy;
 pub mod gemm_small;
 mod gemm_thin;
 pub mod gemm_winograd;
@@ -102,12 +103,60 @@ pub use trsm::{
 /// does not cap SIMD (`force-scalar`, `max-simd-128` and `max-simd-256` keep
 /// the backend off), the `OXIBLAS_DISABLE_SME2` environment variable is unset,
 /// empty or `0` (read once, at the first call), the operating system reports
-/// SME2 with a 512-bit streaming vector length, and the calling thread is
-/// not in streaming mode, holds no live ZA state and has no pending lazy ZA
-/// save. A host where the detection cannot run (for example a sandbox that
-/// forbids spawning `sysctl` on macOS) leaves the backend off.
+/// SME2 with a 512-bit streaming vector length, the first-use checks of the
+/// SME2 kernels passed on this CPU (they run once per process, at the first
+/// call of this function or at the first GEMM or GEMV call the backend could
+/// serve, whichever comes first), and the calling thread is not in streaming
+/// mode, holds no live ZA state, has no pending lazy ZA save and still has a
+/// 512-bit streaming vector length (Linux lets a thread change it). A host
+/// where the detection cannot run (for example a sandbox that forbids
+/// spawning `sysctl` on macOS) leaves the backend off.
 ///
 /// A `true` result covers `f32`; `f64` additionally needs FEAT_SME_F64F64.
+///
+/// While the backend is active, [`gemm::gemm`] and the other GEMM entry
+/// points run the products that a build without it computes on the blocked
+/// route (more than 32³ multiply-adds) on SME2, and [`gemv`](fn@crate::level2::gemv)
+/// and [`gemv_with_par`](fn@crate::level2::gemv_with_par) run GEMVs past
+/// a size crossover on SME2, as do the GEMM entry points for the products
+/// with one row or one column that they compute as one GEMV (the thin
+/// products the default GEMM policy of aarch64 sends to its GEMV route:
+/// those of its measured scope, with both operands stored column-major;
+/// a thin product with a transposed or strided view as an operand takes
+/// the blocked route above 32³, where the SME2 GEMM driver declines thin
+/// products, and the small routes below). The
+/// results equal those of a build without the backend bit for bit, except
+/// the sign and payload of NaN results and the floating-point flags.
+///
+/// This function waits for another thread that runs the detection or the
+/// first-use checks, and returns their answer, on any calling thread; it
+/// runs the checks itself only on a thread that is ready for SME code (see
+/// above: outside streaming mode, no live ZA state, no pending lazy ZA
+/// save, a 512-bit streaming vector length; a thread outside SME code
+/// whose vector length was changed is not ready). The GEMM and GEMV calls
+/// never wait for another thread (such a call runs on NEON, with the same
+/// result). When this function returns, no
+/// detection or check that was in progress when it was called is still in
+/// progress. In a build that does not cap SIMD the detection is then
+/// settled. Where it found SME2 that the backend can use (a 512-bit
+/// streaming vector length, not turned off by `OXIBLAS_DISABLE_SME2`), the
+/// checks are settled too, unless they have not run yet (only possible when
+/// it was called from a thread that is not ready, for example one inside
+/// SME code); where it found none, the checks never run. A build that caps
+/// SIMD runs neither the detection nor the checks.
+///
+/// In a child forked while another thread was inside the detection or the
+/// checks, before they stored their result, the GEMM and GEMV calls never
+/// use SME2 and never wait, and this function would wait forever. A program
+/// that forks should therefore call this function once before it forks,
+/// from a thread that is ready for SME code: when it returns, the detection
+/// and the checks are settled as far as this process runs them at all (see
+/// above), so the child inherits their results and never waits for them,
+/// whatever other threads do. Called from a thread that is not ready, it
+/// may return before the checks have run; the fork is then safe only when
+/// no other thread is in a GEMM, GEMV or `sme2_active` call, or starts
+/// one, between this call and the fork (the usual rule for forking a
+/// multi-threaded process).
 pub fn sme2_active() -> bool {
     #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
     {

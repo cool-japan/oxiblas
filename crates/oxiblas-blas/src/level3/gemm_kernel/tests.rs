@@ -755,10 +755,18 @@ mod tests_2 {
             && canonical_is_8x8;
         let canonical = f32::micro_kernel_shape();
         let wide = GemmPlan::<f32>::for_problem(CANDIDATE_X86, 24, 4096, 64);
-        assert_eq!(wide.kernel.shape, canonical, "for_problem 24x4096x64");
+        assert_eq!(
+            wide.micro_kernel().shape,
+            canonical,
+            "for_problem 24x4096x64"
+        );
         let tall = GemmPlan::<f32>::for_problem(CANDIDATE_X86, 4096, 24, 64);
         let tall_expected = if host_switches { TILE_16X6 } else { canonical };
-        assert_eq!(tall.kernel.shape, tall_expected, "for_problem 4096x24x64");
+        assert_eq!(
+            tall.micro_kernel().shape,
+            tall_expected,
+            "for_problem 4096x24x64"
+        );
     }
 }
 
@@ -1118,16 +1126,10 @@ mod tests_f32_16x6 {
         /// kernel (LEGACY policy otherwise).
         fn blocked_plans() -> (GemmPlan<f32>, GemmPlan<f32>) {
             let base = GemmPlan::<f32>::new(LEGACY_POLICY).with_forced_route(GemmRoute::Blocked);
-            let p8x8 = GemmPlan {
-                kernel: f32_kernel_for(GemmKernelKind::Avx2),
-                ..base
-            };
-            let p16x6 = GemmPlan {
-                kernel: avx2_f32::micro_kernel_16x6(),
-                ..base
-            };
-            assert_eq!(p8x8.kernel.shape, TILE_8X8);
-            assert_eq!(p16x6.kernel.shape, TILE_16X6);
+            let p8x8 = base.with_kernel(f32_kernel_for(GemmKernelKind::Avx2));
+            let p16x6 = base.with_kernel(avx2_f32::micro_kernel_16x6());
+            assert_eq!(p8x8.micro_kernel().shape, TILE_8X8);
+            assert_eq!(p16x6.micro_kernel().shape, TILE_16X6);
             (p8x8, p16x6)
         }
 
@@ -1299,16 +1301,17 @@ mod tests_f32_16x6 {
             let candidate = GemmPlan::<f32>::for_problem(CANDIDATE_X86, m, n, k);
             let legacy = GemmPlan::<f32>::new(LEGACY_POLICY);
             let canonical = f32::micro_kernel_shape();
-            assert_eq!(legacy.kernel.shape, canonical);
+            assert_eq!(legacy.micro_kernel().shape, canonical);
             if canonical == TILE_8X8 {
                 assert!(!f32_avx2_prefers_8x8(m, n, k));
                 assert_eq!(
-                    candidate.kernel.shape, TILE_16X6,
+                    candidate.micro_kernel().shape,
+                    TILE_16X6,
                     "the candidate picks 16x6"
                 );
             } else {
                 // An AVX-512 host keeps its canonical 16×16 kernel.
-                assert_eq!(candidate.kernel.shape, canonical);
+                assert_eq!(candidate.micro_kernel().shape, canonical);
             }
             for trans in [TRANS[0], TRANS[3]] {
                 for scalars in SCALARS {

@@ -34,8 +34,9 @@
 //! - non-plain strides (large `lda`, gaps between B panels, large `ldc`);
 //! - special values in A, B, C, alpha and beta;
 //! - the FPSR frame: the flags each epilogue mode can raise, exactly;
-//! - thread state: ready before, SVCR and TPIDR2_EL0 zero after, the entry
-//!   counter, and repeated calls interleaved with scalar and NEON `f64` work.
+//! - thread state: ready before, SVCR and TPIDR2_EL0 zero after, exactly
+//!   one kernel entry per call counted on this thread, and repeated calls
+//!   interleaved with scalar and NEON `f64` work.
 //!
 //! A read of A rows `≥ m` cannot be seen in the results (such a lane only
 //! feeds C rows `≥ m`, which are never stored), and neither can a read of C
@@ -47,17 +48,20 @@
 //! braced destination list or a `pn` alias counts as a write), and no
 //! predicate appears anywhere else outside a governing position. Mutated
 //! templates that break these rules are rejected by the same checker
-//! (`test_sme2_kernel_f32_template_checker_rejects_mutants`).
+//! (`test_sme2_kernel_f32_template_checker_rejects_mutants`). The rules hold
+//! for the A loads of both the plain depth loops and the packing pass of
+//! online packing, whose stores go only through the buffer register `x6`,
+//! as whole vectors of A or of the zero vector `z18`; the interpreter of
+//! `tests_kernel_f32_online.rs` proves where they land.
 
 use std::hint::black_box;
 
 use super::args::{Epilogue, MR, MacroArgs, reference, same_result};
-use super::detect;
 use super::kernel_f32::{SME_KERNELS, sme2_gemm_f32};
 use super::lint::{lint_kernel, lint_streaming_template, report};
 use super::test_support::{
     FPSR_DZC, FPSR_IDC, FPSR_IOC, FPSR_IXC, FPSR_OFC, FPSR_QC, FPSR_UFC, Need, fpsr_read,
-    fpsr_write, hardware_or_skip, kernel_entries, sme_state,
+    fpsr_write, hardware_or_skip, kernel_entries_here, kernel_ready, sme_state,
 };
 
 /// Columns of one packed B panel.
@@ -378,19 +382,19 @@ impl Block {
 /// One kernel call with the state checks of the contract around it.
 #[track_caller]
 fn call(args: &MacroArgs<f32>) {
-    assert!(detect::thread_ready(), "thread not ready before the kernel");
-    let entries = kernel_entries();
+    assert!(kernel_ready(), "thread not ready before the kernel");
+    let entries = kernel_entries_here();
     // SAFETY: the thread is ready (checked above); every caller builds the
     // block with `Block::args`, whose buffers cover every address the
     // layout names, with `m, n, kc ≥ 1`, `ldc ≥ m` and the mode chosen by
     // `Epilogue::select`.
     unsafe { sme2_gemm_f32(args) };
-    // `kernel_entries()` is process-wide: kernel calls of other test threads
-    // also raise it, so this comparison can be satisfied by them and does
-    // not prove that this call was counted (the contract sanctions `>`).
-    assert!(
-        kernel_entries() > entries,
-        "the kernel entry was not counted"
+    // Counted on this thread, so no other test's kernel call can satisfy
+    // it: exactly this call's one entry.
+    assert_eq!(
+        kernel_entries_here(),
+        entries + 1,
+        "the kernel entry was not counted on this thread"
     );
     assert_eq!(
         sme_state(),
@@ -440,17 +444,19 @@ fn test_sme2_kernel_f32_registered_and_linted() {
     if let Err(errors) = lint_kernel(entry) {
         panic!("sme2_gemm_f32:\n{}", report(&errors));
     }
-    // The Wave-4 fields are never read.
-    assert!(
-        entry
-            .consts
-            .iter()
-            .all(|name| !matches!(*name, "off_a_pack" | "off_prefetch")),
-        "{:?}",
-        entry.consts
-    );
-    // Strides come from the block, never from the plain packing.
-    for field in ["off_a_depth", "off_a_panel", "off_b_panel", "off_ldc"] {
+    // Strides come from the block, never from the plain packing; the
+    // online-packing and prefetch fields (online packing of A, prefetch
+    // switches) are read
+    // as well (`tests_kernel_f32_online.rs` tests what the kernel does with
+    // them).
+    for field in [
+        "off_a_depth",
+        "off_a_panel",
+        "off_b_panel",
+        "off_ldc",
+        "off_a_pack",
+        "off_prefetch",
+    ] {
         assert!(entry.consts.contains(&field), "{field} is not read");
     }
 }
@@ -740,8 +746,43 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
         "p0..p4 must each be written once, by their own line: written {writes:?} times"
     );
 
+    // `z18` is the zero vector of the packing pass (the rows of a tile
+    // without a live row): set by exactly one line, `dup z18.s, #0`, and
+    // named nowhere else but as the stored register of a buffer store
+    // (checked below), neither alone nor inside a register range.
+    let mut zero_sets = 0;
+    for line in body {
+        let named = line
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "z18");
+        let in_range = line.match_indices("-z").any(|(at, _)| {
+            let number = |text: &str| -> Option<usize> {
+                let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            };
+            let first = line[..at].rfind('z').and_then(|z| number(&line[z + 1..at]));
+            let last = number(&line[at + 2..]);
+            matches!((first, last), (Some(a), Some(b)) if a <= 18 && 18 <= b)
+        });
+        if *line == "dup z18.s, #0" {
+            zero_sets += 1;
+        } else if named && line.starts_with("st1w {z18.s}, p0, [x6") {
+            // A buffer store of zeros: the store rules below apply.
+        } else {
+            ensure!(
+                !named && !in_range,
+                "z18 (the zero vector) named outside its `dup` and the buffer stores: {line:?}"
+            );
+        }
+    }
+    ensure!(
+        zero_sets == 1,
+        "`dup z18.s, #0` must occur exactly once, not {zero_sets} times"
+    );
+
     // Every load and store of the body, classified by its base register.
     let (mut a_loads, mut b_loads, mut c_loads, mut c_stores) = (0, 0, 0, 0);
+    let mut buffer_stores = 0;
     for line in body {
         let mnemonic = line.split(' ').next().unwrap_or("");
         if mnemonic.starts_with("ld") {
@@ -794,6 +835,29 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
             }
         } else if mnemonic.starts_with("st") {
             let access = Access::parse(line)?;
+            if access.base == "x6" {
+                // The packing pass (online packing of A): whole vectors
+                // (all-true `p0`) at vector offset `k` of a double step,
+                // which in the plain packed layout is tile `k % 4` at depth
+                // step `p + k / 4`, so the vector stored there is that
+                // tile's A vector `z<k>` (rows ≥ m zero from its `/z`
+                // load) or the zero vector `z18` (a tile without a live
+                // row). Where x6 points and that the stores cover the
+                // buffer exactly once is the interpreter's proof
+                // (`tests_kernel_f32_online.rs`).
+                ensure!(access.pred == "p0", "partial buffer store {line:?}");
+                let k = access
+                    .vl_offset
+                    .ok_or_else(|| format!("indexed buffer store {line:?}"))?;
+                ensure!(k < 8, "buffer store beyond a double step: {line:?}");
+                ensure!(
+                    access.list == format!("z{k}.s") || access.list == "z18.s",
+                    "buffer store {k} of {:?}: {line:?}",
+                    access.list
+                );
+                buffer_stores += 1;
+                continue;
+            }
             ensure!(access.base == "x13", "store outside C: {line:?}");
             let t = access.c_tile()?;
             ensure!(
@@ -809,12 +873,22 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
             c_stores += 1;
         }
     }
-    // Variants of 1, 2, 3 and 4 tiles: (2 + 1) loads per tile; M1 and M3
-    // load C of 4 tiles; each of the 4 modes stores 4 tiles.
-    let counts = (a_loads, b_loads, c_loads, c_stores);
+    // Variants of 1, 2, 3 and 4 tiles, twice (the plain depth loops and the
+    // packing pass): (2 + 1) A loads per tile and 2 + 1 B loads per
+    // variant; M1 and M3 load C of 4 tiles; each of the 4 modes stores 4
+    // tiles; each packing variant stores 8 + 4 vectors (a double step and
+    // the remainder, whole 64-element depth steps).
+    let counts = (a_loads, b_loads, c_loads, c_stores, buffer_stores);
     ensure!(
-        counts == (3 * (1 + 2 + 3 + 4), 3 * 4, 2 * 4, 4 * 4),
-        "(A loads, B loads, C loads, C stores) = {counts:?}"
+        counts
+            == (
+                2 * 3 * (1 + 2 + 3 + 4),
+                2 * 3 * 4,
+                2 * 4,
+                4 * 4,
+                4 * (8 + 4)
+            ),
+        "(A loads, B loads, C loads, C stores, buffer stores) = {counts:?}"
     );
     Ok(())
 }
@@ -826,7 +900,7 @@ fn test_sme2_kernel_f32_template_row_predicates() {
     // feeds ZA rows that belong to C rows `≥ m`, which are never stored,
     // and the test buffers end where the contract says, but a heap read
     // past them does not fault. Only the predicated `/z` loads keep the
-    // kernel off those rows (Wave 4 reads A in place, where they may not
+    // kernel off those rows (the driver reads A in place, where they may not
     // exist). So this test asserts the property on the text that is
     // assembled: every A load of tile t is governed by `p<t+1>/z`, the
     // predicate `whilelt(i0 + 16t, m)`, never by the all-true `p0`, and no
@@ -856,12 +930,15 @@ struct Mutant {
 fn test_sme2_kernel_f32_template_checker_rejects_mutants() {
     // Wrong templates that every result test and the lint accept: each
     // overwrites a row predicate (so tile-t A loads may read rows ≥ m) in a
-    // form that a first-operand-only parse does not see.
+    // form that a first-operand-only parse does not see. The anchors are
+    // variant labels (each occurs once; the zeroing lines occur in both the
+    // plain variants 41-47 and the packing variants 71-77), half of them in
+    // the packing pass.
     const MUTANTS: [Mutant; 6] = [
         Mutant {
-            label: "review m12: p4 all-true through the pair form, restored for the stores",
+            label: "p4 all-true through the pair form, restored for the stores",
             edits: &[
-                ("zero {{za}}", &["whilelt {{p4.s, p5.s}}, x9, x20"]),
+                ("47:", &["whilelt {{p4.s, p5.s}}, x9, x20"]),
                 (
                     "50:",
                     &["add x16, x9, #48", "whilelt {{p4.s, p5.s}}, x16, x20"],
@@ -872,31 +949,31 @@ fn test_sme2_kernel_f32_template_checker_rejects_mutants() {
         },
         Mutant {
             label: "the pair form as a register range",
-            edits: &[("zero {{za}}", &["whilelt {{p4.s-p5.s}}, x9, x20"])],
+            edits: &[("77:", &["whilelt {{p4.s-p5.s}}, x9, x20"])],
             culprit: "whilelt {p4.s-p5.s}, x9, x20",
             lint_accepts: true,
         },
         Mutant {
             label: "pext into a pair of row predicates",
-            edits: &[("zero {{za0.s, za1.s}}", &["pext {{p2.s, p3.s}}, pn8[0]"])],
+            edits: &[("43:", &["pext {{p2.s, p3.s}}, pn8[0]"])],
             culprit: "pext {p2.s, p3.s}, pn8[0]",
             lint_accepts: true,
         },
         Mutant {
             label: "a row predicate copied from the all-true p0 (sel)",
-            edits: &[("zero {{za}}", &["sel p4.b, p0, p0.b, p4.b"])],
+            edits: &[("47:", &["sel p4.b, p0, p0.b, p4.b"])],
             culprit: "sel p4.b, p0, p0.b, p4.b",
             lint_accepts: true,
         },
         Mutant {
             label: "a row predicate written through its pn alias",
-            edits: &[("zero {{za0.s, za1.s, za2.s}}", &["mov pn3.b, pn8.b"])],
+            edits: &[("75:", &["mov pn3.b, pn8.b"])],
             culprit: "mov pn3.b, pn8.b",
             lint_accepts: true,
         },
         Mutant {
             label: "a row predicate read outside a governing position",
-            edits: &[("zero {{za}}", &["cntp x16, p0, p4.s"])],
+            edits: &[("77:", &["cntp x16, p0, p4.s"])],
             culprit: "cntp x16, p0, p4.s",
             lint_accepts: true,
         },
@@ -1273,7 +1350,7 @@ fn test_sme2_kernel_f32_special_values() {
 fn fpsr_across(block: &Block, before: u64, label: &str) -> u64 {
     let mut got = block.c.clone();
     let args = black_box(block.args(&mut got));
-    assert!(detect::thread_ready());
+    assert!(kernel_ready());
     let saved = fpsr_read();
     fpsr_write(before);
     // SAFETY: as in `call`: the thread is ready and the block covers every
@@ -1504,14 +1581,14 @@ fn test_sme2_kernel_f32_repeated_calls_keep_thread_state() {
     for round in 0..rounds {
         quiet = scalar_work(quiet) + crate::level1::dot_f64(&x, &y) * f64::from(round);
     }
-    let entries = kernel_entries();
+    let entries = kernel_entries_here();
     let mut busy = 1.0_f64;
     for round in 0..rounds {
         // An `f64` value live across the call.
         let live = black_box(f64::from(round) * 1.25 + 0.5);
         let dot = crate::level1::dot_f64(&x, &y);
         let block = &blocks[round as usize % blocks.len()];
-        assert!(detect::thread_ready(), "round {round}: thread not ready");
+        assert!(kernel_ready(), "round {round}: thread not ready");
         let got = block.run();
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -1525,9 +1602,8 @@ fn test_sme2_kernel_f32_repeated_calls_keep_thread_state() {
         busy = scalar_work(busy) + dot * f64::from(round);
     }
     assert_eq!(busy.to_bits(), quiet.to_bits(), "f64 work around the calls");
-    // Process-wide counter: other test threads' kernel calls count as well,
-    // so this lower bound can be met without these rounds being counted.
-    assert!(kernel_entries() >= entries + u64::from(rounds));
+    // One kernel entry per round, counted on this thread.
+    assert_eq!(kernel_entries_here(), entries + u64::from(rounds));
     assert_eq!(sme_state(), Some((0, 0)));
-    assert!(detect::thread_ready());
+    assert!(kernel_ready());
 }

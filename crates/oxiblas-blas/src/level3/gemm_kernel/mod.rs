@@ -13,6 +13,8 @@ mod avx2_f32;
 #[cfg(target_arch = "x86_64")]
 use super::gemm_kernel_sse42::{micro_kernel_f32_sse42, micro_kernel_f64_sse42};
 use super::gemm_packing::PackSlot;
+#[cfg(test)]
+use super::gemm_plan::call_probe;
 use super::gemm_plan::{F32Avx2Policy, SimdTier};
 use crate::level1::typed::same_value;
 use core::any::TypeId;
@@ -68,6 +70,8 @@ pub struct MicroKernel<T> {
 /// leave out).
 #[inline]
 pub(crate) fn selected_kernel_kind() -> GemmKernelKind {
+    #[cfg(test)]
+    call_probe::note(call_probe::Event::KernelDispatch);
     #[cfg(feature = "force-scalar")]
     {
         GemmKernelKind::Scalar
@@ -109,6 +113,8 @@ pub(crate) fn kernel_for_problem<T: GemmKernel>(
     n: usize,
     k: usize,
 ) -> MicroKernel<T> {
+    #[cfg(test)]
+    call_probe::note(call_probe::Event::KernelResolution);
     // The type test first: other types never look at the f32 canonical shape.
     let per_problem = if TypeId::of::<T>() == TypeId::of::<f32>()
         && f32_avx2_picks_16x6(tier, f32_avx2, f32::micro_kernel_shape(), m, n, k)
@@ -134,8 +140,10 @@ fn f32_16x6_kernel() -> Option<MicroKernel<f32>> {
     None
 }
 
-/// Whether one GEMM call's plan carries the f32 16×6 kernel instead of the
-/// canonical f32 kernel whose shape is `canonical`.
+/// Whether the micro-kernel resolved for one GEMM call
+/// ([`kernel_for_problem`], when the call's blocked route starts) is the f32
+/// 16×6 kernel instead of the canonical f32 kernel whose shape is
+/// `canonical`.
 ///
 /// True exactly when `tier` is [`SimdTier::Avx2Fma`], `f32_avx2` is
 /// [`F32Avx2Policy::Adaptive`], `canonical` is 8×8 (the AVX2 kernel; never

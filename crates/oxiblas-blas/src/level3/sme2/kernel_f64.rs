@@ -17,12 +17,35 @@
 //! `≥ m` are never read, and only the live rows and columns of C are read or
 //! written; packed B is zero-padded, so its loads run all-true.
 //!
+//! # Online packing of A and prefetching
+//!
+//! - **Online packing** (`a_pack` non-null). The row panels of column panel
+//!   0 run the packing twins of the depth loops: each depth step loads all
+//!   64 rows of A (rows `≥ m` and tiles without a live row are inactive
+//!   lanes: never read, `+0` in the register), feeds the live tiles exactly
+//!   as the plain loop does, and stores the eight vectors as one whole
+//!   64-element step of the plain packed layout. The twin is chosen once per
+//!   row panel; the depth loops themselves never test whether they pack.
+//!   After column panel 0 the kernel reads A from the buffer (`a_depth =
+//!   64`, `a_panel = 64 · kc`). The buffer is written once, front to back,
+//!   `ceil(m / 64) · 64 · kc` elements and nothing beyond, also when `n ≤ 8`.
+//! - **Prefetch of C** (`prefetch & PREFETCH_C`). Before the depth loop of
+//!   each tile a small loop over its live columns issues one
+//!   `prfm pldl2keep` per 64 bytes of the column's live rows
+//!   (`C(i0 + 8t, j0 + c)` for every live tile `t`). With the bit clear the
+//!   loop is skipped as a whole.
+//!
+//! Neither adds a floating-point flag (stores and hints do no arithmetic),
+//! and with `a_pack` null and `prefetch` 0 the kernel makes exactly the
+//! loads, outer products and stores of a plain packed block.
+//!
 //! # Generated text
 //!
 //! The ZA tile number of `zero`, `fmopa`, `mova` and a slice `st1d` is an
 //! immediate, and every template line of `sme_kernels!` is a literal, so the
-//! eight depth-loop variants and the four epilogues (each unrolled over the
-//! eight tiles) are written out in full. The lines between the `@generated`
+//! eight depth-loop variants, their eight packing twins and the four
+//! epilogues (each unrolled over the eight tiles) are written out in full.
+//! The lines between the `@generated`
 //! markers below are the output of the generator
 //! `crates/oxiblas-blas/tools/gen_sme2_kernel_f64.py`. Edit the generator, not
 //! the lines; this command, run from the workspace root, proves that they are
@@ -32,14 +55,17 @@
 //! python3 -I crates/oxiblas-blas/tools/gen_sme2_kernel_f64.py --check
 //! ```
 //!
-//! The kernel is not called by the library yet: the Wave-3 driver and the
-//! first-use self-test call it by name. The macro's `#[used]` keep-alive
+//! The GEMM driver (`driver.rs`) and the first-use self-test call it by
+//! name. The macro's `#[used]` keep-alive
 //! makes it code-generated and assembled in every build all the same. Its
-//! tests are in `tests_kernel_f64.rs`.
+//! tests are in `tests_kernel_f64.rs` (plain blocks and the template
+//! structure) and `tests_kernel_f64_online.rs` (online packing, prefetch,
+//! and the interpreter of the registered template in
+//! `test_interpreter_f64.rs`).
 
 use super::args::{
-    MacroArgs, OFF_A, OFF_A_DEPTH, OFF_A_PANEL, OFF_ALPHA, OFF_B, OFF_B_PANEL, OFF_BETA, OFF_C,
-    OFF_KC, OFF_LDC, OFF_M, OFF_MODE, OFF_N,
+    MacroArgs, OFF_A, OFF_A_DEPTH, OFF_A_PACK, OFF_A_PANEL, OFF_ALPHA, OFF_B, OFF_B_PANEL,
+    OFF_BETA, OFF_C, OFF_KC, OFF_LDC, OFF_M, OFF_MODE, OFF_N, OFF_PREFETCH,
 };
 use super::asm::sme_kernels;
 
@@ -52,18 +78,33 @@ sme_kernels! {
     /// # Loop nest
     ///
     /// ```text
+    /// x8 = a_pack (0: no packing), x6 = x8
     /// for j0 in (0..n).step_by(8)                       label 20, ncols = min(8, n - j0)
     ///   for i0 in (0..m).step_by(64)                    label 30
-    ///     L = ceil(min(64, m - i0) / 8)                  live tiles: variant 4L (41..48)
-    ///     zero za0..za(L-1)
-    ///     for p in pairs of 0..kc                        label 6L: two depth steps per pass
-    ///       A(i0.., p), B(p, j0..j0+8)  -> FMOPA into za0..za(L-1)
-    ///       A(i0.., p+1), B(p+1, ..)    -> FMOPA into za0..za(L-1)
-    ///     if kc is odd: the last depth step              label 7L
+    ///     L = ceil(min(64, m - i0) / 8)                  live tiles
+    ///     if prefetch & PREFETCH_C                       skipped otherwise (to 39)
+    ///       for c in 0..ncols                            labels 32, 33
+    ///         prfm pldl2keep, C(i0 + 8t, j0 + c) for t in 0..L
+    ///     if x8 != 0 (the packing pass)                  label 39; the plain dispatch is 40
+    ///       packing twin 14L (141..148)
+    ///         zero za0..za(L-1)
+    ///         for p in pairs of 0..kc                    label 16L
+    ///           A(i0..i0+63, p), B(p, ..)   -> FMOPA into za0..za(L-1)
+    ///           A(i0..i0+63, p+1), B(p+1, ..) -> FMOPA into za0..za(L-1)
+    ///           store both steps at x6 (16 vectors); x6 += 1024
+    ///         if kc is odd: the last depth step          label 17L (8 vectors; x6 += 512)
+    ///     else variant 4L (41..48)
+    ///       zero za0..za(L-1)
+    ///       for p in pairs of 0..kc                      label 6L: two depth steps per pass
+    ///         A(i0.., p), B(p, j0..j0+8)  -> FMOPA into za0..za(L-1)
+    ///         A(i0.., p+1), B(p+1, ..)    -> FMOPA into za0..za(L-1)
+    ///       if kc is odd: the last depth step            label 7L
     ///     epilogue of the mode                           labels 50 (dispatch), 51..54
     ///       for each tile t whose first row i0 + 8t < m (rows predicated by p1)
     ///         for c in 0..ncols: slice c of za{t} -> C(i0 + 8t.., j0 + c)
-    ///     next row panel / next column panel             label 59
+    ///     next row panel                                 label 59
+    ///   if x8 != 0: A = the buffer, x8 = 0               skipped otherwise (to 29)
+    ///   next column panel
     /// ```
     ///
     /// Only the live tiles of a row panel (those with at least one row below
@@ -75,6 +116,40 @@ sme_kernels! {
     /// loaded all-true (the packed panel is zero-padded to 8 columns). The
     /// pointers move by `a_depth`, `a_panel` and `b_panel` exactly as given,
     /// so A may be read in place (`a_panel = 64`, `a_depth = lda`).
+    ///
+    /// # Online packing of A
+    ///
+    /// The packing twin 14L makes the outer products of variant 4L, in the
+    /// same order and from the same values, but loads each depth step of A
+    /// as all eight vectors of its 64 rows: `ld1d {z0.d-z3.d}, pn9/z, [x14]`
+    /// and `ld1d {z4.d-z7.d}, pn10/z, [x14, #4, mul vl]` (`z16`–`z23` for
+    /// the second step of a pair). Rows `≥ m`, and with them every vector of
+    /// a tile without a live row, are inactive lanes: not read, `+0` in the
+    /// register. So the eight vectors are exactly one depth step of the plain
+    /// packed layout, and the twin stores them whole (all-true counter
+    /// `pn8`) at the buffer pointer `x6`:
+    ///
+    /// ```text
+    /// st1d {z0.d-z3.d},   pn8, [x6]                 step p (or the remainder step), rows i0..+31
+    /// st1d {z4.d-z7.d},   pn8, [x6, #4, mul vl]     step p, rows i0+32..+63
+    /// st1d {z16.d-z19.d}, pn8, [x6, #8, mul vl]     step p + 1 of a pair, rows i0..+31
+    /// st1d {z20.d-z23.d}, pn8, [x6, #12, mul vl]    step p + 1 of a pair, rows i0+32..+63
+    /// ```
+    ///
+    /// `x6` then moves on by 1024 bytes (a pair) or 512 (the remainder), so
+    /// it runs through the whole packed block, row panel after row panel, in
+    /// column panel 0. Then `x1`, `x2` and `x3` become the buffer, 512 and
+    /// `512 · kc` (bytes) and `x8` becomes 0: the later column panels run the
+    /// plain variants on the buffer.
+    ///
+    /// # Prefetch of C
+    ///
+    /// With bit 0 of `prefetch` (`PREFETCH_C`) set, before the depth loop of
+    /// each tile: for each of its `ncols` columns, `prfm pldl2keep` at
+    /// `C(i0 + 8t, j0 + c)` for every live tile `t` (one hint per 64 bytes
+    /// of the column's live rows; the chain `cmp x13, #8t` / `b.ls 33f`
+    /// stops at the last live tile). Bits other than `PREFETCH_C` are
+    /// reserved (0); the kernel tests bit 0 only.
     ///
     /// # Epilogues
     ///
@@ -95,46 +170,65 @@ sme_kernels! {
     /// predicated SVE `fadd` / `fmul` / `fmla` raise the flags of their live
     /// lanes only. So a call adds nothing to FPSR in M0, the flags of
     /// `acc + C` in M1, of `acc * alpha` in M2, and of `acc * alpha` and
-    /// `t + C * beta` in M3.
+    /// `t + C * beta` in M3. The buffer stores of online packing and the
+    /// prefetch hints raise nothing.
     ///
     /// # Register map
     ///
     /// | Register | Use |
     /// |---|---|
-    /// | `x1`, `x2`, `x3` | `a`, `a_depth` and `a_panel` in bytes |
-    /// | `x4`, `x5` | `b`, `b_panel` in bytes |
-    /// | `x6`, `x7` | `c`, `ldc` in bytes |
+    /// | `x1`, `x2`, `x3` | `a`, `a_depth` and `a_panel` in bytes; from column panel 1 on with online packing the buffer, 512 and `512 · kc` |
+    /// | `x4` | `prefetch` (bit 0: `PREFETCH_C`) |
+    /// | `x5` | `b_panel` in bytes |
+    /// | `x6` | packing pass: where the next depth step of A goes (starts at `a_pack`, 512 bytes per depth step, through all row panels of column panel 0) |
+    /// | `x7` | `ldc` in bytes |
+    /// | `x8` | `a_pack` while the packing pass is pending; 0 once column panel 0 is done, or without online packing (a plain register: the kernel uses no `za.d[w8, …]` vector-select form) |
     /// | `x20`, `x21`, `x22` | `m`, `n`, `kc` |
     /// | `x23`, `x24`, `x25` | alpha bits, beta bits, `mode` |
-    /// | `x26`, `x27`, `x28` | `j0`, B panel of `j0`, C column `j0` |
+    /// | `x26`, `x27`, `x28` | `j0`, B panel of `j0` (starts at `b`), C column `j0` (starts at `c`) |
     /// | `x9` | `ncols = min(8, n - j0)` |
     /// | `x10`, `x11` | `i0`, A panel of `i0` |
-    /// | `x13` | `m - i0` (variant choice), then the first row of the tile being stored |
-    /// | `x14` | A address of the depth step; then the C address of the tile being stored |
+    /// | `x13` | `m - i0` (prefetch chain and variant choice), then the first row of the tile being stored |
+    /// | `x14` | prefetch: `C(i0, j0 + c)`; A address of the depth step; then the C address of the tile being stored |
     /// | `x15` | B address of the depth step; then the C address of the slice |
-    /// | `x16` | depth pairs left; then columns left (`x16` is free in a body) |
+    /// | `x16` | prefetch: columns left; depth pairs left; then columns left (`x16` is free in a body) |
     /// | `w12` | slice index (column within the panel) |
     /// | `z0`–`z7`, `z16`–`z23` | A vectors of depth steps `p` and `p + 1` (tile `t` in `z{t}` / `z{16+t}`) |
     /// | `z8`, `z9` | B rows of depth steps `p` and `p + 1` |
     /// | `z16`, `z17` | epilogue: the slice, the C column |
     /// | `z28`, `z29` | alpha, beta |
     /// | `p0` | all-true |
+    /// | `pn8` | all-true counter: the buffer stores of the packing pass |
     /// | `p1` | epilogue: rows of the tile being stored that are below `m` |
     /// | `p2`, `pn9`, `pn10` | A rows below `m`: `i0..+7`, `i0..+31`, `i0+32..+63` |
     ///
     /// The kernel never writes the argument block, never touches `x17` (the
-    /// FPSR frame's) and leaves through the frame's label 90.
+    /// FPSR frame's) and leaves through the frame's label 90. It reads no A
+    /// row `≥ m` (also not from the buffer), no B beyond panel
+    /// `ceil(n / 8) - 1`, and no C outside `C[0..m, 0..n]` (none at all in
+    /// M0 and M2); it writes only `C[0..m, 0..n]` and, with online packing,
+    /// the first `ceil(m / 64) · 64 · kc` elements of the buffer (each once,
+    /// in column panel 0). Its prefetch hints name only `C[0..m, 0..n]`.
+    /// With `a_pack` null and `prefetch` 0 it computes exactly what the
+    /// plain block computes (the same loads, products and stores);
+    /// with them, C and FPSR are bit for bit those of the same call without
+    /// them.
     ///
     /// # Safety
     ///
     /// - `detect::thread_ready()` must have returned `true` on the calling
-    ///   thread for `f64` (SME2 with a 512-bit streaming vector length and
-    ///   FEAT_SME_F64F64, not in streaming mode, no live ZA state).
+    ///   thread (SME2 with a 512-bit streaming vector length, not in
+    ///   streaming mode, no live ZA state, no pending lazy save), and the
+    ///   process must have FEAT_SME_F64F64: `detect::hw()` reports `f64`,
+    ///   which `detect::enabled::<f64>()` implies (`thread_ready()` does not
+    ///   look at FEAT_SME_F64F64).
     /// - `m ≥ 1`, `n ≥ 1`, `kc ≥ 1`, `ldc ≥ m`, and `mode` must be
     ///   `Epilogue::select(alpha, beta)`.
     /// - Every address that `args.rs` names must be valid: A for `i < m`,
     ///   `p < kc`; B for `p < kc`, `j < ceil(n / 8) * 8`; C for `i < m`,
     ///   `j < n`, writable. C must not overlap A, B or the argument block.
+    /// - `a_pack` is null, or valid for writes of `ceil(m / 64) * 64 * kc`
+    ///   elements that overlap neither A, B, C nor the argument block.
     pub(super) streaming fn sme2_gemm_f64(args: &MacroArgs<f64>) {
         extensions: [f64f64],
         // @generated begin: tools/gen_sme2_kernel_f64.py (edit the generator, not these lines)
@@ -152,15 +246,19 @@ sme_kernels! {
             off_alpha = OFF_ALPHA,
             off_beta = OFF_BETA,
             off_mode = OFF_MODE,
+            off_a_pack = OFF_A_PACK,
+            off_prefetch = OFF_PREFETCH,
         ],
         prologue: [
             "ldr x1, [x0, #{off_a}]",
             "ldr x2, [x0, #{off_a_depth}]",
             "ldr x3, [x0, #{off_a_panel}]",
-            "ldr x4, [x0, #{off_b}]",
+            "ldr x27, [x0, #{off_b}]",
             "ldr x5, [x0, #{off_b_panel}]",
-            "ldr x6, [x0, #{off_c}]",
+            "ldr x28, [x0, #{off_c}]",
             "ldr x7, [x0, #{off_ldc}]",
+            "ldr x8, [x0, #{off_a_pack}]",
+            "ldr x4, [x0, #{off_prefetch}]",
             "ldr x20, [x0, #{off_m}]",
             "ldr x21, [x0, #{off_n}]",
             "ldr x22, [x0, #{off_kc}]",
@@ -173,13 +271,14 @@ sme_kernels! {
             "lsl x7, x7, #3",
         ],
         body: [
-            // p0 all-true; z28 alpha, z29 beta; x26 j0, x27 B panel, x28 C column j0.
+            // p0 all-true, pn8 all-true counter; z28 alpha, z29 beta; x26 j0, x27 B panel,
+            // x28 C column j0; x8 a_pack until column panel 0 is done, x6 where it is written.
             "ptrue p0.d",
+            "ptrue pn8.d",
             "dup z28.d, x23",
             "dup z29.d, x24",
             "mov x26, #0",
-            "mov x27, x4",
-            "mov x28, x6",
+            "mov x6, x8",
             // Column panel: x9 = ncols = min(8, n - j0); row panels from i0 = 0.
             "20:",
             "sub x9, x21, x26",
@@ -189,17 +288,416 @@ sme_kernels! {
             "mov x10, #0",
             "mov x11, x1",
             // Row panel: x13 = m - i0; p2 (rows i0..+7), pn9 (i0..+31) and pn10
-            // (i0+32..+63) select the A rows below m; x14 A, x15 B, x16 kc / 2.
+            // (i0+32..+63) select the A rows below m.
             "30:",
             "sub x13, x20, x10",
             "whilelt p2.d, x10, x20",
             "whilelt pn9.d, x10, x20, vlx4",
             "add x16, x10, #32",
             "whilelt pn10.d, x16, x20, vlx4",
+            // Prefetch (bit 0 of prefetch): x14 C(i0, j0 + c), x16 columns left.
+            "tbz x4, #0, 39f",
+            "add x14, x28, x10, lsl #3",
+            "mov x16, x9",
+            "32:",
+            "prfm pldl2keep, [x14]",
+            "cmp x13, #8",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #64]",
+            "cmp x13, #16",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #128]",
+            "cmp x13, #24",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #192]",
+            "cmp x13, #32",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #256]",
+            "cmp x13, #40",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #320]",
+            "cmp x13, #48",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #384]",
+            "cmp x13, #56",
+            "b.ls 33f",
+            "prfm pldl2keep, [x14, #448]",
+            "33:",
+            "add x14, x14, x7",
+            "subs x16, x16, #1",
+            "b.ne 32b",
+            // x14 A, x15 B, x16 kc / 2. Live tiles L = ceil(min(64, m - i0) / 8) select
+            // the packing twin 14L while online packing is pending (x8 != 0), else 4L.
+            "39:",
             "mov x14, x11",
             "mov x15, x27",
             "lsr x16, x22, #1",
-            // Live tiles L = ceil(min(64, m - i0) / 8) select the variant 4L.
+            "cbz x8, 40f",
+            "cmp x13, #8",
+            "b.ls 141f",
+            "cmp x13, #16",
+            "b.ls 142f",
+            "cmp x13, #24",
+            "b.ls 143f",
+            "cmp x13, #32",
+            "b.ls 144f",
+            "cmp x13, #40",
+            "b.ls 145f",
+            "cmp x13, #48",
+            "b.ls 146f",
+            "cmp x13, #56",
+            "b.ls 147f",
+            "b 148f",
+            // Packing twin of 41 (1 live tile): whole depth steps of A to the buffer at x6.
+            "141:",
+            "zero {{za0.d}}",
+            "cbz x16, 171f",
+            "161:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 161b",
+            "171:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 42 (2 live tiles): whole depth steps of A to the buffer at x6.
+            "142:",
+            "zero {{za0.d, za1.d}}",
+            "cbz x16, 172f",
+            "162:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 162b",
+            "172:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 43 (3 live tiles): whole depth steps of A to the buffer at x6.
+            "143:",
+            "zero {{za0.d, za1.d, za2.d}}",
+            "cbz x16, 173f",
+            "163:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 163b",
+            "173:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 44 (4 live tiles): whole depth steps of A to the buffer at x6.
+            "144:",
+            "zero {{za0.d, za1.d, za2.d, za3.d}}",
+            "cbz x16, 174f",
+            "164:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "fmopa za3.d, p0/m, p0/m, z9.d, z19.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 164b",
+            "174:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 45 (5 live tiles): whole depth steps of A to the buffer at x6.
+            "145:",
+            "zero {{za0.d, za1.d, za2.d, za3.d, za4.d}}",
+            "cbz x16, 175f",
+            "165:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "fmopa za3.d, p0/m, p0/m, z9.d, z19.d",
+            "fmopa za4.d, p0/m, p0/m, z9.d, z20.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 165b",
+            "175:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 46 (6 live tiles): whole depth steps of A to the buffer at x6.
+            "146:",
+            "zero {{za0.d, za1.d, za2.d, za3.d, za4.d, za5.d}}",
+            "cbz x16, 176f",
+            "166:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "fmopa za3.d, p0/m, p0/m, z9.d, z19.d",
+            "fmopa za4.d, p0/m, p0/m, z9.d, z20.d",
+            "fmopa za5.d, p0/m, p0/m, z9.d, z21.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 166b",
+            "176:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 47 (7 live tiles): whole depth steps of A to the buffer at x6.
+            "147:",
+            "zero {{za0.d, za1.d, za2.d, za3.d, za4.d, za5.d, za6.d}}",
+            "cbz x16, 177f",
+            "167:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "fmopa za6.d, p0/m, p0/m, z8.d, z6.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "fmopa za3.d, p0/m, p0/m, z9.d, z19.d",
+            "fmopa za4.d, p0/m, p0/m, z9.d, z20.d",
+            "fmopa za5.d, p0/m, p0/m, z9.d, z21.d",
+            "fmopa za6.d, p0/m, p0/m, z9.d, z22.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 167b",
+            "177:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "fmopa za6.d, p0/m, p0/m, z8.d, z6.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // Packing twin of 48 (8 live tiles): whole depth steps of A to the buffer at x6.
+            "148:",
+            "zero {{za0.d, za1.d, za2.d, za3.d, za4.d, za5.d, za6.d, za7.d}}",
+            "cbz x16, 178f",
+            "168:",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "add x14, x14, x2",
+            "ld1d {{z16.d-z19.d}}, pn9/z, [x14]",
+            "ld1d {{z20.d-z23.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z9.d}}, p0/z, [x15, #1, mul vl]",
+            "add x14, x14, x2",
+            "add x15, x15, #128",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "fmopa za6.d, p0/m, p0/m, z8.d, z6.d",
+            "fmopa za7.d, p0/m, p0/m, z8.d, z7.d",
+            "fmopa za0.d, p0/m, p0/m, z9.d, z16.d",
+            "fmopa za1.d, p0/m, p0/m, z9.d, z17.d",
+            "fmopa za2.d, p0/m, p0/m, z9.d, z18.d",
+            "fmopa za3.d, p0/m, p0/m, z9.d, z19.d",
+            "fmopa za4.d, p0/m, p0/m, z9.d, z20.d",
+            "fmopa za5.d, p0/m, p0/m, z9.d, z21.d",
+            "fmopa za6.d, p0/m, p0/m, z9.d, z22.d",
+            "fmopa za7.d, p0/m, p0/m, z9.d, z23.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "st1d {{z16.d-z19.d}}, pn8, [x6, #8, mul vl]",
+            "st1d {{z20.d-z23.d}}, pn8, [x6, #12, mul vl]",
+            "add x6, x6, #1024",
+            "subs x16, x16, #1",
+            "b.ne 168b",
+            "178:",
+            "tbz x22, #0, 50f",
+            "ld1d {{z0.d-z3.d}}, pn9/z, [x14]",
+            "ld1d {{z4.d-z7.d}}, pn10/z, [x14, #4, mul vl]",
+            "ld1d {{z8.d}}, p0/z, [x15]",
+            "fmopa za0.d, p0/m, p0/m, z8.d, z0.d",
+            "fmopa za1.d, p0/m, p0/m, z8.d, z1.d",
+            "fmopa za2.d, p0/m, p0/m, z8.d, z2.d",
+            "fmopa za3.d, p0/m, p0/m, z8.d, z3.d",
+            "fmopa za4.d, p0/m, p0/m, z8.d, z4.d",
+            "fmopa za5.d, p0/m, p0/m, z8.d, z5.d",
+            "fmopa za6.d, p0/m, p0/m, z8.d, z6.d",
+            "fmopa za7.d, p0/m, p0/m, z8.d, z7.d",
+            "st1d {{z0.d-z3.d}}, pn8, [x6]",
+            "st1d {{z4.d-z7.d}}, pn8, [x6, #4, mul vl]",
+            "add x6, x6, #512",
+            "b 50f",
+            // The plain depth loops.
+            "40:",
             "cmp x13, #8",
             "b.ls 41f",
             "cmp x13, #16",
@@ -1028,6 +1526,13 @@ sme_kernels! {
             "add x11, x11, x3",
             "cmp x10, x20",
             "b.lo 30b",
+            // After column panel 0 with online packing, A is the buffer (plain packed).
+            "cbz x8, 29f",
+            "mov x1, x8",
+            "mov x2, #512",
+            "lsl x3, x22, #9",
+            "mov x8, #0",
+            "29:",
             "add x26, x26, #8",
             "add x27, x27, x5",
             "add x28, x28, x7, lsl #3",

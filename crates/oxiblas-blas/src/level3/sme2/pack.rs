@@ -1,5 +1,5 @@
-//! Operand normalisation and the plain packers of the SME2 path (milestone 1
-//! of the packers; the ZA-based packers come with Wave 4 in `pack_za.rs`).
+//! Operand normalisation and the plain packers of the SME2 path (the
+//! packers through ZA are in `pack_za.rs`).
 //!
 //! # What this module gives a driver
 //!
@@ -58,17 +58,6 @@
 //! that still gets one must not fall back half-way (C may already hold some
 //! blocks), so it should treat it as a bug of its own, before the first
 //! kernel call if it validates up front.
-
-// Nothing in the library packs for the SME2 kernels before the GEMM hook
-// (Wave 6) lands; only tests use this module until then. `expect` turns into
-// a warning once that changes, so the attribute cannot outlive its reason.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the SME2 drivers once the GEMM hook lands"
-    )
-)]
 
 use oxiblas_core::memory::AlignedVec;
 use oxiblas_core::scalar::Field;
@@ -169,7 +158,7 @@ impl<'a, T: SmeElement + Field> ColMajor<'a, T> {
     }
 
     /// The stored, column-major matrix (`col_stride() == 1`; its leading
-    /// dimension is `row_stride()`), for in-place reads (Wave 4).
+    /// dimension is `row_stride()`), for in-place reads.
     pub(super) fn stored(&self) -> &MatRef<'a, T> {
         &self.mat
     }
@@ -240,6 +229,8 @@ pub(super) struct PackedA<'p, T> {
     depth: usize,
 }
 
+// Read by the tests; the library reads the fields directly.
+#[cfg(test)]
 impl<T> PackedA<'_, T> {
     /// The packed elements (`ceil(rows / 64) · 64 · depth`).
     pub(super) fn data(&self) -> &[T] {
@@ -362,8 +353,8 @@ pub(super) fn pack_b<'p, T: SmeElement + Field>(
 /// The argument block of one kernel call: `C[row0.., col0..]` (of size
 /// `a.rows() × b.cols()`) from the packed blocks `a` and `b`, with `alpha`
 /// and the effective beta `beta` ([`block_beta`]); built by
-/// `MacroArgs::packed`, so the mode follows alpha and beta and the Wave-4
-/// fields are off. `ldc` is `c.row_stride()` (at least the block's rows).
+/// `MacroArgs::packed`, so the mode follows alpha and beta and online
+/// packing and prefetch are off. `ldc` is `c.row_stride()` (at least the block's rows).
 ///
 /// `None` when the depths differ, when the block leaves `c`, or when C's
 /// columns overlap (`row_stride` below the block's rows with more than one
@@ -420,4 +411,62 @@ pub(super) fn block_args<T: SmeElement + Field>(
         alpha,
         beta,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers of the ZA packers (`pack_za.rs`)
+// ---------------------------------------------------------------------------
+
+/// The length [`pack_a`] packs for `op(A)[rows, depth]` into a buffer of
+/// `buf_len` elements, or `None` under exactly the conditions in which
+/// [`pack_a`] returns `None` (a span empty or outside `op(A)`, an overflowing
+/// size, a short buffer). The ZA packer checks its inputs with it, so both
+/// packers decline the same requests.
+pub(super) fn a_block_len<T: SmeElement + Field>(
+    a: &ColMajor<'_, T>,
+    rows: Span,
+    depth: Span,
+    buf_len: usize,
+) -> Option<usize> {
+    if !inside(rows, a.rows()) || !inside(depth, a.cols()) {
+        return None;
+    }
+    let len = a_pack_len(rows.len, depth.len)?;
+    (buf_len >= len).then_some(len)
+}
+
+/// The length [`pack_b`] packs for `op(B)[depth, cols]` into a buffer of
+/// `buf_len` elements, or `None` under exactly the conditions in which
+/// [`pack_b`] returns `None`.
+pub(super) fn b_block_len<T: SmeElement + Field>(
+    b: &ColMajor<'_, T>,
+    depth: Span,
+    cols: Span,
+    buf_len: usize,
+) -> Option<usize> {
+    if !inside(depth, b.rows()) || !inside(cols, b.cols()) {
+        return None;
+    }
+    let len = b_pack_len::<T>(depth.len, cols.len)?;
+    (buf_len >= len).then_some(len)
+}
+
+impl<'p, T> PackedA<'p, T> {
+    /// A packed A block that another packer wrote into `data` in the layout
+    /// of [`PackedA`]; `None` unless `rows` and `depth` are at least 1 and
+    /// `data` holds exactly [`a_pack_len`]`(rows, depth)` elements.
+    pub(super) fn from_packed(data: &'p [T], rows: usize, depth: usize) -> Option<Self> {
+        let whole = rows > 0 && depth > 0 && a_pack_len(rows, depth)? == data.len();
+        whole.then_some(Self { data, rows, depth })
+    }
+}
+
+impl<'p, T: SmeElement> PackedB<'p, T> {
+    /// A packed B block that another packer wrote into `data` in the layout
+    /// of [`PackedB`]; `None` unless `depth` and `cols` are at least 1 and
+    /// `data` holds exactly [`b_pack_len`]`(depth, cols)` elements.
+    pub(super) fn from_packed(data: &'p [T], depth: usize, cols: usize) -> Option<Self> {
+        let whole = depth > 0 && cols > 0 && b_pack_len::<T>(depth, cols)? == data.len();
+        whole.then_some(Self { data, depth, cols })
+    }
 }

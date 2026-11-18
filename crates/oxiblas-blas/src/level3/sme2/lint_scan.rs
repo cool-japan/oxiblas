@@ -8,8 +8,9 @@
 //!
 //! - Raw `asm!` may appear only at the sites of [`ASM_SITES`], counted per
 //!   file across the whole crate: the definition of `sme_kernels!`, the
-//!   register probe, the two test-support FPSR accessors, and the two
-//!   `prfm` prefetches of the NEON GEMM. An invocation is the identifier
+//!   register probe, the four FPCR / FPSR accessors, the three
+//!   test-only switches of a thread's SME state (`test_sme_state.rs`), and
+//!   the two `prfm` prefetches of the NEON GEMM. An invocation is the identifier
 //!   `asm` followed by `!`, whatever whitespace separates them (`asm !(…)`
 //!   and `asm\n!(…)` count), so a `macro_rules!` wrapper around `asm!`
 //!   defined anywhere in the crate is a site of its own. `global_asm!` and
@@ -32,7 +33,7 @@
 //!   an SME `.arch_extension`, or a raw encoding: `.inst`, `.word`, `.long`,
 //!   `.4byte`) may appear only inside a file's `sme_kernels!` invocation, or
 //!   anywhere in the files of [`STREAMING_TEXT_FILES`] (the macro, the probe,
-//!   the lint and its tests).
+//!   the test-only state switches, the lint and its tests).
 //!
 //! The sources come from the source tree when it is readable, and otherwise
 //! from copies of the files under [`EMBEDDED_DIRS`] embedded with
@@ -51,16 +52,19 @@ mod tests;
 
 /// Directories whose sources (at any depth) are embedded for hosts without
 /// the source tree, relative to the crate's `src/`: where the SME2 kernels
-/// live (`level2/gemv/` gets `sme2.rs` in Wave 5).
+/// live (`level2/gemv/sme2.rs` is the SME2 GEMV module).
 pub(super) const EMBEDDED_DIRS: [&str; 2] = ["level3/sme2", "level2/gemv"];
 
 /// Files whose string literals may mention streaming-mode code anywhere:
-/// the macro that writes the frame, the probe, the lint and its tests.
+/// the macro that writes the frame, the probe, the test-only switches of a
+/// thread's SME state (their `.arch_extension sme` line), the lint and its
+/// tests.
 pub(super) const STREAMING_TEXT_FILES: &[&str] = &[
     "level3/sme2/asm.rs",
     "level3/sme2/detect.rs",
     "level3/sme2/lint.rs",
     "level3/sme2/lint_scan.rs",
+    "level3/sme2/test_sme_state.rs",
     "level3/sme2/tests_lint.rs",
     "level3/sme2/tests_lint_frame.rs",
     "level3/sme2/tests_registry.rs",
@@ -79,8 +83,13 @@ pub(super) const ASM_SITES: &[(&str, usize)] = &[
     ("level3/sme2/asm.rs", 1),
     // The register probe (SVCR, TPIDR2_EL0, RDSVL), outside streaming mode.
     ("level3/sme2/detect.rs", 1),
-    // The FPSR read and write of the tests, outside streaming mode.
-    ("level3/sme2/test_support.rs", 2),
+    // The FPCR and FPSR reads and writes (the first-use check's
+    // floating-point state, and the tests' FPSR access), outside streaming
+    // mode.
+    ("level3/sme2/fpstate.rs", 4),
+    // The test-only switches of a thread's SME state (ZA storage on, ZA
+    // storage off, a TPIDR2_EL0 write), outside streaming mode.
+    ("level3/sme2/test_sme_state.rs", 3),
 ];
 
 /// Copies of every scanned file, for hosts without the source tree.
@@ -89,6 +98,8 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
     ("level3/sme2/asm.rs", include_str!("asm.rs")),
     ("level3/sme2/detect.rs", include_str!("detect.rs")),
     ("level3/sme2/driver.rs", include_str!("driver.rs")),
+    ("level3/sme2/few_rows.rs", include_str!("few_rows.rs")),
+    ("level3/sme2/fpstate.rs", include_str!("fpstate.rs")),
     ("level3/sme2/kernel_f32.rs", include_str!("kernel_f32.rs")),
     ("level3/sme2/kernel_f64.rs", include_str!("kernel_f64.rs")),
     ("level3/sme2/lint.rs", include_str!("lint.rs")),
@@ -96,11 +107,28 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
     ("level3/sme2/mod.rs", include_str!("mod.rs")),
     ("level3/sme2/oracle.rs", include_str!("oracle.rs")),
     ("level3/sme2/pack.rs", include_str!("pack.rs")),
+    ("level3/sme2/pack_za.rs", include_str!("pack_za.rs")),
     ("level3/sme2/parallel.rs", include_str!("parallel.rs")),
     ("level3/sme2/selftest.rs", include_str!("selftest.rs")),
     (
+        "level3/sme2/test_interpreter.rs",
+        include_str!("test_interpreter.rs"),
+    ),
+    (
+        "level3/sme2/test_interpreter_f64.rs",
+        include_str!("test_interpreter_f64.rs"),
+    ),
+    (
+        "level3/sme2/test_sme_state.rs",
+        include_str!("test_sme_state.rs"),
+    ),
+    (
         "level3/sme2/test_support.rs",
         include_str!("test_support.rs"),
+    ),
+    (
+        "level3/sme2/tests_asm_sites.rs",
+        include_str!("tests_asm_sites.rs"),
     ),
     (
         "level3/sme2/tests_contract.rs",
@@ -110,14 +138,75 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
         "level3/sme2/tests_detect.rs",
         include_str!("tests_detect.rs"),
     ),
+    (
+        "level3/sme2/tests_detect_first_use.rs",
+        include_str!("tests_detect_first_use.rs"),
+    ),
+    (
+        "level3/sme2/tests_detect_forms.rs",
+        include_str!("tests_detect_forms.rs"),
+    ),
+    (
+        "level3/sme2/tests_detect_wait.rs",
+        include_str!("tests_detect_wait.rs"),
+    ),
+    (
+        "level3/sme2/tests_few_rows.rs",
+        include_str!("tests_few_rows.rs"),
+    ),
+    (
+        "level3/sme2/tests_few_rows_grid.rs",
+        include_str!("tests_few_rows_grid.rs"),
+    ),
+    (
+        "level3/sme2/tests_fpstate.rs",
+        include_str!("tests_fpstate.rs"),
+    ),
     ("level3/sme2/tests_gemm.rs", include_str!("tests_gemm.rs")),
+    (
+        "level3/sme2/tests_gemm_harness.rs",
+        include_str!("tests_gemm_harness.rs"),
+    ),
+    (
+        "level3/sme2/tests_gemm_policy.rs",
+        include_str!("tests_gemm_policy.rs"),
+    ),
+    (
+        "level3/sme2/tests_gemm_policy_parts.rs",
+        include_str!("tests_gemm_policy_parts.rs"),
+    ),
+    ("level3/sme2/tests_hook.rs", include_str!("tests_hook.rs")),
+    (
+        "level3/sme2/tests_hook_declines.rs",
+        include_str!("tests_hook_declines.rs"),
+    ),
+    (
+        "level3/sme2/tests_hook_first_use.rs",
+        include_str!("tests_hook_first_use.rs"),
+    ),
+    (
+        "level3/sme2/tests_hook_grid.rs",
+        include_str!("tests_hook_grid.rs"),
+    ),
+    (
+        "level3/sme2/tests_hook_thin.rs",
+        include_str!("tests_hook_thin.rs"),
+    ),
     (
         "level3/sme2/tests_kernel_f32.rs",
         include_str!("tests_kernel_f32.rs"),
     ),
     (
+        "level3/sme2/tests_kernel_f32_online.rs",
+        include_str!("tests_kernel_f32_online.rs"),
+    ),
+    (
         "level3/sme2/tests_kernel_f64.rs",
         include_str!("tests_kernel_f64.rs"),
+    ),
+    (
+        "level3/sme2/tests_kernel_f64_online.rs",
+        include_str!("tests_kernel_f64_online.rs"),
     ),
     ("level3/sme2/tests_lint.rs", include_str!("tests_lint.rs")),
     (
@@ -129,6 +218,14 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
         include_str!("tests_oracle.rs"),
     ),
     (
+        "level3/sme2/tests_pack_za.rs",
+        include_str!("tests_pack_za.rs"),
+    ),
+    (
+        "level3/sme2/tests_pack_za_native.rs",
+        include_str!("tests_pack_za_native.rs"),
+    ),
+    (
         "level3/sme2/tests_registry.rs",
         include_str!("tests_registry.rs"),
     ),
@@ -136,10 +233,34 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
         "level3/sme2/tests_selftest.rs",
         include_str!("tests_selftest.rs"),
     ),
+    (
+        "level3/sme2/tests_selftest_edits.rs",
+        include_str!("tests_selftest_edits.rs"),
+    ),
+    (
+        "level3/sme2/tests_selftest_online.rs",
+        include_str!("tests_selftest_online.rs"),
+    ),
+    (
+        "level3/sme2/tests_selftest_paths.rs",
+        include_str!("tests_selftest_paths.rs"),
+    ),
+    (
+        "level3/sme2/tests_selftest_text.rs",
+        include_str!("tests_selftest_text.rs"),
+    ),
+    (
+        "level3/sme2/tests_selftest_text_online.rs",
+        include_str!("tests_selftest_text_online.rs"),
+    ),
     ("level3/sme2/tests_smoke.rs", include_str!("tests_smoke.rs")),
     (
         "level3/sme2/tests_stress.rs",
         include_str!("tests_stress.rs"),
+    ),
+    (
+        "level3/sme2/tests_threads.rs",
+        include_str!("tests_threads.rs"),
     ),
     (
         "level2/gemv/kernel_tests.rs",
@@ -152,6 +273,30 @@ pub(super) const EMBEDDED_SOURCES: &[(&str, &str)] = &[
     (
         "level2/gemv/neon.rs",
         include_str!("../../level2/gemv/neon.rs"),
+    ),
+    (
+        "level2/gemv/sme2.rs",
+        include_str!("../../level2/gemv/sme2.rs"),
+    ),
+    (
+        "level2/gemv/sme2_hook_grid_tests.rs",
+        include_str!("../../level2/gemv/sme2_hook_grid_tests.rs"),
+    ),
+    (
+        "level2/gemv/sme2_hook_tests.rs",
+        include_str!("../../level2/gemv/sme2_hook_tests.rs"),
+    ),
+    (
+        "level2/gemv/sme2_tests.rs",
+        include_str!("../../level2/gemv/sme2_tests.rs"),
+    ),
+    (
+        "level2/gemv/sme2_tests_grid.rs",
+        include_str!("../../level2/gemv/sme2_tests_grid.rs"),
+    ),
+    (
+        "level2/gemv/sme2_tests_templates.rs",
+        include_str!("../../level2/gemv/sme2_tests_templates.rs"),
     ),
     (
         "level2/gemv/tests.rs",

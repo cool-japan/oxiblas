@@ -389,6 +389,27 @@ pub(crate) fn scope_runs() -> (usize, usize) {
     SCOPE_RUNS.try_with(core::cell::Cell::get).unwrap_or((0, 0))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls the 2D driver declined on this thread because its widest NC
+    /// block gave fewer than two tiles (test hook; counted on the calling
+    /// thread, before the caller falls back to the sequential driver).
+    static SCOPE_DECLINES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts one declined call of the 2D driver on this thread.
+#[cfg(test)]
+fn count_scope_decline() {
+    let _ = SCOPE_DECLINES.try_with(|declines| declines.set(declines.get() + 1));
+}
+
+/// How many calls the 2D driver declined on this thread (fewer than two
+/// tiles; test hook).
+#[cfg(test)]
+pub(crate) fn scope_declines() -> usize {
+    SCOPE_DECLINES.try_with(core::cell::Cell::get).unwrap_or(0)
+}
+
 /// [`try_gemm_blocked_parallel`] with [`PackScope::Shared`]: one packed B~
 /// per `(jc, pc)` step, packed in parallel and shared by every tile.
 #[allow(clippy::too_many_arguments)]
@@ -422,6 +443,8 @@ fn run_shared<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Grids of the full-width NC blocks and of the (possibly narrower) last.
     let full_grid = TileGrid::choose(m, nc, shape, threads);
     if full_grid.count() < 2 {
+        #[cfg(test)]
+        count_scope_decline();
         return false;
     }
     let last_w = n - (n - 1) / nc * nc;
@@ -544,6 +567,8 @@ fn run_per_tile<T: Field + GemmKernel + bytemuck::Zeroable>(
     // Grids of the full-width NC blocks and of the (possibly narrower) last.
     let full_grid = TileGrid::choose_per_tile(m, nc, shape, threads);
     if full_grid.count() < 2 {
+        #[cfg(test)]
+        count_scope_decline();
         return false;
     }
     let last_w = n - (n - 1) / nc * nc;

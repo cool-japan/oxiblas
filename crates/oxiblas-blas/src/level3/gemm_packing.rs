@@ -264,6 +264,24 @@ pub(crate) fn pack_cache_capacity<T: GemmKernel>(slot: PackSlot) -> usize {
     .unwrap_or(0)
 }
 
+/// Frees every buffer parked in this thread's packing cache, of every element
+/// type with a cache and both slots (test and A/B hook).
+///
+/// Each buffer leaves through `take_cached`, which keeps the parked-byte count
+/// in step, so [`pack_cache_bytes`] is 0 afterwards. The limit is unchanged.
+#[cfg(test)]
+pub(crate) fn drain_pack_cache() {
+    fn drain<T: GemmKernel>() {
+        for slot in [PackSlot::A, PackSlot::B] {
+            drop(take_cached::<T>(slot));
+        }
+    }
+    drain::<f64>();
+    drain::<f32>();
+    drain::<num_complex::Complex64>();
+    drain::<num_complex::Complex32>();
+}
+
 /// How far ahead [`pack_a_optimized`] prefetches, in source columns (one
 /// prefetch every four columns), and the default of
 /// [`PackingConfig::prefetch_distance`].

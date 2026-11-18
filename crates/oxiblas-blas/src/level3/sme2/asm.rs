@@ -57,7 +57,7 @@
 //! ```
 //!
 //! Every change of PSTATE.SM sets FPSR to `0x0800009f` (`ResetSVEState` in the
-//! Arm ARM; measured under QEMU, see the hand-over notes). Without the FPSR
+//! Arm ARM; measured under QEMU). Without the FPSR
 //! lines every call would leave IOC, DZC, OFC, UFC, IXC, IDC and QC set for a
 //! caller that inspects the flags. With them a kernel call leaves the
 //! caller's flags plus the flags raised by the kernel's SVE vector arithmetic
@@ -162,27 +162,11 @@ pub(crate) struct KernelEntry {
 
 /// The `.arch_extension` line of an optional extension. Only `f64f64` exists;
 /// any other name is a compile error.
-// Library builds have no kernel before Wave 2 (the smoke kernels are
-// test-only), so the frame rules are unused there until then.
-#[cfg_attr(
-    not(test),
-    allow(
-        unused_macros,
-        reason = "expanded by every library kernel (Wave 2 onwards)"
-    )
-)]
 macro_rules! sme_extension {
     (f64f64) => {
         ".arch_extension sme-f64f64\n"
     };
 }
-#[cfg_attr(
-    not(test),
-    allow(
-        unused_imports,
-        reason = "expanded by every library kernel (Wave 2 onwards)"
-    )
-)]
 pub(crate) use sme_extension;
 
 /// Whether an extension list enables `sme-f64f64`.
@@ -201,15 +185,6 @@ pub(crate) use sme_has_f64f64;
 /// The full template of one kernel: directives, the FPSR frame, the prologue
 /// and the body. Used for both `asm!` and the registry, so the lint checks
 /// exactly the text that is assembled.
-// Library builds have no kernel before Wave 2 (the smoke kernels are
-// test-only), so the frame rules are unused there until then.
-#[cfg_attr(
-    not(test),
-    allow(
-        unused_macros,
-        reason = "expanded by every library kernel (Wave 2 onwards)"
-    )
-)]
 macro_rules! sme_template {
     ([$($ext:ident)?], [$($pro:literal),*], [$($body:literal),*]) => {
         concat!(
@@ -228,13 +203,6 @@ macro_rules! sme_template {
         )
     };
 }
-#[cfg_attr(
-    not(test),
-    allow(
-        unused_imports,
-        reason = "expanded by every library kernel (Wave 2 onwards)"
-    )
-)]
 pub(crate) use sme_template;
 
 /// Defines the streaming kernels of one module; see the module docs.

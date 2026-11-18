@@ -41,13 +41,19 @@ mod avx2;
 ///
 /// Under the default policy, GEMM sends a `NoTrans`/`NoTrans` problem with
 /// `m * n * k` at most this threshold (32³) to the small path, on every SIMD
-/// tier. (The candidate policies first send thin problems, `m == 1` or
-/// `n == 1`, to the thin route, and, on a tier whose SIMD small kernels take
-/// the shape, a problem with operands that are not column-major between 8³
-/// and 32³ to the copy-to-column-major small path.) A routing policy
-/// may raise the ceiling for column-major `f64`/`f32` problems that a tier's
-/// SIMD small kernels take (`small_simd_max_work`): the x86-64 candidate
-/// policy (`--cfg oxiblas_gemm_candidate`) uses 80³ for the AVX2 + FMA small
+/// tier, unless it is a thin product (`m == 1` or `n == 1`) that the policy
+/// sends to the thin route. The default policy of an aarch64 build without
+/// `force-scalar` sends the thin products of its measured scope there (from
+/// 1024 multiply-adds, both operands stored column-major, on the NEON
+/// tier), and, on the NEON tier, a product from 12³ to 32³ with A
+/// transposed and both operands stored column-major (`m, n >= 4`) to the
+/// copy-to-column-major small path (`gemm_small_trans_copy`); a product
+/// with a transposed or strided view as an operand keeps the route of
+/// 0.2.3, and every other build's default policy keeps the routes of 0.2.3
+/// (the policies: `gemm_policy`). A routing policy may raise the ceiling
+/// for column-major `f64`/`f32` problems that a tier's SIMD small kernels
+/// take (`small_simd_max_work`): the x86-64 candidate policy
+/// (`--cfg oxiblas_gemm_candidate`) uses 80³ for the AVX2 + FMA small
 /// kernels; the default policy keeps 32³ everywhere.
 pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 
@@ -65,9 +71,11 @@ pub const SMALL_THRESHOLD: usize = 32 * 32 * 32;
 /// On x86-64 with AVX2 and FMA, the same problems with `m >= 5`, `n >= 4` run
 /// on the AVX2 + FMA small kernels only when the crate is built with the
 /// candidate policy (`--cfg oxiblas_gemm_candidate`); the default policy
-/// keeps the portable loops there, bit for bit as in 0.2.3. All other cases
-/// (other element types, strided or transposed views, SSE4.2, `force-scalar`
-/// builds, and x86 builds capped by `max-simd-128`) use the portable loops.
+/// keeps the portable loops of 0.2.3 there (the bits of 0.2.3, except which
+/// NaN a result carries where an operation meets two NaNs, which the
+/// compiler chooses). All other cases (other element types, strided or
+/// transposed views, SSE4.2, `force-scalar` builds, and x86 builds capped by
+/// `max-simd-128`) use the portable loops.
 pub fn gemm_small<T: Field>(
     alpha: T,
     a: &MatRef<'_, T>,
@@ -128,6 +136,15 @@ pub(crate) fn gemm_small_with<T: Field>(
 /// behave exactly as for `NoTrans`/`NoTrans`, and the result is bit for bit
 /// that of `gemm_small_with` on column-major operands holding the same values.
 ///
+/// The router takes this route where the policy's `small_trans_copy` range
+/// holds the problem and the tier has SIMD small kernels for its shape
+/// (with `small_trans_copy_a_only`, only with A transposed and both
+/// operands stored column-major: `TN` and `TT`, the measured class). The
+/// default policy of an aarch64 build without `force-scalar` does so from
+/// 12³ to 32³ with `small_trans_copy_a_only`; there the result of such a
+/// call is this contract's, not 0.2.3's (the rule about result bits: the
+/// module docs of `gemm_policy`).
+///
 /// Returns `false` without touching C when the shapes are inconsistent or a
 /// scratch view cannot be formed; the caller then uses the transpose-aware
 /// loops.
@@ -167,6 +184,25 @@ pub(crate) fn gemm_small_trans_copy<T: Field + GemmKernel + bytemuck::Zeroable>(
     };
     gemm_small_with(ctx, alpha, &a_view, &b_view, beta, c);
     true
+}
+
+/// [`gemm_small_trans_copy`] as the GEMM core calls it: never inlined, with
+/// the operands by value, for the reasons given at `gemm_thin_route` (the
+/// core stays small and keeps its operands in registers; the copies are made
+/// at this call, on the copy route only).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn gemm_small_trans_copy_route<T: Field + GemmKernel + bytemuck::Zeroable>(
+    ctx: GemmContext,
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    mut c: MatMut<'_, T>,
+) -> bool {
+    gemm_small_trans_copy(ctx, trans_a, trans_b, alpha, &a, &b, beta, &mut c)
 }
 
 /// `op(x)` is `x` itself in plain column-major storage.
@@ -258,10 +294,15 @@ fn small_simd<T: Field>(
     let k = a.ncols();
     let n = b.ncols();
 
-    // The SIMD kernels address the operands through raw pointers with unit
-    // row-to-row strides (plain column-major A and B; `MatMut` always has
-    // them), so they need those strides and consistent shapes.
-    let eligible = a.col_stride() == 1
+    // No tier has a SIMD small kernel for fewer than 4 rows or 4 columns
+    // (NEON from 4 × 4, AVX2 + FMA from 5 × 4), so the tiniest products leave
+    // here first, before any other test (as in 0.2.3). The SIMD kernels
+    // address the operands through raw pointers with unit row-to-row strides
+    // (plain column-major A and B; `MatMut` always has them), so they need
+    // those strides and consistent shapes.
+    let eligible = m >= 4
+        && n >= 4
+        && a.col_stride() == 1
         && b.col_stride() == 1
         && b.nrows() == k
         && c.nrows() == m
@@ -1171,6 +1212,695 @@ unsafe fn gemm_4x4_neon_f32(
     *c_col3.add(1) += tmp[1];
     *c_col3.add(2) += tmp[2];
     *c_col3.add(3) += tmp[3];
+}
+
+/// Rows of a column of C up to which the axpy order of `gemm::gemm_small_trans`
+/// keeps the column in register blocks ([`axpy_column_blocks`]) where they
+/// pay ([`axpy_blocks_pay`]); a longer column is updated `p` by `p`
+/// ([`small_trans_axpy_by_p`], the loop of 0.2.3).
+///
+/// On an Apple M3 (`NoTrans`/`Trans`, f64 and f32) the blocks took 0.31 to
+/// 0.96 times the time of 0.2.3 up to 64 rows (cubes from 8³ to 32³,
+/// 40×4×40, 48×16×16, 64×8×8). With blocks at every length, `f32` at
+/// 128×16×8 and 256×8×16 took 1.04 and 1.14 times the time of 0.2.3, where
+/// the loop's stores and loads no longer wait on each other and the blocks
+/// pay the factor and the column checks once per block and step; with that
+/// loop above 64 rows those shapes take 1.00 to 1.02 times it.
+const AXPY_BLOCK_MAX_ROWS: usize = 64;
+
+/// The terms `(a, b)` of [`axpy_blocks_pay`] (the blocks are used when `n *
+/// (k - a) >= b`) for columns of C of `rows` rows and elements of at most 4
+/// bytes (`narrow`) or wider ones; `None` where the blocks are never used.
+///
+/// Both loops sit behind the call of [`small_trans_axpy`]. The blocks save
+/// the store and the load of a column between two `p`; they cost more to
+/// enter (a large function with a frame to match) and pay once per block
+/// and `p` for the factor and the column of A. Measured on an Apple M3
+/// (performance cores) with the tall-shape benchmark of
+/// `tools/gemm_tiny_call_check.sh` (`NoTrans`/`Trans`, `f32` and `f64`, 1,
+/// 2 and 8 columns of C, depths up to 10) at 30 of the 57 row counts from 8
+/// to 64: every count up to 17, then 20, 22, 23, 24, 28, 29, 31, 32, 36, 37,
+/// 40, 44, 45, 48, 52, 53, 56, 60, 61 and 64. In those runs the blocks were
+/// compared with the loop of 0.2.3 inside the GEMM core (where 0.2.3 runs
+/// it); the terms take the blocks where they cost at most what the call of
+/// the `p` by `p` loop costs on top of that (2 ns for narrow elements in one
+/// block, 3 ns for narrow elements in more blocks and wide ones in one, 4 ns
+/// for wide elements in more blocks). The depth from which that holds is
+/// irregular in the rows, because the two loops differ in what they do with
+/// the rows outside whole vectors; each class has the terms of its slowest
+/// measured length:
+///
+/// | rows of a column | elements of at most 4 bytes | wider elements |
+/// |---|---|---|
+/// | 8 | (1, 3) | (1, 3) |
+/// | 9 to 15 | (2, 1) | (2, 1) |
+/// | 16 | (2, 4) | (2, 1) |
+/// | 17 to 32 | (3, 2) | (3, 1) |
+/// | 33 to 48 | (5, 1) | (3, 1) |
+/// | 49 to [`AXPY_BLOCK_MAX_ROWS`] | (6, 1) | (4, 1) |
+/// | 1 to 3 more than 16, 32 or 48 | (9, 1) | those of the class |
+/// | more than [`AXPY_BLOCK_MAX_ROWS`] | never (see the constant) | never |
+///
+/// So most classes take the blocks from a fixed depth (`k > a`); columns of
+/// 8 and 16 rows need more depth when C has one or two columns. The last
+/// but one line: with 1 to 3 rows more than a multiple of 16 the rows after
+/// the blocks of 16 go in two short blocks (8 rows and 9 to 11), where the
+/// loop of 0.2.3 has one whole step and 1 to 3 single elements. Measured at
+/// 17 rows, narrow elements then needed depth 10 with eight columns of C;
+/// 18, 19, 33 to 35 and 49 to 51 rows have the same term unmeasured.
+///
+/// AXPY_BLOCKS_PAY_FIGURES
+#[inline(always)]
+const fn axpy_blocks_terms(narrow: bool, rows: usize) -> Option<(usize, usize)> {
+    Some(if rows <= 16 {
+        if rows == 8 {
+            (1, 3)
+        } else if narrow && rows == 16 {
+            (2, 4)
+        } else {
+            (2, 1)
+        }
+    } else if rows > AXPY_BLOCK_MAX_ROWS {
+        return None;
+    } else if narrow && matches!(rows % 16, 1..=3) {
+        (9, 1)
+    } else if rows <= 32 {
+        if narrow { (3, 2) } else { (3, 1) }
+    } else if rows <= 48 {
+        if narrow { (5, 1) } else { (3, 1) }
+    } else if narrow {
+        (6, 1)
+    } else {
+        (4, 1)
+    })
+}
+
+/// Whether [`small_trans_axpy`] uses the register blocks
+/// ([`small_trans_axpy_blocks`]) for a product whose columns of C have
+/// `rows` rows, of depth `k`, with `n` columns of C. Where it does not, the
+/// `p` by `p` loop of 0.2.3 ([`small_trans_axpy_by_p`]) does the same
+/// operations per element in the same order of `p`, so the choice changes
+/// no result bit (but for which NaN an add of two NaNs keeps:
+/// [`small_trans_axpy`]).
+///
+/// The blocks are used when `n * (k - a) >= b`: beyond the depth `a` a
+/// column in blocks is the faster one, and `b` such steps over all columns
+/// make up for their more expensive entry. The terms depend on the rows of
+/// a column and on the element width ([`axpy_blocks_terms`]). With the
+/// blocks at every depth, products of depth 2 to 4 took 1.07 to 1.47 times
+/// the time of 0.2.3 on an Apple M3.
+#[inline(always)]
+pub(super) fn axpy_blocks_pay<T>(rows: usize, k: usize, n: usize) -> bool {
+    match axpy_blocks_terms(core::mem::size_of::<T>() <= 4, rows) {
+        Some((a, b)) => k > a && n.saturating_mul(k - a) >= b,
+        None => false,
+    }
+}
+
+/// The axpy order of `gemm::gemm_small_trans` once `C = beta * C` is done:
+/// `C[i, j] = C[i, j] + A[i, p] * (alpha * op(B)[p, j])` for every element
+/// and `p = 0, 1, ..., k - 1` in that order (`op(A) = A`, `m × k`).
+///
+/// Every element gets one multiply and one add per `p`, in the order of `p`,
+/// exactly as in the loop of 0.2.3, which updated a whole column of C for
+/// one `p` before the next: only the order in which different elements are
+/// updated differs, and no element depends on another. A column of C with
+/// adjacent rows takes [`axpy_column_blocks`] (where the blocks pay,
+/// [`axpy_blocks_pay`]: up to [`AXPY_BLOCK_MAX_ROWS`] rows, from a depth
+/// that depends on the rows and the columns; in
+/// [`small_trans_axpy_blocks`]) or the `p` by `p` loop
+/// ([`small_trans_axpy_by_p`]); any other column gets the same operations
+/// element by element.
+///
+/// So the results have the bits of 0.2.3, except which NaN an add of two
+/// NaNs keeps, which the compiler chooses: in aarch64 release builds the
+/// register blocks keep the accumulator's NaN where 0.2.3 keeps the
+/// product's (the legacy policy promises NaN positions there, not payloads:
+/// `gemm_plan::LEGACY_POLICY`).
+///
+/// A function of its own (not inlined): its loops then get registers of
+/// their own instead of sharing them with the whole GEMM core it would
+/// otherwise be inlined into. The views pass by value: a reference to the
+/// caller's views would need them in memory, and the compiler then stored
+/// them at the entry of the GEMM core, on every call of every route (about
+/// 0.5 ns more per tiny `f32` call on an Apple M3). The function itself
+/// only chooses, by the rows and the columns of C and the depth, between
+/// the two functions that hold the loops (a few comparisons and a jump).
+/// The loop of 0.2.3 was tried inside the GEMM core again, where 0.2.3 has
+/// it: products that keep it then took the time of 0.2.3, but in a build
+/// with the `sme2` feature the core's other loops changed with it (`f32`
+/// `Trans`/`NoTrans` cubes from 6³ to 11³ took 1.09 to 1.32 times the time
+/// of 0.2.3), so it stays behind this call, which costs such a product 2 to
+/// 5 ns.
+///
+/// # Panics
+///
+/// When `op(B)` has fewer than `k` rows or fewer columns than C
+/// ([`check_op_b`], at the entry of the function that holds the loops): the
+/// reads of `op(B)` are unchecked
+/// ([`read_op`]), and this check keeps them in bounds for any arguments.
+#[inline(never)]
+pub(super) fn small_trans_axpy<T: Field>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    trans_b: Trans,
+    b: MatRef<'_, T>,
+    mut c: MatMut<'_, T>,
+    k: usize,
+) {
+    if axpy_blocks_pay::<T>(c.nrows(), k, c.ncols()) {
+        small_trans_axpy_blocks(alpha, &a, trans_b, &b, &mut c, k);
+    } else {
+        small_trans_axpy_by_p(alpha, &a, trans_b, &b, &mut c, k);
+    }
+}
+
+/// [`small_trans_axpy`] in register blocks ([`axpy_column_blocks`]), which
+/// it uses where they pay ([`axpy_blocks_pay`]: columns of C of at most
+/// [`AXPY_BLOCK_MAX_ROWS`] rows, from a depth that depends on the rows and
+/// the columns; the blocks do the same operations per element for any
+/// number of rows and any depth).
+///
+/// A function of its own, apart from [`small_trans_axpy_by_p`]: every block
+/// length is compiled into this one, which makes it thousands of
+/// instructions long with a frame to match, and its entry prepares the
+/// block layout. A column that takes the `p` by `p` loop does not pay for
+/// that.
+///
+/// # Panics
+///
+/// As [`small_trans_axpy`] ([`check_op_b`]).
+#[inline(never)]
+pub(super) fn small_trans_axpy_blocks<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    trans_b: Trans,
+    b: &MatRef<'_, T>,
+    c: &mut MatMut<'_, T>,
+    k: usize,
+) {
+    let m = c.nrows();
+    check_op_b(b, trans_b, k, c.ncols());
+    for j in 0..c.ncols() {
+        // The factor of column `p` of A in column `j` of C, computed the same
+        // way wherever it is needed, so every block of rows sees the same
+        // value.
+        let factor = |p: usize| alpha * read_op(b, trans_b, p, j);
+        if let Some(c_col) = c.col_as_slice_mut(j) {
+            axpy_column_blocks(c_col, a, k, &factor);
+            continue;
+        }
+        for p in 0..k {
+            let t = factor(p);
+            for i in 0..m {
+                let v = c[(i, j)] + a[(i, p)] * t;
+                c.set(i, j, v);
+            }
+        }
+    }
+}
+
+/// [`small_trans_axpy`] `p` by `p`, which it uses where the register blocks
+/// do not pay ([`axpy_blocks_pay`]: columns of C longer than
+/// [`AXPY_BLOCK_MAX_ROWS`] rows, and products below the depth of their
+/// rows and columns): for every column `j` of C and every `p < k` in
+/// order, the whole column gets `C[i, j] = A[i, p] * (alpha * op(B)[p, j])
+/// + C[i, j]` ([`axpy_column`], the loop of 0.2.3).
+///
+/// Lean on purpose: 0.2.3 ran this loop inside the GEMM core, so everything
+/// a call spends before and after it is extra, and it shows in products
+/// with long columns and few of them. On an Apple M3, `NoTrans`/`Trans`
+/// 128 × 8 × 1 and 256 × 4 × 1 took 1.05 and 1.06 times the time of 0.2.3
+/// in `f64` and 1.15 and 1.12 times in `f32` while this loop sat behind the
+/// entry of the register blocks; from here they take 1.02 times in `f64`
+/// and 1.07 and 1.05 times in `f32` (2 to 4.5 ns per call more than 0.2.3,
+/// whose loop ran inside the GEMM core).
+///
+/// The loop holds nothing but the slice update. A column of C or of A that
+/// is not available as a slice (not reached from `gemm::gemm_small_trans`,
+/// which checks that A has adjacent rows; a column of a `MatMut` always is
+/// one) ends the function: [`small_trans_axpy_by_element`] computes
+/// everything that is left, out of line, and the function returns right
+/// after it, so the loop keeps no value across a call.
+///
+/// # Panics
+///
+/// As [`small_trans_axpy`] ([`check_op_b`]).
+#[inline(never)]
+fn small_trans_axpy_by_p<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    trans_b: Trans,
+    b: &MatRef<'_, T>,
+    c: &mut MatMut<'_, T>,
+    k: usize,
+) {
+    let (m, n) = (c.nrows(), c.ncols());
+    check_op_b(b, trans_b, k, n);
+    for j in 0..n {
+        let Some(c_col) = c.col_as_slice_mut(j) else {
+            small_trans_axpy_by_element(alpha, a, trans_b, b, c, k, j, 0);
+            return;
+        };
+        for p in 0..k {
+            let Some(a_rows) = a.col_as_slice(p).and_then(|col| col.get(..m)) else {
+                small_trans_axpy_by_element(alpha, a, trans_b, b, c, k, j, p);
+                return;
+            };
+            axpy_column(c_col, a_rows, alpha * read_op(b, trans_b, p, j));
+        }
+    }
+}
+
+/// What is left of [`small_trans_axpy_by_p`] from column `from_j` of C and,
+/// in that column, from `p = from_p`: the same operations per element in
+/// the same order of `p`, element by element through checked accessors
+/// (`C[i, j] + A[i, p] * (alpha * op(B)[p, j])`).
+///
+/// Out of line and cold, see [`small_trans_axpy_by_p`].
+///
+/// # Panics
+///
+/// As [`small_trans_axpy`] ([`check_op_b`], checked again here: the reads
+/// of `op(B)` below are unchecked).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn small_trans_axpy_by_element<T: Field>(
+    alpha: T,
+    a: &MatRef<'_, T>,
+    trans_b: Trans,
+    b: &MatRef<'_, T>,
+    c: &mut MatMut<'_, T>,
+    k: usize,
+    from_j: usize,
+    from_p: usize,
+) {
+    let (m, n) = (c.nrows(), c.ncols());
+    check_op_b(b, trans_b, k, n);
+    for j in from_j..n {
+        let first = if j == from_j { from_p } else { 0 };
+        for p in first..k {
+            let t = alpha * read_op(b, trans_b, p, j);
+            for i in 0..m {
+                let v = c[(i, j)] + a[(i, p)] * t;
+                c.set(i, j, v);
+            }
+        }
+    }
+}
+
+/// The bounds that the unchecked reads of `op(B)` ([`read_op`]) in the
+/// functions behind [`small_trans_axpy`] ([`small_trans_axpy_blocks`],
+/// [`small_trans_axpy_by_p`], [`small_trans_axpy_by_element`]) and in
+/// [`small_trans_dot_columns`] rely on, checked at the entry of each of
+/// them: they read `op(B)[p, j]` for every `p < k` and every column `j` of C
+/// (`j < n`), so `op(B)` needs at least `k` rows and `n` columns. Their
+/// reads of A and C go through checked accessors and slices and need no
+/// check here.
+///
+/// `gemm::gemm_small_trans` passes the operands of a call whose dimensions
+/// the GEMM core has checked (`op(B)` is exactly `k × n`), so the check
+/// never fails from there; it makes those functions sound for any
+/// arguments, at the cost of two comparisons per function entered.
+///
+/// # Panics
+///
+/// When `op(B)` has fewer than `k` rows or fewer than `n` columns.
+#[inline(always)]
+fn check_op_b<T: Scalar>(b: &MatRef<'_, T>, trans_b: Trans, k: usize, n: usize) {
+    let (rows, cols) = op_dims(b, trans_b);
+    assert!(
+        k <= rows && n <= cols,
+        "small transposed GEMM: op(B) has fewer than k rows or fewer columns than C"
+    );
+}
+
+/// The rows `row..row + c.len()` of a column of C, `p` by `p`: for every
+/// `p < k`, `c[i] = c[i] + A[row + i, p] * factor(p)` for all `i` (the loop
+/// of 0.2.3, applied to these rows). Only arms of the register blocks use
+/// it that are not reached from `gemm::gemm_small_trans`; a column longer
+/// than [`AXPY_BLOCK_MAX_ROWS`] rows takes [`small_trans_axpy_by_p`].
+fn axpy_column_by_p<T: Field>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    row: usize,
+    k: usize,
+    factor: &impl Fn(usize) -> T,
+) {
+    for p in 0..k {
+        let t = factor(p);
+        match a
+            .col_as_slice(p)
+            .and_then(|col| col.get(row..row + c.len()))
+        {
+            Some(a_rows) => axpy_column(c, a_rows, t),
+            None => {
+                for (i, ci) in c.iter_mut().enumerate() {
+                    *ci = *ci + a[(row + i, p)] * t;
+                }
+            }
+        }
+    }
+}
+
+/// `c[i] = a[i] * t + c[i]` for every `i < min(c.len(), a.len())`: the
+/// update of [`small_trans_axpy_by_p`] (and of [`axpy_column_by_p`]) for one
+/// `p` (one multiply and one add per element, in order).
+///
+/// A function of its own so that, wherever it is inlined, the compiler may
+/// rely on the two columns not overlapping (`&mut` and `&` arguments).
+///
+/// The product is the first operand of the add because that is the order
+/// the release build of 0.2.3's loop executes: when the product and `c[i]`
+/// are both NaNs, the product's NaN is the result, as in 0.2.3 (an aarch64
+/// release build checked with distinct NaN payloads; written `c[i] + a[i] *
+/// t`, this loop kept the payload of `c[i]` instead). The legacy policy does
+/// not promise that payload (`gemm_plan::LEGACY_POLICY`); the order costs
+/// nothing and keeps it where the compiler follows it.
+#[inline]
+fn axpy_column<T: Field>(c: &mut [T], a: &[T], t: T) {
+    for (ci, &ai) in c.iter_mut().zip(a) {
+        *ci = ai * t + *ci;
+    }
+}
+
+/// The axpy order on one column `c` of C of at most [`AXPY_BLOCK_MAX_ROWS`]
+/// rows: `c[i] = c[i] + A[i, p] * factor(p)` for every row `i` and
+/// `p = 0, 1, ..., k - 1` in that order.
+///
+/// The rows go in blocks that keep their partial sums in registers for all
+/// `p` ([`axpy_rows`]): a column of 8 to 16 rows is one block, read and
+/// written once, in one pass over `p` that computes each factor once; a
+/// longer column takes blocks of 16 rows until 16 to 31 rows are left. 16
+/// rows are one more block; 17 to 31 rows go in two blocks of 8 to 16 rows
+/// (so no block is short), the first of them a multiple of 4 rows, so that
+/// the blocks leave no more rows outside whole vectors than the column has
+/// (20 rows are 12 + 8, not 10 + 10: in two halves, `f32` columns of 20
+/// rows needed a depth of 9 to 10 before the blocks were as fast as the
+/// loop of 0.2.3 on an Apple M3, and 5 to 8 with this split).
+///
+/// Why blocks: the loop of 0.2.3 stores the column after every `p` and loads
+/// it again for the next, so a short column waits on that round trip through
+/// memory once per `p`, and its speed then depended on where the compiler
+/// happened to place the loop. On an Apple M3, `f32` `NoTrans`/`Trans` 10³
+/// took 1.06 to 1.11 times the time of 0.2.3 in every 0.2.4 build measured,
+/// with the loop of 0.2.3 (less its run-time overlap check) at other
+/// offsets; with the blocks it takes 0.46 to 0.47 times.
+#[inline(always)]
+fn axpy_column_blocks<T: Field>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    k: usize,
+    factor: &impl Fn(usize) -> T,
+) {
+    let m = c.len();
+    // The rows after the last block of 16 that leaves at least 16 rows.
+    let last = if m <= 16 { m } else { 16 + m % 16 };
+    let Some((head, tail)) = c.split_at_mut_checked(m - last) else {
+        // Not reached (`last <= m`).
+        axpy_column_by_p(c, a, 0, k, factor);
+        return;
+    };
+    let mut row = 0;
+    let (blocks, _) = head.as_chunks_mut::<16>();
+    for block in blocks {
+        axpy_rows(block, a, row, k, factor);
+        row += 16;
+    }
+    if last <= 16 {
+        axpy_block(tail, a, row, k, factor);
+        return;
+    }
+    // 17 to 31 rows are left: the first block takes the largest multiple of
+    // 4 rows that leaves at least 8 (8, 12 or 16 rows; the second 8 to 15).
+    let head_rows = (last - 8).min(16) / 4 * 4;
+    match tail.split_at_mut_checked(head_rows) {
+        Some((first, second)) => {
+            axpy_block(first, a, row, k, factor);
+            axpy_block(second, a, row + head_rows, k, factor);
+        }
+        // Not reached (`head_rows <= last`).
+        None => axpy_column_by_p(tail, a, row, k, factor),
+    }
+}
+
+/// One block of [`axpy_column_blocks`]: the rows `row..row + c.len()` of a
+/// column of C, 8 to 16 of them, kept in registers for all `p`
+/// ([`axpy_rows`]). A block of any other length (not formed by
+/// [`axpy_column_blocks`] for a column of at least 8 rows, which
+/// `gemm::gemm_small_trans` guarantees) takes [`axpy_column_by_p`].
+#[inline(always)]
+fn axpy_block<T: Field>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    row: usize,
+    k: usize,
+    factor: &impl Fn(usize) -> T,
+) {
+    match c.len() {
+        8 => axpy_rest::<T, 8>(c, a, row, k, factor),
+        9 => axpy_rest::<T, 9>(c, a, row, k, factor),
+        10 => axpy_rest::<T, 10>(c, a, row, k, factor),
+        11 => axpy_rest::<T, 11>(c, a, row, k, factor),
+        12 => axpy_rest::<T, 12>(c, a, row, k, factor),
+        13 => axpy_rest::<T, 13>(c, a, row, k, factor),
+        14 => axpy_rest::<T, 14>(c, a, row, k, factor),
+        15 => axpy_rest::<T, 15>(c, a, row, k, factor),
+        16 => axpy_rest::<T, 16>(c, a, row, k, factor),
+        _ => axpy_column_by_p(c, a, row, k, factor),
+    }
+}
+
+/// [`axpy_rows`] on a block `c` that the caller matched to have exactly `R`
+/// rows.
+#[inline(always)]
+fn axpy_rest<T: Field, const R: usize>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    row: usize,
+    k: usize,
+    factor: &impl Fn(usize) -> T,
+) {
+    let (blocks, _) = c.as_chunks_mut::<R>();
+    for block in blocks {
+        axpy_rows(block, a, row, k, factor);
+    }
+}
+
+/// [`axpy_column_blocks`] for the `R` rows `row..row + R` of a column of C
+/// (`block`): the partial sums stay in a local array (registers) while `p`
+/// runs from `0` to `k - 1`.
+///
+/// The rows of column `p` of A come from `a.col_as_slice(p)`, checked for
+/// every `p` against the caller's `k` (an A without adjacent rows or with
+/// too few rows or columns takes the same operations element by element).
+/// That check also keeps the loop as it is written: in a variant that took
+/// the count of columns from A, the compiler could prove it away and then
+/// vectorized the `f32` 16-row block across `p` instead of across the rows
+/// (16 in-order reductions with lane extracts), which made `f32`
+/// `NoTrans`/`Trans` from 16 rows on 1.1 to 2.6 times slower than 0.2.3 on
+/// an Apple M3.
+#[inline(always)]
+fn axpy_rows<T: Field, const R: usize>(
+    block: &mut [T; R],
+    a: &MatRef<'_, T>,
+    row: usize,
+    k: usize,
+    factor: &impl Fn(usize) -> T,
+) {
+    let mut acc = *block;
+    for p in 0..k {
+        let t = factor(p);
+        match a
+            .col_as_slice(p)
+            .and_then(|col| col.get(row..))
+            .and_then(<[T]>::first_chunk::<R>)
+        {
+            Some(a_rows) => {
+                for (s, &x) in acc.iter_mut().zip(a_rows) {
+                    *s = *s + x * t;
+                }
+            }
+            None => acc = axpy_rows_by_element(acc, a, row, p, t),
+        }
+    }
+    *block = acc;
+}
+
+/// The step `p` of [`axpy_rows`] element by element (`acc[i] + A[row + i,
+/// p] * t`, the same operations), for a column of A that is not available
+/// as a slice of at least `row + R` rows (not reached from
+/// `gemm::gemm_small_trans`, which checks that A has adjacent rows).
+///
+/// Out of line and cold, and `acc` passes by value, so that the compiler
+/// keeps the partial sums of [`axpy_rows`] in registers and its vector loads
+/// apart from this path.
+#[cold]
+#[inline(never)]
+fn axpy_rows_by_element<T: Field, const R: usize>(
+    mut acc: [T; R],
+    a: &MatRef<'_, T>,
+    row: usize,
+    p: usize,
+    t: T,
+) -> [T; R] {
+    for (i, s) in acc.iter_mut().enumerate() {
+        *s = *s + a[(row + i, p)] * t;
+    }
+    acc
+}
+
+/// The dot order of `gemm::gemm_small_trans` for `op(A) = A` with adjacent
+/// rows (`a.col_stride() == 1`, `m × k`, a real type) and 3 to 7 rows: every
+/// `C[i, j]` becomes `alpha * dot + beta * C[i, j]` (C not read when
+/// `beta == 0`), with `dot` summed from `+0` as `dot + A[i, p] * op(B)[p, j]`
+/// for `p = 0, 1, ..., k - 1` in that order.
+///
+/// Every element gets exactly the operations of the loop of 0.2.3, which
+/// computed one element after the other; here the `m` dot products of a
+/// column of C run together ([`dot_rows`]), their partial sums in registers,
+/// so the column of A for one `p` is one load and `op(B)[p, j]` is read once
+/// for all of them. Another number of rows, or a column of C without
+/// adjacent rows, gets the loop of 0.2.3 for that column.
+///
+/// So the results have the bits of 0.2.3, except which NaN a multiply of two
+/// NaNs keeps, which the compiler chooses: in aarch64 release builds the
+/// columns here keep `op(B)`'s NaN where 0.2.3 keeps A's (the legacy policy
+/// promises NaN positions there, not payloads: `gemm_plan::LEGACY_POLICY`).
+///
+/// Why: the loop of 0.2.3 is one short chain of dependent adds per element,
+/// and its speed then depended on where the compiler placed it. On an Apple
+/// M3, `f64` `NoTrans`/`Trans` 3³ to 7³ took 1.06 to 1.09 times the time of
+/// 0.2.3 in some builds of 0.2.4 and 0.96 to 1.00 in others, with the same
+/// instructions at other addresses; computed this way they take 0.31 to
+/// 0.70 times.
+///
+/// A function of its own (not inlined), with the views passed by value, for
+/// the reasons given at [`small_trans_axpy`].
+///
+/// # Panics
+///
+/// When `op(B)` has fewer than `k` rows or fewer columns than C
+/// ([`check_op_b`], once per call), as [`small_trans_axpy`].
+#[inline(never)]
+pub(super) fn small_trans_dot_columns<T: Field>(
+    alpha: T,
+    a: MatRef<'_, T>,
+    trans_b: Trans,
+    b: MatRef<'_, T>,
+    beta: T,
+    mut c: MatMut<'_, T>,
+    k: usize,
+) {
+    let m = c.nrows();
+    check_op_b(&b, trans_b, k, c.ncols());
+    for j in 0..c.ncols() {
+        let b_of = |p: usize| read_op(&b, trans_b, p, j);
+        if let Some(c_col) = c.col_as_slice_mut(j) {
+            match c_col.len() {
+                3 => dot_rest::<T, 3>(c_col, &a, k, &b_of, alpha, beta),
+                4 => dot_rest::<T, 4>(c_col, &a, k, &b_of, alpha, beta),
+                5 => dot_rest::<T, 5>(c_col, &a, k, &b_of, alpha, beta),
+                6 => dot_rest::<T, 6>(c_col, &a, k, &b_of, alpha, beta),
+                7 => dot_rest::<T, 7>(c_col, &a, k, &b_of, alpha, beta),
+                _ => dot_column_by_element(c_col, &a, k, &b_of, alpha, beta),
+            }
+            continue;
+        }
+        for i in 0..m {
+            let mut acc = T::zero();
+            for p in 0..k {
+                acc = acc + a[(i, p)] * b_of(p);
+            }
+            let val = dot_result(acc, alpha, beta, || c[(i, j)]);
+            c.set(i, j, val);
+        }
+    }
+}
+
+/// The loop of 0.2.3 on one column `c` of C (any number of rows): the dot
+/// product of each row of A with `op(B)[.., j]` (`b_of`), then
+/// [`dot_result`].
+fn dot_column_by_element<T: Field>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    k: usize,
+    b_of: &impl Fn(usize) -> T,
+    alpha: T,
+    beta: T,
+) {
+    for (i, ci) in c.iter_mut().enumerate() {
+        let mut acc = T::zero();
+        for p in 0..k {
+            acc = acc + a[(i, p)] * b_of(p);
+        }
+        *ci = dot_result(acc, alpha, beta, || *ci);
+    }
+}
+
+/// `alpha * dot + beta * c` with `c` asked for only when `beta != 0` (C is
+/// not read when `beta == 0`): the end of every dot product of the dot
+/// order.
+#[inline(always)]
+fn dot_result<T: Field>(dot: T, alpha: T, beta: T, c: impl FnOnce() -> T) -> T {
+    let scaled = alpha * dot;
+    if beta == T::zero() {
+        scaled
+    } else {
+        scaled + beta * c()
+    }
+}
+
+/// [`dot_rows`] on a column `c` that the caller matched to have exactly `R`
+/// rows.
+#[inline(always)]
+fn dot_rest<T: Field, const R: usize>(
+    c: &mut [T],
+    a: &MatRef<'_, T>,
+    k: usize,
+    b_of: &impl Fn(usize) -> T,
+    alpha: T,
+    beta: T,
+) {
+    let (blocks, _) = c.as_chunks_mut::<R>();
+    for block in blocks {
+        dot_rows(block, a, k, b_of, alpha, beta);
+    }
+}
+
+/// The `R` dot products of one column of C (`block`, rows `0..R`) in one pass
+/// over `p`, their partial sums in a local array (registers), then
+/// [`dot_result`] for each.
+///
+/// The rows of column `p` of A come from `a.col_as_slice(p)`, checked for
+/// every `p` against the caller's `k`, as in [`axpy_rows`] (an A without
+/// adjacent rows, or with too few rows or columns, takes the same
+/// operations element by element).
+#[inline(always)]
+fn dot_rows<T: Field, const R: usize>(
+    block: &mut [T; R],
+    a: &MatRef<'_, T>,
+    k: usize,
+    b_of: &impl Fn(usize) -> T,
+    alpha: T,
+    beta: T,
+) {
+    let mut acc = [T::zero(); R];
+    for p in 0..k {
+        let y = b_of(p);
+        match a.col_as_slice(p).and_then(<[T]>::first_chunk::<R>) {
+            Some(a_rows) => {
+                for (s, &x) in acc.iter_mut().zip(a_rows) {
+                    *s = *s + x * y;
+                }
+            }
+            None => acc = axpy_rows_by_element(acc, a, 0, p, y),
+        }
+    }
+    for (ci, &s) in block.iter_mut().zip(&acc) {
+        *ci = dot_result(s, alpha, beta, || *ci);
+    }
 }
 
 #[cfg(test)]

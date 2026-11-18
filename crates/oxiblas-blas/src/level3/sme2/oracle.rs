@@ -14,6 +14,15 @@
 //! the contract in test builds, which `tests_contract.rs` in turn proves
 //! equal to the NEON blocked path.
 //!
+//! With online packing on (`a_pack` non-null) it also writes the packed copy
+//! of the A block into the buffer, as `args::reference` defines it: `A(i,
+//! p)` at `(i / 64) · 64 · kc + p · 64 + i % 64` for `i < m`, `p < kc`, and
+//! `+0` for the rows `m ≤ i < 64 · ceil(m / 64)` of the last row panel; it
+//! writes nothing beyond those `64 · ceil(m / 64) · kc` elements and still
+//! reads A from the source (a correct kernel's C does not depend on where it
+//! reads A from). `prefetch` changes nothing (hints have no effect), so the
+//! oracle ignores it.
+//!
 //! # The arithmetic
 //!
 //! Per element, with `NR = T::NR`:
@@ -64,30 +73,49 @@
 //! encodes it (0 M0, 1 M1, 2 M2, 3 M3). A value above 3 is treated as M3, as
 //! the executable definition in `args.rs` does; the contract never passes one.
 
-// No `expect(dead_code)` here, unlike `selftest.rs` and `pack.rs`. Observed
-// with rustc 1.89 and 1.95: the self-test's items are still reported dead
-// (their `expect` is fulfilled), but what they call is not, so nothing in
-// this file is reported dead before Wave 6 and an `expect` here would be
-// unfulfilled (an error under `-D warnings`).
-
 use super::args::{MR, MacroArgs, SmeElement};
 
 /// Writes the contract's value into every element of `C[0..m, 0..n]` of
 /// `args`, reading A, B and C through the layouts of `args.rs`, exactly as a
-/// macro-kernel does (see the module docs for the arithmetic).
+/// macro-kernel does (see the module docs for the arithmetic), and with
+/// `a_pack` non-null first the packed copy of A into that buffer (module
+/// docs).
 ///
 /// C is read only in modes M1 and M3; in M0 and M2 whatever C holds (a NaN
-/// included) has no influence. Nothing outside `C[0..m, 0..n]` is read or
-/// written, A rows `≥ m` and B columns `≥ n` are never read.
+/// included) has no influence. Nothing outside `C[0..m, 0..n]` and the first
+/// `64 · ceil(m / 64) · kc` elements of the buffer is written, nothing
+/// outside the block of C is read, A rows `≥ m` and B columns `≥ n` are never
+/// read.
 ///
 /// # Safety
 ///
 /// As for a macro-kernel, minus the hardware: every address that the layout
 /// of `args.rs` names for `args` must be valid for reads, namely A for
 /// `i < m`, `p < kc` and B for `p < kc`, `j < n`; C for `i < m`, `j < n` must be
-/// valid for reads and writes and must not overlap A or B. `m`, `n` or `kc`
-/// may be zero (then the block is empty or every accumulator is `+0`).
+/// valid for reads and writes and must not overlap A or B; `a_pack` must be
+/// null or valid for writes of `64 · ceil(m / 64) · kc` elements that overlap
+/// none of A, B and C. `m`, `n` or `kc` may be zero (then the block is empty
+/// or every accumulator is `+0`).
 pub(super) unsafe fn oracle_block<T: SmeElement>(args: &MacroArgs<T>) {
+    if !args.a_pack.is_null() {
+        let panel = MR * args.kc;
+        for i in 0..args.m.div_ceil(MR) * MR {
+            let a_row = (i / MR) * args.a_panel + i % MR;
+            for p in 0..args.kc {
+                let value = if i < args.m {
+                    // SAFETY: `i < m` and `p < kc`: the address of `A(i, p)`,
+                    // valid for reads by the caller's contract.
+                    unsafe { *args.a.add(a_row + p * args.a_depth) }
+                } else {
+                    T::ZERO
+                };
+                // SAFETY: `i < 64 · ceil(m / 64)` and `p < kc`, so the offset
+                // is below `64 · ceil(m / 64) · kc`: inside the buffer the
+                // caller guarantees, which overlaps nothing else.
+                unsafe { *args.a_pack.add((i / MR) * panel + p * MR + i % MR) = value };
+            }
+        }
+    }
     let nr = T::NR;
     let alpha = T::from_bits64(args.alpha_bits);
     let beta = T::from_bits64(args.beta_bits);

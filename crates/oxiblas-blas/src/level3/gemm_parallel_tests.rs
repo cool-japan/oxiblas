@@ -154,12 +154,10 @@ fn fit(blk: &GemmBlocking, m: usize, k: usize, n: usize, shape: &MicroKernelShap
 
 /// A LEGACY plan forced onto the blocked route with `kernel` and `scope`.
 fn blocked_plan<T: Probe>(kernel: MicroKernel<T>, scope: PackScope) -> GemmPlan<T> {
-    GemmPlan {
-        kernel,
-        ..GemmPlan::<T>::new(LEGACY_POLICY)
-    }
-    .with_forced_route(GemmRoute::Blocked)
-    .with_forced_scope(scope)
+    GemmPlan::<T>::new(LEGACY_POLICY)
+        .with_kernel(kernel)
+        .with_forced_route(GemmRoute::Blocked)
+        .with_forced_scope(scope)
 }
 
 /// Runs the 2D driver directly with `scope` and asserts that it engaged with
@@ -1401,8 +1399,16 @@ fn test_gemm_parallel_scope_selection() {
     }
 
     // The public entry point follows the build's policy (`DEFAULT_POLICY`:
-    // LEGACY, or the candidate of the target under
-    // `--cfg oxiblas_gemm_candidate`).
+    // the adopted policy on aarch64 without `force-scalar`, LEGACY elsewhere
+    // and with `--cfg oxiblas_gemm_legacy`, or the candidate of the target
+    // under `--cfg oxiblas_gemm_candidate`; only the x86-64 candidate packs
+    // per tile).
+    // This counts the pack scopes of the NEON 2D parallel driver. Where the
+    // SME2 backend is on (the `sme2` feature on SME2 hardware or QEMU) the
+    // public call would run on SME2 instead, so the backend is held off on
+    // this thread (the guard does not exist without the feature).
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    let _neon_only = crate::level3::sme2::test_support::force_off();
     for threads in [4usize, 5] {
         let mut c = c0.clone();
         let before = scope_runs();

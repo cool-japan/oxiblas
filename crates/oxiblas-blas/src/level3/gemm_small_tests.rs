@@ -1678,7 +1678,11 @@ fn check_avx2_legacy_portable<T: Real>(test: &str) {
             "{test} {m}x{k}x{n}: gemm_small does not follow the default policy"
         );
     }
-    assert_eq!(DEFAULT_POLICY.small_simd_x86, cfg!(oxiblas_gemm_candidate));
+    // Only the x86-64 candidate has the AVX2 small kernels: the default has
+    // them exactly with `--cfg oxiblas_gemm_candidate` and without
+    // `--cfg oxiblas_gemm_legacy` (which wins over it).
+    let candidate_default = cfg!(oxiblas_gemm_candidate) && !cfg!(oxiblas_gemm_legacy);
+    assert_eq!(DEFAULT_POLICY.small_simd_x86, candidate_default);
 }
 
 #[test]
@@ -1879,4 +1883,51 @@ fn test_gemm_small_trans_copy_avx2_bitwise_f64() {
 #[test]
 fn test_gemm_small_trans_copy_avx2_bitwise_f32() {
     check_trans_copy_avx2::<f32>("test_gemm_small_trans_copy_avx2_bitwise_f32");
+}
+
+// ------------------------------------------------------------------
+// The entry of the SIMD small kernels (`small_simd`): its early exit for
+// fewer than 4 rows or 4 columns declines nothing that a tier's kernel
+// takes.
+// ------------------------------------------------------------------
+
+/// For every `m` and `n` up to 9 (two depths, every policy), `small_simd`
+/// takes the product exactly when the tier's kernels (`small_simd_f64` /
+/// `small_simd_f32`) take it, with the same bits; on the NEON tier that is
+/// from 4 × 4, the 0.2.3 rule.
+fn check_small_simd_entry<T: Real>() {
+    for policy in [LEGACY_POLICY, CANDIDATE_POLICY, CANDIDATE_X86] {
+        let ctx = GemmContext::detect(policy);
+        for m in 1..=9 {
+            for n in 1..=9 {
+                for k in [1, 3] {
+                    let a: Mat<T> = pattern_random(m, k, 11);
+                    let b: Mat<T> = pattern_random(k, n, 13);
+                    let start: Mat<T> = pattern_random(m, n, 17);
+                    let alpha = T::of(0.75);
+                    let mut via_entry = start.clone();
+                    let mut via_kernel = start.clone();
+                    let (a, b) = (a.as_ref(), b.as_ref());
+                    let took = small_simd(ctx, alpha, &a, &b, &mut via_entry.as_mut());
+                    let kernel_took = T::simd(ctx, alpha, &a, &b, &mut via_kernel.as_mut());
+                    let what = format!("{policy:?} {m}x{k}x{n}");
+                    assert_eq!(took, kernel_took, "{what}");
+                    assert_eq!(bits_of(&via_entry), bits_of(&via_kernel), "{what}");
+                    if ctx.tier() == SimdTier::Neon {
+                        assert_eq!(took, m >= 4 && n >= 4, "{what}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_gemm_small_simd_entry_matches_kernels_f64() {
+    check_small_simd_entry::<f64>();
+}
+
+#[test]
+fn test_gemm_small_simd_entry_matches_kernels_f32() {
+    check_small_simd_entry::<f32>();
 }

@@ -1,6 +1,7 @@
 //! Tests for SME2 detection: the `sysctl` and auxv parsers, the order of the
-//! detection steps, the environment override and the guarantee that nothing
-//! is selected (and no SME instruction runs) without SME2 hardware.
+//! detection steps, the environment override, the guarantee that nothing
+//! is selected (and no SME instruction runs) without SME2 hardware, and the
+//! detection report. The first-use check: `tests_detect_first_use.rs`.
 
 use std::cell::Cell;
 use std::ffi::OsStr;
@@ -64,10 +65,17 @@ fn test_sme2_detect_parse_macos_m4_like() {
             sme2: true,
             f64f64: true,
             max_svl_bytes: Some(64),
+            units: 2,
         }
     );
     assert!(os.offers_sme2());
-    assert_eq!(hw_from_report(os, || 64), Some(Sme2Hw { f64: true }));
+    assert_eq!(
+        hw_from_report(os, || 64),
+        Some(Sme2Hw {
+            f64: true,
+            units: 2
+        })
+    );
     // A streaming vector length other than 512 bits is rejected even when the
     // operating system reports SME2.
     assert_eq!(hw_from_report(os, || 32), None);
@@ -79,7 +87,13 @@ fn test_sme2_detect_parse_macos_m4_like() {
 
     // Without FEAT_SME_F64F64 only f32 may use the backend.
     let no_f64 = macos_report(&text.replace("FEAT_SME_F64F64: 1", "FEAT_SME_F64F64: 0"));
-    assert_eq!(hw_from_report(no_f64, || 64), Some(Sme2Hw { f64: false }));
+    assert_eq!(
+        hw_from_report(no_f64, || 64),
+        Some(Sme2Hw {
+            f64: false,
+            units: 2
+        })
+    );
 
     // A reported maximum SVL other than 64 bytes is rejected before RDSVL.
     let svl_256 = macos_report(&text.replace("sme_max_svl_b: 64", "sme_max_svl_b: 32"));
@@ -104,6 +118,7 @@ fn test_sme2_detect_parse_macos_m3() {
             sme2: false,
             f64f64: false,
             max_svl_bytes: Some(0),
+            units: 1,
         }
     );
     assert!(!os.offers_sme2());
@@ -152,6 +167,7 @@ fn test_sme2_detect_parse_macos_unknown_keys() {
             sme2: false,
             f64f64: false,
             max_svl_bytes: Some(64),
+            units: 1,
         }
     );
 
@@ -169,6 +185,7 @@ fn test_sme2_detect_parse_macos_unknown_keys() {
             sme2: false,
             f64f64: false,
             max_svl_bytes: Some(0),
+            units: 1,
         }
     );
     // Even with the features present, a missing maximum SVL fails.
@@ -202,17 +219,27 @@ fn test_sme2_detect_parse_auxv_bits() {
             sme2: true,
             f64f64: true,
             max_svl_bytes: None,
+            units: 1,
         }
     );
     assert!(os.offers_sme2());
-    assert_eq!(hw_from_report(os, || 64), Some(Sme2Hw { f64: true }));
+    assert_eq!(
+        hw_from_report(os, || 64),
+        Some(Sme2Hw {
+            f64: true,
+            units: 1
+        })
+    );
     // qemu-user's default streaming vector length is 32 bytes.
     assert_eq!(hw_from_report(os, || 32), None);
 
     // SME2 without SME_F64F64 serves f32 only.
     assert_eq!(
         hw_from_report(linux_report(HWCAP2_SME | HWCAP2_SME2), || 64),
-        Some(Sme2Hw { f64: false })
+        Some(Sme2Hw {
+            f64: false,
+            units: 1
+        })
     );
     // An SME-only CPU (no SME2) is not offered.
     assert!(!linux_report(HWCAP2_SME | HWCAP2_SME_F64F64).offers_sme2());
@@ -228,6 +255,7 @@ fn test_sme2_detect_parse_auxv_bits() {
             sme2: false,
             f64f64: false,
             max_svl_bytes: None,
+            units: 1,
         }
     );
     assert_eq!(hw_from_report(os, never_probe), None);
@@ -296,6 +324,7 @@ fn test_sme2_detect_probe_runs_only_after_os_reports_sme2() {
         sme2: true,
         f64f64: false,
         max_svl_bytes: None,
+        units: 1,
     };
     for os in [
         OsSme { sme: false, ..base },
@@ -316,14 +345,26 @@ fn test_sme2_detect_probe_runs_only_after_os_reports_sme2() {
     }
     assert_eq!(calls.get(), 0, "RDSVL ran without an SME2 report");
 
-    assert_eq!(hw_from_report(base, probe(64)), Some(Sme2Hw { f64: false }));
+    assert_eq!(
+        hw_from_report(base, probe(64)),
+        Some(Sme2Hw {
+            f64: false,
+            units: 1
+        })
+    );
     assert_eq!(calls.get(), 1);
     let macos = OsSme {
         max_svl_bytes: Some(64),
         f64f64: true,
         ..base
     };
-    assert_eq!(hw_from_report(macos, probe(64)), Some(Sme2Hw { f64: true }));
+    assert_eq!(
+        hw_from_report(macos, probe(64)),
+        Some(Sme2Hw {
+            f64: true,
+            units: 1
+        })
+    );
     // RDSVL has the last word, even when the report says 64 bytes.
     assert_eq!(hw_from_report(macos, probe(16)), None);
     assert_eq!(calls.get(), 3);
@@ -364,6 +405,35 @@ fn test_sme2_detect_not_selected_without_hw() {
 }
 
 #[test]
+fn test_sme2_detect_thread_state_ready_rule() {
+    // The rule of `thread_ready`, on states no emulator thread is in.
+    let ready = ThreadState {
+        svcr: 0,
+        tpidr2: 0,
+        svl_bytes: 64,
+    };
+    assert!(ready.ready());
+    // Streaming mode on (bit 0), ZA storage on (bit 1), both.
+    for svcr in [1, 2, 3] {
+        assert!(!ThreadState { svcr, ..ready }.ready(), "SVCR {svcr}");
+    }
+    // A pending lazy save of a caller's ZA contents.
+    for tpidr2 in [1, 0x1000, u64::MAX] {
+        assert!(
+            !ThreadState { tpidr2, ..ready }.ready(),
+            "TPIDR2 {tpidr2:#x}"
+        );
+    }
+    // Another streaming vector length (Linux lets a thread change it).
+    for svl_bytes in [0, 16, 32, 128, 256] {
+        assert!(
+            !ThreadState { svl_bytes, ..ready }.ready(),
+            "SVL {svl_bytes} bytes"
+        );
+    }
+}
+
+#[test]
 fn test_sme2_detect_report() {
     // Prints what the detection sees; never fails on hosts without SME.
     println!("SME2_ALLOWED (build does not cap SIMD): {SME2_ALLOWED}");
@@ -384,7 +454,16 @@ fn test_sme2_detect_report() {
         None => println!("AT_HWCAP2 not available"),
     }
     println!("operating-system report: {:?}", os_report());
-    println!("hw(): {:?}", hw());
+    // The candidate first: reading it never starts the first-use check, so
+    // the line is in the log even when the check then ends the process (a
+    // kernel instruction that this CPU does not implement raises SIGILL
+    // inside the check); `tools/sme2_qemu.sh` tells that case from a SIGILL
+    // in the register probe by this line. Then `hw()`: on this (ready)
+    // thread it settles the verdict, which the next line shows.
+    println!("candidate: {:?}", candidate());
+    let reported = hw();
+    println!("{}", verdict_line(verdict()));
+    println!("hw(): {reported:?}");
     if hw().is_some() {
         // SAFETY: `hw()` is `Some` only after the operating system reported
         // FEAT_SME and the detection already executed this probe.
@@ -406,4 +485,235 @@ fn test_sme2_detect_report() {
         "SME2 backend: {}",
         if sme2_active() { "active" } else { "inactive" }
     );
+    println!("SME units: {}", units());
+}
+
+/// The verdict line of the detection report: `first-use check: passed`,
+/// `first-use check: failed: <line>` or `first-use check: open`.
+fn verdict_line(verdict: Verdict<'_>) -> String {
+    match verdict {
+        Verdict::Passed => "first-use check: passed".to_owned(),
+        Verdict::Failed(line) => format!("first-use check: failed: {line}"),
+        Verdict::Open => "first-use check: open".to_owned(),
+    }
+}
+
+/// The detection report prints the candidate before anything that can
+/// start the first-use check: when a kernel instruction raises SIGILL
+/// inside the check, the `candidate:` line is what tells
+/// `tools/sme2_qemu.sh` that the probe passed and the check ended the
+/// process. Read from the source (comments removed, string literals empty).
+#[test]
+fn test_sme2_detect_report_prints_the_candidate_before_the_check() {
+    let lexed = super::super::lint_scan::lex(include_str!("tests_detect.rs"));
+    let code = lexed.code.as_str();
+    let Some(start) = code.find("fn test_sme2_detect_report()") else {
+        panic!("tests_detect.rs: no test_sme2_detect_report");
+    };
+    let body = &code[start..];
+    let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+    let candidate_at = body.find("candidate()");
+    // Everything that reaches `hw()`, and so can start the check.
+    let first_check = [
+        "hw()",
+        "enabled::<",
+        "thread_ready()",
+        "units()",
+        "sme2_active()",
+    ]
+    .iter()
+    .filter_map(|call| body.find(call).map(|at| (at, *call)))
+    .min();
+    match (candidate_at, first_check) {
+        (Some(candidate_at), Some((check_at, call))) => assert!(
+            candidate_at < check_at,
+            "test_sme2_detect_report reaches {call} before it prints the candidate"
+        ),
+        other => panic!("test_sme2_detect_report: candidate and hw() calls: {other:?}"),
+    }
+}
+
+#[test]
+fn test_sme2_detect_report_verdict_lines() {
+    assert_eq!(verdict_line(Verdict::Passed), "first-use check: passed");
+    assert_eq!(verdict_line(Verdict::Open), "first-use check: open");
+    let line = failure_line(&CheckFailure::Gemv);
+    assert_eq!(
+        verdict_line(Verdict::Failed(&line)),
+        "first-use check: failed: oxiblas: the SME2 backend is off for this process: \
+         the check of the SME2 GEMV failed; please report this line"
+    );
+    // None of the report's own lines may contain the `hw(): ` that
+    // `tools/sme2_qemu.sh` looks for.
+    for verdict in [Verdict::Passed, Verdict::Open, Verdict::Failed(&line)] {
+        assert!(!verdict_line(verdict).contains("hw(): "));
+    }
+    assert!(!format!("candidate: {:?}", candidate()).contains("hw(): "));
+}
+
+#[test]
+fn test_sme2_detect_parse_macos_units() {
+    // M4 Pro-like: 8 performance cores, 4 per cluster: two SME units.
+    assert_eq!(macos_report(&m4_like_output()).units, 2);
+    // M4 Max-like: 12 performance cores in two clusters of 6.
+    let max_like = m4_like_output()
+        .replace("physicalcpu: 8", "physicalcpu: 12")
+        .replace("cpusperl2: 4", "cpusperl2: 6");
+    assert_eq!(macos_report(&max_like).units, 2);
+    // M4-like: 4 performance cores, one cluster.
+    let one = m4_like_output().replace("physicalcpu: 8", "physicalcpu: 4");
+    assert_eq!(macos_report(&one).units, 1);
+    // The unit count reaches `Sme2Hw`.
+    let os = macos_report(&m4_like_output());
+    assert_eq!(hw_from_report(os, || 64).map(|hw| hw.units), Some(2));
+
+    // The pure function: the quotient rounds down, and every odd report
+    // gives one unit.
+    assert_eq!(macos_units(Some(8), Some(4)), 2);
+    assert_eq!(macos_units(Some(10), Some(4)), 2);
+    assert_eq!(macos_units(Some(16), Some(4)), 4);
+    assert_eq!(macos_units(Some(4), Some(4)), 1);
+    assert_eq!(
+        macos_units(Some(3), Some(4)),
+        1,
+        "fewer cores than a cluster"
+    );
+    assert_eq!(macos_units(Some(0), Some(4)), 1, "no performance cores");
+    assert_eq!(macos_units(Some(8), Some(0)), 1, "zero cores per cluster");
+    assert_eq!(macos_units(None, Some(4)), 1, "physicalcpu missing");
+    assert_eq!(macos_units(Some(8), None), 1, "cpusperl2 missing");
+    assert_eq!(macos_units(None, None), 1);
+
+    // Missing, unparsable or zero keys in the text.
+    let text = m4_like_output().replace("hw.perflevel0.cpusperl2: 4\n", "");
+    assert_eq!(macos_report(&text).units, 1);
+    let text = m4_like_output().replace("cpusperl2: 4", "cpusperl2: four");
+    assert_eq!(macos_report(&text).units, 1);
+    let text = m4_like_output().replace("cpusperl2: 4", "cpusperl2: 0");
+    assert_eq!(macos_report(&text).units, 1);
+    // A key that merely starts with the right name is not the key.
+    let text = m4_like_output().replace("hw.perflevel0.cpusperl2", "hw.perflevel0.cpusperl2x");
+    assert_eq!(macos_report(&text).units, 1);
+}
+
+#[test]
+fn test_sme2_detect_parse_linux_units() {
+    let all = HWCAP2_SME | HWCAP2_SME2 | HWCAP2_SME_F64F64;
+    assert_eq!(linux_report(all).units, 1);
+    assert_eq!(linux_report(0).units, 1);
+    assert_eq!(
+        hw_from_report(linux_report(all), || 64).map(|hw| hw.units),
+        Some(1)
+    );
+    // A report with a zero unit count (no parser makes one) still yields one
+    // unit.
+    let zero = OsSme {
+        units: 0,
+        ..linux_report(all)
+    };
+    assert_eq!(hw_from_report(zero, || 64).map(|hw| hw.units), Some(1));
+}
+
+#[test]
+fn test_sme2_detect_units_override_nests_and_is_per_thread() {
+    let detected = hw().map_or(1, |hw| hw.units);
+    assert!(detected >= 1);
+    assert_eq!(units(), detected);
+    {
+        let _two = override_units(2);
+        assert_eq!(units(), 2);
+        {
+            let _three = override_units(3);
+            assert_eq!(units(), 3);
+            // Another thread sees the detected count.
+            let elsewhere = std::thread::spawn(units).join();
+            assert!(
+                matches!(elsewhere, Ok(seen) if seen == detected),
+                "{elsewhere:?}"
+            );
+        }
+        assert_eq!(units(), 2, "the inner guard restores the outer override");
+        // An override of 0 counts as 1 unit.
+        let _zero = override_units(0);
+        assert_eq!(units(), 1);
+    }
+    assert_eq!(units(), detected);
+}
+
+#[test]
+fn test_sme2_detect_pretend_not_ready_is_per_thread() {
+    // What `thread_ready` says on this host without the switch (false
+    // without SME2, true under QEMU): a fresh thread says the same.
+    // `thread_ready` never waits for a first-use check that another thread
+    // runs (it answers `false` meanwhile), so the verdict is settled first
+    // with the waiting form: from then on its answer is stable.
+    let _ = hw();
+    assert!(!pretends_not_ready());
+    let natural = thread_ready();
+    // Setting returns the previous value; the switch answers first.
+    assert!(!set_pretend_not_ready(true));
+    let (pretending, ready, active) = (pretends_not_ready(), thread_ready(), sme2_active());
+    assert!(set_pretend_not_ready(true), "the second set sees the first");
+    // Not visible on another thread.
+    let elsewhere = std::thread::spawn(|| (pretends_not_ready(), thread_ready())).join();
+    // Cleared again (before any assertion can fail); the previous value
+    // comes back.
+    assert!(set_pretend_not_ready(false));
+    assert!(!set_pretend_not_ready(false));
+    assert!(pretending);
+    assert!(!ready, "thread_ready while pretending");
+    assert!(!active, "sme2_active while pretending");
+    assert!(
+        matches!(elsewhere, Ok((false, other)) if other == natural),
+        "{elsewhere:?}"
+    );
+    assert!(!pretends_not_ready());
+    assert_eq!(thread_ready(), natural);
+}
+
+#[test]
+fn test_sme2_detect_ready_countdown_counts_calls_per_thread() {
+    // What `thread_ready` says on this host without a countdown (false
+    // without SME2, true under QEMU). The verdict is settled first with the
+    // waiting form (see the test above), so the answer is stable.
+    let _ = hw();
+    let natural = thread_ready();
+    assert_eq!(
+        set_ready_countdown(Some(2)),
+        None,
+        "a countdown was running"
+    );
+    // Two calls answer as usual, every later one `false`; each call counts.
+    let answers = [
+        thread_ready(),
+        thread_ready(),
+        thread_ready(),
+        thread_ready(),
+    ];
+    let left = set_ready_countdown(Some(1));
+    // A call that the pretend flag answers still counts down.
+    let previous = set_pretend_not_ready(true);
+    let pretending = (thread_ready(), sme2_active());
+    set_pretend_not_ready(previous);
+    let after_pretend = (set_ready_countdown(Some(3)), thread_ready());
+    // Not visible on another thread, which answers as usual.
+    let elsewhere = std::thread::spawn(|| (set_ready_countdown(None), thread_ready())).join();
+    // Stopped again (before any assertion can fail); the calls left come
+    // back.
+    let stopped = set_ready_countdown(None);
+    assert_eq!(answers, [natural, natural, false, false]);
+    assert_eq!(left, Some(0), "the calls did not count down");
+    assert_eq!(pretending, (false, false));
+    assert_eq!(
+        after_pretend,
+        (Some(0), natural),
+        "a call under the pretend flag did not count down"
+    );
+    assert!(
+        matches!(elsewhere, Ok((None, other)) if other == natural),
+        "{elsewhere:?}"
+    );
+    assert_eq!(stopped, Some(2));
+    assert_eq!(set_ready_countdown(None), None);
+    assert_eq!(thread_ready(), natural);
 }

@@ -5,7 +5,7 @@ use super::*;
 use crate::level3::gemm::{BlockingSource, gemm_planned, op_dims, read_op};
 use crate::level3::gemm_plan::{
     CANDIDATE_POLICY, GemmPlan, GemmPolicy, GemmRoute, LEGACY_POLICY, RouteInputs, SimdTier,
-    avx2_fma_tier_or_skip, choose_route,
+    THIN_MIN_WORK, ThinPolicy, avx2_fma_tier_or_skip, choose_route,
 };
 use oxiblas_core::parallel::Par;
 use oxiblas_matrix::Mat;
@@ -186,6 +186,35 @@ fn dot_ref<T: Elem>(mode: Madd, len: usize, pair: impl Fn(usize) -> (T, T)) -> T
     s
 }
 
+/// The thin route's contract for `f64` on `tier` (the oracle below with the
+/// multiply-add of that tier), for the tests of the public path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn contract_f64(
+    tier: SimdTier,
+    (ta, tb): (Trans, Trans),
+    alpha: f64,
+    a: &MatRef<'_, f64>,
+    b: &MatRef<'_, f64>,
+    beta: f64,
+    c0: &Mat<f64>,
+) -> Mat<f64> {
+    oracle(madd_of(tier), ta, tb, alpha, a, b, beta, c0)
+}
+
+/// [`contract_f64`] for `f32`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn contract_f32(
+    tier: SimdTier,
+    (ta, tb): (Trans, Trans),
+    alpha: f32,
+    a: &MatRef<'_, f32>,
+    b: &MatRef<'_, f32>,
+    beta: f32,
+    c0: &Mat<f32>,
+) -> Mat<f32> {
+    oracle(madd_of(tier), ta, tb, alpha, a, b, beta, c0)
+}
+
 /// The contract computed from its definition with plain indexing: the
 /// result `C` (`m × n`) for the stored operands `a`, `b` and the initial `c0`,
 /// with the multiply-adds formed as `mode` says.
@@ -321,12 +350,38 @@ fn check_shape<T: Elem>(plan: &GemmPlan<T>, (m, k, n): (usize, usize, usize)) {
                     );
                     let inputs = RouteInputs::new(ta, tb, &a, &b, m, n, k, SimdTier::Portable);
                     assert_eq!(plan.route(&inputs), GemmRoute::Thin, "{ctx}");
+                    // The candidate (and the adopted policy) take the thin
+                    // route for the products of the scope only (from 1024
+                    // multiply-adds); every other product keeps 0.2.3's
+                    // route on this tier.
+                    // The scope needs a tier with SIMD thin kernels: on this
+                    // (portable) tier no product is in it, on the NEON tier
+                    // the products of the scope are.
+                    let work = inputs.work();
+                    let neon = RouteInputs {
+                        tier: SimdTier::Neon,
+                        ..inputs
+                    };
+                    assert!(!inputs.thin_in_scope(work), "{ctx}");
+                    let scoped = work >= THIN_MIN_WORK && neon.thin_in_scope(work);
+                    let candidate_thin =
+                        if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+                            ThinPolicy::Scoped
+                        } else {
+                            ThinPolicy::Off
+                        };
+                    assert_eq!(CANDIDATE_POLICY.thin, candidate_thin, "{ctx}");
                     assert_eq!(
                         choose_route(&inputs, &CANDIDATE_POLICY),
-                        if CANDIDATE_POLICY.thin {
+                        choose_route(&inputs, &LEGACY_POLICY),
+                        "{ctx}"
+                    );
+                    assert_eq!(
+                        choose_route(&neon, &CANDIDATE_POLICY),
+                        if scoped && candidate_thin == ThinPolicy::Scoped {
                             GemmRoute::Thin
                         } else {
-                            choose_route(&inputs, &LEGACY_POLICY)
+                            choose_route(&neon, &LEGACY_POLICY)
                         },
                         "{ctx}"
                     );
@@ -531,7 +586,7 @@ fn test_gemm_thin_route_table() {
         tier: SimdTier::Neon,
     };
     let thin_policy = GemmPolicy {
-        thin: true,
+        thin: ThinPolicy::All,
         ..LEGACY_POLICY
     };
     let tiers = [
@@ -1382,6 +1437,10 @@ fn test_gemm_thin_avx2_matches_portable() {
 fn test_gemm_thin_neon_matches_portable_bitwise() {
     // Bitwise: on aarch64 the portable kernels fuse every multiply-add of the
     // contract, exactly like the NEON kernels.
+    if !crate::level3::gemm_plan::neon_tier_or_skip("test_gemm_thin_neon_matches_portable_bitwise")
+    {
+        return;
+    }
     fn check<T: Elem>() {
         let neon = native_plan::<T>();
         assert_eq!(neon.ctx.tier(), SimdTier::Neon);
@@ -1446,6 +1505,11 @@ fn test_gemm_thin_neon_equals_gemv_kernels_bitwise() {
     // The NEON tier runs the level-2 NEON GEMV kernels, so the thin path is
     // bit for bit `level2::gemv` and the kernels called directly.
     use crate::level2::gemv::neon;
+    if !crate::level3::gemm_plan::neon_tier_or_skip(
+        "test_gemm_thin_neon_equals_gemv_kernels_bitwise",
+    ) {
+        return;
+    }
     let (f64_plan, f32_plan) = (native_plan::<f64>(), native_plan::<f32>());
     assert_eq!(f64_plan.ctx.tier(), SimdTier::Neon);
     check_plan_equals_gemv(&f64_plan);

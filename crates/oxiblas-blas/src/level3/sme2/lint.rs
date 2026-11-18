@@ -49,8 +49,9 @@
 //! - **Read-only argument block.** No store uses `x0` as its base.
 //!
 //! The registry walk (`tests_registry.rs`) calls [`lint_kernel`] for every
-//! registered kernel; the register probe in `detect.rs` is checked with
-//! [`lint_probe_template`] and the test-support FPSR accessors with
+//! registered kernel; the register probe in `detect.rs` and the test-only
+//! thread-state switches in `test_sme_state.rs` are checked with
+//! [`lint_probe_template`], and the test-support FPSR accessors with
 //! [`lint_fpsr_template`]. [`report`] formats violations for assertion
 //! messages.
 
@@ -305,12 +306,17 @@ const BASE_A64: &[&str] = &[
 // caught by the vector-addressing rule; the families below hold none of them.
 
 /// SVE predicate instructions, including the SME2 predicate-as-counter forms
-/// (`ptrue pn8.s`, `whilelt pn9.s, …, vlx4`, `pext`, `cntp …, vlx4`).
+/// (`ptrue pn8.s`, `whilelt pn9.s, …, vlx4`, `pext`, `cntp …, vlx4`) and the
+/// SME2 predicate select `psel` (`psel p5, p1, p2.b[w13, 0]`: `p1` when the
+/// indexed element of `p2` is active, all-false otherwise).
 ///
 /// Streaming-legal: predicate generation is outside the FA64-only set, and
-/// the counter forms exist only for multi-vector streaming code.
+/// the counter forms exist only for multi-vector streaming code. `psel` is
+/// an SME2 instruction (also FEAT_SVE2p1): it is defined in streaming mode
+/// without FEAT_SME_FA64, like the other SME2 additions, and touches only
+/// predicate registers and a general-purpose index.
 const SVE_PREDICATES: &[&str] = &[
-    "ptrue", "pfalse", "whilelt", "whilelo", "whilele", "whilels", "pext", "cntp",
+    "ptrue", "pfalse", "whilelt", "whilelo", "whilele", "whilels", "pext", "cntp", "psel",
 ];
 
 /// SVE vector-length counters and address arithmetic.

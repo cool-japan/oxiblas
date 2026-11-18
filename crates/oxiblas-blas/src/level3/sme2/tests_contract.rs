@@ -206,11 +206,10 @@ where
     let ldc = m + 3;
     let mode = Epilogue::select(alpha, beta);
     // C outside the block holds a sentinel; inside, NaN when C is not read.
-    let sentinel = T::from_bits64(if T::NR == 16 {
-        0x7fc0_beef
-    } else {
-        0x7ff8_0000_0000_beef
-    });
+    // The sentinel is a signalling NaN (quiet bit clear): a read-modify-write
+    // of a border element (`acc + C`, `C · beta + t`) returns it quiet, with
+    // other bits, where a quiet sentinel would come back unchanged.
+    let sentinel = border_sentinel::<T>();
     let start = values(ldc * (n + 1), seed + 2, from_f64);
     let mut c0 = vec![sentinel; ldc * (n + 1)];
     for j in 0..n {
@@ -280,38 +279,56 @@ where
         assert_eq!(inplace.bits(), sme.bits(), "{label}: in-place A");
         if i >= m || j >= n {
             assert_eq!(sme.bits(), sentinel.bits(), "{label}: outside the block");
+            assert_eq!(
+                neon.bits(),
+                sentinel.bits(),
+                "{label}: the NEON path changed the border"
+            );
         }
     }
 }
+
+/// The border sentinel around C in [`compare`] (and in the oracle tests of
+/// `tests_oracle.rs`): a signalling NaN of an unusual payload (`f32`
+/// `0x7f80_beef`, `f64` `0x7ff0_0000_0000_beef`).
+pub(super) fn border_sentinel<T: SmeElement>() -> T {
+    T::from_bits64(if T::NR == 16 {
+        0x7f80_beef
+    } else {
+        0x7ff0_0000_0000_beef
+    })
+}
+
+/// The alpha/beta pairs of the contract tests (here and in `tests_oracle.rs`):
+/// M0, M0 (beta = -0), M1, M2, M2, M3, M3 (alpha = 1), M3 (beta = 1), and
+/// two M3 pairs whose beta is not a power of two, one with alpha != 1 (the
+/// NEON epilogue multiplies by alpha, then FMLA `acc + C * beta`) and one
+/// with alpha == 1 (no multiply, then FMLA): `C * beta` is inexact there, so
+/// only these tell the single rounding `fma(C, beta, t)` of the contract
+/// from `C * beta` rounded before the sum. With a power-of-two beta both
+/// give the same bits.
+pub(super) const CONTRACT_PAIRS: [(f64, f64); 10] = [
+    (1.0, 0.0),
+    (1.0, -0.0),
+    (1.0, 1.0),
+    (-1.5, 0.0),
+    (0.3, 0.0),
+    (-1.5, 0.25),
+    (1.0, -0.5),
+    (2.0, 1.0),
+    (0.3, 0.7),
+    (1.0, 0.7),
+];
 
 /// Runs [`compare`] over shapes and every mode for one type.
 fn compare_all<T>(from_f64: fn(f64) -> T)
 where
     T: SmeElement + GemmKernel + oxiblas_core::scalar::Field,
 {
-    // M0, M0 (beta = -0), M1, M2, M2, M3, M3 (alpha = 1), M3 (beta = 1),
-    // and two M3 pairs whose beta is not a power of two, one with
-    // alpha != 1 (the NEON epilogue multiplies by alpha, then FMLA
-    // `acc + C * beta`) and one with alpha == 1 (no multiply, then FMLA):
-    // `C * beta` is inexact there, so only these tell the single rounding
-    // `fma(C, beta, t)` of the contract from `C * beta` rounded before the
-    // sum. With a power-of-two beta both give the same bits.
-    let pairs = [
-        (1.0, 0.0),
-        (1.0, -0.0),
-        (1.0, 1.0),
-        (-1.5, 0.0),
-        (0.3, 0.0),
-        (-1.5, 0.25),
-        (1.0, -0.5),
-        (2.0, 1.0),
-        (0.3, 0.7),
-        (1.0, 0.7),
-    ];
     for m in [1, 7, 9, 64, 65, 130] {
         for n in [1, 6, 8, 9, 17, 33] {
             for kc in [1, 7, 65] {
-                for (alpha, beta) in pairs {
+                for (alpha, beta) in CONTRACT_PAIRS {
                     compare(m, n, kc, from_f64(alpha), from_f64(beta), from_f64);
                 }
             }

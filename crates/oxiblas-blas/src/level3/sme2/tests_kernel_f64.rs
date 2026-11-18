@@ -17,7 +17,15 @@
 //!   every A load uses the predicate of its rows, M0 and M2 load nothing,
 //!   M1 and M3 load only the C column under `p1`, and every store is under
 //!   `p1`. Mutated templates that break the predicate rules are rejected by
-//!   the same checker.
+//!   the same checker. The rules hold for both passes of the depth loops:
+//!   the plain variants `4L` and their packing twins `14L` (online packing
+//!   of A in column panel 0), whose A loads take whole depth steps under
+//!   `pn9` / `pn10` and whose only stores are whole four-vector groups of
+//!   those A vectors under the all-true counter `pn8` through the buffer
+//!   register `x6`; the prefetch hints are `prfm pldl2keep` of the eight
+//!   64-byte tile starts in the row-panel setup only. Where the buffer
+//!   stores and the hints land is the proof of the interpreter in
+//!   `tests_kernel_f64_online.rs`.
 //! - **Shapes**: the grid of m around 8 / 64, n around 8, kc around the
 //!   unroll and 64, every (alpha, beta) pair of `tests_contract.rs` (all four
 //!   modes; M3 also with betas that are not powers of two, so that the single
@@ -40,23 +48,25 @@
 //! - **Special values** in A, B, C, alpha and beta.
 //! - **FPSR**: flags set before a call survive it; the call adds exactly the
 //!   flags of its live SVE epilogue lanes (none in M0).
-//! - **Thread state**: ready before, SVCR = TPIDR2_EL0 = 0 after, kernel
-//!   entries counted, and 120 calls interleaved with NEON and scalar `f64`
-//!   work give the same bits every time.
+//! - **Thread state**: ready before, SVCR = TPIDR2_EL0 = 0 after, exactly
+//!   one kernel entry per call counted on this thread, and 120 calls
+//!   interleaved with blocked products of the dispatched micro-kernel and
+//!   scalar `f64` work give the same bits every time (and the bits of that
+//!   product, where the dispatched micro-kernel is the NEON one).
 
+use oxiblas_core::simd::dispatch::GemmKernelKind;
 use oxiblas_matrix::MatMut;
 
 use super::args::{Epilogue, MR, MacroArgs, reference, same_result};
-use super::detect;
 use super::kernel_f64::{SME_KERNELS, sme2_gemm_f64};
 use super::lint::{lint_kernel, lint_streaming_template, report};
 use super::test_support::{
     FPSR_DZC, FPSR_IDC, FPSR_IOC, FPSR_IXC, FPSR_OFC, FPSR_QC, FPSR_UFC, Need, fpsr_read,
-    fpsr_write, hardware_or_skip, kernel_entries, sme_state,
+    fpsr_write, hardware_or_skip, kernel_entries_here, kernel_ready, sme_state,
 };
 use super::tests_kernel_f32::{PredicateUse, predicate_uses, template_with};
 use crate::level3::gemm::macro_panel_multiply_with;
-use crate::level3::gemm_kernel::GemmKernel;
+use crate::level3::gemm_kernel::{GemmKernel, selected_kernel_kind};
 
 /// Columns of one packed B panel.
 const NR: usize = 8;
@@ -374,13 +384,20 @@ fn test_sme2_kernel_f64_registered_and_linted() {
     if let Err(errors) = lint_kernel(entry) {
         panic!("{}", report(&errors));
     }
-    // The Wave-4 fields are never read.
-    for unused in ["a_pack", "prefetch"] {
-        assert!(
-            entry.consts.iter().all(|name| !name.contains(unused)),
-            "{unused} is declared: {:?}",
-            entry.consts
-        );
+    // Strides come from the block, never from the plain packing; the
+    // online-packing and prefetch fields (online packing of A, prefetch
+    // switches) are read
+    // as well (`tests_kernel_f64_online.rs` tests what the kernel does with
+    // them).
+    for field in [
+        "off_a_depth",
+        "off_a_panel",
+        "off_b_panel",
+        "off_ldc",
+        "off_a_pack",
+        "off_prefetch",
+    ] {
+        assert!(entry.consts.contains(&field), "{field} is not read");
     }
     // The driver and the self-test call it through this type.
     let _: unsafe fn(&MacroArgs<f64>) = sme2_gemm_f64;
@@ -398,15 +415,28 @@ fn tiles_in(line: &str) -> Vec<usize> {
 fn test_sme2_kernel_f64_variants_touch_only_live_tiles() {
     let template = SME_KERNELS[0].template;
     // Variant `4L` (L live tiles) runs from its label to the next variant or
-    // to the epilogue dispatch (`50:`).
+    // to the epilogue dispatch (`50:`); its packing twin `14L` (online
+    // packing, column panel 0) from its label to the next twin or to the
+    // plain dispatch (`40:`). Slot `L` of `seen` is variant `4L`, slot
+    // `8 + L` the twin `14L`.
     let mut variant: Option<usize> = None;
-    let mut seen: Vec<(bool, Vec<usize>)> = vec![(false, Vec::new()); 9];
+    let mut seen: Vec<(bool, Vec<usize>)> = vec![(false, Vec::new()); 17];
     let mut epilogue_tiles = Vec::new();
     let mut in_epilogue = false;
+    let name = |slot: usize| {
+        let live = (slot - 1) % 8 + 1;
+        if slot > 8 {
+            format!("packing twin {} ({live} live tiles)", 140 + live)
+        } else {
+            format!("variant {} ({live} live tiles)", 40 + live)
+        }
+    };
     for line in template.lines().map(str::trim) {
         if let Some(label) = line.strip_suffix(':') {
             match label.parse::<usize>() {
-                Ok(live @ 41..=48) => variant = Some(live - 40),
+                Ok(label @ 41..=48) => variant = Some(label - 40),
+                Ok(label @ 141..=148) => variant = Some(label - 140 + 8),
+                Ok(40) => variant = None,
                 Ok(50) => {
                     variant = None;
                     in_epilogue = true;
@@ -416,36 +446,39 @@ fn test_sme2_kernel_f64_variants_touch_only_live_tiles() {
             }
             continue;
         }
-        let Some(live) = variant else {
+        let Some(slot) = variant else {
             if in_epilogue {
                 epilogue_tiles.extend(tiles_in(line));
             }
             continue;
         };
+        let live = (slot - 1) % 8 + 1;
         let tiles = tiles_in(line);
         if line.starts_with("zero") {
-            assert!(!seen[live].0, "variant {live} zeroes twice");
+            assert!(!seen[slot].0, "{} zeroes twice", name(slot));
             assert_eq!(
                 tiles,
                 (0..live).collect::<Vec<_>>(),
-                "zero of variant {live}"
+                "zero of {}",
+                name(slot)
             );
-            seen[live].0 = true;
+            seen[slot].0 = true;
         }
         if line.starts_with("fmopa") {
             assert!(
                 tiles.iter().all(|&t| t < live),
-                "variant {live} accumulates a dead tile: {line}"
+                "{} accumulates a dead tile: {line}",
+                name(slot)
             );
-            seen[live].1.extend(tiles);
+            seen[slot].1.extend(tiles);
         }
     }
-    for (live, (zeroed, accumulated)) in seen.iter().enumerate().skip(1) {
-        assert!(zeroed, "variant {live} has no zero");
+    for (slot, (zeroed, accumulated)) in seen.iter().enumerate().skip(1) {
+        assert!(zeroed, "{} has no zero", name(slot));
         // Unrolled pair (2 FMOPAs per tile) plus the remainder step (1).
-        for tile in 0..live {
+        for tile in 0..(slot - 1) % 8 + 1 {
             let count = accumulated.iter().filter(|&&t| t == tile).count();
-            assert_eq!(count, 3, "variant {live}, tile {tile}: {count} FMOPAs");
+            assert_eq!(count, 3, "{}, tile {tile}: {count} FMOPAs", name(slot));
         }
     }
     // Each of the four epilogues walks the eight tiles in order.
@@ -461,15 +494,23 @@ fn test_sme2_kernel_f64_variants_touch_only_live_tiles() {
     }
     let sections = sections(template);
     check_a_loads(&sections);
+    check_packing_pass(&sections);
+    check_prefetch(&sections);
     check_epilogue_memory(&sections);
 }
 
-/// Labels that start a section of the loop nest: the column panel (20), the
-/// row panel (30), the depth-loop variants (41..48), the epilogue dispatch
-/// (50), the four epilogues (51..54), the panel advance (59) and the frame's
-/// exit (90). The inner labels (6L, 7L, 56) stay inside their section.
-const SECTION_LABELS: [usize; 17] = [
-    20, 30, 41, 42, 43, 44, 45, 46, 47, 48, 50, 51, 52, 53, 54, 59, 90,
+/// Labels that start a section of the loop nest, in text order: the column
+/// panel (20), the row panel with the prefetch block (30), the depth-loop
+/// setup and the dispatch of the packing twins (39), the packing twins
+/// (141..148), the plain dispatch (40), the depth-loop variants (41..48),
+/// the epilogue dispatch (50), the four epilogues (51..54), the panel
+/// advance with the switch to the buffer (59) and the frame's exit (90).
+/// The inner labels (32, 33 of the prefetch loop; 6L, 7L, 16L, 17L, 56 of
+/// the depth loops and epilogues; 29 after the switch) stay inside their
+/// section.
+const SECTION_LABELS: [usize; 27] = [
+    20, 30, 39, 141, 142, 143, 144, 145, 146, 147, 148, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 51,
+    52, 53, 54, 59, 90,
 ];
 
 /// The template's instruction lines, grouped by the section label that
@@ -553,12 +594,15 @@ const ROW_PANEL_SETUP: [&str; 4] = [
 /// and `pn10` (`i0+32..+63`), all bounded by `m`, set once per row panel by
 /// exactly [`ROW_PANEL_SETUP`] and nowhere else; the epilogue's `p1` is only
 /// ever `whilelt p1.d, x13, x20` (rows of the tile being stored below `m`);
-/// `p0` is only `ptrue p0.d`. A write in any form counts: a braced
-/// destination list (`whilelt {{p2.d, p3.d}}, …`, `pext {{…}}, pn…[i]`), a
-/// register range, or the other name of a register (`p9` is `pn9`). No
-/// predicate appears outside a governing position (`pK/z`, `pK/m`, a
-/// store's `pK`) except in those defining lines. Checked on a template text:
-/// the registered one, or a mutated copy of it.
+/// `p0` is only `ptrue p0.d`; the all-true counter `pn8` is only `ptrue
+/// pn8.d` and governs nothing but the buffer stores of the packing pass
+/// (`st1d {{…}}, pn8, [x6…]`): an A load under it would read rows `≥ m`. A
+/// write in any form counts: a braced destination list (`whilelt {{p2.d,
+/// p3.d}}, …`, `pext {{…}}, pn…[i]`), a register range, or the other name of
+/// a register (`p9` is `pn9`). No predicate appears outside a governing
+/// position (`pK/z`, `pK/m`, a store's `pK`) except in those defining
+/// lines. Checked on a template text: the registered one, or a mutated copy
+/// of it.
 fn check_row_predicates(template: &str) -> Result<(), String> {
     let sections = sections(template);
     let row_panel = section(&sections, 30);
@@ -576,7 +620,7 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
         return Err(format!("the row-panel predicate setup: {setup:?}"));
     }
     let mut a_predicates = Vec::new();
-    let mut p0_writes = 0_usize;
+    let (mut p0_writes, mut p8_writes) = (0_usize, 0_usize);
     for (label, lines) in &sections {
         for line in lines {
             for PredicateUse {
@@ -585,13 +629,22 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
                 governing,
             } in predicate_uses(line)
             {
-                if !matches!(register, 0 | 1 | 2 | 9 | 10) {
+                if !matches!(register, 0 | 1 | 2 | 8 | 9 | 10) {
                     return Err(format!(
                         "section {label}: p{register} is not a predicate of this kernel: {line:?}"
                     ));
                 }
                 if !written {
                     if governing {
+                        if register == 8
+                            && !(is_store(line)
+                                && (line.contains(", pn8, [x6]") || line.contains(", pn8, [x6, #")))
+                        {
+                            return Err(format!(
+                                "section {label}: the all-true counter pn8 governs a statement \
+                                 that is not a buffer store: {line:?}"
+                            ));
+                        }
                         continue;
                     }
                     return Err(format!(
@@ -601,6 +654,7 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
                 }
                 let defining = match register {
                     0 => *line == "ptrue p0.d",
+                    8 => *label == 0 && *line == "ptrue pn8.d",
                     1 => (51..=54).contains(label) && *line == "whilelt p1.d, x13, x20",
                     _ => *label == 30 && ROW_PANEL_SETUP.contains(line),
                 };
@@ -612,6 +666,7 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
                 }
                 match register {
                     0 => p0_writes += 1,
+                    8 => p8_writes += 1,
                     1 => {}
                     _ => a_predicates.push((*label, *line)),
                 }
@@ -627,6 +682,9 @@ fn check_row_predicates(template: &str) -> Result<(), String> {
     }
     if p0_writes != 1 {
         return Err(format!("`ptrue p0.d` occurs {p0_writes} times"));
+    }
+    if p8_writes != 1 {
+        return Err(format!("`ptrue pn8.d` occurs {p8_writes} times"));
     }
     Ok(())
 }
@@ -645,16 +703,20 @@ struct Mutant {
 fn test_sme2_kernel_f64_predicate_checker_rejects_mutants() {
     // Wrong templates that the lint accepts and that a first-operand-only
     // parse does not see: each widens or moves an A-row predicate, so A
-    // loads may read rows >= m (which no result test can observe).
-    const MUTANTS: [Mutant; 6] = [
+    // loads may read rows >= m (which no result test can observe), or
+    // narrows the all-true counter of the buffer stores. The anchors are
+    // variant labels (each occurs once; the zeroing lines occur in both the
+    // plain variants 41-48 and the packing twins 141-148), the last four in
+    // the packing pass.
+    const MUTANTS: [Mutant; 9] = [
         Mutant {
             label: "p2 from row 0 through the pair form (second row panel reads rows >= m)",
-            edits: &[("zero {{za0.d}}", &["whilelt {{p2.d, p3.d}}, xzr, x20"])],
+            edits: &[("41:", &["whilelt {{p2.d, p3.d}}, xzr, x20"])],
             culprit: "whilelt {{p2.d, p3.d}}, xzr, x20",
         },
         Mutant {
             label: "the pair form as a register range",
-            edits: &[("zero {{za0.d}}", &["whilelt {{p2.d-p3.d}}, xzr, x20"])],
+            edits: &[("41:", &["whilelt {{p2.d-p3.d}}, xzr, x20"])],
             culprit: "whilelt {{p2.d-p3.d}}, xzr, x20",
         },
         Mutant {
@@ -673,9 +735,24 @@ fn test_sme2_kernel_f64_predicate_checker_rejects_mutants() {
             culprit: "sel p10.b, p0, p0.b, p10.b",
         },
         Mutant {
-            label: "a second pn9 with other operands, in a variant",
-            edits: &[("zero {{za0.d, za1.d}}", &["whilelt pn9.d, xzr, x20, vlx4"])],
+            label: "a second pn9 with other operands, in a packing twin",
+            edits: &[("142:", &["whilelt pn9.d, xzr, x20, vlx4"])],
             culprit: "whilelt pn9.d, xzr, x20, vlx4",
+        },
+        Mutant {
+            label: "the all-true counter narrowed in a packing twin (partial buffer stores)",
+            edits: &[("145:", &["whilelt pn8.d, x10, x20, vlx4"])],
+            culprit: "whilelt pn8.d, x10, x20, vlx4",
+        },
+        Mutant {
+            label: "an A load of the packing pass under the all-true counter (rows >= m)",
+            edits: &[("147:", &["ld1d {{z0.d-z3.d}}, pn8/z, [x14]"])],
+            culprit: "ld1d {{z0.d-z3.d}}, pn8/z, [x14]",
+        },
+        Mutant {
+            label: "pn8 copied into pn10 through its other name p10 (sel)",
+            edits: &[("148:", &["sel p10.b, p0, p8.b, p10.b"])],
+            culprit: "sel p10.b, p0, p8.b, p10.b",
         },
     ];
     let registered = SME_KERNELS[0].template;
@@ -775,11 +852,154 @@ fn check_a_loads(sections: &[(usize, Vec<&str>)]) {
     }
 }
 
+/// The packing twin `14L` (label 141..148, its loop 16L and its remainder
+/// 17L) loads every depth step of A whole: the first group `[x14]` (rows
+/// `i0..+31`) under `pn9/z` and the second `[x14, #4, mul vl]` (rows
+/// `i0+32..+63`) under `pn10/z`, four vectors each, into `z0` / `z4` for
+/// step `p` and `z16` / `z20` for step `p + 1` of a pair, in every twin
+/// (rows `≥ m`, and with them the tiles without a live row, are inactive
+/// lanes: not read, `+0`). B loads as in the plain variants. Its only stores
+/// are those A groups, whole (all-true counter `pn8`), through the buffer
+/// register `x6`, each at the vector offset that the plain packed layout
+/// gives it: rows `32g..` of the step `s` of a pair (`s = 0, 1`) at
+/// `#(4g + 8s), mul vl`, so group `z0` / `z4` / `z16` / `z20` at `#0` /
+/// `#4` / `#8` / `#12`; per twin a pair stores all four groups once and the
+/// remainder the two of its step.
+fn check_packing_pass(sections: &[(usize, Vec<&str>)]) {
+    for live in 1..=8_usize {
+        let label = 140 + live;
+        let (mut first_group, mut second_group) = (0, 0);
+        let mut stored = Vec::new();
+        for line in section(sections, label) {
+            let Some((register, width, predicate, address)) = vector_access(line) else {
+                assert!(
+                    !is_load(line) && !is_store(line),
+                    "twin {label}: unexpected memory access `{line}`"
+                );
+                continue;
+            };
+            if is_store(line) {
+                let offset = match address {
+                    "x6" => Some(0),
+                    other => other
+                        .strip_prefix("x6, #")
+                        .and_then(|rest| rest.strip_suffix(", mul vl"))
+                        .and_then(|k| k.parse::<usize>().ok()),
+                };
+                let Some(offset) = offset else {
+                    panic!("twin {label}: a store outside the buffer register x6: `{line}`");
+                };
+                assert_eq!(
+                    (width, predicate),
+                    (4, "pn8"),
+                    "twin {label}: not a whole group of four: `{line}`"
+                );
+                let (group, step) = (register % 16 / 4, register / 16);
+                assert!(
+                    matches!(register, 0 | 4 | 16 | 20),
+                    "twin {label}: stores z{register}, not an A group: `{line}`"
+                );
+                assert_eq!(
+                    offset,
+                    4 * group + 8 * step,
+                    "twin {label}: group z{register} stored at the wrong offset: `{line}`"
+                );
+                stored.push(register);
+                continue;
+            }
+            assert!(is_load(line), "twin {label}: `{line}`");
+            match address {
+                // B rows: the packed panel is zero-padded, loaded all-true.
+                "x15" | "x15, #1, mul vl" => {
+                    assert_eq!(
+                        (width, predicate),
+                        (1, "p0/z"),
+                        "twin {label}: B load `{line}`"
+                    );
+                }
+                "x14" => {
+                    assert_eq!(
+                        (width, predicate),
+                        (4, "pn9/z"),
+                        "twin {label}: first A group `{line}`"
+                    );
+                    assert!(
+                        register == 0 || register == 16,
+                        "twin {label}: first A group in z{register}: `{line}`"
+                    );
+                    first_group += 1;
+                }
+                "x14, #4, mul vl" => {
+                    assert_eq!(
+                        (width, predicate),
+                        (4, "pn10/z"),
+                        "twin {label}: second A group `{line}`"
+                    );
+                    assert!(
+                        register == 4 || register == 20,
+                        "twin {label}: second A group in z{register}: `{line}`"
+                    );
+                    second_group += 1;
+                }
+                _ => panic!("twin {label}: load from an unexpected address `{line}`"),
+            }
+        }
+        // Two depth steps in the loop and one in the remainder.
+        assert_eq!(
+            (first_group, second_group),
+            (3, 3),
+            "twin {label}: loads of A rows i0..+31 and i0+32..+63"
+        );
+        stored.sort_unstable();
+        assert_eq!(stored, [0, 0, 4, 4, 16, 20], "twin {label}: buffer stores");
+    }
+}
+
+/// The prefetch hints: only in the row-panel section (30), before the
+/// depth loops, each `prfm pldl2keep` at `[x14]` plus the start of one
+/// 8-row tile (`#64t`, `t` = 0..7, each once and in order). Where `x14`
+/// points (the live columns of C) and that the chain stops at the last live
+/// tile is the interpreter's proof (`tests_kernel_f64_online.rs`).
+fn check_prefetch(sections: &[(usize, Vec<&str>)]) {
+    let mut offsets = Vec::new();
+    for (label, lines) in sections {
+        for line in lines {
+            if mnemonic(line) != "prfm" {
+                continue;
+            }
+            assert_eq!(
+                *label, 30,
+                "a prefetch hint outside the row panel: `{line}`"
+            );
+            let rest = line
+                .strip_prefix("prfm pldl2keep, [x14")
+                .and_then(|rest| rest.strip_suffix(']'));
+            let offset = match rest {
+                Some("") => Some(0),
+                Some(rest) => rest
+                    .strip_prefix(", #")
+                    .and_then(|k| k.parse::<usize>().ok()),
+                None => None,
+            };
+            let Some(offset) = offset else {
+                panic!("not a `prfm pldl2keep, [x14, #imm]` hint: `{line}`");
+            };
+            offsets.push(offset);
+        }
+    }
+    let tile_bytes = 8 * core::mem::size_of::<f64>();
+    let want: Vec<usize> = (0..8).map(|t| t * tile_bytes).collect();
+    assert_eq!(offsets, want, "the prefetch hints of a column");
+}
+
 /// C is read and written only under the epilogue's row predicate `p1`
 /// (rows of the tile below `m`), at the slice address `x15`; M0 (51) and M2
 /// (53) contain no load at all; M1 (52) and M3 (54) load only the C column
 /// of the slice. No other section of the body reads or writes memory, except
-/// the prologue's reads of the argument block.
+/// the prologue's reads of the argument block and the depth loops (A and B
+/// loads, and the buffer stores of the packing twins, checked by
+/// [`check_a_loads`] and [`check_packing_pass`]); a prefetch hint is no
+/// access ([`check_prefetch`]).
 fn check_epilogue_memory(sections: &[(usize, Vec<&str>)]) {
     const C_LOAD: &str = "ld1d {{z17.d}}, p1/z, [x15]";
     for (label, lines) in sections {
@@ -799,8 +1019,8 @@ fn check_epilogue_memory(sections: &[(usize, Vec<&str>)]) {
                 );
                 assert!(stores.is_empty(), "the prologue stores: {stores:?}");
             }
-            // Checked by `check_a_loads`.
-            41..=48 => {}
+            // Checked by `check_a_loads` and `check_packing_pass`.
+            41..=48 | 141..=148 => {}
             51..=54 => {
                 let mode = label - 51;
                 if mode % 2 == 0 {
@@ -1082,7 +1302,7 @@ const EARLIER: [u64; 6] = [
 /// FPSR after one call that starts from `before`, and the call's C.
 fn fpsr_across(ops: &Operands, c: &mut CBlock, alpha: f64, beta: f64, before: u64) -> u64 {
     let args = std::hint::black_box(ops.args(c, alpha, beta));
-    assert!(detect::thread_ready());
+    assert!(kernel_ready());
     let saved = fpsr_read();
     fpsr_write(before);
     // SAFETY: as in `run` (the caller passed the hardware gate).
@@ -1289,9 +1509,13 @@ fn pack_cols(b: &[f64], kc: usize, n: usize, nr: usize) -> Vec<f64> {
     packed
 }
 
-/// The NEON blocked product `C = alpha * A * B + beta * C` of the same
-/// operands (`ldc = m`).
-fn neon_product(
+/// The blocked product `C = alpha * A * B + beta * C` of the same operands
+/// (`ldc = m`) with the dispatched micro-kernel
+/// (`f64::micro_kernel_dispatch()`) on panels packed for its shape: the NEON
+/// micro-kernel, except in a `force-scalar` build, where it is the portable
+/// one, whose epilogue rounds differently (`alpha · acc + beta · C` as one
+/// `mul_add` of a rounded `beta · C`; see `tests_contract.rs`).
+fn dispatched_product(
     a: &[f64],
     b: &[f64],
     (m, n, kc): (usize, usize, usize),
@@ -1331,17 +1555,22 @@ fn test_sme2_kernel_f64_thread_state_and_interleaving() {
     let (alpha, beta) = (0.75, -0.5);
     let fresh_c = || CBlock::new(m, n, |i, j| c0[i + j * m]);
 
+    // The dispatched micro-kernel is the NEON one unless the build forces
+    // the portable kernel (`max-simd-*` caps leave NEON in place on
+    // aarch64): only then does the contract make it bit-equal to SME2.
+    let dispatched_is_neon = selected_kernel_kind() == GemmKernelKind::Neon;
     let mut first: Option<Vec<u64>> = None;
-    let mut neon_first: Option<Vec<u64>> = None;
+    let mut dispatched_first: Option<Vec<u64>> = None;
     let mut scalar = std::hint::black_box(1.0_f64);
     for round in 0..120_u32 {
         let mut c = fresh_c();
-        assert!(detect::thread_ready(), "round {round}: thread not ready");
-        let entries = kernel_entries();
+        assert!(kernel_ready(), "round {round}: thread not ready");
+        let entries = kernel_entries_here();
         let want = run(&ops, &mut c, alpha, beta);
-        assert!(
-            kernel_entries() > entries,
-            "round {round}: entry not counted"
+        assert_eq!(
+            kernel_entries_here(),
+            entries + 1,
+            "round {round}: kernel entries on this thread"
         );
         assert_eq!(
             sme_state(),
@@ -1355,30 +1584,39 @@ fn test_sme2_kernel_f64_thread_state_and_interleaving() {
             Some(first) => assert_eq!(first, &bits, "round {round}: SME2 result changed"),
         }
 
-        // NEON work on the same thread, then scalar f64 work kept live
-        // across the next kernel call. The NEON blocked path computes the
-        // same call (same alpha, beta and initial C), and the contract makes
-        // it bit-equal to the SME2 block: compare the two backends directly.
-        let mut neon_c = c0.clone();
-        neon_product(&a, &b, (m, n, kc), (alpha, beta), &mut neon_c);
+        // Blocked work with the dispatched micro-kernel on the same thread,
+        // then scalar f64 work kept live across the next kernel call. The
+        // blocked product computes the same call (same alpha, beta and
+        // initial C). Where the dispatched micro-kernel is the NEON one, the
+        // contract makes it bit-equal to the SME2 block: compare the two
+        // backends directly. Under `force-scalar` it is the portable kernel,
+        // whose epilogue rounds differently (`tests_contract.rs` skips the
+        // same comparison there): the work still runs between the kernel
+        // calls and must repeat its own bits, but it is not compared with
+        // SME2.
+        let mut dispatched_c = c0.clone();
+        dispatched_product(&a, &b, (m, n, kc), (alpha, beta), &mut dispatched_c);
         for j in 0..n {
             for i in 0..m {
-                let (sme2, neon) = (c.data[i + (j + 1) * c.ldc], neon_c[i + j * m]);
+                let (sme2, neon) = (c.data[i + (j + 1) * c.ldc], dispatched_c[i + j * m]);
                 assert!(
-                    same_result(sme2, neon),
+                    !dispatched_is_neon || same_result(sme2, neon),
                     "round {round}: C({i}, {j}) SME2 {sme2:e} ({:#x}), NEON {neon:e} ({:#x})",
                     sme2.to_bits(),
                     neon.to_bits()
                 );
             }
         }
-        let neon_bits: Vec<u64> = neon_c.iter().map(|v| v.to_bits()).collect();
-        match &neon_first {
-            None => neon_first = Some(neon_bits),
-            Some(first) => assert_eq!(first, &neon_bits, "round {round}: NEON result changed"),
+        let dispatched_bits: Vec<u64> = dispatched_c.iter().map(|v| v.to_bits()).collect();
+        match &dispatched_first {
+            None => dispatched_first = Some(dispatched_bits),
+            Some(first) => assert_eq!(
+                first, &dispatched_bits,
+                "round {round}: the dispatched blocked result changed"
+            ),
         }
         scalar = std::hint::black_box(scalar.mul_add(1.000_001, f64::from(round)));
     }
     assert!(scalar.is_finite() && scalar > 1.0);
-    assert!(detect::thread_ready());
+    assert!(kernel_ready());
 }

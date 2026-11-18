@@ -393,7 +393,7 @@ fn test_edge_tiles_every_remainder() {
         let (m0, n0) = (64, 48);
         let canonical = T::micro_kernel_shape();
         let planned = GemmPlan::<T>::for_problem(DEFAULT_POLICY, m0, n0, k)
-            .kernel
+            .micro_kernel()
             .shape;
         for dm in 0..canonical.mr.max(planned.mr) {
             for dn in 0..canonical.nr.max(planned.nr) {
@@ -595,14 +595,22 @@ fn test_strided_c_view_and_border_untouched() {
 
 #[test]
 fn test_pack_cache_stays_bounded_after_oversized_gemm() {
-    // 8 x 416 x 4096 (short-wide) with the auto-tuned blocking passed
-    // explicitly, so no B-block cap can shrink it (a capping policy would
-    // make this test vacuous): the packed B panel is about 416 x 4098 f64,
-    // some 13.6 MB, above the cache limit, so it must be freed on return.
+    // 8 x 416 x 4096 (short-wide) with an explicit blocking of one KC block
+    // and one NC block. Explicit targets are never capped (a capping policy
+    // would make this test vacuous) and do not depend on the machine's cache
+    // sizes, which the auto-tuned blocking follows (a small L2 gives a KC far
+    // below 416): the packed B panel is 416 x 4096 f64 (whole NR columns),
+    // some 13.6 MB, above the cache limit on every machine, so it must be
+    // freed on return.
     let (m, k, n) = (8usize, 416usize, 4096usize);
     let shape = f64::micro_kernel_shape();
-    let targets = GemmBlocking::auto_tuned::<f64>(m, k, n, &shape);
+    let targets = GemmBlocking::custom(64, k, n.next_multiple_of(shape.nr), &shape);
     let fitted = targets.fit_to_dims(m, k, n, &shape);
+    assert_eq!(
+        (fitted.kc, fitted.nc >= n),
+        (k, true),
+        "{fitted:?}: one KC block and one NC block"
+    );
     let b_bytes = fitted.kc * fitted.nc.div_ceil(shape.nr) * shape.nr * 8;
     assert!(
         b_bytes > PACK_CACHE_MAX_BYTES,
@@ -1045,7 +1053,7 @@ fn test_issue_23_b_cap_shallow_leaves_room_for_a() {
     };
     let capped = GemmPlan::<f64>::new(policy).with_forced_route(GemmRoute::Blocked);
     let (uncapped, _) = b_cap_plans::<f64>();
-    let shape = capped.kernel.shape;
+    let shape = capped.micro_kernel().shape;
     let (mc, kc) = (64usize, 128usize);
     assert_eq!(mc % shape.mr, 0);
     // n is two blocks of the plain cap's NC, so that cap would give a B block

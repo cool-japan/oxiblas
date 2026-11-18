@@ -82,6 +82,31 @@
 //! runs, one per thread, and every part runs the same kernel on its rows
 //! (axpy form) or columns (dot form) of the large operand. The kernels are
 //! position-independent, so the result is bit for bit the sequential one.
+//!
+//! # SME2
+//!
+//! With the `sme2` feature on aarch64, the GEMV of a production plan (one of
+//! the public entry points: no forced route, scope or micro-kernel) first
+//! goes to the SME2 GEMV (`level2::gemv::sme2::try_gemv`, on the
+//! column-major operand: `NoTrans` for the axpy form, `Trans` for the dot
+//! form, with the caller's `Par`). It takes `f64` / `f32` past its size
+//! crossover while the backend is active, and gives the bits of the NEON
+//! GEMV kernels (NaN sign and payload aside), which on aarch64 are this
+//! route's bits; otherwise the kernels above run.
+//!
+//! # When the thin route is taken
+//!
+//! Only where the route policy turns it on (`GemmPolicy::thin`). The
+//! default policy of an aarch64 build without `force-scalar` takes it for
+//! the thin products of the measured scope (`ThinPolicy::Scoped`: both
+//! operands stored column-major, on the NEON tier; every such thin product
+//! above 32³ multiply-adds and, from 1024 up to 32³, four layouts;
+//! `RouteInputs::thin_in_scope` states the rule), so those calls give this
+//! route's bits instead of 0.2.3's (the rule about result bits: the module
+//! docs of `gemm_policy`). A thin product with a transposed or strided view
+//! as an operand, and every thin product on the portable tier, keeps the
+//! route of 0.2.3. The default policy of every other build, and of every
+//! build with `--cfg oxiblas_gemm_legacy`, never takes it.
 
 use super::gemm_kernel::GemmKernel;
 use super::gemm_packing::{PackBuffer, PackSlot};
@@ -202,9 +227,19 @@ fn thin_kernels<T: Field>(tier: SimdTier) -> Option<ThinKernels<T>> {
 /// large operand has no unit stride. The operand shapes must be consistent
 /// (the GEMM core checks them), and `alpha == 0` / `k == 0` must have been
 /// handled by the caller.
+///
+/// With the `sme2` feature on aarch64, `production` says whether the call's
+/// plan is one of the public entry points (`GemmPlan::is_production`): only
+/// then the GEMV of either branch first goes to the SME2 GEMV
+/// (`gemv::sme2::try_gemv` on the column-major operand, `NoTrans` for the
+/// axpy form and `Trans` for the dot form), which gives the bits of the NEON
+/// GEMV kernels, so of this route on aarch64; when it declines (below its
+/// crossover, without the backend, a thread that is not ready) the kernels
+/// below run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_thin<T: Field + GemmKernel + bytemuck::Zeroable>(
     ctx: GemmContext,
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))] production: bool,
     trans_a: Trans,
     trans_b: Trans,
     alpha: T,
@@ -233,6 +268,10 @@ pub(crate) fn gemm_thin<T: Field + GemmKernel + bytemuck::Zeroable>(
             return false;
         };
         scale_like_gemv(beta, y);
+        #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+        if production && sme2_gemv(form, alpha, s, x, y, par) {
+            return true;
+        }
         run_split(kernels, form, alpha, s, x, y, thin_threads(&ctx, &s, par));
         return true;
     }
@@ -256,6 +295,11 @@ pub(crate) fn gemm_thin<T: Field + GemmKernel + bytemuck::Zeroable>(
             }
             scale_like_gemv(beta, y);
         }
+        #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+        if !(production && sme2_gemv(form, alpha, s, x, y, par)) {
+            run_split(kernels, form, alpha, s, x, y, thin_threads(&ctx, &s, par));
+        }
+        #[cfg(not(all(feature = "sme2", target_arch = "aarch64")))]
         run_split(kernels, form, alpha, s, x, y, thin_threads(&ctx, &s, par));
         for (j, &yj) in y.iter().enumerate() {
             c.set(0, j, yj);
@@ -263,6 +307,66 @@ pub(crate) fn gemm_thin<T: Field + GemmKernel + bytemuck::Zeroable>(
         return true;
     }
     false
+}
+
+/// [`gemm_thin`] as the GEMM core calls it: never inlined, with the operands
+/// by value.
+///
+/// Only thin products come here, and the GEMM core must stay small and must
+/// not hand out the address of its operands: inlined into the core, this
+/// route made the compiler keep the small routes out of line, and a callee
+/// that takes `&a`, `&b` and `&mut c` makes the core copy its operands to
+/// the stack on entry and read them back, on every call (together 4 to 6 ns
+/// per call on an Apple M3, against 8 to 50 ns for the products up to 8³).
+/// By value, the copies are made at this call, on the thin route only.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn gemm_thin_route<T: Field + GemmKernel + bytemuck::Zeroable>(
+    ctx: GemmContext,
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))] production: bool,
+    trans_a: Trans,
+    trans_b: Trans,
+    alpha: T,
+    a: MatRef<'_, T>,
+    b: MatRef<'_, T>,
+    beta: T,
+    mut c: MatMut<'_, T>,
+    par: Par,
+) -> bool {
+    gemm_thin(
+        ctx,
+        #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+        production,
+        trans_a,
+        trans_b,
+        alpha,
+        &a,
+        &b,
+        beta,
+        &mut c,
+        par,
+    )
+}
+
+/// The GEMV of `form` on the column-major `s` on SME2 (`gemv::sme2::try_gemv`
+/// with `NoTrans` for the axpy form and `Trans` for the dot form): `true`
+/// when it computed `y += alpha·op(s)·x`, `false` (y untouched) when it
+/// declined. `y` is already scaled by `beta` and `alpha != 0`.
+#[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+#[inline]
+fn sme2_gemv<T: Field>(
+    form: Form,
+    alpha: T,
+    s: MatRef<'_, T>,
+    x: &[T],
+    y: &mut [T],
+    par: Par,
+) -> bool {
+    let trans = match form {
+        Form::Axpy => crate::level2::gemv::GemvTrans::NoTrans,
+        Form::Dot => crate::level2::gemv::GemvTrans::Trans,
+    };
+    crate::level2::gemv::sme2::try_gemv(trans, alpha, s, x, y, par)
 }
 
 /// `y := beta·y` exactly as [`gemv`](fn@crate::level2::gemv) does it: zeros
@@ -375,6 +479,8 @@ fn run_split<T: Scalar + Send + Sync>(
     use rayon::prelude::*;
 
     let len = part_len(y.len(), threads);
+    #[cfg(test)]
+    count_thin_split(threads > 1, threads > 1 && len < y.len());
     if threads <= 1 || len >= y.len() {
         run(kernels, form, alpha, s, x, y);
         return;
@@ -388,6 +494,72 @@ fn run_split<T: Scalar + Send + Sync>(
         };
         run(kernels, form, alpha, sub, x, part);
     });
+}
+
+/// The parallel thin calls of one thread (test hook, see [`thin_splits`]).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ThinSplits {
+    /// Calls whose work gate gave more than one thread.
+    pub(crate) gated: usize,
+    /// Calls among those whose `y` was split into more than one part.
+    pub(crate) split: usize,
+}
+
+#[cfg(all(test, feature = "parallel"))]
+thread_local! {
+    /// The parallel thin calls made on this thread (test hook; counted on the
+    /// calling thread, before the split).
+    static THIN_SPLITS: core::cell::Cell<ThinSplits> =
+        const { core::cell::Cell::new(ThinSplits { gated: 0, split: 0 }) };
+}
+
+/// Counts one thin call on this thread: `gated` when its work gate gave more
+/// than one thread, `split` when `y` was split.
+#[cfg(all(test, feature = "parallel"))]
+fn count_thin_split(gated: bool, split: bool) {
+    let _ = THIN_SPLITS.try_with(|runs| {
+        let ThinSplits {
+            gated: gated_runs,
+            split: split_runs,
+        } = runs.get();
+        runs.set(ThinSplits {
+            gated: gated_runs + usize::from(gated),
+            split: split_runs + usize::from(split),
+        });
+    });
+}
+
+/// The parallel thin calls made on this thread so far (test hook; always
+/// zero without `parallel`).
+#[cfg(test)]
+pub(crate) fn thin_splits() -> ThinSplits {
+    #[cfg(feature = "parallel")]
+    {
+        THIN_SPLITS
+            .try_with(core::cell::Cell::get)
+            .unwrap_or_default()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        ThinSplits::default()
+    }
+}
+
+/// Whether a thin call whose `y` has `len` elements is split into more than
+/// one part on `threads` threads once its work gate has passed (test hook;
+/// the rule of `run_split`, never without `parallel`).
+#[cfg(test)]
+pub(crate) fn thin_split_expected(len: usize, threads: usize) -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        threads > 1 && part_len(len, threads) < len
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = (len, threads);
+        false
+    }
 }
 
 /// Without `parallel` there is one thread: the kernel of `form` on all of
@@ -613,4 +785,4 @@ mod avx2;
 
 #[cfg(test)]
 #[path = "gemm_thin_tests.rs"]
-mod tests;
+pub(crate) mod tests;

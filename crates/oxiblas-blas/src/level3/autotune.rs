@@ -1379,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_issue_23_b_cap_follows_the_thread_cache_limit() {
-        // `capped_nc` (what `gemm::call_blocking` calls) uses the calling
+        // `capped_nc` (what `gemm::call_blocking_for` calls) uses the calling
         // thread's packing-cache limit, so the room it leaves for A always
         // matches the limit the cache enforces.
         use crate::level3::gemm_packing::set_pack_cache_limit;

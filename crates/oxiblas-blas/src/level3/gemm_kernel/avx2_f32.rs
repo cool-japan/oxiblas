@@ -4,8 +4,9 @@
 //! The f32 16×6 AVX2 + FMA micro-kernel (x86-64 only).
 //!
 //! It is never the canonical f32 kernel (`f32::micro_kernel_dispatch()` stays
-//! the 8×8 kernel on the AVX2 tier); a GEMM call's plan carries it when
-//! `kernel_for_problem` picks it for the problem's shape.
+//! the 8×8 kernel on the AVX2 tier); a GEMM call's blocked route uses it when
+//! `kernel_for_problem`, which resolves the micro-kernel for the call when
+//! that route starts, picks it for the problem's shape.
 //!
 //! # Bitwise contract
 //!

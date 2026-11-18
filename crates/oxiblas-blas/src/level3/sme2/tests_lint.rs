@@ -124,6 +124,7 @@ fn test_sme2_lint_accepts_spike_verified_instructions() {
         "incw x1",
         "cntp x1, pn9.s, vlx4",
         "pext p1.s, pn9[0]",
+        "psel p5, p1, p2.b[w13, 0]",
         "str za[w12, 15], [x6, #15, mul vl]",
         "movprfx z16, z17",
         "sel z20.s, p0, z21.s, z22.s",

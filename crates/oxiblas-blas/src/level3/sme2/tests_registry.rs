@@ -3,19 +3,24 @@
 //! every rule of the scan rejects a source that breaks it.
 //!
 //! [`registry`] is the one list of registered modules. A module that gets its
-//! first `sme_kernels!` invocation (Wave 4 `pack_za.rs`, Wave 5
-//! `level2/gemv/sme2.rs`) adds its `SME_KERNELS` here; until it does, the scan
-//! fails and names the module.
+//! first `sme_kernels!` invocation adds its `SME_KERNELS` here; until it does,
+//! the scan fails and names the module.
 
 use super::*;
+use crate::level2::gemv::sme2 as gemv_sme2;
 use crate::level3::sme2::lint::{lint_kernel, lint_probe_template, report};
-use crate::level3::sme2::{detect, kernel_f32, kernel_f64, test_support, tests_smoke};
+use crate::level3::sme2::{
+    detect, few_rows, fpstate, kernel_f32, kernel_f64, pack_za, tests_smoke,
+};
 
 /// Every registered streaming kernel of the crate.
 fn registry() -> Vec<KernelEntry> {
     [
         kernel_f32::SME_KERNELS,
         kernel_f64::SME_KERNELS,
+        few_rows::SME_KERNELS,
+        pack_za::SME_KERNELS,
+        gemv_sme2::SME_KERNELS,
         tests_smoke::SME_KERNELS,
     ]
     .concat()
@@ -64,11 +69,12 @@ fn test_sme2_registry_lints_every_registered_kernel() {
             panic!("{} ({}):\n{}", entry.name, entry.file, report(&errors));
         }
     }
-    // The other templates of the module: the probe and the FPSR accessors.
+    // The other templates of the module: the probe and the FPSR accessors
+    // (the FPCR accessors: `tests_asm_sites.rs`).
     if let Err(errors) = lint_probe_template(detect::PROBE_TEMPLATE) {
         panic!("probe: {}", report(&errors));
     }
-    for template in test_support::FPSR_TEMPLATES {
+    for template in fpstate::FPSR_TEMPLATES {
         if let Err(errors) = crate::level3::sme2::lint::lint_fpsr_template(template) {
             panic!("{template}: {}", report(&errors));
         }
@@ -282,8 +288,8 @@ fn test_sme2_registry_scan_rejects_unregistered_regions() {
 
 #[test]
 fn test_sme2_registry_scan_covers_the_gemv_directory() {
-    // Today the GEMV directory has no SME code; when Wave 5 adds
-    // `level2/gemv/sme2.rs` with kernels, they must be registered.
+    // `level2/gemv/sme2.rs` holds the SME2 GEMV kernels: they must be
+    // registered.
     let path = "level2/gemv/sme2.rs";
     let module = kernel_module(&["gemv_notrans_f32"]);
     let problems = check_sources(&sources(&[(path, &module)]), &[]);

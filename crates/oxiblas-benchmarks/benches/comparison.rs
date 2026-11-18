@@ -25,8 +25,15 @@
 //! dimensions match, and neither side allocates inside the measured loop.
 //! The sequential groups run OpenBLAS on one thread, whatever
 //! `OPENBLAS_NUM_THREADS` says: startup sets the count through
-//! `openblas_set_num_threads` and, in OpenMP builds, `omp_set_num_threads`, and
-//! panics if a threaded GEMM still uses more than one core of CPU time. The
+//! `openblas_set_num_threads` and, in OpenMP builds, `omp_set_num_threads`.
+//! Startup then times one 1024 x 1024 DGEMM and measures the CPU time it
+//! used. The workers of a pthread build busy-wait for a while after the
+//! library is loaded, so a reading of 1.5 cores or more is taken again after
+//! a pause of 1 s, up to 30 pauses; startup panics if the GEMM still uses
+//! 1.5 cores or more after that, and otherwise prints the reading and the
+//! number of pauses it needed. With `OPENBLAS_NUM_THREADS=1` in the
+//! environment no worker exists at load and no pause is needed; the parallel
+//! groups still get their threads, because they set the count themselves. The
 //! `*_parallel_comparison` groups give both libraries the same thread count:
 //! `RAYON_NUM_THREADS` when it is set, otherwise every available core.
 //!
@@ -50,12 +57,17 @@
 //! ### GEMM shapes (single-threaded)
 //! - `sgemm_narrow_comparison`: f32 with 8, 12, 16 or 24 rows or columns of C
 //!   against 4096 x 4096
-//! - `gemm_small_comparison`, `sgemm_small_comparison`: cubes from 5 to 80 and
-//!   small rectangles, plain and with transposed operands
+//! - `gemm_small_comparison`, `sgemm_small_comparison`: plain (NN) cubes
+//!   from 5 to 96 and small rectangles, and TN, NT and TT cubes from 4 to 80
+//!   and rectangles: the shapes of the A/B harness groups
+//!   `ab_seq_small_simd` and `ab_seq_small_trans_copy` (in `oxiblas-blas`),
+//!   plus 33 x 47 x 29 in every transposition pair. These two groups warm up
+//!   for 1 s and measure for 2 s per benchmark.
 //! - `gemm_thin_comparison`, `sgemm_thin_comparison`: one row or one column of
 //!   C with k from 256 to 16384, either operand plain or transposed
 //! - `gemm_short_wide_comparison`: the m x k x n shapes of issue #23,
-//!   (64, 512, 32768), (128, 256, 16384) and (32, 1024, 32768), f64 and f32
+//!   (64, 512, 32768), (128, 256, 16384) and (32, 1024, 32768), and
+//!   (1024, 256, 16384), f64 and f32 (the B-cap targets of the A/B harness)
 //!
 //! These groups name their cases `<op(A)><op(B)>/<m>x<k>x<n>` (`N` plain,
 //! `T` transposed), and call OpenBLAS through `openblas::{dgemm_t, sgemm_t}`.
@@ -83,6 +95,7 @@ use std::hint::black_box;
 use std::num::NonZero;
 use std::sync::Once;
 use std::thread;
+use std::time::Duration;
 
 // OxiBLAS imports
 use oxiblas_blas::level1::{axpy, dot, nrm2};
@@ -1289,25 +1302,55 @@ fn bench_sgemm_narrow_comparison(c: &mut Criterion) {
     group.finish();
 }
 
-/// Small products: cubes from 5 to 80 and rectangles, plain (NN), and cubes
-/// from 8 to 80 and one rectangle with transposed operands (TN, NT, TT).
+/// Plain (NN) small products: the cubes and rectangles of the A/B harness
+/// group `ab_seq_small_simd`, and 33 x 47 x 29 (odd sizes in every
+/// dimension).
+const SMALL_NN_SHAPES: [(usize, usize, usize); 18] = [
+    (5, 5, 5),
+    (8, 8, 8),
+    (12, 12, 12),
+    (16, 16, 16),
+    (24, 24, 24),
+    (32, 32, 32),
+    (40, 40, 40),
+    (48, 48, 48),
+    (64, 64, 64),
+    (80, 80, 80),
+    (96, 96, 96),
+    (4, 64, 4),
+    (5, 256, 4),
+    (8, 512, 8),
+    (16, 128, 64),
+    (64, 8, 64),
+    (40, 32, 80),
+    (33, 47, 29),
+];
+
+/// Cubes of the A/B harness group `ab_seq_small_trans_copy`, timed in TN, NT
+/// and TT.
+const SMALL_TRANS_CUBES: [usize; 11] = [4, 6, 8, 12, 16, 24, 32, 40, 48, 64, 80];
+
+/// Rectangles of `ab_seq_small_trans_copy`, timed in TN and NT only.
+const SMALL_TRANS_RECTANGLES: [(usize, usize, usize); 3] = [(16, 64, 8), (32, 8, 48), (8, 128, 16)];
+
+/// Small products, with the shapes of the A/B harness groups
+/// `ab_seq_small_simd` (plain, [`SMALL_NN_SHAPES`]) and
+/// `ab_seq_small_trans_copy` (TN, NT and TT over [`SMALL_TRANS_CUBES`]; TN and
+/// NT also over [`SMALL_TRANS_RECTANGLES`]), plus 33 x 47 x 29 in every
+/// transposition pair: 60 cases, 120 benchmarks per element type.
+///
+/// Each benchmark warms up for 1 s and is measured for 2 s (criterion's
+/// defaults are 3 s and 5 s): a small product takes microseconds, so 2 s
+/// still gives every sample many iterations, and the two small groups
+/// together take about 13 minutes instead of about 35.
 fn bench_small_shapes<T: GemmElem>(c: &mut Criterion, name: &str) {
     let blas = openblas::get();
     check_gemm_wrapper::<T>(blas);
     let mut group = c.benchmark_group(name);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
 
-    let cubes = [5, 8, 12, 16, 24, 32, 40, 48, 64, 80];
-    let rectangles = [
-        (4, 64, 64),
-        (64, 64, 4),
-        (16, 80, 8),
-        (80, 8, 80),
-        (33, 47, 29),
-    ];
-    for n in cubes {
-        bench_gemm_case::<T>(&mut group, blas, &format!("NN/{n}x{n}x{n}"), (n, n, n), NN);
-    }
-    for (m, k, n) in rectangles {
+    for (m, k, n) in SMALL_NN_SHAPES {
         bench_gemm_case::<T>(&mut group, blas, &format!("NN/{m}x{k}x{n}"), (m, k, n), NN);
     }
 
@@ -1316,16 +1359,14 @@ fn bench_small_shapes<T: GemmElem>(c: &mut Criterion, name: &str) {
         (Trans::NoTrans, Trans::Trans),
         (Trans::Trans, Trans::Trans),
     ];
-    let trans_shapes = [
-        (8, 8, 8),
-        (16, 16, 16),
-        (32, 32, 32),
-        (64, 64, 64),
-        (80, 80, 80),
-        (33, 47, 29),
-    ];
     for (trans_a, trans_b) in transposed {
-        for (m, k, n) in trans_shapes {
+        let mut shapes: Vec<(usize, usize, usize)> =
+            SMALL_TRANS_CUBES.iter().map(|&n| (n, n, n)).collect();
+        if trans_a != trans_b {
+            shapes.extend(SMALL_TRANS_RECTANGLES);
+        }
+        shapes.push((33, 47, 29));
+        for (m, k, n) in shapes {
             let label = format!(
                 "{}{}/{m}x{k}x{n}",
                 trans_letter(trans_a),
@@ -1396,7 +1437,9 @@ fn bench_sgemm_thin_comparison(c: &mut Criterion) {
 
 /// Benchmark the short, wide products of issue #23 (m x k x n), in f64 and
 /// f32: few rows of C against a long n, where the packed B block can outgrow
-/// the packing-buffer cache.
+/// the packing-buffer cache. The shapes are the B-cap targets of the A/B
+/// harness groups `ab_seq_b_cap` and `ab_par_b_cap`: the three of the issue
+/// and 1024 x 256 x 16384.
 fn bench_gemm_short_wide_comparison(c: &mut Criterion) {
     let blas = openblas::get();
     check_gemm_wrapper::<f64>(blas);
@@ -1404,7 +1447,12 @@ fn bench_gemm_short_wide_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("gemm_short_wide_comparison");
     group.sample_size(20);
 
-    for (m, k, n) in [(64, 512, 32768), (128, 256, 16384), (32, 1024, 32768)] {
+    for (m, k, n) in [
+        (64, 512, 32768),
+        (128, 256, 16384),
+        (32, 1024, 32768),
+        (1024, 256, 16384),
+    ] {
         let label = format!("{}/{m}x{k}x{n}", f64::NAME);
         bench_gemm_case::<f64>(&mut group, blas, &label, (m, k, n), NN);
         let label = format!("{}/{m}x{k}x{n}", f32::NAME);

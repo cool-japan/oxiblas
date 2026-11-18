@@ -76,7 +76,8 @@ unsafe_op_in_unsafe_fn = "allow"  # Rust 2024 defaults to requiring unsafe block
 # oxiblas-blas (same-source A/B runs), and `--cfg oxiblas_gemm_bcap_all` makes
 # those candidates cap the B block in both blocked drivers (A/B of the
 # `BCapScope::All` variant); declared so the cfgs are checked.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(oxiblas_gemm_candidate)', 'cfg(oxiblas_gemm_bcap_all)'] }
+# `--cfg oxiblas_gemm_legacy` restores the GEMM routes of 0.2.3 (it wins over the candidate cfg).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(oxiblas_gemm_candidate)', 'cfg(oxiblas_gemm_bcap_all)', 'cfg(oxiblas_gemm_legacy)'] }
 
 [workspace.lints.clippy]
 all = "warn"

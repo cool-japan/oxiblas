@@ -19,8 +19,9 @@ use super::oracle::{oracle_block, same_bits_or_nan};
 use super::pack::{
     ColMajor, Span, a_pack_len, b_pack_len, block_args, block_beta, pack_a, pack_b, spans,
 };
-use super::selftest::{ALayout, Case, Data, KernelFn, self_test_cases};
+use super::selftest::{ALayout, Case, Data, KernelFn, Online, self_test_cases};
 use super::test_support::{Need, hardware_or_skip, sme_state};
+use super::tests_contract::{CONTRACT_PAIRS, border_sentinel};
 use super::tests_smoke::{smoke_tile_f32, smoke_tile_f64};
 use crate::level3::gemm::read_op;
 use crate::level3::trsm::Trans;
@@ -68,26 +69,12 @@ fn values<T: TestFloat>(len: usize, seed: u64) -> Vec<T> {
         .collect()
 }
 
-/// A NaN that no arithmetic produces, for borders.
+/// A NaN that no arithmetic produces, for borders: the signalling sentinel
+/// of `tests_contract.rs` (quiet bit clear), so that a read-modify-write of
+/// a border element (which returns it quiet) changes its bits.
 fn border<T: TestFloat>() -> T {
-    T::from_bits64(if T::NR == 16 {
-        0x7fc0_beef
-    } else {
-        0x7ff8_0000_0000_beef
-    })
+    border_sentinel()
 }
-
-/// The alpha/beta pairs of `tests_contract.rs`.
-const PAIRS: [(f64, f64); 8] = [
-    (1.0, 0.0),
-    (1.0, -0.0),
-    (1.0, 1.0),
-    (-1.5, 0.0),
-    (0.3, 0.0),
-    (-1.5, 0.25),
-    (1.0, -0.5),
-    (2.0, 1.0),
-];
 
 // ---------------------------------------------------------------------------
 // oracle.rs
@@ -197,12 +184,13 @@ fn oracle_vs_reference<T: TestFloat>(
     }
 }
 
-/// [`oracle_vs_reference`] over the grid of `tests_contract.rs`.
+/// [`oracle_vs_reference`] over the grid and the ten alpha/beta pairs of
+/// `tests_contract.rs`.
 fn oracle_grid<T: TestFloat>() {
     for m in [1, 7, 9, 64, 65, 130] {
         for n in [1, 6, 8, 9, 17, 33] {
             for kc in [1, 7, 65] {
-                for (alpha, beta) in PAIRS {
+                for (alpha, beta) in CONTRACT_PAIRS {
                     oracle_vs_reference(m, n, kc, T::of(alpha), T::of(beta), values::<T>);
                 }
             }
@@ -246,6 +234,120 @@ fn test_sme2_oracle_equals_reference_special_values() {
             oracle_vs_reference(m, n, kc, alpha as f32, beta as f32, specials::<f32>);
         }
     }
+}
+
+/// With online packing (`a_pack` non-null) `oracle_block` writes the packed
+/// copy exactly as `args::reference` does (A packed and in place, rows
+/// `≥ m` of the last panel `+0`), nothing before or after it, and the same C
+/// as without packing; the stale contents of the buffer and of A's spare
+/// rows (NaN) never show.
+fn oracle_packs_like_reference<T: TestFloat>() {
+    for m in [1, 7, 9, 63, 64, 65, 130] {
+        for (n, kc) in [(1, 1), (9, 7), (17, 65)] {
+            let lda = m + 3;
+            let seed = (m * 7919 + n * 31 + kc) as u64;
+            let a: Vec<T> = values::<T>(lda * kc + MR, seed)
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if index % lda < m {
+                        value
+                    } else {
+                        border::<T>()
+                    }
+                })
+                .collect();
+            let b = values::<T>(n.div_ceil(T::NR) * T::NR * kc, seed + 1);
+            let len = m.div_ceil(MR) * MR * kc;
+            let guard = 2 * MR;
+            let stale = |index: usize| {
+                if index < guard || index >= guard + len {
+                    border::<T>()
+                } else {
+                    T::of(-1_000.0 - index as f64)
+                }
+            };
+            let fresh: Vec<T> = (0..len + 2 * guard).map(stale).collect();
+            let c0 = values::<T>(m * n, seed + 2);
+            let mut results = Vec::new();
+            for (pack, use_reference) in [(false, false), (true, false), (true, true)] {
+                let mut c = c0.clone();
+                let mut buffer = fresh.clone();
+                let a_pack = if pack {
+                    buffer[guard..].as_mut_ptr()
+                } else {
+                    core::ptr::null_mut()
+                };
+                let args = MacroArgs::packed(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    c.as_mut_ptr(),
+                    m,
+                    m,
+                    n,
+                    kc,
+                    T::of(0.5),
+                    T::of(-0.25),
+                )
+                .with_a_in_place(a.as_ptr(), lda)
+                .with_online_pack(a_pack);
+                if use_reference {
+                    // SAFETY: A in place with `lda ≥ m` and `kc` columns, B
+                    // whole zero-padded panels, C of `m × n` with `ldc = m`,
+                    // the buffer `len` elements after its guard; none overlap.
+                    unsafe { reference(&args) };
+                } else {
+                    // SAFETY: as above.
+                    unsafe { oracle_block(&args) };
+                }
+                results.push((c, buffer));
+            }
+            let [
+                (plain_c, untouched),
+                (oracle_c, oracle_buffer),
+                (reference_c, reference_buffer),
+            ] = &results[..]
+            else {
+                panic!("three runs");
+            };
+            let bits = |values: &[T]| values.iter().map(|value| value.bits()).collect::<Vec<_>>();
+            assert_eq!(bits(untouched), bits(&fresh), "{m}x{n}x{kc}: no buffer");
+            assert_eq!(bits(oracle_c), bits(plain_c), "{m}x{n}x{kc}: C");
+            assert_eq!(
+                bits(reference_c),
+                bits(plain_c),
+                "{m}x{n}x{kc}: reference C"
+            );
+            assert_eq!(
+                bits(oracle_buffer),
+                bits(reference_buffer),
+                "{m}x{n}x{kc}: the packed copy and its guards"
+            );
+            for (index, value) in oracle_buffer.iter().enumerate() {
+                let Some(e) = index.checked_sub(guard).filter(|&e| e < len) else {
+                    assert_eq!(
+                        value.bits(),
+                        border::<T>().bits(),
+                        "{m}x{n}x{kc}: guard {index}"
+                    );
+                    continue;
+                };
+                let (i, p) = ((e / (MR * kc)) * MR + e % MR, (e % (MR * kc)) / MR);
+                let want = if i < m { a[i + p * lda] } else { T::ZERO };
+                assert_eq!(
+                    value.bits(),
+                    want.bits(),
+                    "{m}x{n}x{kc}: row {i}, depth {p}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_sme2_oracle_online_pack_equals_reference() {
+    oracle_packs_like_reference::<f32>();
+    oracle_packs_like_reference::<f64>();
 }
 
 #[test]
@@ -371,6 +473,7 @@ fn smoke_cases(nr: usize) -> Vec<Case> {
                     lda_pad,
                     b_pad: 0,
                     data,
+                    online: Online::Off,
                 });
             }
         }

@@ -1,7 +1,8 @@
 //! End-to-end smoke test of the streaming-region chain: `sme_kernels!` →
 //! assembler (Mach-O on the Mac, ELF in the QEMU container) → registry →
-//! template lint → `detect::thread_ready()` → the FPSR frame → SVCR and
-//! TPIDR2_EL0 back at zero.
+//! template lint → the readiness rule of `detect::thread_ready()`
+//! (`test_support::kernel_ready()`) → the FPSR frame → SVCR and TPIDR2_EL0
+//! back at zero.
 //!
 //! The two kernels below are real contract kernels (`args.rs`) for the
 //! smallest case: one 16 × 16 (`f32`) or 8 × 8 (`f64`) tile, `kc = 1`, modes
@@ -19,10 +20,9 @@ use super::args::{
     SmeElement, reference, same_result,
 };
 use super::asm::sme_kernels;
-use super::detect;
 use super::test_support::{
     FPSR_AFTER_SM_CHANGE, FPSR_DZC, FPSR_IDC, FPSR_IOC, FPSR_IXC, FPSR_OFC, FPSR_QC, FPSR_UFC,
-    Need, fpsr_read, fpsr_write, hardware_or_skip, kernel_entries, sme_state,
+    Need, fpsr_read, fpsr_write, hardware_or_skip, kernel_entries_here, kernel_ready, sme_state,
 };
 
 sme_kernels! {
@@ -257,21 +257,22 @@ impl<T: SmeElement> Tile<T> {
 #[track_caller]
 fn run<T: SmeElement>(kernel: unsafe fn(&MacroArgs<T>), tile: &mut Tile<T>, alpha: T) {
     let args = tile.args(alpha);
-    assert!(detect::thread_ready(), "thread not ready before the kernel");
-    let entries = kernel_entries();
+    assert!(kernel_ready(), "thread not ready before the kernel");
+    let entries = kernel_entries_here();
     // SAFETY: the thread is ready (checked above), 1 ≤ m, n ≤ NR, kc = 1,
     // and the block lies inside the tile's buffers.
     unsafe { kernel(&args) };
-    assert!(
-        kernel_entries() > entries,
-        "the kernel entry was not counted"
+    assert_eq!(
+        kernel_entries_here(),
+        entries + 1,
+        "the kernel entry was not counted on this thread"
     );
     assert_eq!(
         sme_state(),
         Some((0, 0)),
         "SVCR / TPIDR2_EL0 after the kernel"
     );
-    assert!(detect::thread_ready(), "thread not ready after the kernel");
+    assert!(kernel_ready(), "thread not ready after the kernel");
 }
 
 #[test]
@@ -327,7 +328,7 @@ fn fpsr_across<T: SmeElement>(
     before: u64,
 ) -> u64 {
     let args = std::hint::black_box(tile.args(alpha));
-    assert!(detect::thread_ready());
+    assert!(kernel_ready());
     let saved = fpsr_read();
     fpsr_write(before);
     // SAFETY: as in `run`.

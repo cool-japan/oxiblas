@@ -4,31 +4,40 @@
 //!   claims its fixed blocks ([`CASES`]) make, and the verdict logic of the
 //!   binder (`self_test_kernels`) with exact call counts. These run on every
 //!   host.
-//! - The path table: from the self-test's own block list it computes, for the
-//!   tile height and panel width of each element type, every path a block
-//!   takes through that type's macro-kernel, and requires the set of paths
-//!   that the kernels' structure defines (the [`KernelPaths`] descriptions).
-//!   This runs on every host and is the permanent guard that the self-test
-//!   reaches every part of the kernels.
-//! - The real macro-kernels through `run_self_test` and `self_test_with`;
-//!   these skip without SME2.
+//! - The guard border: its sentinel is a signalling NaN, and stand-ins that
+//!   read, compute on and write back one element beyond the block in M1 or
+//!   M3 (as a kernel does that addresses one row or column too many) are
+//!   rejected.
+//! - The mismatch report: where the self-test says it failed, for stand-ins
+//!   whose defect is known.
+//! - The real macro-kernels through `run_self_test` and `self_test_with`
+//!   (their failure messages print the mismatch); these skip without SME2.
+//!
+//! The path table (every path class of both kernels is taken, and the model
+//! matches the kernel text) is in `tests_selftest_paths.rs`, the edited
+//! kernel texts that the model must reject in `tests_selftest_edits.rs`, and
+//! the online cases (online packing, prefetch: the buffer's guards and
+//! report, its containment limit) in `tests_selftest_online.rs`; the shape
+//! of the sweep is at the end of this file.
 
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
+use core::hint::black_box;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
 use super::args::{Epilogue, MR, MacroArgs, SmeElement};
-use super::detect;
 use super::kernel_f32::sme2_gemm_f32;
 use super::kernel_f64::sme2_gemm_f64;
 use super::oracle::oracle_block;
 use super::selftest::{
-    ALayout, CASES, Case, Data, KernelFn, SCALARS, SWEEP_BLOCKS_PER_VARIANT, SWEEP_DEPTHS,
-    run_bytes, run_self_test, self_test_blocks, self_test_calls, self_test_cases,
-    self_test_kernels, self_test_with, sweep_cases,
+    ALayout, CASES, CLayout, Case, Data, Difference, KernelFn, Mismatch, Online, SCALARS,
+    SWEEP_BLOCKS_PER_VARIANT, SWEEP_DEPTHS, SWEEP_MIDDLE_BLOCKS, a_spare, b_gap, c_layout,
+    run_buffers, run_bytes, run_self_test, run_self_test_detailed, self_test_blocks,
+    self_test_calls, self_test_cases, self_test_cases_detailed, self_test_kernels, self_test_with,
+    self_test_with_detailed, sentinel, sweep_cases,
 };
 use super::test_support::{
-    Need, fpsr_read, fpsr_write, hardware_or_skip, kernel_entries, sme_state,
+    Need, fpsr_read, fpsr_write, hardware_or_skip, kernel_entries_here, kernel_ready, sme_state,
 };
 use super::tests_oracle::TestFloat;
 
@@ -470,8 +479,174 @@ unsafe fn wrong_ignores_b_panel<T: SmeElement>(args: &MacroArgs<T>) {
     unsafe { oracle_block(&tight) };
 }
 
+/// The read-modify-write that the M1 and M3 epilogues of the kernels make
+/// on one element, with a dead (zero) accumulator lane: `acc + C` in M1 and
+/// `fma(C, beta, acc · alpha)` in M3 (FMUL, then FMLA), as real
+/// floating-point operations at run time (`black_box` keeps the compiler
+/// from folding the zero away). `None` in M0 and M2, which do not read C.
+fn dead_lane_rmw<T: SmeElement>(args: &MacroArgs<T>, c: T) -> Option<T> {
+    let acc = black_box(T::ZERO);
+    let alpha = T::from_bits64(args.alpha_bits);
+    let beta = T::from_bits64(args.beta_bits);
+    match args.mode {
+        1 => Some(acc + black_box(c)),
+        3 => Some(black_box(c).fused(beta, acc * alpha)),
+        _ => None,
+    }
+}
+
+/// Stand-in: the oracle, and in M1 and M3 calls also the epilogue's
+/// read-modify-write with a zero accumulator on the row just below the
+/// block, `C(m, j)` for `j < n` (a kernel whose row predicate admits one row
+/// too many). Right in M0 and M2.
+///
+/// # Safety
+///
+/// As for `oracle_block`, and row `m` of every column must be readable and
+/// writable (the self-test's guard border).
+unsafe fn wrong_rmw_row_below<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { oracle_block(args) };
+    for j in 0..args.n {
+        // SAFETY: the self-test keeps `ldc ≥ m + 3`, so `C(m, j)` is inside
+        // its C buffer, in the guard rows of column `j`.
+        unsafe {
+            let c = args.c.add(args.m + j * args.ldc);
+            if let Some(value) = dead_lane_rmw(args, *c) {
+                *c = value;
+            }
+        }
+    }
+}
+
+/// Stand-in: the oracle, and in M1 and M3 calls also the epilogue's
+/// read-modify-write with a zero accumulator on the column just beyond the
+/// block, `C(i, n)` for `i < m` (a kernel whose column loop runs once too
+/// often). Right in M0 and M2.
+///
+/// # Safety
+///
+/// As for `oracle_block`, and column `n` must be readable and writable for
+/// rows `0..m` (the self-test's guard column after the block).
+unsafe fn wrong_rmw_column_beyond<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { oracle_block(args) };
+    for i in 0..args.m {
+        // SAFETY: the self-test's C reaches at least the end of column `n`
+        // (`ldc - 1 ≥ m` guard elements of it, see `c_layout`), so `C(i, n)`
+        // is inside its buffer.
+        unsafe {
+            let c = args.c.add(i + args.n * args.ldc);
+            if let Some(value) = dead_lane_rmw(args, *c) {
+                *c = value;
+            }
+        }
+    }
+}
+
+/// What a kernel's dead lane stores to an element it must not touch: zero in
+/// M0 and M2 (the ZA lane of a masked A row or a zero-padded B column holds
+/// `+0`, and `0 · alpha` is zero), the epilogue's read-modify-write with a
+/// zero accumulator in M1 and M3 ([`dead_lane_rmw`]).
+fn dead_lane_store<T: SmeElement>(args: &MacroArgs<T>, c: T) -> T {
+    dead_lane_rmw(args, c).unwrap_or(T::ZERO)
+}
+
+/// Which elements outside the block a whole-tile stand-in stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// All `NR` columns of a partial last column panel (rows `< m`).
+    Columns,
+    /// All 64 rows of a partial last row panel (columns `< n`).
+    Rows,
+    /// Both: every whole `64 × NR` tile of the block.
+    Tiles,
+    /// Only the farthest element a whole tile reaches,
+    /// `C(64 · ceil(m / 64) - 1, NR · ceil(n / NR) - 1)`, when it lies
+    /// outside the block.
+    Farthest,
+}
+
+/// The oracle, and then the dead-lane stores of a kernel that stores whole
+/// tiles in the direction `reach` ([`dead_lane_store`] on every element of
+/// that reach outside the block).
+///
+/// # Safety
+///
+/// As for `oracle_block`, and every element of a whole `64 × NR` tile at
+/// every tile position of the block must be readable and writable: the
+/// self-test's C buffer covers them (`c_layout`, checked for every block by
+/// `test_sme2_selftest_guard_covers_whole_tiles`).
+unsafe fn store_whole_tiles<T: SmeElement>(args: &MacroArgs<T>, reach: Reach) {
+    // SAFETY: forwarded.
+    unsafe { oracle_block(args) };
+    let (m, n) = (args.m, args.n);
+    let rows_end = m.div_ceil(MR) * MR;
+    let columns_end = n.div_ceil(T::NR) * T::NR;
+    let (rows, columns) = match reach {
+        Reach::Columns => (m, columns_end),
+        Reach::Rows => (rows_end, n),
+        Reach::Tiles | Reach::Farthest => (rows_end, columns_end),
+    };
+    for j in 0..columns {
+        for i in 0..rows {
+            let farthest = i + 1 == rows_end && j + 1 == columns_end;
+            let outside = i >= m || j >= n;
+            if outside && (reach != Reach::Farthest || farthest) {
+                // SAFETY: `i < 64 · ceil(m / 64)`, `j < NR · ceil(n / NR)`:
+                // an element of a whole tile, inside the self-test's C
+                // (this function's contract).
+                unsafe {
+                    let c = args.c.add(i + j * args.ldc);
+                    *c = dead_lane_store(args, *c);
+                }
+            }
+        }
+    }
+}
+
+/// Stand-in: stores all `NR` columns of a partial last column panel.
+///
+/// # Safety
+///
+/// As for [`store_whole_tiles`].
+unsafe fn wrong_stores_whole_columns<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { store_whole_tiles(args, Reach::Columns) };
+}
+
+/// Stand-in: stores all 64 rows of a partial last row panel.
+///
+/// # Safety
+///
+/// As for [`store_whole_tiles`].
+unsafe fn wrong_stores_whole_rows<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { store_whole_tiles(args, Reach::Rows) };
+}
+
+/// Stand-in: stores every whole `64 × NR` tile (rows and columns).
+///
+/// # Safety
+///
+/// As for [`store_whole_tiles`].
+unsafe fn wrong_stores_whole_tiles<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { store_whole_tiles(args, Reach::Tiles) };
+}
+
+/// Stand-in: stores only the farthest element of the last whole tile.
+///
+/// # Safety
+///
+/// As for [`store_whole_tiles`].
+unsafe fn wrong_stores_farthest<T: SmeElement>(args: &MacroArgs<T>) {
+    // SAFETY: forwarded.
+    unsafe { store_whole_tiles(args, Reach::Farthest) };
+}
+
 /// Every wrong stand-in for one type, with its name.
-fn wrong_kernels<T: TestFloat>() -> [(&'static str, KernelFn<T>); 19] {
+fn wrong_kernels<T: TestFloat>() -> [(&'static str, KernelFn<T>); 25] {
     [
         ("one ulp off", wrong_one_ulp::<T>),
         (
@@ -495,6 +670,18 @@ fn wrong_kernels<T: TestFloat>() -> [(&'static str, KernelFn<T>); 19] {
         ("last element", wrong_last_element::<T>),
         ("writes A padding", wrong_writes_a_padding::<T>),
         ("writes B padding", wrong_writes_b_padding::<T>),
+        (
+            "read-modify-write below the block",
+            wrong_rmw_row_below::<T>,
+        ),
+        (
+            "read-modify-write beyond the block",
+            wrong_rmw_column_beyond::<T>,
+        ),
+        ("stores whole columns", wrong_stores_whole_columns::<T>),
+        ("stores whole rows", wrong_stores_whole_rows::<T>),
+        ("stores whole tiles", wrong_stores_whole_tiles::<T>),
+        ("stores the farthest element", wrong_stores_farthest::<T>),
     ]
 }
 
@@ -544,6 +731,7 @@ fn test_sme2_selftest_wrong_kernels_pass_where_they_are_right() {
         lda_pad: 0,
         b_pad: 0,
         data: Data::Plain,
+        online: Online::Off,
     };
     // Packed A over 2 row panels (tail 6), odd kc, 2 (f32) column panels,
     // B panels `kc · NR` apart.
@@ -555,6 +743,7 @@ fn test_sme2_selftest_wrong_kernels_pass_where_they_are_right() {
         lda_pad: 0,
         b_pad: 0,
         data: Data::Plain,
+        online: Online::Off,
     };
     let checks: [Check; 10] = [
         // C is NaN only in M0/M2; with M1 the reading stand-in is right.
@@ -592,6 +781,79 @@ fn test_sme2_selftest_wrong_kernels_pass_where_they_are_right() {
     let ignoring: KernelFn<f64> = wrong_ignores_a_strides::<f64>;
     // SAFETY: as above; with the packed layout its stride is the given one.
     assert!(unsafe { self_test_cases(ignoring, &[full], &SCALARS) });
+    // M0 and M2 do not read C: the read-modify-write stand-ins leave the
+    // guard alone there, on every kind of block.
+    rmw_right_without_c::<f32>(&[full, packed]);
+    rmw_right_without_c::<f64>(&[full, packed]);
+    // The whole-tile stand-ins store nothing outside a block of whole tiles,
+    // in every mode; whole rows only, or whole columns only, are right where
+    // that dimension is whole.
+    whole_tiles_right::<f32>();
+    whole_tiles_right::<f64>();
+}
+
+/// The whole-tile stand-ins pass where their reach lies inside the block,
+/// and fail where it does not.
+fn whole_tiles_right<T: TestFloat>() {
+    let block = |m: usize, n: usize| Case {
+        m,
+        n,
+        kc: 3,
+        layout: ALayout::InPlace,
+        lda_pad: 1,
+        b_pad: 1,
+        data: Data::Plain,
+        online: Online::Off,
+    };
+    // Whole tiles for both types (16 is a multiple of either NR).
+    let whole = block(MR, 16);
+    let whole_rows = block(MR, 19);
+    let whole_columns = block(70, 16);
+    let stand_ins: [(Reach, KernelFn<T>); 4] = [
+        (Reach::Columns, wrong_stores_whole_columns::<T>),
+        (Reach::Rows, wrong_stores_whole_rows::<T>),
+        (Reach::Tiles, wrong_stores_whole_tiles::<T>),
+        (Reach::Farthest, wrong_stores_farthest::<T>),
+    ];
+    for (reach, kernel) in stand_ins {
+        for (case, right) in [
+            (whole, true),
+            (whole_rows, reach == Reach::Rows),
+            (whole_columns, reach == Reach::Columns),
+        ] {
+            // SAFETY: plain-Rust stand-ins inside the self-test's buffers
+            // (whole tiles are covered, see `store_whole_tiles`).
+            let verdict = unsafe { self_test_cases(kernel, &[case], &SCALARS) };
+            assert_eq!(verdict, right, "{} {reach:?} on {case}", T::NR);
+        }
+    }
+}
+
+/// The read-modify-write stand-ins pass on `cases` with the M0 and M2 pairs
+/// of [`SCALARS`] (and fail with the M1 and M3 ones).
+fn rmw_right_without_c<T: TestFloat>(cases: &[Case]) {
+    let without_c: Vec<(f64, f64)> = SCALARS
+        .iter()
+        .copied()
+        .filter(|&(alpha, beta)| !Epilogue::select(alpha, beta).reads_c())
+        .collect();
+    let with_c: Vec<(f64, f64)> = SCALARS
+        .iter()
+        .copied()
+        .filter(|&(alpha, beta)| Epilogue::select(alpha, beta).reads_c())
+        .collect();
+    assert_eq!((without_c.len(), with_c.len()), (2, 4));
+    let stand_ins: [KernelFn<T>; 2] = [wrong_rmw_row_below::<T>, wrong_rmw_column_beyond::<T>];
+    for (index, kernel) in stand_ins.into_iter().enumerate() {
+        // SAFETY: plain-Rust stand-ins inside the self-test's buffers.
+        let right = unsafe { self_test_cases(kernel, cases, &without_c) };
+        assert!(right, "{} read-modify-write stand-in {index}", T::NR);
+        for &pair in &with_c {
+            // SAFETY: as above.
+            let wrong = unsafe { self_test_cases(kernel, cases, &[pair]) };
+            assert!(!wrong, "{} stand-in {index} accepted with {pair:?}", T::NR);
+        }
+    }
 }
 
 #[test]
@@ -646,7 +908,16 @@ fn test_sme2_selftest_cases_cover_the_claims() {
             CASES.iter().all(|c| in_place(c) || c.lda_pad == 0),
             "NR {nr}: packed cases carry no lda pad"
         );
+        // What only CASES provides beside the sweep: three row panels
+        // together with three or more column panels.
+        assert!(
+            CASES.iter().any(|c| c.m > 2 * MR && c.n > 2 * nr),
+            "NR {nr}: three row panels and three column panels"
+        );
     }
+    // More than two row panels (the sweep has them as well, with the other
+    // depths and A in place; see the path table).
+    assert!(CASES.iter().any(|c| c.m > 2 * MR), "three row panels");
     assert!(
         CASES.iter().any(|c| c.kc > MR && c.kc % 2 == 1),
         "deep odd kc"
@@ -687,6 +958,310 @@ fn test_sme2_selftest_cases_cover_the_claims() {
     };
     // SAFETY: the oracle is plain Rust.
     assert!(!unsafe { self_test_cases(oracle, &[packed_pad], &SCALARS) });
+}
+
+// ---------------------------------------------------------------------------
+// The guard border and the mismatch report
+// ---------------------------------------------------------------------------
+
+/// Whether `bits` (of a `T`) is a signalling NaN: all exponent bits set, the
+/// quiet bit clear, a non-zero payload.
+fn signalling<T: SmeElement>(bits: u64) -> bool {
+    let (exponent, quiet) = if T::NR == 16 {
+        (0x7f80_0000, 0x0040_0000)
+    } else {
+        (0x7ff0_0000_0000_0000, 0x0008_0000_0000_0000)
+    };
+    let payload = bits & (quiet - 1);
+    bits & exponent == exponent && bits & quiet == 0 && payload != 0
+}
+
+/// The bits of the guard after the kernels' dead-lane read-modify-write:
+/// the sentinel with its quiet bit set.
+fn quieted_guard<T: SmeElement>() -> u64 {
+    let quiet = if T::NR == 16 {
+        0x0040_0000
+    } else {
+        0x0008_0000_0000_0000
+    };
+    sentinel::<T>().bits() | quiet
+}
+
+/// The mechanism of the guard, for one type: the sentinel and the fills of
+/// A and B are signalling NaNs, and arithmetic on the sentinel (with a zero,
+/// as a dead accumulator lane gives) changes its bits.
+fn guard_is_signalling<T: TestFloat>() {
+    let guard = sentinel::<T>();
+    assert!(
+        signalling::<T>(guard.bits()),
+        "{}: {:#x}",
+        T::NR,
+        guard.bits()
+    );
+    assert!(signalling::<T>(a_spare::<T>().bits()), "{}: A", T::NR);
+    assert!(signalling::<T>(b_gap::<T>().bits()), "{}: B", T::NR);
+    let fills = [guard.bits(), a_spare::<T>().bits(), b_gap::<T>().bits()];
+    assert!(fills[0] != fills[1] && fills[1] != fills[2] && fills[0] != fills[2]);
+    // `acc + C` (M1) and `fma(C, beta, acc · alpha)` (M3) with `acc = 0`.
+    let sum = black_box(guard) + black_box(T::ZERO);
+    assert_ne!(sum.bits(), guard.bits(), "{}: guard + 0", T::NR);
+    assert_eq!(sum.bits(), quieted_guard::<T>(), "{}: guard + 0", T::NR);
+    let fused = black_box(guard).fused(black_box(T::of(-0.7)), black_box(T::ZERO));
+    assert_ne!(fused.bits(), guard.bits(), "{}: fma(guard, beta, 0)", T::NR);
+    // A copy keeps the bits (the self-test only copies and compares them).
+    let copied = [guard; 3].to_vec().clone();
+    assert!(copied.iter().all(|value| value.bits() == guard.bits()));
+}
+
+#[test]
+fn test_sme2_selftest_guard_is_signalling() {
+    guard_is_signalling::<f32>();
+    guard_is_signalling::<f64>();
+}
+
+/// The first mismatch of `kernel` over the whole list (`self_test_with`).
+fn report<T: SmeElement>(kernel: KernelFn<T>) -> Mismatch {
+    // SAFETY: the stand-ins are plain Rust and stay inside the self-test's
+    // buffers.
+    match unsafe { self_test_with_detailed(kernel) } {
+        Ok(()) => panic!("{} stand-in accepted", T::NR),
+        Err(mismatch) => {
+            println!("{mismatch}");
+            mismatch
+        }
+    }
+}
+
+/// The location each stand-in with a known defect is reported at, for one
+/// type: the first block of [`CASES`] (`70 × 19 × 13`, packed, `ldc = 73`),
+/// in the first pair that shows the defect.
+fn reports_where<T: TestFloat>() {
+    let bits = if T::NR == 16 { 32 } else { 64 };
+    let case = CASES[0];
+    let (m, n) = (case.m as i32, case.n as i32);
+    let ldc = case.m + 3;
+    let at = |pair: usize, difference: Difference| Mismatch {
+        element_bits: bits,
+        block: 0,
+        case,
+        pair,
+        alpha: SCALARS[pair].0,
+        beta: SCALARS[pair].1,
+        difference,
+    };
+    // One ulp at C(0, 0): block 0, pair 0, element (0, 0).
+    let one_ulp = report(wrong_one_ulp::<T>);
+    let Difference::Element {
+        row: 0,
+        col: 0,
+        found,
+        wanted,
+    } = one_ulp.difference
+    else {
+        panic!("{}: {one_ulp:?}", T::NR);
+    };
+    assert_eq!(found, wanted + 1, "{}", T::NR);
+    assert_eq!(
+        one_ulp,
+        at(
+            0,
+            Difference::Element {
+                row: 0,
+                col: 0,
+                found,
+                wanted
+            }
+        )
+    );
+    let line = one_ulp.to_string();
+    assert!(
+        line.contains("block 0 (70x19x13") && line.contains("C(0, 0) is "),
+        "{line}"
+    );
+    let guard = |row: i32, col: i32, found: u64| kernel_guard(row, col, ldc, found);
+    // The default NaN written to the row below: guard element (m, 0).
+    let below = guard(m, 0, default_nan::<T>().bits());
+    assert_eq!(report(wrong_writes_row_below::<T>), at(0, below));
+    // The element before C(0, 0): offset -1, split as row ldc - 1 of
+    // column -1 (the same element as "one row above C(0, 0)").
+    let before = guard(ldc as i32 - 1, -1, default_nan::<T>().bits());
+    let before_report = report(wrong_writes_before_block::<T>);
+    assert_eq!(before_report, at(0, before));
+    assert!(
+        before_report
+            .to_string()
+            .contains(&format!("(offset -1 from C(0, 0), ldc {ldc})")),
+        "{before_report}"
+    );
+    // The read-modify-writes: first in M1 (pair 1), the quieted sentinel at
+    // row m of column 0, and at row 0 of column n.
+    let quiet = quieted_guard::<T>();
+    let rmw_row = report(wrong_rmw_row_below::<T>);
+    assert_eq!(rmw_row, at(1, guard(m, 0, quiet)));
+    let rmw_column = report(wrong_rmw_column_beyond::<T>);
+    assert_eq!(rmw_column, at(1, guard(0, n, quiet)));
+    assert!(
+        rmw_column.to_string().contains(&format!(
+            "wrote C(0, {n}) outside the block (offset {} from C(0, 0), ldc {ldc})",
+            n as usize * ldc
+        )),
+        "{rmw_column}"
+    );
+    // The whole-tile stores (M0, pair 0: a dead lane stores +0): all NR
+    // columns of the partial last column panel first change C(0, n); all 64
+    // rows of the partial last row panel, and whole tiles, C(m, 0).
+    assert_eq!(
+        report(wrong_stores_whole_columns::<T>),
+        at(0, guard(0, n, 0))
+    );
+    assert_eq!(report(wrong_stores_whole_rows::<T>), at(0, guard(m, 0, 0)));
+    assert_eq!(report(wrong_stores_whole_tiles::<T>), at(0, guard(m, 0, 0)));
+    // The farthest element a whole tile reaches is inside the buffer and
+    // checked: C(64 · ceil(m / 64) - 1, NR · ceil(n / NR) - 1) = C(127, ..),
+    // reported by its offset and split with the row in 0..ldc (it aliases
+    // an element of another column).
+    let far_row = case.m.div_ceil(MR) * MR - 1;
+    let far_col = case.n.div_ceil(T::NR) * T::NR - 1;
+    let far = (far_row + far_col * ldc) as i64;
+    let farthest = report(wrong_stores_farthest::<T>);
+    let ldc_i64 = ldc as i64;
+    let split = guard(
+        far.rem_euclid(ldc_i64) as i32,
+        far.div_euclid(ldc_i64) as i32,
+        0,
+    );
+    assert_eq!(farthest, at(0, split));
+    assert!(
+        farthest
+            .to_string()
+            .contains(&format!("(offset {far} from C(0, 0), ldc {ldc})")),
+        "{farthest}"
+    );
+    // A's padding A(m, 0) of the last row panel, B's padding B(0, n).
+    let a_index = (case.m / MR) * MR * case.kc + case.m % MR;
+    let b_index = (case.n / T::NR) * (T::NR * case.kc + case.b_pad) + case.n % T::NR;
+    assert_eq!(
+        report(wrong_writes_a_padding::<T>),
+        at(0, Difference::AChanged { index: a_index })
+    );
+    assert_eq!(
+        report(wrong_writes_b_padding::<T>),
+        at(0, Difference::BChanged { index: b_index })
+    );
+    // A refused block, through the chosen-list entry point.
+    let degenerate = Case { m: 0, ..case };
+    let oracle: KernelFn<T> = oracle_block::<T>;
+    // SAFETY: the oracle is plain Rust.
+    let refused = unsafe { self_test_cases_detailed(oracle, &[case, degenerate], &SCALARS) };
+    let Err(refused) = refused else {
+        panic!("{}: a degenerate block passed", T::NR);
+    };
+    assert_eq!((refused.block, refused.pair), (1, 0));
+    assert_eq!(refused.difference, Difference::Refused);
+    assert!(refused.to_string().contains("refused"), "{refused}");
+}
+
+/// A guard difference of the kernel's C at (`row`, `col`) relative to
+/// `C(0, 0)` with leading dimension `ldc`, the bits `found`; its offset is
+/// `row + col · ldc`. `row` must be in `0..ldc` (the report's split).
+fn kernel_guard(row: i32, col: i32, ldc: usize, found: u64) -> Difference {
+    assert!((0..ldc as i32).contains(&row), "row {row} outside 0..{ldc}");
+    Difference::KernelGuard {
+        row,
+        col,
+        offset: i64::from(row) + i64::from(col) * ldc as i64,
+        ldc: ldc as u32,
+        found,
+    }
+}
+
+#[test]
+fn test_sme2_selftest_reports_where() {
+    reports_where::<f32>();
+    reports_where::<f64>();
+}
+
+#[test]
+fn test_sme2_selftest_report_is_one_line() {
+    // Every kind of difference prints as one line with the element type,
+    // the block, the pair and the bits in full width.
+    let case = CASES[5];
+    let differences = [
+        Difference::Refused,
+        Difference::AChanged { index: 7 },
+        Difference::BChanged { index: 8 },
+        Difference::KernelGuard {
+            row: 35,
+            col: -1,
+            offset: -1,
+            ldc: 36,
+            found: 0x7fde_1f7e,
+        },
+        Difference::OracleGuard {
+            row: 0,
+            col: 17,
+            offset: 612,
+            ldc: 36,
+            found: 0x7fde_1f7e,
+        },
+        Difference::Element {
+            row: 3,
+            col: 4,
+            found: 0x3f80_0001,
+            wanted: 0x3f80_0000,
+        },
+    ];
+    for difference in differences {
+        let mismatch = Mismatch {
+            element_bits: 32,
+            block: 5,
+            case,
+            pair: 3,
+            alpha: 1.0,
+            beta: -0.7,
+            difference,
+        };
+        let line = mismatch.to_string();
+        println!("{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert!(
+            line.starts_with("SME2 self-test mismatch, f32: block 5 (33x17x5, A packed")
+                && line.contains("special data")
+                && line.contains("pair 3 (alpha 1, beta -0.7)"),
+            "{line}"
+        );
+        // A guard line carries the offset from C(0, 0) and ldc beside the
+        // coordinates.
+        if let Difference::KernelGuard { offset, .. } | Difference::OracleGuard { offset, .. } =
+            difference
+        {
+            assert!(
+                line.contains(&format!(
+                    "outside the block (offset {offset} from C(0, 0), ldc 36)"
+                )),
+                "{line}"
+            );
+        }
+    }
+    let wide = Mismatch {
+        element_bits: 64,
+        block: 0,
+        case,
+        pair: 0,
+        alpha: 1.0,
+        beta: 0.0,
+        difference: Difference::Element {
+            row: 0,
+            col: 0,
+            found: 1,
+            wanted: 2,
+        },
+    };
+    assert!(
+        wide.to_string()
+            .ends_with("C(0, 0) is 0x0000000000000001, the oracle gives 0x0000000000000002"),
+        "{wide}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -739,11 +1314,13 @@ fn test_sme2_selftest_binder_combines_verdicts() {
     let ok64: KernelFn<f64> = counted_oracle::<f64>;
     let wrong32: KernelFn<f32> = wrong_one_ulp::<f32>;
     let wrong64: KernelFn<f64> = wrong_one_ulp::<f64>;
-    // The fixed blocks: 7 × 6 calls per type; with the sweep (4 row variants
-    // of f32, 8 of f64, 12 blocks each) 55 × 6 for f32 and 103 × 6 for f64.
+    // The fixed blocks: 7 × 6 calls per type; with the 4 online cases and
+    // the two sweeps (4 row variants of f32, 8 of f64, 12 blocks each, and 6
+    // blocks of three row panels, once plain and once with online packing)
+    // 119 × 6 for f32 and 215 × 6 for f64.
     assert_eq!(CASES.len() * SCALARS.len(), 42);
     let (n32, n64) = (calls_of::<f32>(), calls_of::<f64>());
-    assert_eq!((n32, n64), (330, 618));
+    assert_eq!((n32, n64), (714, 1_290));
     // Both pass: both types run, every block once.
     assert_eq!(binder_verdict(ok32, Some(ok64)), (true, [n32, n64]));
     // f32 alone: the f64 kernel is not run, so fewer kernel calls.
@@ -757,29 +1334,39 @@ fn test_sme2_selftest_binder_combines_verdicts() {
 }
 
 /// Runs `run_self_test(f64_present)` on the real kernels: the thread is
-/// ready before, the verdict is `true`, no SME state is left, and the process
-/// made at least the expected kernel calls. Restores FPSR.
+/// ready before, the verdict is `true`, no SME state is left, and this
+/// thread made exactly the expected kernel calls. Restores FPSR.
 fn real_run_self_test(test: &str, f64_present: bool) {
-    assert!(detect::thread_ready(), "{test}: thread not ready");
+    assert!(kernel_ready(), "{test}: thread not ready");
     let fpsr = fpsr_read();
-    let entries = kernel_entries();
+    let entries = kernel_entries_here();
     let start = Instant::now();
     // SAFETY: the caller's `hardware_or_skip` returned true (SME2 with SVL
-    // 512, and FEAT_SME_F64F64 when `f64_present`), and `thread_ready()` was
+    // 512, and FEAT_SME_F64F64 when `f64_present`), and `kernel_ready()` was
     // true on this thread just above.
-    let verdict = unsafe { run_self_test(f64_present) };
+    let verdict = unsafe { run_self_test_detailed(f64_present) };
     let elapsed = start.elapsed();
     let state = sme_state();
-    let grown = kernel_entries() - entries;
+    let grown = kernel_entries_here() - entries;
     fpsr_write(fpsr);
     println!("{test}: run_self_test({f64_present}) took {elapsed:?}");
-    assert!(verdict, "{test}: run_self_test({f64_present}) failed");
+    if let Err(mismatch) = verdict {
+        panic!("{test}: run_self_test({f64_present}) failed: {mismatch}");
+    }
     assert_eq!(state, Some((0, 0)), "{test}: SME state left");
-    // A lower bound only: other tests run kernels concurrently. The exact
-    // counts are checked on stand-ins above.
+    // Counted on this thread, where the self-test makes every call: one
+    // entry per block, as on the stand-ins above.
     let want = calls_of::<f32>() + if f64_present { calls_of::<f64>() } else { 0 };
-    assert!(grown >= want, "{test}: {grown} kernel calls, want {want}");
-    assert!(detect::thread_ready(), "{test}: thread not ready after");
+    assert_eq!(grown, want, "{test}: kernel calls on this thread");
+    assert!(kernel_ready(), "{test}: thread not ready after");
+    if !f64_present {
+        // The `bool` binding agrees (it is `is_ok()` of the detailed one).
+        let fpsr = fpsr_read();
+        // SAFETY: as above; the thread is ready again (checked just above).
+        let again = unsafe { run_self_test(false) };
+        fpsr_write(fpsr);
+        assert!(again, "{test}: run_self_test(false) failed");
+    }
 }
 
 #[test]
@@ -804,22 +1391,24 @@ fn test_sme2_selftest_real_f32_alone_passes() {
 ///
 /// `hardware_or_skip` returned true for the kernel's type.
 unsafe fn real_kernel_passes<T: SmeElement>(test: &str, kernel: KernelFn<T>) {
-    assert!(detect::thread_ready(), "{test}: thread not ready");
+    assert!(kernel_ready(), "{test}: thread not ready");
     let fpsr = fpsr_read();
-    let entries = kernel_entries();
+    let entries = kernel_entries_here();
     let start = Instant::now();
     // SAFETY: SME2 (with FEAT_SME_F64F64 for `f64`) is present by this
-    // function's contract, and `thread_ready()` was true just above.
-    let verdict = unsafe { self_test_with(kernel) };
+    // function's contract, and `kernel_ready()` was true just above.
+    let verdict = unsafe { self_test_with_detailed(kernel) };
     let elapsed = start.elapsed();
     let state = sme_state();
-    let grown = kernel_entries() - entries;
+    let grown = kernel_entries_here() - entries;
     fpsr_write(fpsr);
     println!("{test}: self_test_with took {elapsed:?}");
-    assert!(verdict, "{test}: the kernel differs from the oracle");
+    if let Err(mismatch) = verdict {
+        panic!("{test}: the kernel differs from the oracle: {mismatch}");
+    }
     assert_eq!(state, Some((0, 0)), "{test}: SME state left");
     let want = calls_of::<T>();
-    assert!(grown >= want, "{test}: {grown} kernel calls, want {want}");
+    assert_eq!(grown, want, "{test}: kernel calls on this thread");
 }
 
 #[test]
@@ -841,594 +1430,132 @@ fn test_sme2_selftest_real_kernel_f64() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The path table: every path of both kernels is taken by the self-test
-// ---------------------------------------------------------------------------
-
-/// The structure of one macro-kernel as data: what decides the path a block
-/// takes through it.
-///
-/// Both kernels (`kernel_f32.rs`, `kernel_f64.rs`) walk column panels of
-/// `nr` columns and, inside each, row panels of 64 rows. For one (row panel,
-/// column panel) pair the path is:
-///
-/// - the row variant: the number of live tiles `L = ceil(rows / tile_rows)`,
-///   `1..=variants`, where `rows = min(64, m - i0)`; each variant has its own
-///   zeroing, depth loop and remainder, and the epilogue's tile chain stops
-///   after tile `L`;
-/// - the depth: the loop unrolled by `unroll` makes `kc / unroll` passes
-///   (none, or two and more, which takes its back branch and pointer steps)
-///   and then a remainder of `kc % unroll` steps;
-/// - the epilogue mode, M0 to M3, and for M3 the branch of the contract
-///   (`alpha == 1`, `beta == 1`, neither) that the scalars select;
-/// - the column panel: full (`nr` columns) or the partial last one;
-/// - the position of the row panel: the only one, a leading (always full)
-///   one, or the last one after a full one;
-/// - the A layout: packed, or in place;
-/// - the last live tile of the row panel: full, or holding a single row (the
-///   lower edge of the variant, where the row predicates and the tile chain
-///   cut).
-///
-/// A change of a kernel's structure (another row variant, another unrolling
-/// of the depth loop, another epilogue mode or branch, another edge that the
-/// code treats on its own) must be reflected here and in [`paths_of_call`];
-/// the table then fails until the sweep of `selftest.rs` takes the new paths.
-#[derive(Clone, Copy, Debug)]
-struct KernelPaths {
-    /// The element type.
-    name: &'static str,
-    /// Rows of one ZA tile (`T::TILE_ROWS`).
-    tile_rows: usize,
-    /// Columns of one B panel (`T::NR`).
-    nr: usize,
-    /// Row variants: `1..=variants` live tiles.
-    variants: usize,
-    /// Depth steps per pass of the unrolled depth loop.
-    unroll: usize,
-}
-
-/// `kernel_f32.rs`: 16-row tiles, 16-column panels, variants of 1 to 4
-/// tiles (labels 41 to 48 and 61 to 64), a depth loop unrolled by two.
-const F32_PATHS: KernelPaths = KernelPaths {
-    name: "f32",
-    tile_rows: 16,
-    nr: 16,
-    variants: 4,
-    unroll: 2,
-};
-
-/// `kernel_f64.rs`: 8-row tiles, 8-column panels, variants of 1 to 8 tiles
-/// (labels 41 to 48, 61 to 68 and 71 to 78), a depth loop unrolled by two.
-const F64_PATHS: KernelPaths = KernelPaths {
-    name: "f64",
-    tile_rows: 8,
-    nr: 8,
-    variants: 8,
-    unroll: 2,
-};
-
-/// The epilogue of a call: the mode and, for M3, the branch of the contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum EpilogueClass {
-    /// `alpha == 1`, `beta == 0`.
-    M0,
-    /// `alpha == 1`, `beta == 1`.
-    M1,
-    /// `alpha != 1`, `beta == 0`.
-    M2,
-    /// M3 with `alpha == 1`.
-    M3AlphaOne,
-    /// M3 with `beta == 1`.
-    M3BetaOne,
-    /// M3 with neither.
-    M3General,
-}
-
-/// Every [`EpilogueClass`].
-const EPILOGUES: [EpilogueClass; 6] = [
-    EpilogueClass::M0,
-    EpilogueClass::M1,
-    EpilogueClass::M2,
-    EpilogueClass::M3AlphaOne,
-    EpilogueClass::M3BetaOne,
-    EpilogueClass::M3General,
-];
-
-/// The column panel of a path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Columns {
-    /// `nr` columns.
-    Full,
-    /// The partial last panel.
-    Partial,
-}
-
-/// The position of the row panel of a path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Position {
-    /// The first and last row panel (`m ≤ 64`).
-    Only,
-    /// A row panel that is not the last one (always 64 full rows).
-    Leading,
-    /// The last row panel after a full one.
-    Last,
-}
-
-/// The A layout of a path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Layout {
-    /// `a_depth = 64`, `a_panel = 64 · kc`.
-    Packed,
-    /// Any other strides (in place: `a_depth = lda`, `a_panel = 64`).
-    InPlace,
-}
-
-/// The last live tile of the row panel of a path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum LastTile {
-    /// All `tile_rows` rows live.
-    Full,
-    /// One live row.
-    OneRow,
-    /// Between the two (never required).
-    Other,
-}
-
-/// One path through a kernel: what one (row panel, column panel) pair of one
-/// call takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Path {
-    /// Live tiles (the row variant).
-    tiles: usize,
-    /// Passes of the unrolled depth loop: 0, 1, or 2 for two and more.
-    passes: usize,
-    /// Depth steps after the loop (`kc % unroll`).
-    remainder: usize,
-    /// Mode and M3 branch.
-    epilogue: EpilogueClass,
-    /// Full or partial column panel.
-    columns: Columns,
-    /// Position of the row panel.
-    position: Position,
-    /// A layout.
-    layout: Layout,
-    /// The last live tile.
-    last_tile: LastTile,
-}
-
-/// A class of paths: a [`Path`] reduced to some of its dimensions (the
-/// others are `None`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Pattern {
-    /// See [`Path`].
-    tiles: Option<usize>,
-    /// See [`Path`].
-    passes: Option<usize>,
-    /// See [`Path`].
-    remainder: Option<usize>,
-    /// See [`Path`].
-    epilogue: Option<EpilogueClass>,
-    /// See [`Path`].
-    columns: Option<Columns>,
-    /// See [`Path`].
-    position: Option<Position>,
-    /// See [`Path`].
-    layout: Option<Layout>,
-    /// See [`Path`].
-    last_tile: Option<LastTile>,
-}
-
-/// A dimension of [`Path`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Dim {
-    /// [`Path::tiles`].
-    Tiles,
-    /// [`Path::passes`].
-    Passes,
-    /// [`Path::remainder`].
-    Remainder,
-    /// [`Path::epilogue`].
-    Epilogue,
-    /// [`Path::columns`].
-    Columns,
-    /// [`Path::position`].
-    Position,
-    /// [`Path::layout`].
-    Layout,
-    /// [`Path::last_tile`].
-    LastTile,
-}
-
-/// The requirements: for each, every combination of the values of its
-/// dimensions must be taken by some call (other dimensions free).
-///
-/// 1. Every row variant, with every depth (`kc = 1`, even, odd), in every
-///    epilogue mode and M3 branch, with a full and a partial column panel, as
-///    the only row panel and as the last one after a full one, packed and in
-///    place.
-/// 2. The same with the last live tile full and holding one row, per
-///    position of the row panel ...
-/// 3. ... and per A layout.
-const REQUIREMENTS: [&[Dim]; 3] = [
-    &[
-        Dim::Tiles,
-        Dim::Passes,
-        Dim::Remainder,
-        Dim::Epilogue,
-        Dim::Columns,
-        Dim::Position,
-        Dim::Layout,
-    ],
-    &[
-        Dim::Tiles,
-        Dim::Passes,
-        Dim::Remainder,
-        Dim::Epilogue,
-        Dim::Columns,
-        Dim::Position,
-        Dim::LastTile,
-    ],
-    &[
-        Dim::Tiles,
-        Dim::Passes,
-        Dim::Remainder,
-        Dim::Epilogue,
-        Dim::Columns,
-        Dim::Layout,
-        Dim::LastTile,
-    ],
-];
-
-/// Every path that the structure `desc` makes possible and that the table
-/// requires: the passes are none or two and more (one pass never takes the
-/// loop's back branch), the last tile full or holding one row.
-fn possible_paths(desc: &KernelPaths) -> Vec<Path> {
-    let mut paths = Vec::new();
-    for tiles in 1..=desc.variants {
-        for passes in [0, 2] {
-            for remainder in 0..desc.unroll {
-                // kc ≥ 1: without a pass there is a remainder.
-                if passes == 0 && remainder == 0 {
-                    continue;
-                }
-                for epilogue in EPILOGUES {
-                    for columns in [Columns::Full, Columns::Partial] {
-                        for position in [Position::Only, Position::Leading, Position::Last] {
-                            for layout in [Layout::Packed, Layout::InPlace] {
-                                for last_tile in [LastTile::Full, LastTile::OneRow] {
-                                    // A leading row panel holds 64 rows.
-                                    let leading_ok = position != Position::Leading
-                                        || (tiles == desc.variants && last_tile == LastTile::Full);
-                                    // One row is a full tile when tiles have one row.
-                                    let edge_ok =
-                                        last_tile != LastTile::OneRow || desc.tile_rows > 1;
-                                    if leading_ok && edge_ok {
-                                        paths.push(Path {
-                                            tiles,
-                                            passes,
-                                            remainder,
-                                            epilogue,
-                                            columns,
-                                            position,
-                                            layout,
-                                            last_tile,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+/// The C buffer of every block covers, for each type, every element that a
+/// whole `64 × NR` tile at any tile position of the block addresses, the
+/// guard column before the block and the column after it (computed here from
+/// the shape alone, independently of `c_layout`).
+fn guard_covers_whole_tiles<T: SmeElement>() -> usize {
+    let mut beyond_two_columns = 0;
+    let mut inside_two_columns = Vec::new();
+    for case in self_test_blocks(T::TILE_ROWS, T::NR) {
+        let Some(CLayout { ldc, origin, len }) = c_layout::<T>(&case) else {
+            panic!("{}: no layout for {case}", T::NR);
+        };
+        assert_eq!((ldc, origin), (case.m + 3, case.m + 4), "{case}");
+        assert_eq!(
+            run_buffers::<T>(&case).map(|[_, _, c, _]| c),
+            Some(len),
+            "{case}"
+        );
+        // Every tile position: its farthest element, `C(i0 + 63, j0 + NR - 1)`.
+        let mut reach = 0;
+        for j0 in (0..case.n).step_by(T::NR) {
+            for i0 in (0..case.m).step_by(MR) {
+                let far = (i0 + MR - 1) + (j0 + T::NR - 1) * ldc;
+                assert!(origin + far < len, "{}: {case}: tile ({i0}, {j0})", T::NR);
+                reach = reach.max(far);
             }
         }
-    }
-    paths
-}
-
-/// `path` reduced to the dimensions `dims`.
-fn project(path: &Path, dims: &[Dim]) -> Pattern {
-    let keep = |dim: Dim| dims.contains(&dim);
-    Pattern {
-        tiles: keep(Dim::Tiles).then_some(path.tiles),
-        passes: keep(Dim::Passes).then_some(path.passes),
-        remainder: keep(Dim::Remainder).then_some(path.remainder),
-        epilogue: keep(Dim::Epilogue).then_some(path.epilogue),
-        columns: keep(Dim::Columns).then_some(path.columns),
-        position: keep(Dim::Position).then_some(path.position),
-        layout: keep(Dim::Layout).then_some(path.layout),
-        last_tile: keep(Dim::LastTile).then_some(path.last_tile),
-    }
-}
-
-/// Every class of paths the table requires for `desc`.
-fn required(desc: &KernelPaths) -> BTreeSet<Pattern> {
-    let paths = possible_paths(desc);
-    REQUIREMENTS
-        .iter()
-        .flat_map(|dims| paths.iter().map(move |path| project(path, dims)))
-        .collect()
-}
-
-/// What decides the path of a kernel call: the fields of its argument block
-/// that the kernel branches on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Call {
-    /// Rows.
-    m: usize,
-    /// Columns.
-    n: usize,
-    /// Depth.
-    kc: usize,
-    /// A step between depth steps.
-    a_depth: usize,
-    /// A step between row panels.
-    a_panel: usize,
-    /// Bits of alpha.
-    alpha_bits: u64,
-    /// Bits of beta.
-    beta_bits: u64,
-}
-
-impl Call {
-    /// The call of a recorded argument block.
-    fn of_args<T: SmeElement>(args: &MacroArgs<T>) -> Self {
-        Self {
-            m: args.m,
-            n: args.n,
-            kc: args.kc,
-            a_depth: args.a_depth,
-            a_panel: args.a_panel,
-            alpha_bits: args.alpha_bits,
-            beta_bits: args.beta_bits,
-        }
-    }
-
-    /// The call that the self-test makes for `case` and the pair `scalars`
-    /// (as `Operands::new` lays A out).
-    fn of_case<T: TestFloat>(case: &Case, (alpha, beta): (f64, f64)) -> Self {
-        let (a_depth, a_panel) = match case.layout {
-            ALayout::Packed => (MR, MR * case.kc),
-            ALayout::InPlace => (case.m + case.lda_pad, MR),
-        };
-        Self {
-            m: case.m,
-            n: case.n,
-            kc: case.kc,
-            a_depth,
-            a_panel,
-            alpha_bits: T::of(alpha).bits(),
-            beta_bits: T::of(beta).bits(),
-        }
-    }
-}
-
-/// The epilogue class of a call of a `T` kernel.
-fn epilogue_of<T: SmeElement>(call: &Call) -> EpilogueClass {
-    let alpha = T::from_bits64(call.alpha_bits);
-    let beta = T::from_bits64(call.beta_bits);
-    match Epilogue::select(alpha, beta) {
-        Epilogue::Store => EpilogueClass::M0,
-        Epilogue::Add => EpilogueClass::M1,
-        Epilogue::Scale => EpilogueClass::M2,
-        Epilogue::ScaleCombine if alpha == T::ONE => EpilogueClass::M3AlphaOne,
-        Epilogue::ScaleCombine if beta == T::ONE => EpilogueClass::M3BetaOne,
-        Epilogue::ScaleCombine => EpilogueClass::M3General,
-    }
-}
-
-/// Every path one call of a `T` kernel with structure `desc` takes: one per
-/// (row panel, column panel) pair, in the kernel's order.
-fn paths_of_call<T: SmeElement>(desc: &KernelPaths, call: &Call) -> Vec<Path> {
-    let epilogue = epilogue_of::<T>(call);
-    let layout = if call.a_depth == MR && call.a_panel == MR * call.kc {
-        Layout::Packed
-    } else {
-        Layout::InPlace
-    };
-    let passes = (call.kc / desc.unroll).min(2);
-    let remainder = call.kc % desc.unroll;
-    let mut paths = Vec::new();
-    for j0 in (0..call.n).step_by(desc.nr) {
-        let columns = if call.n - j0 >= desc.nr {
-            Columns::Full
+        // The column after the block (rows 0..ldc - 1) and the one before.
+        let column_after = case.n * ldc + ldc - 2;
+        assert!(origin + column_after < len, "{}: {case}", T::NR);
+        assert!(origin > ldc, "{case}");
+        // Nothing more than the farther of the two.
+        assert_eq!(len, origin + reach.max(column_after) + 1, "{case}");
+        // A buffer of `ldc · (n + 2)` elements would end before it.
+        if origin + reach >= ldc * (case.n + 2) {
+            beyond_two_columns += 1;
         } else {
-            Columns::Partial
-        };
-        for i0 in (0..call.m).step_by(MR) {
-            let rows = (call.m - i0).min(MR);
-            let position = if i0 + MR < call.m {
-                Position::Leading
-            } else if i0 == 0 {
-                Position::Only
-            } else {
-                Position::Last
-            };
-            let last_tile = match rows % desc.tile_rows {
-                0 => LastTile::Full,
-                1 => LastTile::OneRow,
-                _ => LastTile::Other,
-            };
-            paths.push(Path {
-                tiles: rows.div_ceil(desc.tile_rows),
-                passes,
-                remainder,
-                epilogue,
-                columns,
-                position,
-                layout,
-                last_tile,
-            });
+            inside_two_columns.push((case.m, case.n, case.online));
         }
     }
-    paths
-}
-
-/// The calls the self-test makes for the blocks `cases`, in order.
-fn listed_calls<T: TestFloat>(cases: impl Iterator<Item = Case>) -> Vec<Call> {
-    cases
-        .flat_map(|case| {
-            SCALARS
-                .iter()
-                .map(move |&pair| Call::of_case::<T>(&case, pair))
-        })
-        .collect()
-}
-
-/// The classes of `desc` that no call of `calls` takes.
-fn missing<T: SmeElement>(desc: &KernelPaths, calls: &[Call]) -> Vec<Pattern> {
-    let taken: BTreeSet<Path> = calls
-        .iter()
-        .flat_map(|call| paths_of_call::<T>(desc, call))
-        .collect();
-    // Every class a taken path belongs to (a class is a projection).
-    let classes: BTreeSet<Pattern> = REQUIREMENTS
-        .iter()
-        .flat_map(|dims| taken.iter().map(move |path| project(path, dims)))
-        .collect();
-    required(desc)
-        .into_iter()
-        .filter(|pattern| !classes.contains(pattern))
-        .collect()
-}
-
-/// The table for one type: the description matches the type, and every
-/// required class is taken by the self-test's own block list.
-fn table_is_complete<T: TestFloat>(desc: &KernelPaths) {
-    assert_eq!(desc.tile_rows, T::TILE_ROWS, "{}: tile rows", desc.name);
-    assert_eq!(desc.nr, T::NR, "{}: panel width", desc.name);
-    assert_eq!(desc.variants, MR / T::TILE_ROWS, "{}: variants", desc.name);
-    let calls = listed_calls::<T>(self_test_blocks(T::TILE_ROWS, T::NR));
-    let classes = required(desc).len();
-    let gaps = missing::<T>(desc, &calls);
     println!(
-        "{}: {} calls, {} required path classes, {} not taken",
-        desc.name,
-        calls.len(),
-        classes,
-        gaps.len()
-    );
-    assert!(
-        gaps.is_empty(),
-        "{}: {} of {classes} path classes not taken by the self-test, first: {:?}",
-        desc.name,
-        gaps.len(),
-        gaps.first()
-    );
-}
-
-#[test]
-fn test_sme2_selftest_paths_all_taken_f32() {
-    table_is_complete::<f32>(&F32_PATHS);
-}
-
-#[test]
-fn test_sme2_selftest_paths_all_taken_f64() {
-    table_is_complete::<f64>(&F64_PATHS);
-}
-
-/// The table on `desc` changed by `change` (a class the kernels do not
-/// have) reports gaps.
-fn new_class_is_a_gap<T: TestFloat>(desc: &KernelPaths) {
-    let calls = listed_calls::<T>(self_test_blocks(T::TILE_ROWS, T::NR));
-    assert!(missing::<T>(desc, &calls).is_empty(), "{}", desc.name);
-    let more_variants = KernelPaths {
-        variants: desc.variants + 1,
-        ..*desc
-    };
-    assert!(
-        !missing::<T>(&more_variants, &calls).is_empty(),
-        "{}: another row variant",
-        desc.name
-    );
-    let unrolled_by_4 = KernelPaths { unroll: 4, ..*desc };
-    assert!(
-        !missing::<T>(&unrolled_by_4, &calls).is_empty(),
-        "{}: a depth loop unrolled by 4",
-        desc.name
-    );
-    // No calls at all: every class is missing.
-    assert_eq!(missing::<T>(desc, &[]).len(), required(desc).len());
-}
-
-#[test]
-fn test_sme2_selftest_paths_new_class_is_a_gap() {
-    new_class_is_a_gap::<f32>(&F32_PATHS);
-    new_class_is_a_gap::<f64>(&F64_PATHS);
-}
-
-/// The sweep alone (without [`CASES`]) takes every required class, and
-/// without any one of its blocks it has a gap: every block takes a class
-/// that no other block of the sweep takes. (A class may also be taken by a
-/// block of `CASES`, which tests other claims and may change.)
-fn every_sweep_block_counts<T: TestFloat>(desc: &KernelPaths) {
-    let sweep: Vec<Case> = sweep_cases(T::TILE_ROWS, T::NR).collect();
-    assert_eq!(sweep.len(), desc.variants * SWEEP_BLOCKS_PER_VARIANT);
-    let alone = listed_calls::<T>(sweep.iter().copied());
-    assert!(
-        missing::<T>(desc, &alone).is_empty(),
-        "{}: the sweep alone",
-        desc.name
-    );
-    for skip in 0..sweep.len() {
-        let without = sweep
-            .iter()
-            .enumerate()
-            .filter(|&(index, _)| index != skip)
-            .map(|(_, &case)| case);
-        let calls = listed_calls::<T>(without);
-        assert!(
-            !missing::<T>(desc, &calls).is_empty(),
-            "{}: sweep block {skip} ({:?}) is not needed",
-            desc.name,
-            sweep.get(skip)
-        );
-    }
-}
-
-#[test]
-fn test_sme2_selftest_paths_every_sweep_block_counts() {
-    every_sweep_block_counts::<f32>(&F32_PATHS);
-    every_sweep_block_counts::<f64>(&F64_PATHS);
-}
-
-thread_local! {
-    /// Calls seen by [`recording_oracle`] on this thread.
-    static RECORDED: RefCell<Vec<Call>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Stand-in: the oracle, recording each call.
-///
-/// # Safety
-///
-/// As for `oracle_block`.
-unsafe fn recording_oracle<T: SmeElement>(args: &MacroArgs<T>) {
-    RECORDED.with(|recorded| recorded.borrow_mut().push(Call::of_args(args)));
-    // SAFETY: forwarded from this function's contract.
-    unsafe { oracle_block(args) };
-}
-
-/// `self_test_with` makes exactly the calls of the block list the table is
-/// computed from, in order.
-fn runs_its_list<T: TestFloat>() {
-    RECORDED.with(|recorded| recorded.borrow_mut().clear());
-    let kernel: KernelFn<T> = recording_oracle::<T>;
-    // SAFETY: the stand-in is plain Rust.
-    assert!(unsafe { self_test_with(kernel) });
-    let recorded = RECORDED.with(|recorded| recorded.take());
-    let listed = listed_calls::<T>(self_test_blocks(T::TILE_ROWS, T::NR));
-    assert_eq!(recorded.len(), self_test_calls::<T>());
-    assert!(
-        recorded == listed,
-        "{}: the run differs from the list",
+        "{}: whole tiles inside ldc · (n + 2): {inside_two_columns:?}",
         T::NR
     );
+    beyond_two_columns
 }
 
 #[test]
-fn test_sme2_selftest_paths_run_equals_list() {
-    runs_its_list::<f32>();
-    runs_its_list::<f64>();
+fn test_sme2_selftest_guard_covers_whole_tiles() {
+    let f32_blocks = guard_covers_whole_tiles::<f32>();
+    let f64_blocks = guard_covers_whole_tiles::<f64>();
+    println!(
+        "blocks whose whole tiles reach beyond ldc · (n + 2): f32 {f32_blocks}, f64 {f64_blocks}"
+    );
+    // Every block but a few has a whole tile beyond `ldc · (n + 2)`: all
+    // but `64 × 16` of the 119 for f32; all but `64 × 16`, `84 × 40`, and
+    // `64 × 15` and `128 × 15` of each sweep, of the 215 for f64 (tiles
+    // whole in both directions, or rows that end before the column after
+    // the block).
+    assert_eq!((f32_blocks, f64_blocks), (118, 209));
 }
+
+/// Kernel calls and bytes of one `self_test_with` run for `T`: calls, the
+/// largest run's bytes, the largest single buffer's bytes, all runs' bytes.
+fn cost<T: SmeElement>(cases: impl Iterator<Item = Case>) -> (usize, usize, usize, usize) {
+    let mut calls = 0;
+    let mut largest = 0;
+    let mut largest_buffer = 0;
+    let mut total = 0;
+    for case in cases {
+        let (Some(bytes), Some(buffers)) = (run_bytes::<T>(&case), run_buffers::<T>(&case)) else {
+            panic!("refused block {case:?}");
+        };
+        calls += SCALARS.len();
+        largest = largest.max(bytes);
+        let buffer = buffers.into_iter().max().unwrap_or(0) * size_of::<T>();
+        largest_buffer = largest_buffer.max(buffer);
+        total += bytes * SCALARS.len();
+    }
+    (calls, largest, largest_buffer, total)
+}
+
+#[test]
+fn test_sme2_selftest_cost_matches_the_docs() {
+    // The figures of the module docs of `selftest.rs` and `detect.rs`.
+    let before_f32 = cost::<f32>(CASES.into_iter());
+    let before_f64 = cost::<f64>(CASES.into_iter());
+    let after_f32 = cost::<f32>(self_test_blocks(16, 16));
+    let after_f64 = cost::<f64>(self_test_blocks(8, 8));
+    println!("CASES only: f32 {before_f32:?}, f64 {before_f64:?}");
+    println!("with the sweep: f32 {after_f32:?}, f64 {after_f64:?}");
+    // (calls, bytes of the largest run, bytes of the largest single buffer,
+    // bytes of all runs together)
+    assert_eq!(before_f32, (42, 80_844, 26_308, 1_584_480));
+    assert_eq!(before_f64, (42, 143_744, 44_104, 2_698_416));
+    assert_eq!(after_f32, (714, 131_860, 26_308, 29_329_440));
+    assert_eq!(after_f64, (1_290, 207_464, 51_200, 61_938_096));
+    let largest = |tile: usize| {
+        self_test_blocks(tile, tile)
+            .max_by_key(|case| {
+                if tile == 16 {
+                    run_bytes::<f32>(case)
+                } else {
+                    run_bytes::<f64>(case)
+                }
+            })
+            .map(|case| (case.m, case.n, case.kc, case.layout, case.online))
+    };
+    println!("largest runs: f32 {:?}, f64 {:?}", largest(16), largest(8));
+    // The largest run: the third online case, `84 × (2 · NR + 3) × 16` in
+    // place with online packing (three column panels, so its buffer's guard
+    // holds two more copies), for either type.
+    assert_eq!(
+        largest(16),
+        Some((84, 35, 16, ALayout::InPlace, Online::Pack))
+    );
+    assert_eq!(
+        largest(8),
+        Some((84, 19, 16, ALayout::InPlace, Online::Pack))
+    );
+    assert_eq!(after_f32.0, self_test_calls::<f32>());
+    assert_eq!(after_f64.0, self_test_calls::<f64>());
+}
+
+// ---------------------------------------------------------------------------
+// The sweep
+// ---------------------------------------------------------------------------
 
 #[test]
 fn test_sme2_selftest_sweep_shape() {
@@ -1437,52 +1564,39 @@ fn test_sme2_selftest_sweep_shape() {
     // shape (one full and one partial column panel, 1 or 64 + rows rows).
     for (tile_rows, nr) in [(16, 16), (8, 8), (32, 4), (4, 2)] {
         let sweep: Vec<Case> = sweep_cases(tile_rows, nr).collect();
-        assert_eq!(sweep.len(), MR / tile_rows * SWEEP_BLOCKS_PER_VARIANT);
+        let per_variant = MR / tile_rows * SWEEP_BLOCKS_PER_VARIANT;
+        assert_eq!(sweep.len(), per_variant + SWEEP_MIDDLE_BLOCKS);
         for case in &sweep {
             assert!(case.n > nr && case.n < 2 * nr, "{case:?}");
             assert!(SWEEP_DEPTHS.contains(&case.kc), "{case:?}");
-            assert!(case.m >= 1 && case.m <= 2 * MR, "{case:?}");
+            assert!(case.m >= 1 && case.m <= 3 * MR, "{case:?}");
             assert_eq!(case.data, Data::Plain);
             assert_eq!(case.layout == ALayout::Packed, case.lda_pad == 0);
+        }
+        // The first part has at most two row panels; the blocks of three
+        // row panels (129 ≤ m ≤ 192) come last, with last panels of
+        // different sizes, each depth once per layout.
+        let (front, middle) = sweep.split_at(per_variant);
+        assert!(front.iter().all(|case| case.m <= 2 * MR));
+        assert!(
+            middle
+                .iter()
+                .all(|case| case.m > 2 * MR && case.m <= 3 * MR),
+            "{middle:?}"
+        );
+        let sizes: BTreeSet<usize> = middle.iter().map(|case| case.m).collect();
+        assert_eq!(sizes.len(), SWEEP_MIDDLE_BLOCKS, "{middle:?}");
+        for layout in [ALayout::Packed, ALayout::InPlace] {
+            let depths: BTreeSet<usize> = middle
+                .iter()
+                .filter(|case| case.layout == layout)
+                .map(|case| case.kc)
+                .collect();
+            assert_eq!(depths, SWEEP_DEPTHS.into_iter().collect(), "{layout:?}");
         }
     }
     // Degenerate shapes give no blocks rather than wrong ones.
     assert_eq!(sweep_cases(0, 16).count(), 0);
     assert_eq!(sweep_cases(16, 1).count(), 0);
     assert_eq!(sweep_cases(16, 0).count(), 0);
-}
-
-/// Kernel calls and bytes of one `self_test_with` run for `T`: calls, the
-/// largest run's bytes, all runs' bytes.
-fn cost<T: SmeElement>(cases: impl Iterator<Item = Case>) -> (usize, usize, usize) {
-    let mut calls = 0;
-    let mut largest = 0;
-    let mut total = 0;
-    for case in cases {
-        let Some(bytes) = run_bytes::<T>(&case) else {
-            panic!("refused block {case:?}");
-        };
-        calls += SCALARS.len();
-        largest = largest.max(bytes);
-        total += bytes * SCALARS.len();
-    }
-    (calls, largest, total)
-}
-
-#[test]
-fn test_sme2_selftest_cost_matches_the_docs() {
-    // The figures of the module docs of `selftest.rs` (and the Wave-6 notes).
-    let before_f32 = cost::<f32>(CASES.into_iter());
-    let before_f64 = cost::<f64>(CASES.into_iter());
-    let after_f32 = cost::<f32>(self_test_blocks(16, 16));
-    let after_f64 = cost::<f64>(self_test_blocks(8, 8));
-    println!("CASES only: f32 {before_f32:?}, f64 {before_f64:?}");
-    println!("with the sweep: f32 {after_f32:?}, f64 {after_f64:?}");
-    // (calls, bytes of the largest run, bytes of all runs together)
-    assert_eq!(before_f32, (42, 72_848, 1_274_592));
-    assert_eq!(before_f64, (42, 143_744, 2_469_600));
-    assert_eq!(after_f32, (330, 72_848, 8_160_288));
-    assert_eq!(after_f64, (618, 143_744, 19_579_872));
-    assert_eq!(after_f32.0, self_test_calls::<f32>());
-    assert_eq!(after_f64.0, self_test_calls::<f64>());
 }

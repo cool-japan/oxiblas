@@ -16,7 +16,12 @@
 //! ever see packed panels, so a transposed operand is simply *read with swapped
 //! (row, col) indices* (and conjugated for `ConjTrans`) while it is copied into
 //! the packing buffer. This is genuinely zero-copy — no materialized transpose
-//! of the source is ever produced for the real (`f32`/`f64`) path.
+//! of the source is produced for the real (`f32`/`f64`) path, with one
+//! exception: under the default policy of aarch64 (without `force-scalar`),
+//! a small product of 12³ to 32³ multiply-adds (`m, n >= 4`) with A
+//! transposed and both operands stored column-major is copied to
+//! column-major scratch in the thread's packing buffers and run on the NEON
+//! small kernels (`gemm_small::gemm_small_trans_copy`).
 //!
 //! The complex wrappers [`gemm_transposed_c64`] / [`gemm_transposed_c32`] route
 //! through the 3M complex kernel (which already splits operands into real/imag
@@ -46,8 +51,10 @@ use crate::level3::complex_gemm::{gemm3m_c32, gemm3m_c64};
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernel, MicroKernelShape};
 use crate::level3::gemm_packing::{PackBuffer, PackSlot, pack_a_optimized, pack_b_optimized};
 use crate::level3::gemm_plan::{BCapScope, DEFAULT_POLICY, GemmPlan, GemmRoute, RouteInputs};
-use crate::level3::gemm_small::{gemm_small_trans_copy, gemm_small_with};
-use crate::level3::gemm_thin::gemm_thin;
+use crate::level3::gemm_small::{
+    gemm_small_trans_copy_route, gemm_small_with, small_trans_axpy, small_trans_dot_columns,
+};
+use crate::level3::gemm_thin::gemm_thin_route;
 use crate::level3::trsm::Trans;
 use num_complex::{Complex32, Complex64};
 use oxiblas_core::memory::{AlignedVec, StackReq};
@@ -508,14 +515,9 @@ impl CallBlocking {
 }
 
 /// The fitted blocking of an `m × k` by `k × n` call of `plan` whose block
-/// sizes come from `source`.
-///
-/// This is the single place that decides the block sizes and the B-block cap
-/// of a blocked call: targets from `source` (the default blocking for the
-/// plan's kernel, or the caller's / heuristic targets), fitted with the
-/// plan's kernel shape; the cap of `plan`'s policy unless the source is
-/// [`BlockingSource::Explicit`]. Every driver of the call (and any backend
-/// that must reproduce its KC partition) takes its block sizes from here.
+/// sizes come from `source` ([`call_blocking_for`] with the plan's
+/// micro-kernel, resolved here).
+#[cfg(test)]
 pub(super) fn call_blocking<T: Field + GemmKernel>(
     source: BlockingSource,
     plan: &GemmPlan<T>,
@@ -523,7 +525,27 @@ pub(super) fn call_blocking<T: Field + GemmKernel>(
     k: usize,
     n: usize,
 ) -> CallBlocking {
-    let shape = &plan.kernel.shape;
+    call_blocking_for(source, plan, &plan.micro_kernel().shape, m, k, n)
+}
+
+/// The fitted blocking of an `m × k` by `k × n` call of `plan` whose block
+/// sizes come from `source`, for the plan's micro-kernel of shape `shape`
+/// (`plan.micro_kernel().shape`, resolved once by the caller).
+///
+/// This is the single place that decides the block sizes and the B-block cap
+/// of a blocked call: targets from `source` (the default blocking for the
+/// plan's kernel, or the caller's / heuristic targets), fitted with the
+/// plan's kernel shape; the cap of `plan`'s policy unless the source is
+/// [`BlockingSource::Explicit`]. Every driver of the call (and any backend
+/// that must reproduce its KC partition) takes its block sizes from here.
+pub(super) fn call_blocking_for<T: Field + GemmKernel>(
+    source: BlockingSource,
+    plan: &GemmPlan<T>,
+    shape: &MicroKernelShape,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> CallBlocking {
     let policy = &plan.ctx.policy;
     let (targets, cap) = match source {
         BlockingSource::Default => (default_blocking::<T>(m, k, n, shape), policy.b_cap),
@@ -771,9 +793,10 @@ pub fn gemm_transposed_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
     par: Par,
 ) {
-    // One plan for the whole call: the micro-kernel it carries shapes the
-    // blocking (MC / NC; KC is the canonical one) and is passed down to the
-    // packers and the macro-kernel.
+    // One plan for the whole call (tier, policy and problem). Only the
+    // blocked route resolves its micro-kernel (once, in `gemm_core`), whose
+    // shape then shapes the blocking (MC / NC; KC is the canonical one) and
+    // which is passed down to the packers and the macro-kernel.
     let (m, k) = op_dims(&a, trans_a);
     let n = op_dims(&b, trans_b).1;
     let plan = GemmPlan::<T>::for_problem(DEFAULT_POLICY, m, n, k);
@@ -794,8 +817,9 @@ pub fn gemm_transposed_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// Transpose-aware GEMM core with explicit blocking parameters.
 ///
 /// All the public GEMM entry points funnel through the same core as this
-/// function: each call builds one plan (micro-kernel, SIMD tier and routing
-/// policy) and every route of the call uses it. The `NoTrans`/`NoTrans`
+/// function: each call builds one plan (SIMD tier, routing policy and
+/// problem; the blocked route resolves the micro-kernel from it) and every
+/// route of the call uses it. The `NoTrans`/`NoTrans`
 /// path uses the same small-matrix fast path, packers and blocked kernel as
 /// [`gemm`]; the transpose flags only change how operands are *read* during
 /// packing.
@@ -864,7 +888,40 @@ pub(crate) fn gemm_planned<T: Field + GemmKernel + bytemuck::Zeroable>(
 /// The order of decisions is fixed: the dimension checks, then the quick
 /// returns (`m == 0`, `n == 0`, `k == 0`, `alpha == 0`; none of them reads A
 /// or B, and C is not read when `beta == 0`), then the route of the plan.
-/// Only the blocked route uses `blocking` ([`call_blocking`] fits it there).
+/// Only the blocked route uses `blocking` ([`call_blocking_for`] fits it
+/// there), and only the blocked route resolves the plan's micro-kernel.
+///
+/// # The SME2 backend
+///
+/// With the `sme2` feature on aarch64, the blocked route of a plan of the
+/// public entry points (`GemmPlan::is_production`) first offers the call to
+/// the SME2 GEMM driver (`sme2::try_gemm`), after `plan.micro_kernel()` and
+/// [`call_blocking_for`] have run once, with those blocks; when it declines
+/// (without touching C), the NEON blocked driver runs with the same blocks.
+/// The hook sits there, rather than ahead of the route, for three reasons:
+///
+/// - SME2 replaces exactly the calls whose NEON path is the blocked route
+///   with these blocks, and the driver gives that route's bits (NaN sign and
+///   payload and the floating-point flags aside), so "equal to the build
+///   without the backend" holds by construction whatever the route policy
+///   is (a hook ahead of the route would have to mirror its thresholds);
+/// - the hook's own work (the plan predicate, the driver's decision) runs
+///   only on this arm (and, for the thin route of a production plan, the
+///   SME2 GEMV's crossover compares in `gemm_thin`), never on the small
+///   routes. The compiled `gemm_core` of an `sme2` build is not the same
+///   machine code as without the feature all the same (a larger stack
+///   frame, one more store on entry, other registers); measured on an
+///   Apple M3, tiny products (`1³` to `8³`, `f32` / `f64`, `NoTrans` and
+///   `Trans`) take the same time per call within noise (median difference
+///   below 0.4 ns). Builds without the feature compile to the same code as
+///   before the hook;
+/// - the depth partition (KC) is one value shared by both paths.
+///
+/// A plan that forces a route, a pack scope or a micro-kernel (tests of the
+/// NEON internals, A/B runs) runs what it forced: the hook leaves it alone.
+/// The thin route of such a plan likewise keeps its own GEMV kernels
+/// (`gemm_thin`); the thin route of a production plan offers its GEMV to the
+/// SME2 GEMV.
 #[allow(clippy::too_many_arguments)]
 fn gemm_core<T: Field + GemmKernel + bytemuck::Zeroable>(
     trans_a: Trans,
@@ -908,16 +965,46 @@ fn gemm_core<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Everything below reads A and B.
 
-    // (Wave 6: the SME2 hook goes here, ahead of the route; it takes its block
-    // sizes from `call_blocking`, so its KC partition is the NEON path's.)
-
+    // The plan's micro-kernel is resolved only on the blocked route below:
+    // the other routes run no micro-kernel, and tiny products must not pay
+    // for the dispatch.
     let inputs = RouteInputs::new(trans_a, trans_b, &a, &b, m, n, k, plan.ctx.tier());
     let route = plan.route(&inputs);
     // m == 1 or n == 1 as one GEMV. `gemm_thin` declines (leaving C as it
     // is) only for operands the router never sends it, which the blocked
     // route below then computes.
+    #[cfg(not(all(feature = "sme2", target_arch = "aarch64")))]
     if route == GemmRoute::Thin
-        && gemm_thin(plan.ctx, trans_a, trans_b, alpha, &a, &b, beta, &mut c, par)
+        && gemm_thin_route(
+            plan.ctx,
+            trans_a,
+            trans_b,
+            alpha,
+            a,
+            b,
+            beta,
+            c.rb_mut(),
+            par,
+        )
+    {
+        return;
+    }
+    // With `sme2`, the thin route of a production plan first offers its GEMV
+    // to the SME2 GEMV (see `gemm_thin`).
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    if route == GemmRoute::Thin
+        && gemm_thin_route(
+            plan.ctx,
+            plan.is_production(),
+            trans_a,
+            trans_b,
+            alpha,
+            a,
+            b,
+            beta,
+            c.rb_mut(),
+            par,
+        )
     {
         return;
     }
@@ -925,27 +1012,54 @@ fn gemm_core<T: Field + GemmKernel + bytemuck::Zeroable>(
         // NoTrans/NoTrans without packing (SIMD small kernels where the tier
         // has them).
         GemmRoute::Small => gemm_small_with(plan.ctx, alpha, &a, &b, beta, &mut c),
-        // Transposed or strided small problems copied to column-major for
-        // the SIMD small kernels (the loops if no copy can be made).
-        GemmRoute::SmallTransCopy => {
-            if !gemm_small_trans_copy(plan.ctx, trans_a, trans_b, alpha, &a, &b, beta, &mut c) {
+        // Transposed small problems: the transpose-aware loops. With
+        // `SmallTransCopy`, the problem is first copied to column-major for
+        // the SIMD small kernels (the loops run if no copy can be made).
+        // One arm, so that the loops have one call site and stay inlined
+        // here: the copy is a call out of line, and the smallest transposed
+        // products pay for neither.
+        GemmRoute::SmallTransCopy | GemmRoute::SmallTrans => {
+            let copied = route == GemmRoute::SmallTransCopy
+                && gemm_small_trans_copy_route(
+                    plan.ctx,
+                    trans_a,
+                    trans_b,
+                    alpha,
+                    a,
+                    b,
+                    beta,
+                    c.rb_mut(),
+                );
+            if !copied {
                 gemm_small_trans(trans_a, trans_b, alpha, &a, &b, beta, &mut c);
             }
-        }
-        // Transposed small problems: the transpose-aware loops.
-        GemmRoute::SmallTrans => {
-            gemm_small_trans(trans_a, trans_b, alpha, &a, &b, beta, &mut c);
         }
         // `Thin` reaches this arm only when `gemm_thin` declined above (it
         // returned `false` and left C untouched): the blocked driver then
         // computes the product like any other.
         GemmRoute::Thin | GemmRoute::Blocked => {
+            // The plan's micro-kernel, resolved once for the whole call.
+            let kernel = plan.micro_kernel();
             // The blocking targets fitted to this problem: every caller
             // (including hand-built `for_kernel` / `custom` blockings) gets
             // balanced blocks instead of a full block plus a sliver.
-            let blocks = call_blocking(blocking, plan, m, k, n);
+            let blocks = call_blocking_for(blocking, plan, &kernel.shape, m, k, n);
+            // The SME2 backend (the `sme2` feature on aarch64): it takes the
+            // call with these blocks, or declines without touching C, and
+            // the NEON blocked driver below then runs with the same blocks.
+            // (Inline here: an out-of-line arm stops `gemm_core` from being
+            // inlined into the entry points, which costs tiny products about
+            // 1.6 ns per call.)
+            #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+            if plan.is_production()
+                && super::sme2::try_gemm(
+                    trans_a, trans_b, alpha, &a, &b, beta, &mut c, &blocks, par,
+                )
+            {
+                return;
+            }
             gemm_blocked(
-                trans_a, trans_b, alpha, &a, &b, beta, &mut c, &blocks, plan, par,
+                trans_a, trans_b, alpha, &a, &b, beta, &mut c, &blocks, &kernel, plan, par,
             );
         }
     }
@@ -1060,13 +1174,22 @@ fn materialize_op<T: Scalar + bytemuck::Zeroable>(src: &MatRef<'_, T>, trans: Tr
 /// Rows of C from which [`gemm_small_trans`] uses the axpy order for
 /// `op(A) = A` (real types only).
 ///
-/// The axpy order pays a fixed cost per `(j, p)` pair and then updates `m`
-/// elements with vector instructions; the dot order costs per multiply-add.
-/// On an Apple M3 (`NoTrans`/`Trans`, `m * n * k <= 32³`) the axpy order took
-/// 1.2-1.6x the dot order's time at `m = 1, 3, 5`, and 0.30-0.93x of it for
-/// `m >= 8` (f64 and f32; square, wide and tall shapes), except for a tie
-/// (+1.7%) at `8 x 64 x 64`.
+/// The two orders round differently (the axpy order adds each product to
+/// `beta * C` as it goes, the dot order adds `alpha * dot` to `beta * C` at
+/// the end), so this threshold is part of the result bits of the transposed
+/// small path and stays at the value of 0.2.3. It was chosen with the loops
+/// of 0.2.3 on an Apple M3 (`NoTrans`/`Trans`, `m * n * k <= 32³`): the axpy
+/// order took 1.2-1.6x the dot order's time at `m = 1, 3, 5`, and 0.30-0.93x
+/// of it for `m >= 8` (f64 and f32; square, wide and tall shapes), except for
+/// a tie (+1.7%) at `8 x 64 x 64`.
 const SMALL_AXPY_MIN_ROWS: usize = 8;
+
+/// Rows of C from which [`gemm_small_trans`] computes the dot order for
+/// `op(A) = A` with adjacent rows (real types, fewer than
+/// [`SMALL_AXPY_MIN_ROWS`] rows) a whole column of C at a time
+/// ([`small_trans_dot_columns`], out of line); one and two rows keep the
+/// inline loop, where the call would cost more than it saves.
+const SMALL_DOT_COLUMN_MIN_ROWS: usize = 3;
 
 /// Transpose-aware naive GEMM for the small-matrix fast path.
 ///
@@ -1078,11 +1201,19 @@ const SMALL_AXPY_MIN_ROWS: usize = 8;
 ///
 /// - real `op(A) = A` in column-major storage with at least
 ///   [`SMALL_AXPY_MIN_ROWS`] rows: `C = beta * C`, then
-///   `C[:, j] += A[:, p] * (alpha * op(B)[p, j])` over unit-stride columns of
-///   A and C (the reference-BLAS order, which vectorizes).
+///   `C[i, j] += A[i, p] * (alpha * op(B)[p, j])` for `p = 0, 1, ..., k - 1`
+///   in that order (the reference-BLAS axpy order), by
+///   [`small_trans_axpy`]: a column of C of up to 64 rows is updated in
+///   register blocks that stay in registers for all `p` (read and written
+///   once per block, not once per `p`) from a depth that depends on the
+///   rows, the number of columns and the element width; a longer column and
+///   every other product `p` by `p`.
 /// - otherwise every `C[i, j]` becomes `alpha * dot + beta * C[i, j]`, where
 ///   the dot product runs along a row of `op(A)` (a column of the stored A
-///   when A is transposed).
+///   when A is transposed), from `+0` in the order of `p`. For a real
+///   `op(A) = A` in column-major storage with [`SMALL_DOT_COLUMN_MIN_ROWS`]
+///   to 7 rows, [`small_trans_dot_columns`] computes the dot products of a
+///   whole column of C together (the same operations per element).
 ///
 /// C is not read when `beta == 0`, and neither A nor B when `alpha == 0`.
 fn gemm_small_trans<T: Field>(
@@ -1104,27 +1235,16 @@ fn gemm_small_trans<T: Field>(
         return;
     }
 
-    if T::is_real() && trans_a == Trans::NoTrans && a.col_stride() == 1 && m >= SMALL_AXPY_MIN_ROWS
-    {
+    let a_columns = T::is_real() && trans_a == Trans::NoTrans && a.col_stride() == 1;
+    if a_columns && m >= SMALL_AXPY_MIN_ROWS {
         // C = beta * C first (C is not read when beta == 0).
         scale_matrix(c, beta);
-        for j in 0..n {
-            for p in 0..k {
-                let t = alpha * read_op(b, trans_b, p, j);
-                if let (Some(a_col), Some(c_col)) = (a.col_as_slice(p), c.col_as_slice_mut(j)) {
-                    for (ci, &ai) in c_col.iter_mut().zip(a_col) {
-                        *ci += ai * t;
-                    }
-                    continue;
-                }
-                // Not reached (`p < k`, `j < n`, unit row strides); kept so the
-                // update never depends on that.
-                for i in 0..m {
-                    let v = c[(i, j)] + a[(i, p)] * t;
-                    c.set(i, j, v);
-                }
-            }
-        }
+        small_trans_axpy(alpha, *a, trans_b, *b, c.rb_mut(), k);
+        return;
+    }
+    if a_columns && m >= SMALL_DOT_COLUMN_MIN_ROWS {
+        // The dot order below, a whole column of C at a time.
+        small_trans_dot_columns(alpha, *a, trans_b, *b, beta, c.rb_mut(), k);
         return;
     }
 
@@ -1149,8 +1269,9 @@ fn gemm_small_trans<T: Field>(
 ///
 /// `blocking` is fitted to the problem, with the B-block cap decided per
 /// driver ([`CallBlocking`]); the cap only changes NC, so not the result.
-/// Both drivers run the plan's micro-kernel, and the 2D parallel driver uses
-/// the plan's pack scope.
+/// Both drivers run `kernel`, the plan's micro-kernel
+/// ([`GemmPlan::micro_kernel`], resolved once by the caller), and the 2D
+/// parallel driver uses the plan's pack scope.
 #[allow(clippy::too_many_arguments)]
 fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     trans_a: Trans,
@@ -1161,11 +1282,10 @@ fn gemm_blocked<T: Field + GemmKernel + bytemuck::Zeroable>(
     beta: T,
     c: &mut MatMut<'_, T>,
     blocking: &CallBlocking,
+    kernel: &MicroKernel<T>,
     plan: &GemmPlan<T>,
     par: Par,
 ) {
-    let kernel = &plan.kernel;
-
     #[cfg(feature = "parallel")]
     {
         // Below 128^3 multiply-adds (or 80^3 per thread) the fork/join and
@@ -1377,7 +1497,7 @@ pub(super) fn pack_b_trans_dispatch<T: Field>(
 
 /// Sequential blocked GEMM implementation.
 #[allow(clippy::too_many_arguments)]
-fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
+pub(super) fn gemm_blocked_sequential<T: Field + GemmKernel + bytemuck::Zeroable>(
     trans_a: Trans,
     trans_b: Trans,
     alpha: T,
@@ -1655,3 +1775,7 @@ mod reuse_tests;
 #[cfg(test)]
 #[path = "gemm_blocking_tests.rs"]
 mod blocking_tests;
+
+#[cfg(test)]
+#[path = "gemm_small_trans_tests.rs"]
+mod small_trans_tests;

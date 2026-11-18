@@ -21,7 +21,7 @@
 //! - **A** (`a`, `a_depth`, `a_panel`): `A(i, p) = a[(i / 64) * a_panel + p * a_depth + i % 64]`.
 //!   The plain packed layout of `pack_a_trans_dispatch(.., mr = 64)` is
 //!   `a_depth = 64`, `a_panel = 64 * kc` ([`MacroArgs::packed`]); it is
-//!   zero-padded to whole 64-row panels. Wave 4 reads column-major A in place
+//!   zero-padded to whole 64-row panels. The driver reads column-major A in place
 //!   with `a_depth = lda`, `a_panel = 64`, where rows `≥ m` do not exist. So
 //!   the kernel must never read `A(i, p)` for `i ≥ m` (predicate the loads,
 //!   `whilelt … /z`) and must use both strides as given.
@@ -89,31 +89,30 @@
 //! the panel size; `kc` being even or a multiple of anything; any pointer or
 //! `ldc` alignment beyond the element's own; finite values in C (M0/M2 never
 //! read it, so a NaN there must not leak); the plain-packing values of the
-//! strides; anything about `a_pack` and `prefetch` other than their "off"
-//! values below.
+//! strides.
 //!
-//! # Fields reserved for Wave 4
+//! # Online packing of A and prefetching
 //!
-//! - `a_pack`: online packing of A. Null means off. When non-null (Wave 4
-//!   only), the kernel stores the A panels it reads during column panel 0 to
-//!   `a_pack` in the plain packed layout (zero-filled rows included) and reads
-//!   them from there for the other column panels. Until Wave 4 every caller
-//!   passes null and kernels do not read the field.
-//! - `prefetch`: prefetch switches ([`PREFETCH_OFF`] = 0). Prefetching never
-//!   changes results; until Wave 4 every caller passes 0 and kernels ignore
-//!   the field.
-
-// The block and its helpers are consumed by the kernels, the oracle, the
-// self-test and the drivers of later waves; until the GEMM hook calls them
-// (Wave 6) only tests use them. `expect` turns into a warning once that
-// changes, so the attribute cannot outlive its reason.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the SME2 drivers once the GEMM hook lands"
-    )
-)]
+//! - `a_pack`: online packing of A. Null means off. When it is non-null it
+//!   points at a writable buffer of at least `ceil(m / 64) · 64 · kc`
+//!   elements that overlaps neither A, B, C nor the argument block. The
+//!   kernel then reads A with the given `a` / `a_depth` / `a_panel` while it
+//!   computes column panel 0 and stores what it loads into the buffer in the
+//!   plain packed layout; for every later column panel it reads A from the
+//!   buffer (`a_depth = 64`, `a_panel = 64 · kc`). After the call the first
+//!   `ceil(m / 64) · 64 · kc` elements of the buffer are, bit for bit, the
+//!   plain packed block (`A(i, p)` at `(i / 64) · 64 · kc + p · 64 + i % 64`,
+//!   `+0` for the rows `m ≤ i < ceil(m / 64) · 64` of the last panel),
+//!   nothing beyond them is written, and C is exactly what the same call
+//!   without `a_pack` computes. A call with `n ≤ NR` still fills the buffer.
+//! - `prefetch`: prefetch switches ([`PREFETCH_OFF`] = 0). With
+//!   [`PREFETCH_C`] set, the kernel issues prefetch hints for the live part
+//!   of each tile's C columns before the tile's depth loop. Hints never
+//!   change a result, a flag or any memory. The other bits are reserved and
+//!   must be 0.
+//!
+//! Both macro-kernels honour both fields; with the "off" values they
+//! compute a plain packed block.
 
 use core::mem::offset_of;
 use core::ops::{Add, Mul};
@@ -124,6 +123,10 @@ pub(crate) const MR: usize = 64;
 
 /// `prefetch` value that turns every prefetch off.
 pub(crate) const PREFETCH_OFF: u64 = 0;
+
+/// `prefetch` bit 0: prefetch the live part of each tile's C columns before
+/// the tile's depth loop.
+pub(crate) const PREFETCH_C: u64 = 1;
 
 /// The element types of the SME2 backend: `f32` and `f64`.
 pub(crate) trait SmeElement:
@@ -255,16 +258,16 @@ pub(crate) struct MacroArgs<T> {
     pub(crate) beta_bits: u64,
     /// [`Epilogue`] as its discriminant (0–3).
     pub(crate) mode: u64,
-    /// Online packing target for A (Wave 4); null = off.
+    /// Online packing target for A (module docs); null = off.
     pub(crate) a_pack: *mut T,
-    /// Prefetch switches (Wave 4); [`PREFETCH_OFF`] = off.
+    /// Prefetch switches ([`PREFETCH_C`]); [`PREFETCH_OFF`] = off.
     pub(crate) prefetch: u64,
 }
 
 impl<T: SmeElement> MacroArgs<T> {
     /// A block in the plain packed layouts (`a_depth = 64`,
     /// `a_panel = 64 * kc`, `b_panel = kc * NR`), with the epilogue chosen
-    /// from `alpha` and `beta` and the Wave-4 fields off.
+    /// from `alpha` and `beta`, online packing and prefetch off.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn packed(
         a: *const T,
@@ -294,6 +297,30 @@ impl<T: SmeElement> MacroArgs<T> {
             a_pack: core::ptr::null_mut(),
             prefetch: PREFETCH_OFF,
         }
+    }
+
+    /// The block with A read in place from a column-major matrix:
+    /// `A(i, p) = a[i + p * lda]`, that is `a_depth = lda` and
+    /// `a_panel = 64` (rows `≥ m` do not exist; the kernel never reads them).
+    pub(crate) fn with_a_in_place(mut self, a: *const T, lda: usize) -> Self {
+        self.a = a;
+        self.a_depth = lda;
+        self.a_panel = MR;
+        self
+    }
+
+    /// The block with online packing of A into `a_pack` (module docs); a
+    /// null pointer turns it off.
+    pub(crate) fn with_online_pack(mut self, a_pack: *mut T) -> Self {
+        self.a_pack = a_pack;
+        self
+    }
+
+    /// The block with the prefetch switches `prefetch` ([`PREFETCH_C`] or
+    /// [`PREFETCH_OFF`]).
+    pub(crate) fn with_prefetch(mut self, prefetch: u64) -> Self {
+        self.prefetch = prefetch;
+        self
     }
 }
 
@@ -329,16 +356,39 @@ pub(crate) const OFF_A_PACK: usize = offset_of!(MacroArgs<f32>, a_pack);
 pub(crate) const OFF_PREFETCH: usize = offset_of!(MacroArgs<f32>, prefetch);
 
 /// Writes the contract's value into every element of `C[0..m, 0..n]`: the
-/// executable definition of what a macro-kernel computes (module docs).
+/// executable definition of what a macro-kernel computes (module docs). With
+/// online packing on (`a_pack` non-null) it also writes the packed copy of
+/// the A block, zero padding included, as the module docs define it.
 ///
 /// # Safety
 ///
 /// Every address that the layout of the module docs names for `args` must be
 /// valid: A for `i < m`, `p < kc`; B for `p < kc`, `j < ceil(n / NR) * NR`;
-/// C for `i < m`, `j < n` (C is read only when the mode reads it).
+/// C for `i < m`, `j < n` (C is read only when the mode reads it); and, when
+/// `a_pack` is non-null, `ceil(m / 64) * 64 * kc` writable elements there
+/// that overlap none of the others.
 #[cfg(test)]
 pub(crate) unsafe fn reference<T: SmeElement>(args: &MacroArgs<T>) {
     let nr = T::NR;
+    if !args.a_pack.is_null() {
+        for i in 0..args.m.div_ceil(MR) * MR {
+            for p in 0..args.kc {
+                let value = if i < args.m {
+                    // SAFETY: inside the A block by the caller's contract.
+                    unsafe {
+                        *args
+                            .a
+                            .add((i / MR) * args.a_panel + p * args.a_depth + i % MR)
+                    }
+                } else {
+                    T::ZERO
+                };
+                // SAFETY: inside the first `ceil(m / 64) * 64 * kc` elements
+                // of the packing buffer, valid by the caller's contract.
+                unsafe { *args.a_pack.add((i / MR) * MR * args.kc + p * MR + i % MR) = value };
+            }
+        }
+    }
     let alpha_one = args.alpha_bits == T::ONE.bits();
     let (alpha, beta) = (
         T::from_bits64(args.alpha_bits),
@@ -388,4 +438,119 @@ pub(crate) unsafe fn reference<T: SmeElement>(args: &MacroArgs<T>) {
 #[cfg(test)]
 pub(crate) fn same_result<T: SmeElement>(got: T, want: T) -> bool {
     got.bits() == want.bits() || (got.nan() && want.nan())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic, non-trivial value for element `index` of a buffer.
+    fn value(index: usize, salt: u32) -> f32 {
+        let mixed = (index as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(salt.wrapping_mul(40_503));
+        (mixed >> 8) as f32 / 65_536.0 - 128.0
+    }
+
+    #[test]
+    fn test_sme2_args_builders_set_only_their_fields() {
+        let (a, b, mut c) = ([1.0f32; 4], [2.0f32; 16], [3.0f32; 4]);
+        let plain =
+            MacroArgs::<f32>::packed(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), 4, 4, 1, 1, 1.0, 0.0);
+        assert!(plain.a_pack.is_null());
+        assert_eq!(plain.prefetch, PREFETCH_OFF);
+        assert_eq!((plain.a_depth, plain.a_panel), (MR, MR));
+
+        let mut copy = [0.0f32; 64];
+        let block = plain
+            .with_a_in_place(a.as_ptr(), 7)
+            .with_online_pack(copy.as_mut_ptr())
+            .with_prefetch(PREFETCH_C);
+        assert_eq!(block.a, a.as_ptr());
+        assert_eq!((block.a_depth, block.a_panel), (7, MR));
+        assert_eq!(block.a_pack, copy.as_mut_ptr());
+        assert_eq!(block.prefetch, PREFETCH_C);
+        // Everything else is the plain block's.
+        assert_eq!(
+            (block.b, block.b_panel, block.c, block.ldc),
+            (plain.b, plain.b_panel, plain.c, plain.ldc)
+        );
+        assert_eq!((block.m, block.n, block.kc), (plain.m, plain.n, plain.kc));
+        assert_eq!(
+            (block.alpha_bits, block.beta_bits, block.mode),
+            (plain.alpha_bits, plain.beta_bits, plain.mode)
+        );
+        assert!(
+            block
+                .with_online_pack(core::ptr::null_mut())
+                .a_pack
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn test_sme2_args_reference_online_pack_writes_plain_layout() {
+        // 70 rows (two panels, the second with 6 live rows), depth 3, A read
+        // in place with a leading dimension larger than the rows.
+        let (m, n, kc, lda, ldc) = (70usize, 5usize, 3usize, 77usize, 71usize);
+        let a: Vec<f32> = (0..lda * kc).map(|index| value(index, 1)).collect();
+        let b: Vec<f32> = (0..kc * 16)
+            .map(|index| if index % 16 < n { value(index, 2) } else { 0.0 })
+            .collect();
+        let panels = m.div_ceil(MR);
+        let len = panels * MR * kc;
+        let sentinel = f32::from_bits(0x7fa5_5a5a);
+        let guard = 8;
+
+        let mut c_plain = vec![0.5f32; ldc * n];
+        let mut c_online = c_plain.clone();
+        let mut copy = vec![sentinel; len + guard];
+
+        let plain = MacroArgs::<f32>::packed(
+            a.as_ptr(),
+            b.as_ptr(),
+            c_plain.as_mut_ptr(),
+            ldc,
+            m,
+            n,
+            kc,
+            0.5,
+            -0.25,
+        )
+        .with_a_in_place(a.as_ptr(), lda);
+        let online = MacroArgs {
+            c: c_online.as_mut_ptr(),
+            ..plain
+        }
+        .with_online_pack(copy.as_mut_ptr());
+        // SAFETY: A holds `lda * kc >= (kc - 1) * lda + m` elements, B one
+        // whole zero-padded panel of depth `kc`, each C `ldc * n` elements
+        // with `ldc >= m`, and the copy `len + guard` elements; none overlap.
+        unsafe {
+            reference(&plain);
+            reference(&online);
+        }
+
+        // C does not depend on the packing.
+        assert!(
+            c_plain
+                .iter()
+                .zip(&c_online)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        );
+        // The copy is the plain packed block: A where the row exists, +0 in
+        // the padding rows of the last panel, nothing beyond it.
+        for i in 0..panels * MR {
+            for p in 0..kc {
+                let got = copy[(i / MR) * MR * kc + p * MR + i % MR];
+                let want = if i < m { a[i + p * lda] } else { 0.0 };
+                assert_eq!(got.to_bits(), want.to_bits(), "row {i}, depth {p}");
+            }
+        }
+        assert!(
+            copy[len..]
+                .iter()
+                .all(|x| x.to_bits() == sentinel.to_bits())
+        );
+    }
 }

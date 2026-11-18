@@ -88,7 +88,20 @@
 //! - `f16`: Enable half-precision (f16) support
 //! - `f128`: Enable quad-precision (f128) support
 //! - `serde`: Enable serialization support for matrix types
-//! - `full`: Enable all features
+//! - `full`: Enable all of the features above (not `sme2` and not the SIMD
+//!   control features below)
+//! - `sme2`: Opt-in SME2 backend for GEMM and GEMV on `aarch64` CPUs with
+//!   SME2 and a 512-bit streaming vector length (Apple M4 and later); off by
+//!   default and not part of `full`. The backend as released has run only
+//!   under emulation (QEMU); an early state of its kernels passed its unit
+//!   tests on an Apple M4 Pro except the tests of the floating-point status
+//!   flags (a known limit on macOS, see the CHANGELOG). It compiles to
+//!   nothing on other architectures, and it stays off at run time under
+//!   `force-scalar`, `max-simd-128` and `max-simd-256`, when `OXIBLAS_DISABLE_SME2` is set to anything other
+//!   than an empty string or `0`, when the operating system does not
+//!   report SME2, and when the first-use checks of its kernels fail.
+//!   [`features::HAS_SME2`] describes the build and
+//!   `blas::level3::sme2_active()` gives the run-time answer.
 //!
 //! ### SIMD Control Features
 //!

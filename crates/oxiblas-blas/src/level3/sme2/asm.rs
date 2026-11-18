@@ -66,9 +66,26 @@
 //! all: the Arm ARM evaluates them with `FPMulAdd_ZA` / `FPAdd_ZA`, which
 //! generate no floating-point exceptions and force the default NaN. So a
 //! kernel call can leave fewer flags than the NEON kernel would (no IXC from
-//! the depth loop), never more than its SVE arithmetic raises.
+//! the depth loop), never more than its SVE arithmetic raises, as long as
+//! the thread runs the region without being preempted (next paragraph).
 //! `x17` is reserved for the whole template; `x16` is free inside the body
 //! (its last value is overwritten by the frame).
+//!
+//! Known limit on macOS. The frame trusts the FPSR that it reads at the end
+//! of the streaming region. A run of the macro-kernel tests on an Apple M4
+//! Pro (macOS 27.2.1; reported by tesch1 in PR #20) showed that a thread
+//! which is preempted inside a streaming region continues with FPSR
+//! `0x0800009f`, the value of a change of PSTATE.SM. The frame's
+//! `mrs x16, fpsr` then reads that value instead of the kernel's flags, and
+//! the call returns with IOC, DZC, OFC, UFC, IXC, IDC and QC set on top of
+//! the caller's flags. So on macOS the flags after a call are exact only
+//! when the region was not preempted: in that run the two tests that compare
+//! the FPSR after a kernel call failed in 6 of 20 runs, and the other tests
+//! passed (the results of a kernel do not depend on the FPSR). The tests of
+//! this module that compare the FPSR after a call can fail in the same way
+//! on such a machine. This release does not change the frame; the planned
+//! change is a frame that restores the caller's flags and reports none of
+//! the kernel's.
 //!
 //! # Register conventions
 //!

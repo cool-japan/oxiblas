@@ -77,7 +77,9 @@
 //! epilogue arithmetic raises the flags of its live lanes only. A call leaves
 //! FPSR = the caller's flags | the flags of the epilogues of its depth
 //! blocks (M0 none, M1 those of `acc + C`, M2 of `acc · alpha`, M3 of
-//! `acc · alpha` and `t + C · beta`).
+//! `acc · alpha` and `t + C · beta`). On macOS that holds only for a call
+//! whose streaming region was not preempted: see the known limit under
+//! "The frame" in `asm.rs`.
 //!
 //! # Generated text
 //!

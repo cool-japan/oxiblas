@@ -108,7 +108,10 @@
 //! The ZA-array FMLA raises no flags and forces the default NaN (the Arm
 //! ARM's `FPMulAdd_ZA`), so a kernel call raises only what the SVE `fmul`
 //! of `alpha · x` raises (`NoTrans`), and the Rust finish what its scalar
-//! arithmetic raises (`Trans`). Flag parity with NEON is not promised.
+//! arithmetic raises (`Trans`). Flag parity with NEON is not promised. On
+//! macOS a kernel call whose streaming region was preempted returns with
+//! every cumulative flag set: the known limit of the frame, described under
+//! "The frame" in `level3/sme2/asm.rs`.
 //!
 //! The tests live in `sme2_tests.rs` and `sme2_tests_grid.rs`.
 //!

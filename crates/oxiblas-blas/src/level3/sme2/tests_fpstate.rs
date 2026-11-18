@@ -48,9 +48,17 @@ impl Drop for Keep {
 /// bits of `1 / 3` in `f32` (round to nearest gives `0x3eaa_aaab`, round
 /// towards zero `0x3eaa_aaaa`), then FPSR after an inexact division and an
 /// invalid `0 · ∞`.
+///
+/// Not inlined, as [`with_default_fp_state`] asks of the call it runs: the
+/// compiler may move floating-point arithmetic across the FPCR writes of a
+/// function it can see through (a release build for macOS computed the
+/// division of an inlined copy before the write of FPCR = 0, so under the
+/// caller's rounding mode). Both results pass through `black_box` before
+/// FPSR is read, which keeps the two operations in front of that read.
+#[inline(never)]
 fn inside() -> (u64, u32, u64) {
     let fpcr = fpcr_read();
-    let third = black_box(1.0_f32) / black_box(3.0_f32);
+    let third = black_box(black_box(1.0_f32) / black_box(3.0_f32));
     let invalid = black_box(0.0_f64) * black_box(f64::INFINITY);
     black_box(invalid);
     (fpcr, third.to_bits(), fpsr_read())

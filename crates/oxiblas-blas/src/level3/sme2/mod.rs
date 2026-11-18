@@ -19,8 +19,12 @@
 //!
 //! - The module is compiled only with the `sme2` Cargo feature on `aarch64`.
 //!   The feature is off by default and is not part of the facade's `full`
-//!   feature, because the backend has run only under emulation (QEMU), not on
-//!   SME2 hardware.
+//!   feature, because the backend as it is here has run only under emulation
+//!   (QEMU). On SME2 hardware only an early state has run: the unit tests of
+//!   the GEMM macro-kernels, before the backend was connected to the public
+//!   entry points, on an Apple M4 Pro (reported by tesch1 in PR #20). They
+//!   passed but for the tests of the FPSR after a kernel call; "The frame" in
+//!   `asm.rs` says what that run showed about the flags on macOS.
 //! - When the backend is active ([`sme2_active`]), the public GEMM and GEMV
 //!   entry points use it:
 //!   - **GEMM.** The hook in `gemm_core` sits inside the blocked route, after

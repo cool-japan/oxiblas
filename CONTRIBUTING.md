@@ -77,11 +77,16 @@ change:
 - Four SVD tests that compare with the one-sided Jacobi `Svd` are too slow for
   debug builds and are ignored there; run them with `--release`, or with
   `--run-ignored all` under nextest.
+- The GEMM A/B harness of `oxiblas-blas` (`level3::gemm_ab_tests`) consists of
+  timing tests marked `#[ignore = "timing harness"]`. They decide the GEMM
+  defaults and are not part of the normal run; their module docs say how to run
+  a group.
 
 `--all-features` builds and passes on stable, but it turns on `force-scalar`,
 which replaces the GEMM micro-kernels with the scalar one (and, on aarch64,
 the NEON DOT, NRM2, GEMV and TRSM/TRMM kernels with portable code), so it
-does not replace the default run above.
+does not replace the default run above. It also turns on `sme2`: the backend
+then compiles, but the SIMD caps keep it off at run time.
 To cover other configurations, select features explicitly, for example
 `--features parallel`, or `--features runtime-tuning` on `oxiblas-blas`.
 `oxiblas-core`'s `sve-nightly` needs a nightly toolchain only together with
@@ -91,7 +96,44 @@ hardware.
 
 `crates/oxiblas-blas/src/level3/trsm/tri_kernel_neon.rs` is generated: edit
 `crates/oxiblas-blas/tools/gen_tri_kernel_neon.py` and regenerate it with the
-command in the file's header instead of editing it by hand.
+command in the file's header instead of editing it by hand. The same holds for
+the marked regions of `crates/oxiblas-blas/src/level3/sme2/kernel_f64.rs` and
+`few_rows.rs` (beside it), written by `gen_sme2_kernel_f64.py` and
+`gen_sme2_few_rows.py` in the same `tools/` directory. Check them with
+`python3 -I crates/oxiblas-blas/tools/gen_sme2_kernel_f64.py --check` and
+`python3 -I crates/oxiblas-blas/tools/gen_sme2_few_rows.py --check` (exit 0
+when the committed output is current).
+
+The `sme2` feature (SME2 backend, aarch64): on a machine without SME2 nothing
+of the backend executes natively, so
+`cargo test -p oxiblas-blas --features sme2,parallel --lib sme2` builds and
+assembles it while the tests that need the backend skip.
+`crates/oxiblas-blas/tools/sme2_qemu.sh` runs them under QEMU user-mode
+emulation (Docker, or `--native` on a Linux host with qemu-aarch64 10.1 or
+newer, rustup's `aarch64-unknown-linux-gnu` target, rsync and, on x86-64, an
+aarch64 cross linker): a positive pass on a CPU with a 512-bit streaming
+vector length, where
+`OXIBLAS_TEST_REQUIRE_SME2=1` makes a skipped test a failure, and a negative
+pass with 256 bits, where `OXIBLAS_TEST_EXPECT_NO_SME2=1` makes a test that
+finds SME2 a failure; `OXIBLAS_TEST_SME2_MARKERS=1` makes the tests print the
+marker lines that the verdict counts. Each pass then runs the integration tests
+`sme2_public_path` and `gemm_rayon_pool` as a release and as a debug build. The
+result is one archive, `target/sme2-qemu/sme2-qemu-results.tar.gz`. On SME2
+hardware, `--hardware` runs the positive pass natively, without Docker and QEMU;
+on macOS a test with `fpsr` in its name can then fail at random with the FPSR
+`0x800009f` in its message, a known limit of 0.2.4 (see the CHANGELOG), not a
+wrong result. The script needs `sme2_qemu_verdicts.sh` and
+`sme2_qemu_selftest.sh` beside it; `--self-test` checks its own logic without
+Docker, QEMU or cargo, and `--help` lists the options.
+
+`crates/oxiblas-blas/tools/x86_gemm_runbook.sh` collects, in one run on an
+x86-64 Linux machine with AVX2 and FMA, the tests, A/B passes and benchmarks
+that decide the x86-64 GEMM defaults, and packs them into
+`target/x86-runbook/x86-runbook-results.tar.gz`.
+`crates/oxiblas-blas/tools/gemm_tiny_call_check.sh` compares the per-call time
+of small GEMM products with a base release (v0.2.3 by default) and writes
+`target/gemm_tiny_call/summary.txt`; run it after changing the GEMM entry
+points or routes.
 
 The optional `compare-openblas` benchmark links no BLAS crate. It loads an
 OpenBLAS shared library when it runs, and is not part of the normal development

@@ -1269,7 +1269,14 @@ const AXPY_BLOCK_MAX_ROWS: usize = 64;
 /// 17 rows, narrow elements then needed depth 10 with eight columns of C;
 /// 18, 19, 33 to 35 and 49 to 51 rows have the same term unmeasured.
 ///
-/// AXPY_BLOCKS_PAY_FIGURES
+/// On the last run of that benchmark with these terms (534 cases of 8 to
+/// 512 rows, 415 of them judged by the tool): the products that take the
+/// blocks ran at 0.53 to 1.16 times the time of 0.2.3 (median 0.89; 21 of
+/// 228 above 1.03, at most 2.9 ns more per call); those of up to
+/// [`AXPY_BLOCK_MAX_ROWS`] rows that take the `p` by `p` loop at 0.95 to
+/// 1.40 times (median 1.10; 94 of 141 above 1.03, 0.7 to 6.4 ns more per
+/// call, which is the call: 0.2.3 runs the loop inside the GEMM core);
+/// longer columns at 0.82 to 1.12 times (median 0.99).
 #[inline(always)]
 const fn axpy_blocks_terms(narrow: bool, rows: usize) -> Option<(usize, usize)> {
     Some(if rows <= 16 {
@@ -1350,8 +1357,8 @@ pub(super) fn axpy_blocks_pay<T>(rows: usize, k: usize, n: usize) -> bool {
 /// it: products that keep it then took the time of 0.2.3, but in a build
 /// with the `sme2` feature the core's other loops changed with it (`f32`
 /// `Trans`/`NoTrans` cubes from 6³ to 11³ took 1.09 to 1.32 times the time
-/// of 0.2.3), so it stays behind this call, which costs such a product 2 to
-/// 5 ns.
+/// of 0.2.3), so it stays behind this call, which costs such a product up
+/// to 6.4 ns (the measured figures are with [`axpy_blocks_terms`]).
 ///
 /// # Panics
 ///
@@ -1432,9 +1439,9 @@ pub(super) fn small_trans_axpy_blocks<T: Field>(
 /// with long columns and few of them. On an Apple M3, `NoTrans`/`Trans`
 /// 128 × 8 × 1 and 256 × 4 × 1 took 1.05 and 1.06 times the time of 0.2.3
 /// in `f64` and 1.15 and 1.12 times in `f32` while this loop sat behind the
-/// entry of the register blocks; from here they take 1.02 times in `f64`
-/// and 1.07 and 1.05 times in `f32` (2 to 4.5 ns per call more than 0.2.3,
-/// whose loop ran inside the GEMM core).
+/// entry of the register blocks; from here they take 1.02 to 1.03 times in
+/// `f64` and 1.07 to 1.09 times in `f32` (2 to 6 ns per call more than
+/// 0.2.3, whose loop ran inside the GEMM core).
 ///
 /// The loop holds nothing but the slice update. A column of C or of A that
 /// is not available as a slice (not reached from `gemm::gemm_small_trans`,

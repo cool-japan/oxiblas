@@ -50,7 +50,7 @@
 //! Strassen's algorithm is beneficial for very large matrices (typically > 512×512).
 //! For smaller matrices, the standard blocked GEMM is faster due to lower overhead.
 
-use crate::level3::gemm::{GemmBlocking, gemm_with_blocking};
+use crate::level3::gemm::{GemmBlocking, gemm_with_heuristic_blocking};
 use crate::level3::gemm_kernel::GemmKernel;
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
@@ -193,9 +193,11 @@ fn strassen_direct_gemm<T: Field + GemmKernel + bytemuck::Zeroable>(
     c: MatMut<'_, T>,
     par: Par,
 ) {
+    // Strassen chose these targets (not its caller), so the policy's B-block
+    // cap may lower NC (never a result bit).
     let shape = T::micro_kernel_shape();
     let blocking = GemmBlocking::for_kernel::<T>(&shape);
-    gemm_with_blocking(alpha, a, b, beta, c, par, &blocking);
+    gemm_with_heuristic_blocking(alpha, a, b, beta, c, par, &blocking);
 }
 
 /// Recursive Strassen implementation with dynamic peeling.
@@ -222,7 +224,7 @@ fn strassen_recursive<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     // Base case: fall back to the blocked GEMM kernel once any dimension is
     // small enough to no longer be worth splitting, or the recursion budget
-    // is exhausted. `gemm_with_blocking` handles arbitrary (non-square,
+    // is exhausted. The blocked GEMM handles arbitrary (non-square,
     // odd-sized) shapes directly.
     if m.min(k).min(n) <= STRASSEN_LEAF_SIZE || depth >= MAX_STRASSEN_DEPTH {
         strassen_direct_gemm(alpha, a, b, beta, c, par);
@@ -1008,6 +1010,7 @@ fn copy_to_mat<T: Field + bytemuck::Zeroable>(m: &MatRef<'_, T>) -> Mat<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::level3::gemm::gemm_with_blocking;
 
     #[test]
     fn test_strassen_small() {

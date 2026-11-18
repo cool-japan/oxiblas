@@ -1,11 +1,12 @@
 //! CBLAS Level 2 (matrix-vector) real operations: GEMV.
 //!
 //! On aarch64 (without the `force-scalar` feature), calls with unit increments
-//! are forwarded to [`crate::level2::gemv`] and its NEON kernels: a RowMajor
-//! `m x n` matrix with leading dimension `lda` is the ColMajor `n x m` matrix
-//! `Aᵀ` with the same `lda`, so RowMajor `NoTrans` runs as ColMajor `Trans` and
-//! RowMajor `Trans` / `ConjTrans` as ColMajor `NoTrans`. Other increments and
-//! other targets keep the strided reference loops.
+//! are forwarded to [`crate::level2::gemv`](fn@crate::level2::gemv) and its
+//! NEON kernels: a RowMajor `m x n` matrix with leading dimension `lda` is the
+//! ColMajor `n x m` matrix `Aᵀ` with the same `lda`, so RowMajor `NoTrans`
+//! runs as ColMajor `Trans` and RowMajor `Trans` / `ConjTrans` as ColMajor
+//! `NoTrans`. Other increments and other targets keep the strided reference
+//! loops.
 
 use super::super::types::*;
 use super::super::validate::{gemv_params_valid, inc_valid};
@@ -41,8 +42,8 @@ fn colmajor_gemv_form(
 }
 
 /// Unit-increment GEMV of `cblas_dgemv` / `cblas_sgemv`: forwards to
-/// [`crate::level2::gemv`] (its NEON kernels) on the column-major view given by
-/// [`colmajor_gemv_form`].
+/// [`crate::level2::gemv`](fn@crate::level2::gemv) (its NEON kernels) on the
+/// column-major view given by [`colmajor_gemv_form`].
 ///
 /// Kept out of line (`#[inline(never)]`) so that `cblas_dgemv` stays near its
 /// size from before this fast path existed. The strided reference loops after

@@ -58,7 +58,7 @@
 //! ```
 
 mod gbmv;
-mod gemv;
+pub(crate) mod gemv;
 mod gemv_strided;
 mod ger;
 mod hbmv;

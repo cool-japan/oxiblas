@@ -17,6 +17,18 @@
 //! `force-scalar` feature and all other views and element types keep the
 //! portable code below.
 //!
+//! ## SME2
+//!
+//! With the opt-in `sme2` feature on aarch64, [`gemv`] and [`gemv_with_par`]
+//! (its sequential and its parallel path) first offer the call to the SME2
+//! GEMV (`sme2.rs`), after `y` has been scaled by beta and after the
+//! `alpha == 0` return: it takes `f64` / `f32` with adjacent rows of A past
+//! a size crossover when the SME2 backend is active
+//! ([`sme2_active`](crate::level3::sme2_active)), and gives the bits of the
+//! NEON kernels except the sign and payload of NaN results; a call below the
+//! crossover pays a few compares and never starts the detection. Everything
+//! else runs as described above.
+//!
 //! ## Parallelization
 //!
 //! When the `parallel` feature is enabled, GEMV operations are parallelized:
@@ -36,8 +48,17 @@ use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
 use oxiblas_matrix::MatRef;
 
-#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
-mod neon;
+// The NEON kernels are also the reference and the fallback of the SME2 GEMV
+// (`sme2.rs`), so an `sme2` build compiles them even under `force-scalar`,
+// where the GEMV drivers do not use them; the SME2 GEMV is their caller there.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "force-scalar"), feature = "sme2")
+))]
+pub(crate) mod neon;
+
+#[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+pub(crate) mod sme2;
 
 /// Block size for the column dimension (K blocking) of the portable blocked
 /// kernels: the sequential `gemv_blocked` paths (including the `x86_64` AVX2
@@ -94,6 +115,11 @@ pub enum GemvTrans {
 /// returns immediately and `y` is left untouched (it is *not* scaled by `beta`);
 /// `beta == 0` overwrites `y` without reading it; and `alpha == 0` never reads
 /// `A` or `x`.
+///
+/// With the `sme2` feature on aarch64 and the SME2 backend active, an `f64`
+/// / `f32` call with adjacent rows of A past the SME2 crossover runs on SME2
+/// (see the module docs, "SME2"), with the bits of the NEON kernels except
+/// the sign and payload of NaN results.
 ///
 /// # Panics
 ///
@@ -155,6 +181,13 @@ pub fn gemv<T: Field>(trans: GemvTrans, alpha: T, a: MatRef<'_, T>, x: &[T], bet
 
     // Early exit if alpha is zero
     if alpha == T::zero() {
+        return;
+    }
+
+    // The SME2 GEMV (the `sme2` feature on aarch64): it computes the call,
+    // bit for bit the NEON kernels' result, or declines without touching y.
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    if sme2::try_gemv(trans, alpha, a, x, y, Par::Seq) {
         return;
     }
 
@@ -521,7 +554,10 @@ unsafe fn gemv_blocked_notrans_f64_avx2(
 /// Computes GEMV with parallelization control.
 ///
 /// When the `parallel` feature is enabled and `par` is set to `Par::Rayon`,
-/// this function will parallelize the computation.
+/// this function will parallelize the computation. With the `sme2` feature
+/// both paths first offer the call to the SME2 GEMV, as [`gemv`] does; the
+/// parallel path passes `par` on, so a large matrix is split over the SME
+/// units.
 pub fn gemv_with_par<T: Field + Send + Sync>(
     trans: GemvTrans,
     alpha: T,
@@ -570,7 +606,8 @@ pub fn gemv_with_par<T: Field + Send + Sync>(
     gemv_sequential(trans, alpha, a, x, beta, y);
 }
 
-/// Sequential GEMV implementation.
+/// Sequential GEMV implementation: beta, the `alpha == 0` return, then the
+/// SME2 GEMV (with `sme2`), the NEON kernels, the portable loops.
 fn gemv_sequential<T: Field>(
     trans: GemvTrans,
     alpha: T,
@@ -594,6 +631,13 @@ fn gemv_sequential<T: Field>(
 
     // Early exit if alpha is zero
     if alpha == T::zero() {
+        return;
+    }
+
+    // The SME2 GEMV (the `sme2` feature on aarch64): it computes the call,
+    // bit for bit the NEON kernels' result, or declines without touching y.
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    if sme2::try_gemv(trans, alpha, a, x, y, Par::Seq) {
         return;
     }
 
@@ -694,7 +738,9 @@ fn gemv_neon_parallel_dispatch<T: Field + Send + Sync>(
     false
 }
 
-/// Parallel GEMV implementation.
+/// Parallel GEMV implementation: beta, the `alpha == 0` return, then the
+/// SME2 GEMV with `par` (with `sme2`), the parallel NEON kernels, the
+/// portable parallel loops.
 #[cfg(feature = "parallel")]
 fn gemv_parallel<T: Field + Send + Sync>(
     trans: GemvTrans,
@@ -741,6 +787,12 @@ fn gemv_parallel<T: Field + Send + Sync>(
 
     // Early exit if alpha is zero
     if alpha == T::zero() {
+        return;
+    }
+
+    // The SME2 GEMV, split over SME units for a large matrix (see `gemv`).
+    #[cfg(all(feature = "sme2", target_arch = "aarch64"))]
+    if sme2::try_gemv(trans, alpha, a, x, y, par) {
         return;
     }
 
@@ -1429,3 +1481,18 @@ mod tests;
 
 #[cfg(test)]
 mod kernel_tests;
+
+#[cfg(all(test, feature = "sme2", target_arch = "aarch64"))]
+mod sme2_hook_grid_tests;
+
+#[cfg(all(test, feature = "sme2", target_arch = "aarch64"))]
+mod sme2_hook_tests;
+
+#[cfg(all(test, feature = "sme2", target_arch = "aarch64"))]
+mod sme2_tests;
+
+#[cfg(all(test, feature = "sme2", target_arch = "aarch64"))]
+mod sme2_tests_grid;
+
+#[cfg(all(test, feature = "sme2", target_arch = "aarch64"))]
+mod sme2_tests_templates;

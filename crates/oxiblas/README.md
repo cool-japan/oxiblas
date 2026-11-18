@@ -18,6 +18,7 @@
 - **Tensor operations** - Einstein summation, batched operations
 - **Extended precision** - f16, f128 support
 - **High performance** - BLIS-style blocked algorithms and SIMD kernels; see [Performance](#performance)
+- **Opt-in SME2 backend** - GEMM and GEMV on AArch64 CPUs with SME2 (Apple M4 and later) with the `sme2` feature; as released it has run only under emulation (QEMU), and an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests (a known limit on macOS, see the [CHANGELOG](../../CHANGELOG.md)); see [Feature Flags](#feature-flags)
 - **Pure Rust** - No C, C++ or Fortran in the libraries or their normal dependencies, easy cross-compilation
 
 ## Quick Start
@@ -213,12 +214,15 @@ use oxiblas::prelude::*;
 | `serde` | Serialization support for matrix types | |
 | `mmap` | Memory-mapped matrices for large datasets | |
 | `nalgebra` | nalgebra type conversions | |
-| `full` | `parallel`, `f16`, `f128`, `ndarray`, `sparse`, `serde`, `mmap` and `nalgebra` (not the SIMD flags below) | |
+| `full` | `parallel`, `f16`, `f128`, `ndarray`, `sparse`, `serde`, `mmap` and `nalgebra` (not the SIMD flags and not `sme2` below) | |
 | `force-scalar` | Use the portable scalar GEMM kernel and report no SIMD level; on aarch64 also the portable DOT, NRM2, GEMV and TRSM/TRMM code | |
 | `max-simd-128` | Cap the GEMM kernel at 128-bit SIMD (SSE4.2/NEON) | |
 | `max-simd-256` | Cap the GEMM kernel at 256-bit SIMD (AVX2) | |
+| `sme2` | Opt-in SME2 backend for GEMM and GEMV on AArch64 CPUs with SME2 and a 512-bit streaming vector length (Apple M4 and later), forwarded to `oxiblas-blas`; not part of `full`; as released it has run only under emulation (QEMU), and an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests (a known limit on macOS) | |
 
-The three SIMD flags are forwarded to `oxiblas-core`, `oxiblas-blas` and `oxiblas-lapack`. They take effect in the capability detection and in GEMM kernel selection. On aarch64, `force-scalar` also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`, the unit-stride `cblas_?gemv` and the TRSM/TRMM tile kernels on portable code; the typed `*_f64`/`*_f32` Level-1 kernels and the x86_64 Level-1 and `gemv` kernels pick AVX2 or NEON on their own and ignore the flags.
+The three SIMD flags are forwarded to `oxiblas-core`, `oxiblas-blas` and `oxiblas-lapack`. They take effect in the capability detection and in GEMM kernel selection. On aarch64, `force-scalar` also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`, the unit-stride `cblas_?gemv` and the TRSM/TRMM tile kernels on portable code, and the GEMM routes of 0.2.3 by default; the typed `*_f64`/`*_f32` Level-1 kernels and the x86_64 Level-1 and `gemv` kernels pick AVX2 or NEON on their own and ignore the flags. All three SIMD flags keep the `sme2` backend off at run time.
+
+With `sme2` the backend is used only when the operating system reports SME2 with a 512-bit streaming vector length and the first-use checks of its kernels pass; `OXIBLAS_DISABLE_SME2` set to anything other than an empty string or `0` turns it off. `features::HAS_SME2` says whether the backend is compiled in (the feature on AArch64), and `oxiblas::blas::level3::sme2_active()` whether the backend is active for the calling thread. See the [CHANGELOG](../../CHANGELOG.md) for what was verified and for the known limit about the floating-point status flags on macOS.
 
 > Note: `oxiblas-ffi` (C FFI bindings) was **retired** in v0.2.0 and is no longer
 > a feature of this crate - see the [Module Structure](#module-structure) table above.
@@ -240,6 +244,9 @@ oxiblas = { version = "0.2", features = ["ndarray"] }
 
 # All features
 oxiblas = { version = "0.2", features = ["full"] }
+
+# Opt-in SME2 backend (AArch64; not part of "full")
+oxiblas = { version = "0.2", features = ["sme2"] }
 ```
 
 ## Examples
@@ -272,7 +279,8 @@ Apple M3 on one thread, f64 GEMM runs at 92-99% of OpenBLAS and f32 GEMM at 101-
 `Par::Rayon` GEMM is level with OpenBLAS on 4 threads (95-103%) and ahead on 8
 (115-169%). DOT, NRM2, GEMV, TRSM and SYRK were reworked in 0.2.3 (NEON Level-1/2
 kernels on aarch64, a blocked TRSM, a triangle-only SYRK) and now run at 99% of
-OpenBLAS or faster on one thread, except GEMV at 5000×5000 (97%). See
+OpenBLAS or faster on one thread, except GEMV at 5000×5000 (97%). These figures
+were measured on 0.2.3 and not again for 0.2.4. See
 [Performance](../../README.md#performance) in the root README for the figures.
 
 Actual performance depends heavily on operation, matrix size, and hardware (SIMD width,

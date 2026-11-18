@@ -71,17 +71,14 @@
 //! differ in the last bit.
 
 use crate::level3::autotune::{KC_BLOCK_UNIT, balanced_block};
-use crate::level3::gemm::{GemmBlocking, op_dims, pack_a_trans_dispatch, pack_b_trans_dispatch};
+use crate::level3::gemm::{
+    GemmBlocking, default_blocking, op_dims, pack_a_trans_dispatch, pack_b_trans_dispatch,
+};
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernel, MicroKernelShape};
 use crate::level3::gemm_packing::{PackBuffer, PackSlot};
 use crate::level3::trsm::{Trans, Uplo};
 use oxiblas_core::scalar::{Field, Scalar};
 use oxiblas_matrix::{MatMut, MatRef};
-
-/// Dimension from which GEMM switches to [`GemmBlocking::auto_tuned`]
-/// (`gemm::AUTO_TUNE_THRESHOLD`); mirrored so the blocking, and with it the
-/// accumulation order, matches GEMM's.
-const AUTO_TUNE_THRESHOLD: usize = 512;
 
 /// Largest `MR × NR` of the micro-kernels in this crate (AVX-512 f32 is
 /// 16 × 16); larger shapes would use a heap scratch tile.
@@ -187,11 +184,14 @@ fn tri_update_impl<T: Field + GemmKernel + bytemuck::Zeroable>(
     }
 
     // One dispatch decision for the whole call: the packed layout below uses
-    // the shape of exactly the kernel that consumes it.
+    // the shape of exactly the kernel that consumes it. It is the canonical
+    // kernel, and the blocking is GEMM's default blocking for it, so the KC
+    // partition (and with it the accumulation order) is the one of GEMM
+    // whatever micro-kernel a GEMM plan carries.
     let kernel = T::micro_kernel_dispatch();
     let targets = match blocking {
         Some(b) => *b,
-        None => default_blocking::<T>(n, k_max, &kernel.shape),
+        None => default_blocking::<T>(n, k_max, n, &kernel.shape),
     };
     tri_blocked(
         uplo,
@@ -202,16 +202,6 @@ fn tri_update_impl<T: Field + GemmKernel + bytemuck::Zeroable>(
         &kernel,
         overwrite_first,
     );
-}
-
-/// The blocking GEMM uses for an `n × k` by `k × n` product
-/// (`gemm::default_blocking`).
-fn default_blocking<T: Field>(n: usize, k: usize, shape: &MicroKernelShape) -> GemmBlocking {
-    if n >= AUTO_TUNE_THRESHOLD || k >= AUTO_TUNE_THRESHOLD {
-        GemmBlocking::auto_tuned::<T>(n, k, n, shape)
-    } else {
-        GemmBlocking::for_kernel::<T>(shape)
-    }
 }
 
 /// Rows `[lo, hi)` of column `j` that lie in the `uplo` triangle of an

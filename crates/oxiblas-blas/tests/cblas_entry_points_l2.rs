@@ -1014,13 +1014,13 @@ fn check_ger<T: Num>(name: &str, call: GerCall<T>, conj_y: bool) {
                 let what = format!("{name} {layout:?} m={m} n={n} incx={incx} incy={incy}");
                 let mut touched = vec![false; buf.len()];
                 for i in 0..m {
-                    for j in 0..n {
+                    for (j, yv) in y.iter().enumerate().take(n) {
                         let s = dense_slot(layout, i, j, lda);
                         touched[s] = true;
                         let yj = if conj_y {
-                            y[j].widen().conj()
+                            yv.widen().conj()
                         } else {
-                            y[j].widen()
+                            yv.widen()
                         };
                         let (al, xi) = (alpha.widen(), x[i].widen());
                         let want = a[i][j].widen() + al * xi * yj;

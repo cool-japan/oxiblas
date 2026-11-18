@@ -88,7 +88,20 @@
 //! - `f16`: Enable half-precision (f16) support
 //! - `f128`: Enable quad-precision (f128) support
 //! - `serde`: Enable serialization support for matrix types
-//! - `full`: Enable all features
+//! - `full`: Enable all of the features above (not `sme2` and not the SIMD
+//!   control features below)
+//! - `sme2`: Opt-in SME2 backend for GEMM and GEMV on `aarch64` CPUs with
+//!   SME2 and a 512-bit streaming vector length (Apple M4 and later); off by
+//!   default and not part of `full`. The backend as released has run only
+//!   under emulation (QEMU); an early state of its kernels passed its unit
+//!   tests on an Apple M4 Pro except the tests of the floating-point status
+//!   flags (a known limit on macOS, see the CHANGELOG). It compiles to
+//!   nothing on other architectures, and it stays off at run time under
+//!   `force-scalar`, `max-simd-128` and `max-simd-256`, when `OXIBLAS_DISABLE_SME2` is set to anything other
+//!   than an empty string or `0`, when the operating system does not
+//!   report SME2, and when the first-use checks of its kernels fail.
+//!   [`features::HAS_SME2`] describes the build and
+//!   `blas::level3::sme2_active()` gives the run-time answer.
 //!
 //! ### SIMD Control Features
 //!
@@ -475,6 +488,20 @@ pub mod features {
     pub const HAS_F128: bool = cfg!(feature = "f128");
     /// `true` when the `ndarray` feature (ndarray interop) is compiled in.
     pub const HAS_NDARRAY: bool = cfg!(feature = "ndarray");
+    /// `true` when the opt-in `sme2` feature (the SME2 matrix backend for Arm
+    /// CPUs such as the Apple M4) is compiled in.
+    ///
+    /// The backend exists only on `aarch64`, so this is `false` on every other
+    /// architecture even when the feature is enabled. Like the other flags it
+    /// describes the build, not the machine: at run time the backend is also
+    /// skipped when the crate is built with `force-scalar`, `max-simd-128` or
+    /// `max-simd-256`, when the `OXIBLAS_DISABLE_SME2` environment variable is
+    /// set to anything other than an empty string or `0`, and when the
+    /// operating system does not report SME2 with a 512-bit streaming vector
+    /// length. `oxiblas::blas::level3::sme2_active()` gives the run-time
+    /// answer; it exists in every build and always returns `false` when this
+    /// flag is `false`.
+    pub const HAS_SME2: bool = cfg!(all(feature = "sme2", target_arch = "aarch64"));
     /// `true` when this crate is actually built without the standard library
     /// support that it forwards to the `oxiblas-core`/`oxiblas-matrix` layers
     /// (no-std mode for the core layer).

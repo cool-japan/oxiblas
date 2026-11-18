@@ -21,7 +21,7 @@ members = [
 exclude = ["crates/oxiblas-ffi", "fuzz"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -30,13 +30,13 @@ authors = ["COOLJAPAN OU <contact@cooljapan.tech>"]
 
 [workspace.dependencies]
 # Internal crates
-oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.3", default-features = false }
-oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.3", default-features = false }
-oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.3" }
-oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.3" }
-oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.3" }
-oxiblas = { path = "crates/oxiblas", version = "0.2.3" }
-oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.3" }
+oxiblas-core = { path = "crates/oxiblas-core", version = "0.2.4", default-features = false }
+oxiblas-matrix = { path = "crates/oxiblas-matrix", version = "0.2.4", default-features = false }
+oxiblas-blas = { path = "crates/oxiblas-blas", version = "0.2.4" }
+oxiblas-lapack = { path = "crates/oxiblas-lapack", version = "0.2.4" }
+oxiblas-sparse = { path = "crates/oxiblas-sparse", version = "0.2.4" }
+oxiblas = { path = "crates/oxiblas", version = "0.2.4" }
+oxiblas-ndarray = { path = "crates/oxiblas-ndarray", version = "0.2.4" }
 # oxiblas-ffi has been retired as of v0.2.0 (Pure Rust ecosystem)
 
 # Essential dependencies
@@ -72,6 +72,12 @@ faer = "0.24"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"  # Rust 2024 defaults to requiring unsafe blocks; we allow for now
+# `--cfg oxiblas_gemm_candidate` selects the candidate GEMM policies of
+# oxiblas-blas (same-source A/B runs), and `--cfg oxiblas_gemm_bcap_all` makes
+# those candidates cap the B block in both blocked drivers (A/B of the
+# `BCapScope::All` variant); declared so the cfgs are checked.
+# `--cfg oxiblas_gemm_legacy` restores the GEMM routes of 0.2.3 (it wins over the candidate cfg).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(oxiblas_gemm_candidate)', 'cfg(oxiblas_gemm_bcap_all)', 'cfg(oxiblas_gemm_legacy)'] }
 
 [workspace.lints.clippy]
 all = "warn"

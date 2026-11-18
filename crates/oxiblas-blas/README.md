@@ -22,6 +22,7 @@
 ### High Performance
 
 - **SIMD-optimized** kernels for x86_64 (AVX2/AVX-512) and AArch64 (NEON)
+- **Opt-in SME2 backend** for GEMM and GEMV on AArch64 CPUs with SME2 and a 512-bit streaming vector length (Apple M4 and later), enabled with the `sme2` feature (see [Feature Flags](#feature-flags)); as released it has run only under emulation (QEMU), and an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests (a known limit on macOS, see the [CHANGELOG](../../CHANGELOG.md))
 - **Cache-aware blocking** for optimal L1/L2/L3 utilization
 - **Parallel execution** via Rayon for large matrices (with `parallel` feature); opt in per call, for example `gemm_with_par(.., Par::Rayon)`, because plain `gemm` is always sequential
 - **Close to OpenBLAS or ahead of it** on one thread on an Apple M3: f64 GEMM at 92-99% and f32 GEMM at 101-120% of OpenBLAS; [Performance](#performance) has the other routines
@@ -171,7 +172,9 @@ let mut c: Mat<f64> = Mat::zeros(256, 256);
 gemm_with_par(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut(), Par::Rayon);
 ```
 
-Below a size gate (fewer than 128³ multiply-adds, `m*n*k`, in total or fewer than 80³ per thread) `Par::Rayon` falls back to the sequential path. Above it, a 2D driver splits `C` into tiles, one Rayon task per tile, and its results are bitwise identical to `Par::Seq`. `Par::RayonWith(n)` sizes the gate and the tile grid for `n` threads, but the tasks still run on the ambient Rayon pool (a pool of exactly `n` threads is planned for 0.2.4); bound the thread count with `rayon::ThreadPool::install` or `RAYON_NUM_THREADS`.
+Below a size gate (fewer than 128³ multiply-adds, `m*n*k`, in total or fewer than 80³ per thread) `Par::Rayon` falls back to the sequential path. Above it, a 2D driver splits `C` into tiles, one Rayon task per tile, and its results are bitwise identical to `Par::Seq`. `Par::RayonWith(n)` sizes the gate and the tile grid for `n` threads, but the tasks still run on the ambient Rayon pool (a pool of exactly `n` threads is planned for a later release, see "v0.2.5 - Planned" in the root [TODO.md](../../TODO.md)); bound the thread count with `rayon::ThreadPool::install` or `RAYON_NUM_THREADS`.
+
+On aarch64 the default sends a product with `m == 1` or `n == 1` whose operands are both stored column-major to its thin route (one GEMV) within a measured scope; with `Par::Rayon` such a product splits from 512² multiply-adds in total and 128² per thread, also bitwise identical to `Par::Seq`.
 
 ## Tensor Operations
 
@@ -294,7 +297,7 @@ Known deviations from reference CBLAS:
 
 ## Performance
 
-Measured on 2026-11-09 on an Apple M3 against OpenBLAS 0.3.30 on one thread. Ratio is OxiBLAS's speed as a percentage of OpenBLAS's, so above 100% means OxiBLAS is faster.
+Measured on 2026-11-09 on an Apple M3 against OpenBLAS 0.3.30 on one thread, on 0.2.3 (not measured again for 0.2.4). Ratio is OxiBLAS's speed as a percentage of OpenBLAS's, so above 100% means OxiBLAS is faster.
 
 | Operation | Size | OxiBLAS | OpenBLAS | Ratio |
 |-----------|------|---------|----------|-------|
@@ -319,8 +322,11 @@ The DDOT, DNRM2 and DGEMV kernels behind these rows are aarch64 (NEON) only; x86
 | `force-scalar` | Use the portable scalar GEMM kernel and report no SIMD level; on aarch64 also the portable DOT, NRM2, GEMV and TRSM/TRMM tile code (see below) | |
 | `max-simd-128` | Cap the GEMM kernel at 128-bit SIMD (SSE4.2 on x86_64, NEON on AArch64) | |
 | `max-simd-256` | Cap the GEMM kernel at 256-bit SIMD (AVX2) | |
+| `sme2` | Opt-in SME2 backend for GEMM and GEMV on AArch64 CPUs with SME2 and a 512-bit streaming vector length (Apple M4 and later); compiles to nothing on other architectures; as released it has run only under emulation (QEMU), and an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests (a known limit on macOS, see the [CHANGELOG](../../CHANGELOG.md)) | |
 
-The three SIMD flags are forwarded to `oxiblas-core` and take effect in its capability detection and in GEMM kernel selection. On aarch64, `force-scalar` also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`/`gemv_with_par`, the unit-stride `cblas_?gemv`, the TRSM/TRMM tile kernels, the GEMM B-panel packers and `gemm_small` on portable loops. The typed `*_f64`/`*_f32` Level-1 kernels (`dot_f64`, `nrm2_f32`, `axpy_f64`, ...) and the x86_64 Level-1 and `gemv` kernels pick AVX2 or NEON on their own and ignore all three flags.
+The three SIMD flags are forwarded to `oxiblas-core` and take effect in its capability detection and in GEMM kernel selection, including the SIMD tier of the GEMM routes. On aarch64, `force-scalar` also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`/`gemv_with_par`, the unit-stride `cblas_?gemv`, the TRSM/TRMM tile kernels, the GEMM B-panel packers and `gemm_small` on portable loops, and the GEMM routes of 0.2.3 by default. All three keep the `sme2` backend off at run time. The typed `*_f64`/`*_f32` Level-1 kernels (`dot_f64`, `nrm2_f32`, `axpy_f64`, ...) and the x86_64 Level-1 and `gemv` kernels pick AVX2 or NEON on their own and ignore all three flags.
+
+With `sme2` on AArch64 the backend turns itself on at run time only when the operating system reports SME2 with a 512-bit streaming vector length (macOS through `/usr/sbin/sysctl`, Linux and Android through `/proc/self/auxv`) and the first-use checks of its kernels pass; `OXIBLAS_DISABLE_SME2` set to anything other than an empty string or `0` turns it off, and `level3::sme2_active()` reports whether it is active for the calling thread. Its results equal those of a build without it bit for bit, except the sign and payload of NaN results and the floating-point status flags (on macOS the flags after a call are not reliable; see the [CHANGELOG](../../CHANGELOG.md)).
 
 ## Architecture
 
@@ -339,6 +345,9 @@ oxiblas-blas/
 │   └── ...
 ├── level3/               # Matrix-matrix operations
 │   ├── gemm.rs           # General matrix multiply
+│   ├── gemm_plan.rs      # Per-call GEMM plan and route choice
+│   ├── gemm_policy.rs    # Routing policies and the default per target
+│   ├── gemm_thin.rs      # m == 1 or n == 1 products as one GEMV
 │   ├── gemm_kernel/      # SIMD micro-kernels
 │   ├── gemm_parallel.rs  # 2D parallel driver (`parallel` feature)
 │   ├── autotune.rs       # Cache-aware blocking
@@ -346,6 +355,7 @@ oxiblas-blas/
 │   ├── syrk.rs
 │   ├── trmm.rs
 │   ├── trsm/             # Blocked TRSM driver and tile kernels (shared with TRMM)
+│   ├── sme2/             # Opt-in SME2 backend (`sme2` feature, aarch64)
 │   └── ...
 ├── cblas/                # CBLAS-compatible extern "C" entry points
 ├── tensor.rs             # Einstein summation, batched matmul, Tensor3

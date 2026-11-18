@@ -13,6 +13,7 @@ OxiBLAS is a production-grade, pure Rust implementation of BLAS (Basic Linear Al
 - **SIMD Optimized** - Custom SIMD layer using `core::arch` intrinsics
   - x86_64: SSE4.2, AVX2/FMA (256-bit), AVX-512F (512-bit)
   - AArch64: NEON (128-bit). `oxiblas-core`'s nightly-only `sve-nightly` feature adds SVE length queries and stand-alone `sve_dot_f64`, `sve_dot_f32` and `sve_axpy_f64` kernels, which the BLAS routines do not call yet. `oxiblas-core` declares the `stdarch_aarch64_sve` feature gate for that build; it is compile-checked on nightly with `-C target-feature=+sve`, but has not run on SVE hardware
+  - AArch64 SME2: the opt-in `sme2` feature adds a GEMM and GEMV backend for CPUs with SME2 and a 512-bit streaming vector length (Apple M4 and later). The backend as released has run only under emulation (QEMU); an early state of its kernels passed its unit tests on an Apple M4 Pro, except the tests of the floating-point status flags (a known limit on macOS); see [Feature Flags](#feature-flags) and the [CHANGELOG](CHANGELOG.md)
   - wasm32: SIMD128 (when enabled at compile time)
   - Fallback: Scalar operations
 - **Cache Aware** - BLIS-style blocked algorithms for optimal cache usage
@@ -322,7 +323,7 @@ Differences from reference CBLAS:
 - The symbols live in the `oxiblas-blas` rlib; this workspace does not build a C-linkable library.
 - The symbols are `#[no_mangle]`, so every `cblas_*` reference in a binary that links `oxiblas-blas` binds to OxiBLAS, even when another BLAS is linked too.
 
-The enum and `i?amax` changes break public signatures and are planned for 0.3.0. The remaining NaN/Inf differences in the triangular routines are planned for 0.2.4; see [TODO.md](TODO.md).
+The enum and `i?amax` changes break public signatures and are planned for 0.3.0. The remaining NaN/Inf differences in the triangular routines are planned for a later release (they are not in 0.2.4); see "v0.2.5 - Planned" in [TODO.md](TODO.md).
 
 ## Extended Precision & Tensor Operations
 
@@ -484,6 +485,8 @@ OxiBLAS implements BLIS-style blocked algorithms with architecture-specific SIMD
 
 Disregard figures published before 0.2.3. Their GFLOPS were 8 times too high, and their OpenBLAS columns measured OxiBLAS's own `cblas_*` layer. See the [CHANGELOG](CHANGELOG.md).
 
+The figures below predate 0.2.4 (the Apple M3 ones were measured on 0.2.3) and were not measured again for 0.2.4. The GEMM changes of 0.2.4 and their measured effect on small and thin products are in the [CHANGELOG](CHANGELOG.md).
+
 ### Apple M3
 
 Measured on 2026-11-09 on an Apple M3 (MacBook Pro) with 4 performance and 4 efficiency cores, macOS 27.2, using rustc 1.95.0 and Homebrew OpenBLAS 0.3.30 (`neoversen1` kernels, OpenMP). The [`comparison` benchmark](crates/oxiblas-benchmarks/README.md#comparison-benchmarks-with-openblas) reproduces the OpenBLAS tables.
@@ -630,9 +633,9 @@ let mut c = Mat::<f64>::zeros(n, n);
 gemm_with_par(1.0, a.as_ref(), b.as_ref(), 0.0, c.as_mut(), Par::Rayon);
 ```
 
-GEMM goes parallel from 128³ multiply-adds, with at least 80³ per thread, so from n = 128 on 4 threads and n = 160 on 8; smaller problems run sequentially. Tile edges follow the micro-kernel grid, so the result is bitwise identical to `Par::Seq` for any thread count.
+GEMM goes parallel from 128³ multiply-adds, with at least 80³ per thread, so from n = 128 on 4 threads and n = 160 on 8; smaller problems run sequentially. Tile edges follow the micro-kernel grid, so the result is bitwise identical to `Par::Seq` for any thread count. On aarch64 a product with `m == 1` or `n == 1` that the default sends to its thin route (one GEMV) splits from 512² multiply-adds in total and 128² per thread instead, also bitwise identical to `Par::Seq`.
 
-`Par::RayonWith(n)` partitions the work for `n` threads, but the tasks still run on the ambient Rayon pool. To bound the thread count, run the call inside `rayon::ThreadPool::install` or set `RAYON_NUM_THREADS`. Running on an `n`-thread pool is planned for 0.2.4.
+`Par::RayonWith(n)` partitions the work for `n` threads, but the tasks still run on the ambient Rayon pool. To bound the thread count, run the call inside `rayon::ThreadPool::install` or set `RAYON_NUM_THREADS`. Running on an `n`-thread pool is planned for a later release (it is not in 0.2.4; see "v0.2.5 - Planned" in [TODO.md](TODO.md)).
 
 ### Benchmarking
 
@@ -660,13 +663,15 @@ See [crates/oxiblas-benchmarks/README.md](crates/oxiblas-benchmarks/README.md) f
 | macOS | Apple M3 | NEON 128-bit | 55.0 GFLOPS | 97% |
 | Linux x86_64 | Intel Xeon E5-2623 v4 | AVX2 256-bit | 26.6 GFLOPS (0.1.0) | not measured |
 
-With the `force-scalar` feature the M3 reaches 29.8 GFLOPS for f64 and 34.7 for f32, which is 54% and 30% of its NEON speed. That feature replaces the GEMM micro-kernels and, on aarch64, also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`, the unit-stride `cblas_?gemv`, the TRSM/TRMM tile kernels and the GEMM B-panel packers on portable code; the typed `*_f64`/`*_f32` Level-1 kernels and the x86_64 Level-1 and `gemv` kernels do not consult it.
+With the `force-scalar` feature the M3 reaches 29.8 GFLOPS for f64 and 34.7 for f32, which is 54% and 30% of its NEON speed. That feature replaces the GEMM micro-kernels and, on aarch64, also keeps the generic `dot`, `nrm2` and `cnrm2`, `gemv`, the unit-stride `cblas_?gemv`, the TRSM/TRMM tile kernels and the GEMM B-panel packers on portable code, and the GEMM routes of 0.2.3 by default; the typed `*_f64`/`*_f32` Level-1 kernels and the x86_64 Level-1 and `gemv` kernels do not consult it. It, `max-simd-128` and `max-simd-256` also keep the opt-in SME2 backend off.
+
+The project measured 0.2.4 only on an Apple M3. The x86-64 AVX2 + FMA code of 0.2.4 ran its tests under QEMU emulation and is not enabled by default; on x86-64 hardware the workspace tests passed with all features, which select the portable kernels. The SME2 backend as released has run only under QEMU emulation; an early state of its kernels passed its unit tests on an Apple M4 Pro, except the tests of the floating-point status flags (a known limit on macOS, see the [CHANGELOG](CHANGELOG.md)).
 
 ### SIMD Feature Detection
 
 OxiBLAS automatically detects and uses the best available SIMD:
-- **x86_64**: AVX-512 > AVX2 > SSE4.2 > scalar
-- **aarch64**: NEON (native 128-bit) + emulated 256-bit
+- **x86_64**: AVX-512 > AVX2 > SSE4.2 > scalar. The AVX2 + FMA kernels added in 0.2.4 (an `f32` 16×6 GEMM micro-kernel, small-matrix and thin-product kernels) are compiled in but used only when built with the rustc flag `--cfg oxiblas_gemm_candidate`; they are not timed on x86-64 hardware
+- **aarch64**: NEON (native 128-bit) + emulated 256-bit. With the opt-in `sme2` feature, SME2 is detected at run time (on macOS through `/usr/sbin/sysctl`, on Linux and Android through `/proc/self/auxv`) and used only with a 512-bit streaming vector length, after first-use checks of its kernels; `OXIBLAS_DISABLE_SME2=1` turns it off, and `oxiblas_blas::level3::sme2_active()` reports whether it is active
 - **wasm32**: SIMD128 (if enabled) + emulated 256-bit
 - **others**: Scalar fallback
 
@@ -809,10 +814,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `serde` | Serialization for matrix types |
 | `mmap` | Memory-mapped matrices |
 | `nalgebra` | Conversions to and from nalgebra types |
-| `full` | All of the above (not the SIMD limits below) |
+| `full` | All of the above (not the SIMD limits and not `sme2` below) |
 | `force-scalar` | Use the portable scalar GEMM kernel and report no SIMD level; on aarch64 also keep the generic DOT/NRM2, GEMV and TRSM/TRMM tile kernels on portable code |
 | `max-simd-128` | Cap the GEMM kernel at 128-bit SIMD |
 | `max-simd-256` | Cap the GEMM kernel at 256-bit SIMD |
+| `sme2` | Opt-in SME2 backend for GEMM and GEMV on aarch64 CPUs with SME2 and a 512-bit streaming vector length (Apple M4 and later); not part of `full`, off under the three SIMD limits above; the backend as released has run only under emulation (QEMU), and an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests (a known limit on macOS, see the [CHANGELOG](CHANGELOG.md)) |
 
 **Crate-specific features:**
 | Feature | Crate | Description |
@@ -828,11 +834,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Project Status
 
-**Version:** 0.2.3 (2026-11-12)
+**Version:** 0.2.4 (2026-11-18)
 
-- **Lines of Code:** ~283,000 lines of Rust, of which 228,258 are code (467 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
+- **Lines of Code:** ~355,000 lines of Rust, of which 293,366 are code (571 files, excluding the retired `oxiblas-ffi` crate; `tokei`)
 - **Documentation:** 13 examples
-- **Tests:** 4,437 passing lib/integration tests and 4 release-only ones skipped in debug builds (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 358 passing doctests (`cargo test --doc --workspace --exclude oxiblas-benchmarks`)
+- **Tests:** 4,602 passing lib/integration tests and 9 skipped: 4 release-only ones skipped in debug builds and 5 timing groups of the GEMM A/B harness marked `#[ignore]` (`cargo nextest run --workspace --exclude oxiblas-benchmarks`) + 360 passing doctests (`cargo test --doc --workspace --exclude oxiblas-benchmarks`)
 - **Coverage:**
   - ✅ Full BLAS Level 1/2/3 (including packed/banded variants)
   - ✅ CBLAS interface (every routine in netlib `cblas.h` 3.12.1 except `cblas_xerbla`)
@@ -856,6 +862,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   - ✅ Tensor operations (einsum with 22 patterns, batched matmul)
   - ✅ Extended precision (f16, f128, Kahan/pairwise summation)
   - ✅ Comprehensive benchmarks with OpenBLAS comparison
+  - ✅ Opt-in SME2 GEMM and GEMV backend (`sme2` feature; as released, run only under QEMU emulation; an early state of its kernels passed its unit tests on an Apple M4 Pro except the floating-point status flag tests)
   - ✅ Complete API documentation with examples
 
 See [TODO.md](TODO.md) for the development roadmap.
@@ -874,7 +881,7 @@ OxiBLAS is part of the SciRS2 scientific computing ecosystem:
 
 ## Sponsorship
 
-OxiBLAS is developed and maintained by **COOLJAPAN OU (Team Kitasan)**.
+OxiBLAS is developed and maintained by **COOLJAPAN OU (Team KitaSan)**.
 
 If you find OxiBLAS useful, please consider sponsoring the project to support continued development of the Pure Rust ecosystem.
 
@@ -896,3 +903,5 @@ See [LICENSE](LICENSE) for details.
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) before submitting issues and pull requests.
+
+The x86-64 GEMM kernels and the opt-in SME2 backend added in 0.2.4 are independent implementations of approaches proposed and measured by tesch1 (pull requests #19 and #20, issues #21 to #23).

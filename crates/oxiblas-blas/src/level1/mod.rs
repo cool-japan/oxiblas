@@ -60,7 +60,6 @@ pub mod parallel;
 mod rot;
 mod scal;
 mod strided;
-#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
 pub(crate) mod typed;
 
 pub use asum::{

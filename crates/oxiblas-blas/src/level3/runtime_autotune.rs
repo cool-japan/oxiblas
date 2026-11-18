@@ -30,7 +30,7 @@
 //! println!("Optimal: MC={}, KC={}, NC={}", blocking.mc, blocking.kc, blocking.nc);
 //! ```
 
-use crate::level3::gemm::{GemmBlocking, gemm_with_blocking};
+use crate::level3::gemm::{GemmBlocking, gemm_with_blocking, gemm_with_heuristic_blocking};
 use crate::level3::gemm_kernel::{GemmKernel, MicroKernelShape};
 use oxiblas_core::parallel::Par;
 use oxiblas_core::scalar::Field;
@@ -423,7 +423,9 @@ pub fn gemm_auto_tuned_with_par<T: Field + GemmKernel + bytemuck::Zeroable>(
 
     let size_class = SizeClass::from_dims(m, k, n);
     let blocking = auto_tune_gemm_for_size::<T>(size_class);
-    gemm_with_blocking(alpha, a, b, beta, c, par, &blocking);
+    // The tuner chose these targets (not the caller), so the policy's B-block
+    // cap may lower NC; the timing probes above run them as given.
+    gemm_with_heuristic_blocking(alpha, a, b, beta, c, par, &blocking);
 }
 
 /// Returns the heuristic-fallback blocking for when runtime tuning is skipped.
